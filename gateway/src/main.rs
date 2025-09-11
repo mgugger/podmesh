@@ -12,6 +12,9 @@ pub struct Opt {
 
     #[clap(long, default_value = "0.0.0.0:5000")]
     pub http_addr: String,
+
+    #[clap(long, default_value = "/run/podmesh/raft_testpod.sock")]
+    pub host_socket: String,
 }
 
 #[actix_web::main]
@@ -28,5 +31,5 @@ async fn main() -> std::io::Result<()> {
     // Parse the parameters passed by arguments.
     let options = Opt::parse();
 
-    start_example_raft_node(options.id, options.http_addr).await
+    start_example_raft_node(options.id, options.http_addr, options.host_socket).await
 }

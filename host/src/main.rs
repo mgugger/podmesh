@@ -27,6 +27,7 @@ struct Cli {
 mod libp2pmod;
 mod podman;
 mod restapi;
+mod pod_communication;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -16,7 +16,6 @@ use crate::network::raft;
 use crate::store::Request;
 use crate::store::Response;
 
-
 pub mod network_v1_http;
 pub mod app;
 pub mod network;
@@ -41,7 +40,11 @@ pub type Raft = openraft::Raft<TypeConfig>;
 #[path = "./utils/declare_types.rs"]
 pub mod typ;
 
-pub async fn start_example_raft_node(node_id: NodeId, http_addr: String) -> std::io::Result<()> {
+pub async fn start_example_raft_node(
+    node_id: NodeId,
+    http_addr: String,
+    host_socket: String,
+) -> std::io::Result<()> {
     // Create a configuration for the raft instance.
     let config = Config {
         heartbeat_interval: 500,
@@ -59,7 +62,8 @@ pub async fn start_example_raft_node(node_id: NodeId, http_addr: String) -> std:
 
     // Create the network layer that will connect and communicate the raft instances and
     // will be used in conjunction with the store created above.
-    let network = network_v1_http::NetworkFactory {};
+    let mut network = network_v1_http::NetworkFactory::new(host_socket.clone());
+    let mut event_rx = network.take_event_receiver().unwrap();
 
     // Create a local raft instance.
     let raft = openraft::Raft::new(
@@ -79,6 +83,14 @@ pub async fn start_example_raft_node(node_id: NodeId, http_addr: String) -> std:
         addr: http_addr.clone(),
         raft,
         state_machine_store,
+    });
+
+    // Spawn a task to receive unsolicited events from host and log them for now.
+    tokio::spawn(async move {
+        while let Some(ev) = event_rx.recv().await {
+            tracing::debug!("received host event: {:?}", ev);
+            // TODO: dispatch event into application (e.g., to App or actors)
+        }
     });
 
     // Start the actix-web server.

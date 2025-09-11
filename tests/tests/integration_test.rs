@@ -18,13 +18,26 @@ impl NodeGuard {
     }
 }
 
+// Ensure processes are killed even if the test panics: Drop is called on unwind.
+impl Drop for NodeGuard {
+    fn drop(&mut self) {
+        // Best-effort synchronous kill. tokio::process::Child exposes a synchronous kill().
+        if let Some(mut n2) = self.node2.take() {
+            let _ = n2.kill();
+        }
+        if let Some(mut n1) = self.node1.take() {
+            let _ = n1.kill();
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_run_host_application() {
     let node1 = Command::new("../target/debug/host")
         .spawn()
         .expect("Failed to start host application");
 
-    sleep(Duration::from_secs(2)).await;
+    //sleep(Duration::from_secs(2)).await;
 
     let node2 = Command::new("../target/debug/host")
         .args(&["--disable-rest-api"])
@@ -36,27 +49,60 @@ async fn test_run_host_application() {
         node2: Some(node2),
     };
 
-    let test_result = async {
-        sleep(Duration::from_secs(2)).await;
+    let _sleep = sleep(Duration::from_secs(5)).await;
 
-        // Check health
+     check_health().await;
+    verify_peers().await;
+    init_raft_pod().await;
+    stop_raft_pod().await;
+
+    guard.cleanup().await;
+}
+
+async fn check_health() {
         let resp = tokio::time::timeout(
             Duration::from_secs(5),
             reqwest::get("http://localhost:3000/health")
         ).await.unwrap().unwrap();
         assert_eq!(resp.text().await.unwrap(), "ok");
-        
-        // check peers
-        let resp = tokio::time::timeout(
-            Duration::from_secs(5),
-            reqwest::get("http://localhost:3000/nodes")
-        ).await.unwrap().unwrap();
-        let nodes: serde_json::Value = resp.json().await.unwrap();
-        let peers = nodes["peers"].as_array().expect("peers should be an array");
-        assert!(!peers.is_empty(), "Expected at least one peer in the mesh, got {:?}", nodes);
+}
 
-        Ok::<(), ()>(())
-    }.await;
-    guard.cleanup().await;
-    test_result.unwrap();
+async fn verify_peers() {
+        let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        reqwest::get("http://localhost:3000/nodes")
+    ).await.unwrap().unwrap();
+    let nodes: serde_json::Value = resp.json().await.unwrap();
+    let peers = nodes["peers"].as_array().expect("peers should be an array");
+    assert!(!peers.is_empty(), "Expected at least one peer in the mesh, got {:?}", nodes);
+}
+
+async fn init_raft_pod() {
+    let client = reqwest::Client::new();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.post("http://localhost:3000/init_pod")
+            .json(&serde_json::json!({"pod_name": "testpod"}))
+            .send()
+    ).await.unwrap().unwrap();
+    let text = resp.text().await.unwrap_or_else(|e| panic!("Failed to read body: {}", e));
+    let result: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => panic!("Failed to parse JSON: {}. Body: {}", e, text),
+    };
+    let socket_path = result["socket_path"].as_str().expect("socket_path should be a string");
+    assert!(socket_path.contains("testpod"), "Expected socket path to contain pod name, got {}", socket_path);
+}
+
+async fn stop_raft_pod() {
+    let client = reqwest::Client::new();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.post("http://localhost:3000/stop_pod")
+            .json(&serde_json::json!({"pod_name": "testpod"}))
+            .send()
+    ).await.unwrap().unwrap();
+    let result: serde_json::Value = resp.json().await.unwrap();
+    let status = result["status"].as_str().expect("status should be a string");
+    assert_eq!(status, "stopped gateway", "Expected status to be 'stopped', got {}", status);
 }
