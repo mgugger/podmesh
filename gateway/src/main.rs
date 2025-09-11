@@ -10,10 +10,10 @@ pub struct Opt {
     #[clap(long, default_value = "1")]
     pub id: u64,
 
-    #[clap(long, default_value = "0.0.0.0:5000")]
+    #[clap(long, default_value = "/run/podmesh/gateway_testpod.sock")]
     pub http_addr: String,
 
-    #[clap(long, default_value = "/run/podmesh/raft_testpod.sock")]
+    #[clap(long, default_value = "/run/podmesh/host.sock")]
     pub host_socket: String,
 }
 

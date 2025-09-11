@@ -18,7 +18,6 @@ use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use openraft::BasicNode;
 use openraft::RaftTypeConfig;
-use reqwest::Client;
 use serde_json::Value as JsonValue;
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LinesCodec};
@@ -74,7 +73,7 @@ impl HostConnection {
     ) -> Result<Arc<Self>, std::io::Error> {
         let stream = UnixStream::connect(&socket_path).await?;
         let framed = Framed::new(stream, LinesCodec::new());
-        let (sink, mut stream) = framed.split();
+    let (sink, stream) = framed.split();
 
         let host = Arc::new(HostConnection {
             writer: Mutex::new(sink),
@@ -83,38 +82,112 @@ impl HostConnection {
             event_tx: event_tx.clone(),
         });
 
-        // spawn reader task
+        // spawn reader task with reconnect/backoff logic
         let h = host.clone();
         tokio::spawn(async move {
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(line) => {
-                        if line.is_empty() {
-                            continue;
-                        }
-                        match serde_json::from_str::<JsonValue>(&line) {
-                            Ok(v) => {
-                                if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
-                                    let mut pending = h.pending.lock().await;
-                                    if let Some(tx) = pending.remove(id) {
-                                        let _ = tx.send(v);
-                                        continue;
+            // `stream` is the framed read half; we will replace it on reconnect.
+            let mut stream = stream;
+
+            loop {
+                let mut disconnected = false;
+
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(line) => {
+                            if line.is_empty() {
+                                continue;
+                            }
+                            match serde_json::from_str::<JsonValue>(&line) {
+                                Ok(v) => {
+                                    if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
+                                        let mut pending = h.pending.lock().await;
+                                        if let Some(tx) = pending.remove(id) {
+                                            // reply to an outstanding gateway request
+                                            let _ = tx.send(v);
+                                            continue;
+                                        } else {
+                                            // host-initiated request: check uri and reply if handled
+                                            if let Some(uri) = v.get("uri").and_then(|x| x.as_str()) {
+                                                match uri {
+                                                    "health" => {
+                                                        // reply with simple JSON OK using same id
+                                                        let resp = serde_json::json!({"id": id, "ok": true});
+                                                        let s = resp.to_string();
+                                                        let mut w = h.writer.lock().await;
+                                                        let _ = w.send(s).await;
+                                                        continue;
+                                                    }
+                                                    _ => {
+                                                        // unknown host request: forward to event channel for app handling
+                                                        let _ = h.event_tx.send(v);
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
+                                    let _ = h.event_tx.send(v);
                                 }
-                                let _ = h.event_tx.send(v);
+                                Err(_) => {
+                                    // ignore parse errors for now
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+
+                if !disconnected {
+                    // stream ended normally (None), treat as disconnection
+                    disconnected = true;
+                }
+
+                if disconnected {
+                    // Attempt to reconnect with exponential backoff a few times.
+                    const MAX_RETRIES: usize = 5;
+                    let mut attempt = 0usize;
+                    let mut reconnected = false;
+
+                    while attempt < MAX_RETRIES {
+                        attempt += 1;
+                        let wait_ms = 100u64 * (1 << (attempt - 1));
+                        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                        match UnixStream::connect(&socket_path).await {
+                            Ok(new_stream) => {
+                                let framed = Framed::new(new_stream, LinesCodec::new());
+                                let (new_sink, new_stream) = framed.split();
+
+                                // replace writer sink so senders start using new connection
+                                {
+                                    let mut w = h.writer.lock().await;
+                                    // replace the old sink with the new one
+                                    drop(std::mem::replace(&mut *w, new_sink));
+                                }
+
+                                // set the stream to the newly connected stream and resume reading
+                                stream = new_stream;
+                                reconnected = true;
+                                break;
                             }
                             Err(_) => {
-                                // ignore parse errors for now
+                                // try again
                             }
                         }
                     }
-                    Err(_) => break,
+
+                    if reconnected {
+                        continue; // outer loop will resume reading from updated `stream`
+                    }
+
+                    // failed to reconnect: clear pending so receivers see cancellation and exit
+                    let mut pending = h.pending.lock().await;
+                    pending.clear();
+                    break;
                 }
             }
-
-            // connection ended, clear pending so receivers see cancellation
-            let mut pending = h.pending.lock().await;
-            pending.clear();
         });
 
         Ok(host)
@@ -159,8 +232,6 @@ where
     #[tracing::instrument(level = "debug", skip_all)]
     async fn new_client(&mut self, target: C::NodeId, node: &BasicNode) -> Self::Network {
         let addr = node.addr.clone();
-
-        let client = Client::builder().no_proxy().build().unwrap();
 
         // ensure host connection exists
         if self.host_conn.is_none() {

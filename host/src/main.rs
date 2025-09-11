@@ -1,5 +1,11 @@
 use clap::Parser;
 
+mod hostapi;
+mod libp2pmod;
+mod pod_communication;
+mod podman;
+mod restapi;
+
 /// Podmesh Host Agent
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -16,6 +22,10 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     disable_rest_api: bool,
 
+    /// Disable REST API server
+    #[arg(long, default_value_t = false)]
+    disable_host_api: bool,
+
     /// Custom node name (optional)
     #[arg(long)]
     node_name: Option<String>,
@@ -23,11 +33,10 @@ struct Cli {
     /// Libp2p base port (optional)
     #[arg(long)]
     libp2p_port: Option<u16>,
+
+    #[arg(long, default_value = "/run/podmesh/host.sock")]
+    api_socket: Option<String>,
 }
-mod libp2pmod;
-mod podman;
-mod restapi;
-mod pod_communication;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,28 +50,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let axum_handle = if !cli.disable_rest_api {
-        let app = restapi::build_router(peer_rx).merge(podman::build_router());
+    let mut handles = Vec::new();
+
+    // rest api server
+    if !cli.disable_rest_api {
+        let app = restapi::build_router(peer_rx);
+
+        // Public TCP server
         let bind_addr = format!("{}:{}", cli.api_host, cli.api_port);
-        let listener = tokio::net::TcpListener::bind(&bind_addr)
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
         println!("listening on {}", listener.local_addr().unwrap());
-        Some(tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app.into_make_service()).await {
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app.clone().into_make_service()).await {
                 eprintln!("axum server error: {}", e);
             }
-        }))
+        }));
     } else {
         println!("REST API disabled");
-        None
-    };
+    }
 
-    // Wait for both tasks (if REST API enabled)
-    if let Some(axum_handle) = axum_handle {
-        let _ = tokio::try_join!(libp2p_handle, axum_handle);
-    } else {
+    // host api server - for gateway to host accesss
+    if !cli.disable_host_api {
+        if let Some(socket_path) = cli.api_socket.clone() {
+            // remove stale
+            let _ = std::fs::remove_file(&socket_path);
+            let app2 = hostapi::build_router().merge(podman::build_router());
+            let socket = socket_path.clone();
+            handles.push(tokio::spawn(async move {
+                // bind a unix domain socket and serve the axum app on it
+                match tokio::net::UnixListener::bind(&socket) {
+                    Ok(listener) => {
+                        if let Err(e) = axum::serve(listener, app2.into_make_service()).await {
+                            eprintln!("axum UDS server error: {}", e);
+                        }
+                    }
+                    Err(e) => eprintln!("failed to bind UDS {}: {}", socket, e),
+                }
+            }));
+        }
+    }
+
+    // Wait for tasks
+    if handles.is_empty() {
         let _ = libp2p_handle.await;
+    } else {
+        let mut all = vec![libp2p_handle];
+        all.extend(handles);
+        let _ = futures::future::join_all(all).await;
     }
     Ok(())
 }

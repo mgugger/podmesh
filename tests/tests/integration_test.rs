@@ -40,7 +40,7 @@ async fn test_run_host_application() {
     //sleep(Duration::from_secs(2)).await;
 
     let node2 = Command::new("../target/debug/host")
-        .args(&["--disable-rest-api"])
+        .args(&["--disable-rest-api", "--disable-host-api"])
         .spawn()
         .expect("Failed to start host application");
 
@@ -51,9 +51,13 @@ async fn test_run_host_application() {
 
     let _sleep = sleep(Duration::from_secs(5)).await;
 
-     check_health().await;
+    check_health().await;
     verify_peers().await;
+    start_raft_pod().await;
+    let _sleep = sleep(Duration::from_secs(1)).await;
     init_raft_pod().await;
+    let _sleep = sleep(Duration::from_secs(1)).await;
+    verify_gateway_health().await;
     stop_raft_pod().await;
 
     guard.cleanup().await;
@@ -77,11 +81,11 @@ async fn verify_peers() {
     assert!(!peers.is_empty(), "Expected at least one peer in the mesh, got {:?}", nodes);
 }
 
-async fn init_raft_pod() {
+async fn start_raft_pod() {
     let client = reqwest::Client::new();
     let resp = tokio::time::timeout(
         Duration::from_secs(5),
-        client.post("http://localhost:3000/init_pod")
+        client.post("http://localhost:3000/start_pod")
             .json(&serde_json::json!({"pod_name": "testpod"}))
             .send()
     ).await.unwrap().unwrap();
@@ -92,6 +96,18 @@ async fn init_raft_pod() {
     };
     let socket_path = result["socket_path"].as_str().expect("socket_path should be a string");
     assert!(socket_path.contains("testpod"), "Expected socket path to contain pod name, got {}", socket_path);
+}
+
+async fn init_raft_pod() {
+    let client = reqwest::Client::new();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.post("http://localhost:3000/self/testpod/init_raft")
+            .json(&serde_json::json!({"pod_name": "testpod"}))
+            .send()
+    ).await.unwrap().unwrap();
+    let text = resp.text().await.unwrap_or_else(|e| panic!("Failed to read body: {}", e));
+    assert!(text.contains("ok"), "Expected raft to be initialized, got {}", text);
 }
 
 async fn stop_raft_pod() {
@@ -105,4 +121,18 @@ async fn stop_raft_pod() {
     let result: serde_json::Value = resp.json().await.unwrap();
     let status = result["status"].as_str().expect("status should be a string");
     assert_eq!(status, "stopped gateway", "Expected status to be 'stopped', got {}", status);
+}
+
+async fn verify_gateway_health() {
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        reqwest::get("http://localhost:3000/self/testpod/health")
+    ).await.unwrap().unwrap();
+    let text = resp.text().await.unwrap();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+        if v.get("ok").and_then(|x| x.as_bool()) == Some(true) {
+            return;
+        }
+    }
+    panic!("Expected gateway health OK, got {}", text);
 }

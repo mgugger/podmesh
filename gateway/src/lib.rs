@@ -97,7 +97,7 @@ pub async fn start_example_raft_node(
     let server = HttpServer::new(move || {
         actix_web::App::new()
             .wrap(Logger::default())
-            .wrap(Logger::new("%a %{User-Agent}i"))
+            .wrap(Logger::new("%a %t \"%r\" %s %b \"%{User-Agent}i\" %T"))
             .wrap(middleware::Compress::default())
             .app_data(app_data.clone())
             // raft internal RPC
@@ -113,9 +113,24 @@ pub async fn start_example_raft_node(
             .service(api::write)
             .service(api::read)
             .service(api::linearizable_read)
+            // health
+            .service(api::health_check)
     });
 
-    let x = server.bind(http_addr)?;
+    // Bind Actix to the address provided in `http_addr`. If `http_addr` looks like a
+    // unix socket path (starts with '/'), bind to the UDS file. Otherwise treat it
+    // as a TCP listen address. `host_socket` is reserved for connecting to the host
+    // agent and is not used for Actix binding.
+    if !http_addr.is_empty() && http_addr.starts_with('/') {
+        use std::os::unix::net::UnixListener as StdUnixListener;
 
-    x.run().await
+        let std_listener = StdUnixListener::bind(&http_addr)?;
+        std_listener.set_nonblocking(true)?;
+
+        let server = server.listen_uds(std_listener)?;
+        server.run().await
+    } else {
+        let x = server.bind(http_addr)?;
+        x.run().await
+    }
 }

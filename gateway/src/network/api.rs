@@ -1,7 +1,9 @@
 use actix_web::post;
+use actix_web::get;
 use actix_web::web;
 use actix_web::web::Data;
 use actix_web::Responder;
+use actix_web::HttpResponse;
 use openraft::error::decompose::DecomposeResult;
 use openraft::error::CheckIsLeaderError;
 use openraft::error::Infallible;
@@ -53,5 +55,32 @@ pub async fn linearizable_read(app: Data<App>, req: Json<String>) -> actix_web::
             Ok(Json(res))
         }
         Err(e) => Ok(Json(Err(e))),
+    }
+}
+
+#[get("/health")]
+pub async fn health_check(app: Data<App>) -> actix_web::Result<impl Responder> {
+    // Use the read linearizer (ReadIndex) to check for a healthy leader that can serve
+    // linearizable reads. If there is no leader or the leader is not available this will
+    // return a `CheckIsLeaderError` which we'll propagate as an unhealthy result.
+    let ret = app.raft.get_read_linearizer(ReadPolicy::ReadIndex).await.decompose().unwrap();
+
+    match ret {
+        Ok(linearizer) => {
+            // await_ready returns Result<(), CheckIsLeaderError<TypeConfig>>.
+            let ready = linearizer.await_ready(&app.raft).await;
+
+            if ready.is_ok() {
+                // healthy: return 200 and a consistent JSON shape
+                Ok(HttpResponse::Ok().json(serde_json::json!({"ok": true, "status": "healthy"})))
+            } else {
+                // unhealthy: return 503 Service Unavailable and JSON
+                Ok(HttpResponse::ServiceUnavailable().json(serde_json::json!({"ok": false, "status": "unhealthy"})))
+            }
+        }
+        Err(e) => {
+            // error while obtaining linearizer: treat as unhealthy
+            Ok(HttpResponse::ServiceUnavailable().json(serde_json::json!({"ok": false, "error": format!("{:?}", e)})))
+        }
     }
 }
