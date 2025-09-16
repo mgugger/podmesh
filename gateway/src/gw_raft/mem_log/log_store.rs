@@ -144,7 +144,7 @@ mod impl_log_store {
     use openraft::RaftTypeConfig;
     use openraft::StorageError;
 
-    use crate::mem_log::LogStore;
+    use crate::gw_raft::mem_log::LogStore;
 
     impl<C: RaftTypeConfig> RaftLogReader<C> for LogStore<C>
     where C::Entry: Clone

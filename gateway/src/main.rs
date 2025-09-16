@@ -1,8 +1,9 @@
 use clap::Parser;
-use gateway::start_example_raft_node;
 use tracing_subscriber::EnvFilter;
 
-pub mod mem_log;
+mod gw_raft;
+use gw_raft::start_example_raft_node;
+
 
 #[derive(Parser, Clone, Debug)]
 #[clap(author, version, about, long_about = None)]

@@ -1,6 +1,15 @@
 #![allow(clippy::uninlined_format_args)]
 #![deny(unused_qualifications)]
 
+mod store;
+mod network_v1_http;
+mod mem_log;
+mod network;
+mod app;
+use network::api;
+use network::management;
+use network::raft::{append, snapshot, vote};
+
 use std::sync::Arc;
 
 use actix_web::middleware;
@@ -9,20 +18,10 @@ use actix_web::web::Data;
 use actix_web::HttpServer;
 use openraft::Config;
 
-use crate::app::App;
-use crate::network::api;
-use crate::network::management;
-use crate::network::raft;
-use crate::store::Request;
-use crate::store::Response;
+use crate::gw_raft::store::{Request, Response};
 
-pub mod network_v1_http;
-pub mod app;
-pub mod network;
-pub mod store;
 #[cfg(test)]
 mod test;
-mod mem_log;
 
 pub type NodeId = u64;
 
@@ -37,6 +36,7 @@ pub type LogStore = store::LogStore;
 pub type StateMachineStore = store::StateMachineStore;
 pub type Raft = openraft::Raft<TypeConfig>;
 
+#[allow(dead_code)]
 #[path = "./utils/declare_types.rs"]
 pub mod typ;
 
@@ -101,9 +101,9 @@ pub async fn start_example_raft_node(
             .wrap(middleware::Compress::default())
             .app_data(app_data.clone())
             // raft internal RPC
-            .service(raft::append)
-            .service(raft::snapshot)
-            .service(raft::vote)
+            .service(append)
+            .service(snapshot)
+            .service(vote)
             // admin API
             .service(management::init)
             .service(management::add_learner)
@@ -134,3 +134,5 @@ pub async fn start_example_raft_node(
         x.run().await
     }
 }
+
+use app::App;

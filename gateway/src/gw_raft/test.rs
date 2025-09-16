@@ -4,9 +4,9 @@ use openraft::testing::log::StoreBuilder;
 use openraft::testing::log::Suite;
 use openraft::StorageError;
 
-use crate::store::LogStore;
-use crate::store::StateMachineStore;
-use crate::TypeConfig;
+use crate::gw_raft::store::LogStore;
+use crate::gw_raft::store::StateMachineStore;
+use crate::gw_raft::TypeConfig;
 
 struct MemKVStoreBuilder {}
 

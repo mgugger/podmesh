@@ -11,9 +11,9 @@ use openraft::error::Infallible;
 use openraft::BasicNode;
 use openraft::RaftMetrics;
 
-use crate::app::App;
-use crate::NodeId;
-use crate::TypeConfig;
+use crate::gw_raft::app::App;
+use crate::gw_raft::NodeId;
+use crate::gw_raft::TypeConfig;
 
 // --- Cluster management
 

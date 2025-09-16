@@ -19,9 +19,9 @@ use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::RwLock;
 
-use crate::TypeConfig;
+use crate::gw_raft::TypeConfig;
 
-use crate::mem_log;
+use crate::gw_raft::mem_log;
 pub type LogStore = mem_log::LogStore<TypeConfig>;
 
 /**

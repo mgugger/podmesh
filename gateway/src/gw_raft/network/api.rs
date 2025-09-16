@@ -10,9 +10,9 @@ use openraft::error::Infallible;
 use openraft::ReadPolicy;
 use web::Json;
 
-use crate::app::App;
-use crate::store::Request;
-use crate::TypeConfig;
+use crate::gw_raft::app::App;
+use crate::gw_raft::store::Request;
+use crate::gw_raft::TypeConfig;
 
 /**
  * Application API
