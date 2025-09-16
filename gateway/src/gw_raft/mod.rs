@@ -4,20 +4,19 @@
 mod store;
 mod network_v1_http;
 mod mem_log;
-mod network;
+pub mod network;
 mod app;
-use network::api;
 use network::management;
-use network::raft::{append, snapshot, vote};
+use network::raft;
 
 use std::sync::Arc;
 
-use actix_web::middleware;
-use actix_web::middleware::Logger;
-use actix_web::web::Data;
-use actix_web::HttpServer;
-use openraft::Config;
+use axum::Router;
+use axum::routing::post;
+use axum::routing::get;
+use tower_http::trace::TraceLayer;
 
+use openraft::Config;
 use crate::gw_raft::store::{Request, Response};
 
 #[cfg(test)]
@@ -44,7 +43,7 @@ pub async fn start_example_raft_node(
     node_id: NodeId,
     http_addr: String,
     host_socket: String,
-) -> std::io::Result<()> {
+) -> std::io::Result<Arc<App>> {
     // Create a configuration for the raft instance.
     let config = Config {
         heartbeat_interval: 500,
@@ -78,7 +77,7 @@ pub async fn start_example_raft_node(
 
     // Create an application that will store all the instances created above, this will
     // later be used on the actix-web services.
-    let app_data = Data::new(App {
+    let app_data = Arc::new(App {
         id: node_id,
         addr: http_addr.clone(),
         raft,
@@ -93,46 +92,9 @@ pub async fn start_example_raft_node(
         }
     });
 
-    // Start the actix-web server.
-    let server = HttpServer::new(move || {
-        actix_web::App::new()
-            .wrap(Logger::default())
-            .wrap(Logger::new("%a %t \"%r\" %s %b \"%{User-Agent}i\" %T"))
-            .wrap(middleware::Compress::default())
-            .app_data(app_data.clone())
-            // raft internal RPC
-            .service(append)
-            .service(snapshot)
-            .service(vote)
-            // admin API
-            .service(management::init)
-            .service(management::add_learner)
-            .service(management::change_membership)
-            .service(management::metrics)
-            // application API
-            .service(api::write)
-            .service(api::read)
-            .service(api::linearizable_read)
-            // health
-            .service(api::health_check)
-    });
-
-    // Bind Actix to the address provided in `http_addr`. If `http_addr` looks like a
-    // unix socket path (starts with '/'), bind to the UDS file. Otherwise treat it
-    // as a TCP listen address. `host_socket` is reserved for connecting to the host
-    // agent and is not used for Actix binding.
-    if !http_addr.is_empty() && http_addr.starts_with('/') {
-        use std::os::unix::net::UnixListener as StdUnixListener;
-
-        let std_listener = StdUnixListener::bind(&http_addr)?;
-        std_listener.set_nonblocking(true)?;
-
-        let server = server.listen_uds(std_listener)?;
-        server.run().await
-    } else {
-        let x = server.bind(http_addr)?;
-        x.run().await
-    }
+    // Do not start the HTTP server here. The binary (main.rs) will create the axum Router
+    // and start the server so additional gateway-specific routes can be mounted there.
+    Ok(app_data)
 }
 
 use app::App;

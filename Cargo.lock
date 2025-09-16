@@ -1455,6 +1455,8 @@ version = "0.1.0"
 dependencies = [
  "actix-web",
  "anyhow",
+ "axum",
+ "axum-server",
  "clap",
  "futures",
  "maplit",
@@ -1464,6 +1466,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4357,6 +4361,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
