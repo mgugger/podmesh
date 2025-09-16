@@ -1,15 +1,15 @@
 //! beemesh protocol crate — generated flatbuffers types live in `generated`.
-
 pub mod generated {
+    #![allow(dead_code, non_camel_case_types, non_snake_case, unused_imports, unused_variables, mismatched_lifetime_syntaxes)]
     // include the generated Rust file(s) under src/generated
-    include!("generated/status_generated.rs");
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/generated/status_generated.rs"));
 }
 
 use flatbuffers::FlatBufferBuilder;
 
 /// Build a real FlatBuffer `Status` message as bytes using the generated builder.
 pub fn build_status(ok: bool, status: &str) -> Vec<u8> {
-    let mut fbb = FlatBufferBuilder::new_with_capacity(64);
+    let mut fbb = FlatBufferBuilder::with_capacity(64);
     let status_str = fbb.create_string(status);
     let args = generated::beemesh::StatusArgs { ok, status: Some(status_str) };
     let off = generated::beemesh::Status::create(&mut fbb, &args);

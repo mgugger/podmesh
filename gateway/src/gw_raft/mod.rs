@@ -1,4 +1,4 @@
-#![allow(clippy::uninlined_format_args)]
+#![cfg_attr(not(feature = "raft"), allow(dead_code, unused_imports, unused_variables, unused_mut))]
 #![deny(unused_qualifications)]
 
 mod store;
@@ -6,14 +6,9 @@ mod network_v1_http;
 mod mem_log;
 pub mod network;
 mod app;
-use network::management;
-use network::raft;
 
 use std::sync::Arc;
 
-use axum::Router;
-use axum::routing::post;
-use axum::routing::get;
 use tower_http::trace::TraceLayer;
 use tower_http::add_extension::AddExtensionLayer;
 

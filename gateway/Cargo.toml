@@ -15,29 +15,20 @@ clap = { version = "4.1.11", features = ["derive", "env"] }
 reqwest = { version = "0.12.5", features = ["json"] }
 serde = { version = "1.0.114", features = ["derive"] }
 serde_json = "1.0.57"
-# enable tokio runtime features used by axum
 tokio = { version = "1.0", default-features = false, features = ["rt-multi-thread", "macros", "sync", "net"] }
 tracing = "0.1.29"
 tracing-subscriber = { version = "0.3.0", features = ["env-filter"] }
 tokio-util = "0.7"
 futures = "0.3"
-
-# axum & tower for HTTP server
 axum = "0.8"
 axum-server = "0.4"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "add-extension"] }
-
-# remove explicit hyper dependency; leave reqwest to pull its own hyper
-# remove tokio-stream dependency; not required when using axum::serve directly
-
-# utilities
-# tokio-stream = { version = "0.1", features = ["net"] }
 
 [dev-dependencies]
 anyhow = "1.0.63"
 maplit = "1.0.2"
 
 [features]
-default = ["raft"]
+default = []
 raft = []

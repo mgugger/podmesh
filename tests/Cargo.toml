@@ -6,7 +6,7 @@ description = "Integration tests for beemesh workspace"
 
 [dev-dependencies]
 host = { path = "../host" }
-gateway = { path = "../gateway" }
+gateway = { path = "../gateway", features = ["raft"] }
 cli = { path = "../cli" }
 tokio = { version = "1", features = ["full"] }
 reqwest = {version = "0.11", features = ["json"]}
