@@ -15,6 +15,7 @@ use axum::Router;
 use axum::routing::post;
 use axum::routing::get;
 use tower_http::trace::TraceLayer;
+use tower_http::add_extension::AddExtensionLayer;
 
 use openraft::Config;
 use crate::gw_raft::store::{Request, Response};
@@ -95,6 +96,25 @@ pub async fn start_example_raft_node(
     // Do not start the HTTP server here. The binary (main.rs) will create the axum Router
     // and start the server so additional gateway-specific routes can be mounted there.
     Ok(app_data)
+}
+
+pub fn build_router(app: Arc<App>) -> axum::Router {
+    axum::Router::new()
+        // raft internal RPC
+        .route("/append", axum::routing::post(network::raft::append))
+        .route("/snapshot", axum::routing::post(network::raft::snapshot))
+        .route("/vote", axum::routing::post(network::raft::vote))
+        // admin API
+        .route("/management/init", axum::routing::post(network::management::init))
+        .route("/management/add_learner", axum::routing::post(network::management::add_learner))
+        .route("/management/change_membership", axum::routing::post(network::management::change_membership))
+        .route("/management/metrics", axum::routing::post(network::management::metrics))
+        // application API
+        .route("/write", axum::routing::post(network::api::write))
+        .route("/read", axum::routing::post(network::api::read))
+        .route("/linearizable_read", axum::routing::post(network::api::linearizable_read))
+        .layer(TraceLayer::new_for_http())
+        .layer(AddExtensionLayer::new(app))
 }
 
 use app::App;

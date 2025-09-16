@@ -6,7 +6,7 @@ mod pod_communication;
 mod podman;
 mod restapi;
 
-/// Podmesh Host Agent
+/// beemesh Host Agent
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -34,7 +34,7 @@ struct Cli {
     #[arg(long)]
     libp2p_port: Option<u16>,
 
-    #[arg(long, default_value = "/run/podmesh/host.sock")]
+    #[arg(long, default_value = "/run/beemesh/host.sock")]
     api_socket: Option<String>,
 }
 

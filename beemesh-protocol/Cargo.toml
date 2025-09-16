@@ -1,0 +1,9 @@
+[package]
+name = "beemesh-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Protocol IPC for beemesh"
+build = "build.rs"
+
+[dependencies]
+flatbuffers = "25.2.10"

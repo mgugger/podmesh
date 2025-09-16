@@ -12,7 +12,7 @@ use serde_json;
 static GATEWAY_PROCS: Lazy<Mutex<HashMap<String, tokio::process::Child>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 pub async fn init_pod_listener(pod_name: &str) -> Result<String, String> {
-    let dir = "/run/podmesh";
+    let dir = "/run/beemesh";
     if let Err(e) = fs::create_dir_all(dir).await {
         return Err(format!("failed to create dir {}: {}", dir, e));
     }
@@ -28,7 +28,7 @@ pub async fn init_pod_listener(pod_name: &str) -> Result<String, String> {
 
 /// Send a health check request to the gateway for the named pod over the unix socket.
 pub async fn send_health_check(pod_name: &str) -> Result<bool, String> {
-    let socket_path = format!("/run/podmesh/gateway_{}.sock", pod_name);
+    let socket_path = format!("/run/beemesh/gateway_{}.sock", pod_name);
     let connector = UnixConnector;
     let client: Client<_, Body> = Client::builder().build(connector);
 
@@ -63,7 +63,7 @@ pub async fn send_request<T: Serialize>(
     path: &str,
     json_body: Option<&T>,
 ) -> Result<(StatusCode, Option<serde_json::Value>, String), String> {
-    let socket_path = format!("/run/podmesh/gateway_{}.sock", pod_name);
+    let socket_path = format!("/run/beemesh/gateway_{}.sock", pod_name);
     let connector = UnixConnector;
     let client: Client<_, Body> = Client::builder().build(connector);
 
@@ -133,7 +133,7 @@ pub async fn stop_gateway_for_pod(pod_name: &str) -> Result<(), String> {
         // wait for it to exit
         let _ = child.wait().await;
         // attempt to remove the unix socket for this pod
-        let socket_path = format!("/run/podmesh/_{}.sock", pod_name);
+        let socket_path = format!("/run/beemesh/_{}.sock", pod_name);
         match fs::remove_file(&socket_path).await {
             Ok(_) => {
                 println!("removed socket {}", socket_path);

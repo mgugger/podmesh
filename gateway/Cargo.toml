@@ -2,7 +2,7 @@
 name = "gateway"
 version = "0.1.0"
 edition = "2021"
-description = "Gateway service for podmesh, manages Raft consensus and Podman orchestration"
+description = "Gateway service for beemesh"
 
 [[bin]]
 name = "gateway"
@@ -39,7 +39,5 @@ anyhow = "1.0.63"
 maplit = "1.0.2"
 
 [features]
-
-
-[package.metadata.docs.rs]
-all-features = true
+default = ["raft"]
+raft = []

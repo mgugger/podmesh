@@ -1,0 +1,8 @@
+namespace beemesh;
+
+table Status {
+  ok:bool;
+  status:string;
+}
+
+root_type Status;

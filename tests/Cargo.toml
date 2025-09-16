@@ -2,7 +2,7 @@
 name = "integration"
 version = "0.1.0"
 edition = "2021"
-description = "Integration tests for podmesh workspace"
+description = "Integration tests for beemesh workspace"
 
 [dev-dependencies]
 host = { path = "../host" }

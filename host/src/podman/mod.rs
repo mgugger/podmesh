@@ -15,7 +15,7 @@ pub struct PodResponse {
 
 pub async fn create_podman_socket(Json(req): Json<PodRequest>) -> Json<PodResponse> {
     let pod_name = &req.pod_name;
-    let socket_path = format!("/run/podmesh/pod_{}.sock", pod_name);
+    let socket_path = format!("/run/beemesh/pod_{}.sock", pod_name);
     let pod_status = match Command::new("podman")
         .args(["pod", "create", "--name", pod_name])
         .output()

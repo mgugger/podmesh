@@ -90,3 +90,12 @@ flowchart TD
   %% User submits manifest
   User["Kube YAML manifest"] --> GA
 ```
+
+# Beemesh
+
+This repository contains multiple crates for beemesh. A new `beemesh-protocol` crate was added to hold FlatBuffers schemas and generated code used for IPC between the gateway and host.
+
+beemesh-protocol
+- Schema files live in `beemesh-protocol/schema/`.
+- `build.rs` will run `flatc --rust` to generate Rust files into `beemesh-protocol/src/generated/`.
+- The crate exposes helpers for building message buffers.

@@ -61,7 +61,7 @@ pub fn setup_libp2p_node() -> Result<
         })?
         .build();
 
-    let topic = gossipsub::IdentTopic::new("podmesh-cluster");
+    let topic = gossipsub::IdentTopic::new("beemesh-cluster");
     println!("Subscribing to topic: {}", topic.hash());
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
@@ -105,7 +105,7 @@ pub async fn start_libp2p_node(
                             });
                         }
                         // Update peer list in channel
-                        let topic = gossipsub::IdentTopic::new("podmesh-cluster");
+                        let topic = gossipsub::IdentTopic::new("beemesh-cluster");
                         let peers: Vec<String> = swarm.behaviour().gossipsub.mesh_peers(&topic.hash()).map(|p| p.to_string()).collect();
                         let _ = peer_tx.send(peers);
                     }
@@ -115,7 +115,7 @@ pub async fn start_libp2p_node(
                             handshake_states.remove(&peer_id);
                         }
                         // Update peer list in channel
-                        let topic = gossipsub::IdentTopic::new("podmesh-cluster");
+                        let topic = gossipsub::IdentTopic::new("beemesh-cluster");
                         let peers: Vec<String> = swarm.behaviour().gossipsub.mesh_peers(&topic.hash()).map(|p| p.to_string()).collect();
                         let _ = peer_tx.send(peers);
                     }
@@ -125,7 +125,7 @@ pub async fn start_libp2p_node(
                         message,
                     })) => {
                         let msg_content = String::from_utf8_lossy(&message.data);
-                        if msg_content.starts_with("podmesh-handshake") {
+                        if msg_content.starts_with("beemesh-handshake") {
                             println!("Confirmed peer: {peer_id}");
                             let state = handshake_states.entry(peer_id.clone()).or_insert(HandshakeState {
                                 attempts: 0,
@@ -135,7 +135,7 @@ pub async fn start_libp2p_node(
                             if !state.confirmed {
                                 state.confirmed = true;
                                 // Reply with handshake if not already confirmed
-                                let reply_msg = format!("podmesh-handshake-{}-reply", peer_id);
+                                let reply_msg = format!("beemesh-handshake-{}-reply", peer_id);
                                 let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), reply_msg.as_bytes());
                             }
                         } else {
@@ -174,7 +174,7 @@ pub async fn start_libp2p_node(
                     }
                     if state.last_attempt.elapsed() >= Duration::from_secs(2) {
                         let handshake_msg =
-                            format!("podmesh-handshake-{}-{}", peer_id, state.attempts + 1);
+                            format!("beemesh-handshake-{}-{}", peer_id, state.attempts + 1);
                         match swarm
                             .behaviour_mut()
                             .gossipsub
