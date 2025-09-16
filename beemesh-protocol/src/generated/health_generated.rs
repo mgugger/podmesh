@@ -18,35 +18,35 @@ pub mod beemesh {
   extern crate flatbuffers;
   use self::flatbuffers::{EndianScalar, Follow};
 
-pub enum StatusOffset {}
+pub enum HealthOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
-pub struct Status<'a> {
+pub struct Health<'a> {
   pub _tab: flatbuffers::Table<'a>,
 }
 
-impl<'a> flatbuffers::Follow<'a> for Status<'a> {
-  type Inner = Status<'a>;
+impl<'a> flatbuffers::Follow<'a> for Health<'a> {
+  type Inner = Health<'a>;
   #[inline]
   unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
     Self { _tab: flatbuffers::Table::new(buf, loc) }
   }
 }
 
-impl<'a> Status<'a> {
+impl<'a> Health<'a> {
   pub const VT_OK: flatbuffers::VOffsetT = 4;
   pub const VT_STATUS: flatbuffers::VOffsetT = 6;
 
   #[inline]
   pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
-    Status { _tab: table }
+    Health { _tab: table }
   }
   #[allow(unused_mut)]
   pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: flatbuffers::Allocator + 'bldr>(
     _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr, A>,
-    args: &'args StatusArgs<'args>
-  ) -> flatbuffers::WIPOffset<Status<'bldr>> {
-    let mut builder = StatusBuilder::new(_fbb);
+    args: &'args HealthArgs<'args>
+  ) -> flatbuffers::WIPOffset<Health<'bldr>> {
+    let mut builder = HealthBuilder::new(_fbb);
     if let Some(x) = args.status { builder.add_status(x); }
     builder.add_ok(args.ok);
     builder.finish()
@@ -58,18 +58,18 @@ impl<'a> Status<'a> {
     // Safety:
     // Created from valid Table for this object
     // which contains a valid value in this slot
-    unsafe { self._tab.get::<bool>(Status::VT_OK, Some(false)).unwrap()}
+    unsafe { self._tab.get::<bool>(Health::VT_OK, Some(false)).unwrap()}
   }
   #[inline]
   pub fn status(&self) -> Option<&'a str> {
     // Safety:
     // Created from valid Table for this object
     // which contains a valid value in this slot
-    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(Status::VT_STATUS, None)}
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(Health::VT_STATUS, None)}
   }
 }
 
-impl flatbuffers::Verifiable for Status<'_> {
+impl flatbuffers::Verifiable for Health<'_> {
   #[inline]
   fn run_verifier(
     v: &mut flatbuffers::Verifier, pos: usize
@@ -82,125 +82,125 @@ impl flatbuffers::Verifiable for Status<'_> {
     Ok(())
   }
 }
-pub struct StatusArgs<'a> {
+pub struct HealthArgs<'a> {
     pub ok: bool,
     pub status: Option<flatbuffers::WIPOffset<&'a str>>,
 }
-impl<'a> Default for StatusArgs<'a> {
+impl<'a> Default for HealthArgs<'a> {
   #[inline]
   fn default() -> Self {
-    StatusArgs {
+    HealthArgs {
       ok: false,
       status: None,
     }
   }
 }
 
-pub struct StatusBuilder<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> {
+pub struct HealthBuilder<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> {
   fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a, A>,
   start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
 }
-impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> StatusBuilder<'a, 'b, A> {
+impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> HealthBuilder<'a, 'b, A> {
   #[inline]
   pub fn add_ok(&mut self, ok: bool) {
-    self.fbb_.push_slot::<bool>(Status::VT_OK, ok, false);
+    self.fbb_.push_slot::<bool>(Health::VT_OK, ok, false);
   }
   #[inline]
   pub fn add_status(&mut self, status: flatbuffers::WIPOffset<&'b  str>) {
-    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Status::VT_STATUS, status);
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Health::VT_STATUS, status);
   }
   #[inline]
-  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> StatusBuilder<'a, 'b, A> {
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> HealthBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
-    StatusBuilder {
+    HealthBuilder {
       fbb_: _fbb,
       start_: start,
     }
   }
   #[inline]
-  pub fn finish(self) -> flatbuffers::WIPOffset<Status<'a>> {
+  pub fn finish(self) -> flatbuffers::WIPOffset<Health<'a>> {
     let o = self.fbb_.end_table(self.start_);
     flatbuffers::WIPOffset::new(o.value())
   }
 }
 
-impl core::fmt::Debug for Status<'_> {
+impl core::fmt::Debug for Health<'_> {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    let mut ds = f.debug_struct("Status");
+    let mut ds = f.debug_struct("Health");
       ds.field("ok", &self.ok());
       ds.field("status", &self.status());
       ds.finish()
   }
 }
 #[inline]
-/// Verifies that a buffer of bytes contains a `Status`
+/// Verifies that a buffer of bytes contains a `Health`
 /// and returns it.
 /// Note that verification is still experimental and may not
 /// catch every error, or be maximally performant. For the
 /// previous, unchecked, behavior use
-/// `root_as_status_unchecked`.
-pub fn root_as_status(buf: &[u8]) -> Result<Status, flatbuffers::InvalidFlatbuffer> {
-  flatbuffers::root::<Status>(buf)
+/// `root_as_health_unchecked`.
+pub fn root_as_health(buf: &[u8]) -> Result<Health, flatbuffers::InvalidFlatbuffer> {
+  flatbuffers::root::<Health>(buf)
 }
 #[inline]
 /// Verifies that a buffer of bytes contains a size prefixed
-/// `Status` and returns it.
+/// `Health` and returns it.
 /// Note that verification is still experimental and may not
 /// catch every error, or be maximally performant. For the
 /// previous, unchecked, behavior use
-/// `size_prefixed_root_as_status_unchecked`.
-pub fn size_prefixed_root_as_status(buf: &[u8]) -> Result<Status, flatbuffers::InvalidFlatbuffer> {
-  flatbuffers::size_prefixed_root::<Status>(buf)
+/// `size_prefixed_root_as_health_unchecked`.
+pub fn size_prefixed_root_as_health(buf: &[u8]) -> Result<Health, flatbuffers::InvalidFlatbuffer> {
+  flatbuffers::size_prefixed_root::<Health>(buf)
 }
 #[inline]
 /// Verifies, with the given options, that a buffer of bytes
-/// contains a `Status` and returns it.
+/// contains a `Health` and returns it.
 /// Note that verification is still experimental and may not
 /// catch every error, or be maximally performant. For the
 /// previous, unchecked, behavior use
-/// `root_as_status_unchecked`.
-pub fn root_as_status_with_opts<'b, 'o>(
+/// `root_as_health_unchecked`.
+pub fn root_as_health_with_opts<'b, 'o>(
   opts: &'o flatbuffers::VerifierOptions,
   buf: &'b [u8],
-) -> Result<Status<'b>, flatbuffers::InvalidFlatbuffer> {
-  flatbuffers::root_with_opts::<Status<'b>>(opts, buf)
+) -> Result<Health<'b>, flatbuffers::InvalidFlatbuffer> {
+  flatbuffers::root_with_opts::<Health<'b>>(opts, buf)
 }
 #[inline]
 /// Verifies, with the given verifier options, that a buffer of
-/// bytes contains a size prefixed `Status` and returns
+/// bytes contains a size prefixed `Health` and returns
 /// it. Note that verification is still experimental and may not
 /// catch every error, or be maximally performant. For the
 /// previous, unchecked, behavior use
-/// `root_as_status_unchecked`.
-pub fn size_prefixed_root_as_status_with_opts<'b, 'o>(
+/// `root_as_health_unchecked`.
+pub fn size_prefixed_root_as_health_with_opts<'b, 'o>(
   opts: &'o flatbuffers::VerifierOptions,
   buf: &'b [u8],
-) -> Result<Status<'b>, flatbuffers::InvalidFlatbuffer> {
-  flatbuffers::size_prefixed_root_with_opts::<Status<'b>>(opts, buf)
+) -> Result<Health<'b>, flatbuffers::InvalidFlatbuffer> {
+  flatbuffers::size_prefixed_root_with_opts::<Health<'b>>(opts, buf)
 }
 #[inline]
-/// Assumes, without verification, that a buffer of bytes contains a Status and returns it.
+/// Assumes, without verification, that a buffer of bytes contains a Health and returns it.
 /// # Safety
-/// Callers must trust the given bytes do indeed contain a valid `Status`.
-pub unsafe fn root_as_status_unchecked(buf: &[u8]) -> Status {
-  flatbuffers::root_unchecked::<Status>(buf)
+/// Callers must trust the given bytes do indeed contain a valid `Health`.
+pub unsafe fn root_as_health_unchecked(buf: &[u8]) -> Health {
+  flatbuffers::root_unchecked::<Health>(buf)
 }
 #[inline]
-/// Assumes, without verification, that a buffer of bytes contains a size prefixed Status and returns it.
+/// Assumes, without verification, that a buffer of bytes contains a size prefixed Health and returns it.
 /// # Safety
-/// Callers must trust the given bytes do indeed contain a valid size prefixed `Status`.
-pub unsafe fn size_prefixed_root_as_status_unchecked(buf: &[u8]) -> Status {
-  flatbuffers::size_prefixed_root_unchecked::<Status>(buf)
+/// Callers must trust the given bytes do indeed contain a valid size prefixed `Health`.
+pub unsafe fn size_prefixed_root_as_health_unchecked(buf: &[u8]) -> Health {
+  flatbuffers::size_prefixed_root_unchecked::<Health>(buf)
 }
 #[inline]
-pub fn finish_status_buffer<'a, 'b, A: flatbuffers::Allocator + 'a>(
+pub fn finish_health_buffer<'a, 'b, A: flatbuffers::Allocator + 'a>(
     fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>,
-    root: flatbuffers::WIPOffset<Status<'a>>) {
+    root: flatbuffers::WIPOffset<Health<'a>>) {
   fbb.finish(root, None);
 }
 
 #[inline]
-pub fn finish_size_prefixed_status_buffer<'a, 'b, A: flatbuffers::Allocator + 'a>(fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>, root: flatbuffers::WIPOffset<Status<'a>>) {
+pub fn finish_size_prefixed_health_buffer<'a, 'b, A: flatbuffers::Allocator + 'a>(fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>, root: flatbuffers::WIPOffset<Health<'a>>) {
   fbb.finish_size_prefixed(root, None);
 }
 }  // pub mod beemesh

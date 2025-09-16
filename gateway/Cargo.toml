@@ -10,7 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 openraft = { git = "https://github.com/databendlabs/openraft.git" , features = ["serde", "type-alias"] }
-actix-web = "4.0.0-rc.2"
 clap = { version = "4.1.11", features = ["derive", "env"] }
 reqwest = { version = "0.12.5", features = ["json"] }
 serde = { version = "1.0.114", features = ["derive"] }
@@ -20,10 +19,7 @@ tracing = "0.1.29"
 tracing-subscriber = { version = "0.3.0", features = ["env-filter"] }
 tokio-util = "0.7"
 futures = "0.3"
-axum = "0.8"
-axum-server = "0.4"
-tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "add-extension"] }
+beemesh-protocol = { path = "../beemesh-protocol"}
 
 [dev-dependencies]
 anyhow = "1.0.63"

@@ -51,6 +51,7 @@ pub fn build_router(peer_rx: watch::Receiver<Vec<String>>) -> Router {
         .route("/{peer_id}/{pod_name}/health", get(peer_pod_health))
         .route("/{peer_id}/{pod_name}/init_raft", post(init_raft))
         .route("/nodes", get(get_nodes))
+        // routes for testing
         .route("/start_pod", post(start_pod))
         .route("/stop_pod", post(stop_pod))
         .with_state(peer_rx)

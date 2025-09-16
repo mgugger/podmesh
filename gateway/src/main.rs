@@ -10,13 +10,13 @@ pub struct Opt {
     pub id: u64,
 
     #[clap(long, default_value = "/run/beemesh/gateway_testpod.sock")]
-    pub http_addr: String,
+    pub socket_addr: String,
 
     #[clap(long, default_value = "/run/beemesh/host.sock")]
     pub host_socket: String,
 }
 
-#[actix_web::main]
+#[tokio::main]
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
         .with_target(true)
@@ -26,44 +26,88 @@ async fn main() -> std::io::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    // Parse the parameters passed by arguments.
     let options = Opt::parse();
 
-    // Start raft node and obtain shared app state when raft feature is enabled.
     #[cfg(feature = "raft")]
-    let app_state = gw_raft::start_example_raft_node(options.id, options.http_addr.clone(), options.host_socket).await?;
+    let app_state = gw_raft::start_example_raft_node(options.id, options.socket_addr.clone(), options.host_socket).await?;
 
-    let router = {
-        let base = axum::Router::new()
-            // health (always present)
-            .route("/health", axum::routing::get(gw_raft::network::api::health_check))
-            .layer(tower_http::trace::TraceLayer::new_for_http());
+    if !options.socket_addr.is_empty() && options.socket_addr.starts_with('/') {
+        // Remove stale socket if present
+        let _ = std::fs::remove_file(&options.socket_addr);
+        let listener = match tokio::net::UnixListener::bind(&options.socket_addr) {
+            Ok(l) => l,
+            Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("failed to bind UDS: {}", e))),
+        };
 
-        #[cfg(feature = "raft")]
-        {
-            let raft_routes = gw_raft::build_router(app_state.clone());
-            base.merge(raft_routes)
-        }
+        tracing::info!(socket=%options.socket_addr, "gateway listening on UDS");
 
-        #[cfg(not(feature = "raft"))]
-        {
-            base
-        }
-    };
+        loop {
+            match listener.accept().await {
+                Ok((stream, _addr)) => {
+                    // Spawn a task to handle this connection.
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    if !options.http_addr.is_empty() && options.http_addr.starts_with('/') {
-        let _ = std::fs::remove_file(&options.http_addr); // Remove stale socket if present
-        match tokio::net::UnixListener::bind(&options.http_addr) {
-            Ok(listener) => {
-                if let Err(e) = axum::serve(listener, router.into_make_service()).await {
-                    eprintln!("axum UDS server error: {}", e);
+                        let (r, mut w) = tokio::io::split(stream);
+                        let mut reader = BufReader::new(r);
+                        let mut req_buf: Vec<u8> = Vec::new();
+
+                        // Read a single newline-terminated request from the client.
+                        match reader.read_until(b'\n', &mut req_buf).await {
+                            Ok(0) => {
+                                tracing::debug!("connection closed by peer");
+                                return;
+                            }
+                            Ok(_) => {
+                                let req = String::from_utf8_lossy(&req_buf);
+                                let req_trim = req.trim();
+                                tracing::debug!(request=%req_trim, "received request");
+
+                                // Accept either `/health` or `GET /health` for compatibility with
+                                // simple non-HTTP clients that only send the path or a "GET /health" token.
+                                if req_trim == "/health" || req_trim == "GET /health" {
+                                    // Build the FlatBuffer health message using helper from protocol crate.
+                                    let resp = beemesh_protocol::build_health(true, "healthy");
+                                    let len_be = (resp.len() as u32).to_be_bytes();
+
+                                    if let Err(e) = w.write_all(&len_be).await {
+                                        tracing::error!(error=%e, "failed to write response length");
+                                        return;
+                                    }
+                                    if let Err(e) = w.write_all(&resp).await {
+                                        tracing::error!(error=%e, "failed to write response payload");
+                                        return;
+                                    }
+
+                                    // Flush to ensure client receives the bytes promptly.
+                                    if let Err(e) = w.flush().await {
+                                        tracing::error!(error=%e, "failed to flush response");
+                                    }
+
+                                    tracing::debug!(bytes=%resp.len(), "sent health response");
+                                } else {
+                                    // Unknown request: reply with zero-length payload (len=0)
+                                    let zero: [u8; 4] = 0u32.to_be_bytes();
+                                    if let Err(e) = w.write_all(&zero).await {
+                                        tracing::error!(error=%e, "failed to write zero-length response");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(error=%e, "failed to read from connection");
+                                return;
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::error!(error=%e, "failed to accept incoming connection");
+                    // small sleep to avoid tight loop on repeated accept errors
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }
-            Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("failed to bind UDS: {}", e))),
         }
     } else {
         return Err(std::io::Error::new(std::io::ErrorKind::Other, "gateway expects UDS socket path in http_addr"));
     }
-
-    Ok(())
 }

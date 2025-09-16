@@ -1,8 +1,8 @@
 namespace beemesh;
 
-table Status {
+table Health {
   ok:bool;
   status:string;
 }
 
-root_type Status;
+root_type Health;

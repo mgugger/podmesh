@@ -8,6 +8,8 @@ use hyper::{Client, Body, Request, Method, StatusCode};
 use hyperlocal::{UnixConnector, Uri};
 use serde::Serialize;
 use serde_json;
+use tokio::net::UnixStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 static GATEWAY_PROCS: Lazy<Mutex<HashMap<String, tokio::process::Child>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -29,23 +31,36 @@ pub async fn init_pod_listener(pod_name: &str) -> Result<String, String> {
 /// Send a health check request to the gateway for the named pod over the unix socket.
 pub async fn send_health_check(pod_name: &str) -> Result<bool, String> {
     let socket_path = format!("/run/beemesh/gateway_{}.sock", pod_name);
-    let connector = UnixConnector;
-    let client: Client<_, Body> = Client::builder().build(connector);
 
-    let uri: Uri = Uri::new(socket_path.clone(), "/health").into();
-    let req = Request::get(uri).body(Body::empty()).map_err(|e| format!("request build error: {}", e))?;
+    // Connect to the gateway UDS socket and send the simple text-based request
+    // the gateway expects (a newline-terminated path).
+    let mut stream = UnixStream::connect(&socket_path).await
+        .map_err(|e| format!("failed to connect to gateway socket {}: {}", socket_path, e))?;
 
-    let resp = client.request(req).await.map_err(|e| format!("request failed: {}", e))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(format!("health check returned status {}", status));
+    // Send the request as a single line. The gateway expects `/health` or `GET /health`.
+    if let Err(e) = stream.write_all(b"/health\n").await {
+        return Err(format!("failed to send health request: {}", e));
     }
-    let bytes = hyper::body::to_bytes(resp.into_body()).await.map_err(|e| format!("body read error: {}", e))?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| format!("invalid json: {}", e))?;
-    if let Some(ok) = v.get("ok").and_then(|x| x.as_bool()) {
-        Ok(ok)
-    } else {
-        Err("malformed reply".to_string())
+
+    // Read 4-byte big-endian length prefix
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await
+        .map_err(|e| format!("failed to read response length: {}", e))?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+
+    if len == 0 {
+        return Err("received empty response from gateway".to_string());
+    }
+
+    // Read the FlatBuffer payload
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).await
+        .map_err(|e| format!("failed to read response payload: {}", e))?;
+
+    // Parse the FlatBuffer health message using beemesh-protocol's generated parser.
+    match beemesh_protocol::generated::beemesh::root_as_health(&payload) {
+        Ok(health) => Ok(health.ok()),
+        Err(e) => Err(format!("failed to parse flatbuffer health: {:?}", e)),
     }
 }
 
@@ -106,12 +121,11 @@ pub async fn start_gateway_for_pod(pod_name: &str, gateway_bin: Option<&str>, ho
     // spawn gateway process
     let mut cmd = TokioCommand::new(bin.clone());
     cmd.env("RUST_LOG", "info");
-    cmd.env("actix_web", "info");
     cmd.arg("--host-socket").arg(host_socket);
     // let the gateway use defaults for id and http_addr unless overridden
 
     // Pass the socket path as the gateway's http listen address so the gateway will bind it.
-    cmd.arg("--http-addr").arg(host_socket);
+    cmd.arg("--socket-addr").arg(host_socket);
 
     match cmd.spawn() {
         Ok(child) => {

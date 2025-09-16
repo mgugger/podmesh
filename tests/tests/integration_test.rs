@@ -53,12 +53,10 @@ async fn test_run_host_application() {
 
     check_health().await;
     verify_peers().await;
-    start_raft_pod().await;
-    let _sleep = sleep(Duration::from_secs(1)).await;
-    init_raft_pod().await;
+    start_gateway().await;
     let _sleep = sleep(Duration::from_secs(1)).await;
     verify_gateway_health().await;
-    stop_raft_pod().await;
+    stop_gateway().await;
 
     guard.cleanup().await;
 }
@@ -81,7 +79,7 @@ async fn verify_peers() {
     assert!(!peers.is_empty(), "Expected at least one peer in the mesh, got {:?}", nodes);
 }
 
-async fn start_raft_pod() {
+async fn start_gateway() {
     let client = reqwest::Client::new();
     let resp = tokio::time::timeout(
         Duration::from_secs(5),
@@ -98,19 +96,7 @@ async fn start_raft_pod() {
     assert!(socket_path.contains("testpod"), "Expected socket path to contain pod name, got {}", socket_path);
 }
 
-async fn init_raft_pod() {
-    let client = reqwest::Client::new();
-    let resp = tokio::time::timeout(
-        Duration::from_secs(5),
-        client.post("http://localhost:3000/self/testpod/init_raft")
-            .json(&serde_json::json!({"pod_name": "testpod"}))
-            .send()
-    ).await.unwrap().unwrap();
-    let text = resp.text().await.unwrap_or_else(|e| panic!("Failed to read body: {}", e));
-    assert!(text.contains("ok"), "Expected raft to be initialized, got {}", text);
-}
-
-async fn stop_raft_pod() {
+async fn stop_gateway() {
     let client = reqwest::Client::new();
     let resp = tokio::time::timeout(
         Duration::from_secs(5),

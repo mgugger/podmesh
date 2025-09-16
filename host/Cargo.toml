@@ -17,3 +17,4 @@ hyper = "0.14"
 hyperlocal = "0.8"
 tokio-stream = "0.1"
 axum-server = "0.4"
+beemesh-protocol = { path = "../beemesh-protocol" }
