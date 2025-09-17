@@ -1,7 +1,7 @@
 use clap::Parser;
 
 mod hostapi;
-mod libp2pmod;
+mod libp2p_beemesh;
 mod pod_communication;
 mod podman;
 mod restapi;
@@ -42,10 +42,13 @@ struct Cli {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let (swarm, topic, peer_rx, peer_tx) = libp2pmod::setup_libp2p_node()?;
+    let (swarm, topic, peer_rx, peer_tx) = libp2p_beemesh::setup_libp2p_node()?;
+
+    // control channel for libp2p (from REST handlers to libp2p task)
+    let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel::<libp2p_beemesh::Libp2pControl>();
 
     let libp2p_handle = tokio::spawn(async move {
-        if let Err(e) = libp2pmod::start_libp2p_node(swarm, topic, peer_tx).await {
+        if let Err(e) = libp2p_beemesh::start_libp2p_node(swarm, topic, peer_tx, control_rx).await {
             eprintln!("libp2p node error: {}", e);
         }
     });
@@ -54,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // rest api server
     if !cli.disable_rest_api {
-        let app = restapi::build_router(peer_rx);
+        let app = restapi::build_router(peer_rx, control_tx.clone());
 
         // Public TCP server
         let bind_addr = format!("{}:{}", cli.api_host, cli.api_port);

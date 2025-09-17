@@ -1,0 +1,11 @@
+namespace beemesh;
+
+// CapacityRequest schema (separate file so we can have per-file root_type)
+table CapacityRequest {
+  cpu_milli:uint32;
+  memory_bytes:ulong;
+  storage_bytes:ulong;
+  replicas:uint32 = 1;
+}
+
+root_type CapacityRequest;

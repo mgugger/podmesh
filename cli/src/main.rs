@@ -1,5 +1,9 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use serde_json::Value as JsonValue;
+use serde_yaml;
+use reqwest;
+use std::env;
 
 #[derive(Parser, Debug)]
 #[command(name = "beemesh", about = "beemesh CLI")]
@@ -62,8 +66,36 @@ async fn apply_file(path: PathBuf) -> anyhow::Result<()> {
         _ => println!("No top-level kind/name detected; sending raw payload..."),
     }
 
-    // TODO: send to beemesh API endpoint or socket; for now simulate success
-    println!("Apply succeeded (simulation)");
+    // Send manifest to API
+    let manifest_json: JsonValue = match serde_yaml::from_str(&contents) {
+        Ok(v) => v,
+        Err(_) => serde_json::json!({"raw": contents}),
+    };
+
+    // hardcoded tenant for now
+    let tenant = "00000000-0000-0000-0000-000000000000";
+
+    // API base URL can be overridden with BEEMESH_API env var
+    let base = env::var("BEEMESH_API").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+    let url = format!("{}/tenants/{}/apply", base.trim_end_matches('/'), tenant);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(manifest_json.to_string())
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+
+    println!("API response: {}\n{}", status, body);
+
+    if !status.is_success() {
+        anyhow::bail!("apply failed: {}", status);
+    }
+
+    println!("Apply succeeded");
 
     Ok(())
 }

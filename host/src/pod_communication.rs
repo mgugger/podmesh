@@ -4,9 +4,6 @@ use std::collections::HashMap;
 use once_cell::sync::Lazy;
 use tokio::sync::Mutex;
 use tokio::process::Command as TokioCommand;
-use hyper::{Client, Body, Request, Method, StatusCode};
-use hyperlocal::{UnixConnector, Uri};
-use serde::Serialize;
 use serde_json;
 use tokio::net::UnixStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -58,63 +55,13 @@ pub async fn send_health_check(pod_name: &str) -> Result<bool, String> {
         .map_err(|e| format!("failed to read response payload: {}", e))?;
 
     // Parse the FlatBuffer health message using beemesh-protocol's generated parser.
-    match beemesh_protocol::generated::beemesh::root_as_health(&payload) {
+    match beemesh_protocol::flatbuffer::root_as_health(&payload) {
         Ok(health) => Ok(health.ok()),
         Err(e) => Err(format!("failed to parse flatbuffer health: {:?}", e)),
     }
 }
 
-/// Generic request sender to the gateway unix socket for the given pod.
-///
-/// - `method` is an HTTP verb like "GET" or "POST".
-/// - `path` is the request path (e.g. "/health" or "/init").
-/// - `json_body` is an optional reference to a value that will be serialized as JSON for the request body.
-///
-/// Returns tuple (StatusCode, Option<serde_json::Value>, String) where the Option is the parsed
-/// JSON response if parsing succeeds, and the String is the raw response body as text.
-pub async fn send_request<T: Serialize>(
-    pod_name: &str,
-    method: &str,
-    path: &str,
-    json_body: Option<&T>,
-) -> Result<(StatusCode, Option<serde_json::Value>, String), String> {
-    let socket_path = format!("/run/beemesh/gateway_{}.sock", pod_name);
-    let connector = UnixConnector;
-    let client: Client<_, Body> = Client::builder().build(connector);
-
-    let uri: Uri = Uri::new(socket_path.clone(), path).into();
-
-    let m = Method::from_bytes(method.as_bytes()).map_err(|e| format!("invalid method {}: {}", method, e))?;
-
-    let req = if let Some(body_val) = json_body {
-        let v = serde_json::to_vec(body_val).map_err(|e| format!("json serialize error: {}", e))?;
-        Request::builder()
-            .method(m)
-            .uri(uri)
-            .header("content-type", "application/json")
-            .body(Body::from(v))
-            .map_err(|e| format!("request build error: {}", e))?
-    } else {
-        Request::builder()
-            .method(m)
-            .uri(uri)
-            .body(Body::empty())
-            .map_err(|e| format!("request build error: {}", e))?
-    };
-
-    let resp = client.request(req).await.map_err(|e| format!("request failed: {}", e))?;
-    let status = resp.status();
-    let bytes = hyper::body::to_bytes(resp.into_body()).await.map_err(|e| format!("body read error: {}", e))?;
-    let text = String::from_utf8_lossy(&bytes).to_string();
-    let parsed = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-        Ok(v) => Some(v),
-        Err(_) => None,
-    };
-
-    Ok((status, parsed, text))
-}
-
-/// Start a gateway binary for the given pod, passing --host_socket to it.
+/// Testing only: Start a gateway binary for the given pod, passing --host_socket to it.
 pub async fn start_gateway_for_pod(pod_name: &str, gateway_bin: Option<&str>, host_socket: &str) -> Result<(), String> {
     let bin = if let Some(b) = gateway_bin { b.to_string() } else { "../target/debug/gateway".to_string() };
 
@@ -137,7 +84,7 @@ pub async fn start_gateway_for_pod(pod_name: &str, gateway_bin: Option<&str>, ho
     }
 }
 
-/// Stop a gateway process previously started for the pod.
+/// Testing only: Stop a gateway process previously started for the pod.
 pub async fn stop_gateway_for_pod(pod_name: &str) -> Result<(), String> {
     let mut map = GATEWAY_PROCS.lock().await;
     if let Some(mut child) = map.remove(pod_name) {
@@ -161,4 +108,14 @@ pub async fn stop_gateway_for_pod(pod_name: &str) -> Result<(), String> {
     } else {
         Err("no gateway process for pod".to_string())
     }
+}
+
+/// Send the manifest to a peer. For now this is a stub that just logs the action and returns Ok.
+/// In the future this should implement RPC to the remote peer (via libp2p / HTTP) to instruct it
+/// to instantiate or update the workload described by `manifest`.
+pub async fn send_apply_to_peer(peer: &str, manifest: &serde_json::Value) -> Result<(), String> {
+    println!("send_apply_to_peer: sending manifest to peer {}: {}", peer, manifest);
+    // Simulate small delay
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    Ok(())
 }

@@ -67,7 +67,7 @@ async fn main() -> std::io::Result<()> {
                                 // simple non-HTTP clients that only send the path or a "GET /health" token.
                                 if req_trim == "/health" || req_trim == "GET /health" {
                                     // Build the FlatBuffer health message using helper from protocol crate.
-                                    let resp = beemesh_protocol::build_health(true, "healthy");
+                                    let resp = beemesh_protocol::flatbuffer::build_health(true, "healthy");
                                     let len_be = (resp.len() as u32).to_be_bytes();
 
                                     if let Err(e) = w.write_all(&len_be).await {
