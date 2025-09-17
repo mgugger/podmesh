@@ -36,6 +36,30 @@ mod generated {
         )]
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/generated/capacity_reply_generated.rs"));
     }
+
+    pub mod generated_apply_request {
+        #![allow(
+            dead_code,
+            non_camel_case_types,
+            non_snake_case,
+            unused_imports,
+            unused_variables,
+            mismatched_lifetime_syntaxes
+        )]
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/generated/apply_request_generated.rs"));
+    }
+
+    pub mod generated_apply_response {
+        #![allow(
+            dead_code,
+            non_camel_case_types,
+            non_snake_case,
+            unused_imports,
+            unused_variables,
+            mismatched_lifetime_syntaxes
+        )]
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/generated/apply_response_generated.rs"));
+    }
 }
 
 pub mod flatbuffer {
@@ -43,6 +67,8 @@ pub mod flatbuffer {
     pub use crate::generated::generated_health::beemesh::{Health, root_as_health};
     pub use crate::generated::generated_capacity_reply::beemesh::{ CapacityReply, root_as_capacity_reply};
     pub use crate::generated::generated_capacity_request::beemesh::{ CapacityRequest, root_as_capacity_request};
+    pub use crate::generated::generated_apply_request::beemesh::{ ApplyRequest, root_as_apply_request };
+    pub use crate::generated::generated_apply_response::beemesh::{ ApplyResponse, root_as_apply_response };
 
     use flatbuffers::FlatBufferBuilder;
 
@@ -118,6 +144,20 @@ pub mod flatbuffer {
         [ok: bool, cpu_available_milli: u32, memory_available_bytes: u64, storage_available_bytes: u64],
         [node_id: &str, region: &str],
         [capabilities: &[&str]]
+    );
+
+    fb_builder!(build_apply_request,
+        crate::generated::generated_apply_request::beemesh::ApplyRequestArgs,
+        crate::generated::generated_apply_request::beemesh::ApplyRequest,
+        [replicas: u32],
+        [tenant: &str, operation_id: &str, manifest_json: &str, origin_peer: &str]
+    );
+
+    fb_builder!(build_apply_response,
+        crate::generated::generated_apply_response::beemesh::ApplyResponseArgs,
+        crate::generated::generated_apply_response::beemesh::ApplyResponse,
+        [ok: bool],
+        [operation_id: &str, message: &str]
     );
 }
 

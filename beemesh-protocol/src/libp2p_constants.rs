@@ -15,6 +15,9 @@ pub const FREE_CAPACITY_REPLY_PREFIX: &str = "beemesh-free-capacity-reply";
 /// Timeout, in seconds, to wait for free-capacity responses from peers.
 pub const FREE_CAPACITY_TIMEOUT_SECS: u64 = 3;
 
+/// Timeout, in seconds, to wait for request-response RPCs (ApplyRequest/ApplyResponse)
+pub const REQUEST_RESPONSE_TIMEOUT_SECS: u64 = 3;
+
 /// JSON field name used for replica count in manifests (top-level `replicas`).
 pub const REPLICAS_FIELD: &str = "replicas";
 
