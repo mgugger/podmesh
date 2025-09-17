@@ -13,7 +13,7 @@ use std::{
 use tokio::sync::{watch, mpsc};
 use std::collections::HashMap as StdHashMap;
 
-use beemesh_protocol::libp2p_constants::{BEEMESH_CLUSTER, HANDSHAKE_PREFIX, BINARY_ENVELOPE_VERSION};
+use beemesh_protocol::libp2p_constants::{BEEMESH_CLUSTER, BINARY_ENVELOPE_VERSION};
 
 // Compact binary envelope magic bytes for capacity request/reply (avoids JSON+base64).
 const CAPREQ_MAGIC: u8 = 0xC1;
@@ -22,6 +22,85 @@ const CAPREPLY_MAGIC: u8 = 0xC2;
 // Define a simple codec for apply request/response
 #[derive(Debug, Clone, Default)]
 pub struct ApplyCodec;
+
+// Define a simple codec for handshake request/response
+#[derive(Debug, Clone, Default)]
+pub struct HandshakeCodec;
+
+#[async_trait::async_trait]
+impl request_response::Codec for HandshakeCodec {
+    type Protocol = &'static str;
+    type Request = Vec<u8>;
+    type Response = Vec<u8>;
+
+    async fn read_request<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+    ) -> std::io::Result<Self::Request>
+    where
+        T: futures::io::AsyncRead + Unpin + Send,
+    {
+        use futures::io::AsyncReadExt;
+        let mut len_buf = [0u8; 4];
+        io.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        
+        let mut buf = vec![0u8; len];
+        io.read_exact(&mut buf).await?;
+        Ok(buf)
+    }
+
+    async fn read_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+    ) -> std::io::Result<Self::Response>
+    where
+        T: futures::io::AsyncRead + Unpin + Send,
+    {
+        use futures::io::AsyncReadExt;
+        let mut len_buf = [0u8; 4];
+        io.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        
+        let mut buf = vec![0u8; len];
+        io.read_exact(&mut buf).await?;
+        Ok(buf)
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        req: Self::Request,
+    ) -> std::io::Result<()>
+    where
+        T: futures::io::AsyncWrite + Unpin + Send,
+    {
+        use futures::io::AsyncWriteExt;
+        let len = req.len() as u32;
+        io.write_all(&len.to_be_bytes()).await?;
+        io.write_all(&req).await?;
+        Ok(())
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        res: Self::Response,
+    ) -> std::io::Result<()>
+    where
+        T: futures::io::AsyncWrite + Unpin + Send,
+    {
+        use futures::io::AsyncWriteExt;
+        let len = res.len() as u32;
+        io.write_all(&len.to_be_bytes()).await?;
+        io.write_all(&res).await?;
+        Ok(())
+    }
+}
 
 #[async_trait::async_trait]
 impl request_response::Codec for ApplyCodec {
@@ -136,6 +215,7 @@ pub struct MyBehaviour {
     gossipsub: gossipsub::Behaviour,
     mdns: mdns::tokio::Behaviour,
     apply_rr: request_response::Behaviour<ApplyCodec>,
+    handshake_rr: request_response::Behaviour<HandshakeCodec>,
 }
 
 pub fn setup_libp2p_node() -> Result<
@@ -185,7 +265,13 @@ pub fn setup_libp2p_node() -> Result<
                 request_response::Config::default(),
             );
             
-            Ok(MyBehaviour { gossipsub, mdns, apply_rr })
+            // Create the request-response behavior for handshake protocol
+            let handshake_rr = request_response::Behaviour::new(
+                std::iter::once(("/beemesh/handshake/1.0.0", request_response::ProtocolSupport::Full)),
+                request_response::Config::default(),
+            );
+            
+            Ok(MyBehaviour { gossipsub, mdns, apply_rr, handshake_rr })
         })?
         .build();
 
@@ -290,6 +376,69 @@ pub async fn start_libp2p_node(
             }
             event = swarm.select_next_some() => {
                 match event {
+                    SwarmEvent::Behaviour(MyBehaviourEvent::HandshakeRr(request_response::Event::Message { message, peer, connection_id: _ })) => {
+                        match message {
+                            request_response::Message::Request { request, channel, .. } => {
+                                println!("libp2p: received handshake request from peer={}", peer);
+                                
+                                // Parse the FlatBuffer handshake request
+                                match beemesh_protocol::flatbuffer::root_as_handshake(&request) {
+                                    Ok(handshake_req) => {
+                                        println!("libp2p: handshake request - signature={:?}", handshake_req.signature());
+                                        
+                                        // Mark this peer as confirmed
+                                        let state = handshake_states.entry(peer.clone()).or_insert(HandshakeState {
+                                            attempts: 0,
+                                            last_attempt: Instant::now() - Duration::from_secs(3),
+                                            confirmed: false,
+                                        });
+                                        state.confirmed = true;
+                                        
+                                        // Create a response with our own signature
+                                        let local_peer_id = swarm.local_peer_id().to_string();
+                                        let response = beemesh_protocol::flatbuffer::build_handshake(0, 0, "TODO", "TODO");
+                                        
+                                        // Send the response back
+                                        let _ = swarm.behaviour_mut().handshake_rr.send_response(channel, response);
+                                        println!("libp2p: sent handshake response to peer={}", peer);
+                                    }
+                                    Err(e) => {
+                                        println!("libp2p: failed to parse handshake request: {:?}", e);
+                                        // Send empty response on parse error
+                                        let error_response = beemesh_protocol::flatbuffer::build_handshake(0, 0, "TODO", "TODO");
+                                        let _ = swarm.behaviour_mut().handshake_rr.send_response(channel, error_response);
+                                    }
+                                }
+                            }
+                            request_response::Message::Response { response, .. } => {
+                                println!("libp2p: received handshake response from peer={}", peer);
+                                
+                                // Parse the response
+                                match beemesh_protocol::flatbuffer::root_as_handshake(&response) {
+                                    Ok(handshake_resp) => {
+                                        println!("libp2p: handshake response - signature={:?}", handshake_resp.signature());
+                                        
+                                        // Mark this peer as confirmed
+                                        let state = handshake_states.entry(peer.clone()).or_insert(HandshakeState {
+                                            attempts: 0,
+                                            last_attempt: Instant::now() - Duration::from_secs(3),
+                                            confirmed: false,
+                                        });
+                                        state.confirmed = true;
+                                    }
+                                    Err(e) => {
+                                        println!("libp2p: failed to parse handshake response: {:?}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(MyBehaviourEvent::HandshakeRr(request_response::Event::OutboundFailure { peer, error, .. })) => {
+                        println!("libp2p: handshake outbound failure to peer={}: {:?}", peer, error);
+                    }
+                    SwarmEvent::Behaviour(MyBehaviourEvent::HandshakeRr(request_response::Event::InboundFailure { peer, error, .. })) => {
+                        println!("libp2p: handshake inbound failure from peer={}: {:?}", peer, error);
+                    }
                     SwarmEvent::Behaviour(MyBehaviourEvent::ApplyRr(request_response::Event::Message { message, peer, connection_id: _ })) => {
                         match message {
                             request_response::Message::Request { request, channel, .. } => {
@@ -437,28 +586,13 @@ pub async fn start_libp2p_node(
                         }
 
                         let msg_content = String::from_utf8_lossy(&message.data);
-                        let s = msg_content.as_ref();
+                        let _s = msg_content.as_ref();
 
-                        // Keep handshake handling for nodes joining the cluster; otherwise ignore non-binary messages
-                        if s.starts_with(HANDSHAKE_PREFIX) {
-                            println!("Confirmed peer: {peer_id}");
-                            let state = handshake_states.entry(peer_id.clone()).or_insert(HandshakeState {
-                                attempts: 0,
-                                last_attempt: Instant::now() - Duration::from_secs(3),
-                                confirmed: false,
-                            });
-                            if !state.confirmed {
-                                state.confirmed = true;
-                                // Reply with handshake confirmation
-                                let reply_msg = format!("{}-{}-reply", HANDSHAKE_PREFIX, peer_id);
-                                let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), reply_msg.as_bytes());
-                            }
-                        } else {
-                            println!(
-                                "Received non-binary message ({} bytes) from peer {} — ignoring",
-                                message.data.len(), peer_id
-                            );
-                        }
+                        // All non-binary messages are now ignored since we use request-response for handshake
+                        println!(
+                            "Received non-binary message ({} bytes) from peer {} — ignoring",
+                            message.data.len(), peer_id
+                        );
                     }
                     SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
                         println!("Peer {peer_id} subscribed to topic: {topic}");
@@ -488,22 +622,17 @@ pub async fn start_libp2p_node(
                         continue;
                     }
                     if state.last_attempt.elapsed() >= Duration::from_secs(2) {
-                        let handshake_msg =
-                            format!("{}-{}-{}", HANDSHAKE_PREFIX, peer_id, state.attempts + 1);
-                        match swarm
-                            .behaviour_mut()
-                            .gossipsub
-                            .publish(topic.clone(), handshake_msg.as_bytes())
-                        {
-                            Ok(_) => {
-                                state.attempts += 1;
-                                state.last_attempt = Instant::now();
-                            }
-                            Err(_e) => {
-                                state.attempts += 1;
-                                state.last_attempt = Instant::now();
-                            }
-                        }
+                        // Send handshake request using request-response protocol with FlatBuffer
+                        let local_peer_id = swarm.local_peer_id().to_string();
+                        let handshake_signature = format!("{}-{}", local_peer_id, state.attempts + 1);
+                        let handshake_request = beemesh_protocol::flatbuffer::build_handshake(0, 0, "TODO", &handshake_signature);
+                        
+                        let request_id = swarm.behaviour_mut().handshake_rr.send_request(peer_id, handshake_request);
+                        println!("libp2p: sent handshake request to peer={} request_id={:?} attempt={}", 
+                                peer_id, request_id, state.attempts + 1);
+                        
+                        state.attempts += 1;
+                        state.last_attempt = Instant::now();
                     }
                 }
                 for peer_id in to_remove {

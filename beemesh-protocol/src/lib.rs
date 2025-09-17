@@ -60,6 +60,18 @@ mod generated {
         )]
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/generated/apply_response_generated.rs"));
     }
+
+    pub mod generated_handshake {
+        #![allow(
+            dead_code,
+            non_camel_case_types,
+            non_snake_case,
+            unused_imports,
+            unused_variables,
+            mismatched_lifetime_syntaxes
+        )]
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/generated/handshake_generated.rs"));
+    }
 }
 
 pub mod flatbuffer {
@@ -69,6 +81,7 @@ pub mod flatbuffer {
     pub use crate::generated::generated_capacity_request::beemesh::{ CapacityRequest, root_as_capacity_request};
     pub use crate::generated::generated_apply_request::beemesh::{ ApplyRequest, root_as_apply_request };
     pub use crate::generated::generated_apply_response::beemesh::{ ApplyResponse, root_as_apply_response };
+    pub use crate::generated::generated_handshake::beemesh::{ Handshake, root_as_handshake };
 
     use flatbuffers::FlatBufferBuilder;
 
@@ -158,6 +171,14 @@ pub mod flatbuffer {
         crate::generated::generated_apply_response::beemesh::ApplyResponse,
         [ok: bool],
         [operation_id: &str, message: &str]
+    );
+
+    // Custom handshake builder since it only has string fields
+    fb_builder!(build_handshake,
+        crate::generated::generated_handshake::beemesh::HandshakeArgs,
+        crate::generated::generated_handshake::beemesh::Handshake,
+        [nonce: u32, timestamp: u64],
+        [protocol_version: &str, signature: &str]
     );
 }
 
