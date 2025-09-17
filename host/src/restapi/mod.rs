@@ -165,7 +165,7 @@ pub async fn apply_manifest(
 
     // dispatch manifest to each assigned peer (stubbed)
     for peer in &assigned {
-        match pod_communication::send_apply_to_peer(peer, &manifest).await {
+        match pod_communication::send_apply_to_peer(peer, &manifest, &state.control_tx).await {
             Ok(_) => {
                 per_peer.insert(peer.clone(), serde_json::Value::String("ok".to_string()));
             }

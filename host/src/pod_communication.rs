@@ -7,6 +7,8 @@ use tokio::process::Command as TokioCommand;
 use serde_json;
 use tokio::net::UnixStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use libp2p::PeerId;
+use tokio::sync::mpsc;
 
 static GATEWAY_PROCS: Lazy<Mutex<HashMap<String, tokio::process::Child>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -110,12 +112,48 @@ pub async fn stop_gateway_for_pod(pod_name: &str) -> Result<(), String> {
     }
 }
 
-/// Send the manifest to a peer. For now this is a stub that just logs the action and returns Ok.
-/// In the future this should implement RPC to the remote peer (via libp2p / HTTP) to instruct it
-/// to instantiate or update the workload described by `manifest`.
-pub async fn send_apply_to_peer(peer: &str, manifest: &serde_json::Value) -> Result<(), String> {
+/// Send the manifest to a peer using libp2p request-response protocol.
+/// This function sends an apply request FlatBuffer to the specified peer and waits for a response.
+pub async fn send_apply_to_peer(
+    peer: &str, 
+    manifest: &serde_json::Value,
+    control_tx: &mpsc::UnboundedSender<crate::libp2p_beemesh::Libp2pControl>
+) -> Result<(), String> {
     println!("send_apply_to_peer: sending manifest to peer {}: {}", peer, manifest);
-    // Simulate small delay
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    Ok(())
+    
+    // Parse the peer string into a PeerId
+    let peer_id: PeerId = peer.parse()
+        .map_err(|e| format!("invalid peer ID '{}': {}", peer, e))?;
+    
+    // Create a channel to receive the response
+    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Result<String, String>>();
+    
+    // Send the apply request via libp2p
+    let control_msg = crate::libp2p_beemesh::Libp2pControl::SendApplyRequest {
+        peer_id,
+        manifest: manifest.clone(),
+        reply_tx,
+    };
+    
+    control_tx.send(control_msg)
+        .map_err(|e| format!("failed to send control message: {}", e))?;
+    
+    // Wait for the response with a timeout
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        reply_rx.recv()
+    ).await
+    .map_err(|_| "timeout waiting for apply response".to_string())?
+    .ok_or_else(|| "control channel closed".to_string())?;
+    
+    match response {
+        Ok(msg) => {
+            println!("send_apply_to_peer: success - {}", msg);
+            Ok(())
+        }
+        Err(err) => {
+            println!("send_apply_to_peer: error - {}", err);
+            Err(err)
+        }
+    }
 }

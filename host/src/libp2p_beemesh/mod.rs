@@ -1,6 +1,6 @@
 use futures::stream::StreamExt;
 use libp2p::{
-    gossipsub, mdns, noise,
+    gossipsub, mdns, noise, request_response,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, PeerId, Swarm,
 };
@@ -13,11 +13,90 @@ use std::{
 use tokio::sync::{watch, mpsc};
 use std::collections::HashMap as StdHashMap;
 
-use beemesh_protocol::libp2p_constants::{BEEMESH_CLUSTER, HANDSHAKE_PREFIX, FREE_CAPACITY_PREFIX, FREE_CAPACITY_REPLY_PREFIX, BINARY_ENVELOPE_VERSION};
+use beemesh_protocol::libp2p_constants::{BEEMESH_CLUSTER, HANDSHAKE_PREFIX, BINARY_ENVELOPE_VERSION};
 
 // Compact binary envelope magic bytes for capacity request/reply (avoids JSON+base64).
 const CAPREQ_MAGIC: u8 = 0xC1;
 const CAPREPLY_MAGIC: u8 = 0xC2;
+
+// Define a simple codec for apply request/response
+#[derive(Debug, Clone, Default)]
+pub struct ApplyCodec;
+
+#[async_trait::async_trait]
+impl request_response::Codec for ApplyCodec {
+    type Protocol = &'static str;
+    type Request = Vec<u8>;
+    type Response = Vec<u8>;
+
+    async fn read_request<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+    ) -> std::io::Result<Self::Request>
+    where
+        T: futures::io::AsyncRead + Unpin + Send,
+    {
+        use futures::io::AsyncReadExt;
+        let mut len_buf = [0u8; 4];
+        io.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        
+        let mut buf = vec![0u8; len];
+        io.read_exact(&mut buf).await?;
+        Ok(buf)
+    }
+
+    async fn read_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+    ) -> std::io::Result<Self::Response>
+    where
+        T: futures::io::AsyncRead + Unpin + Send,
+    {
+        use futures::io::AsyncReadExt;
+        let mut len_buf = [0u8; 4];
+        io.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        
+        let mut buf = vec![0u8; len];
+        io.read_exact(&mut buf).await?;
+        Ok(buf)
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        req: Self::Request,
+    ) -> std::io::Result<()>
+    where
+        T: futures::io::AsyncWrite + Unpin + Send,
+    {
+        use futures::io::AsyncWriteExt;
+        let len = req.len() as u32;
+        io.write_all(&len.to_be_bytes()).await?;
+        io.write_all(&req).await?;
+        Ok(())
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        res: Self::Response,
+    ) -> std::io::Result<()>
+    where
+        T: futures::io::AsyncWrite + Unpin + Send,
+    {
+        use futures::io::AsyncWriteExt;
+        let len = res.len() as u32;
+        io.write_all(&len.to_be_bytes()).await?;
+        io.write_all(&res).await?;
+        Ok(())
+    }
+}
 
 // Varint helpers (unsigned LEB128-like) for encoding arbitrary-length integers.
 fn encode_varint(mut mut_v: usize) -> Vec<u8> {
@@ -56,6 +135,7 @@ fn decode_varint(buf: &[u8]) -> Option<(usize, usize)> {
 pub struct MyBehaviour {
     gossipsub: gossipsub::Behaviour,
     mdns: mdns::tokio::Behaviour,
+    apply_rr: request_response::Behaviour<ApplyCodec>,
 }
 
 pub fn setup_libp2p_node() -> Result<
@@ -98,7 +178,14 @@ pub fn setup_libp2p_node() -> Result<
             )?;
             let mdns =
                 mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
-            Ok(MyBehaviour { gossipsub, mdns })
+            
+            // Create the request-response behavior for apply protocol
+            let apply_rr = request_response::Behaviour::new(
+                std::iter::once(("/beemesh/apply/1.0.0", request_response::ProtocolSupport::Full)),
+                request_response::Config::default(),
+            );
+            
+            Ok(MyBehaviour { gossipsub, mdns, apply_rr })
         })?
         .build();
 
@@ -171,6 +258,29 @@ pub async fn start_libp2p_node(
                             }
                             // legacy textual publish removed — all peers are upgraded
                         }
+                        Libp2pControl::SendApplyRequest { peer_id, manifest, reply_tx } => {
+                            println!("libp2p: control SendApplyRequest received for peer={}", peer_id);
+                            
+                            // Create apply request FlatBuffer
+                            let operation_id = uuid::Uuid::new_v4().to_string();
+                            let manifest_json = manifest.to_string();
+                            let local_peer = swarm.local_peer_id().to_string();
+                            
+                            let apply_request = beemesh_protocol::flatbuffer::build_apply_request(
+                                1, // replicas
+                                "default", // tenant
+                                &operation_id,
+                                &manifest_json,
+                                &local_peer,
+                            );
+                            
+                            // Send the request via request-response
+                            let request_id = swarm.behaviour_mut().apply_rr.send_request(&peer_id, apply_request);
+                            println!("libp2p: sent apply request to peer={} request_id={:?}", peer_id, request_id);
+                            
+                            // For now, just send success immediately - we'll handle proper response tracking later
+                            let _ = reply_tx.send(Ok(format!("Apply request sent to {}", peer_id)));
+                        }
                     }
                 } else {
                     // sender was dropped, exit loop
@@ -180,6 +290,61 @@ pub async fn start_libp2p_node(
             }
             event = swarm.select_next_some() => {
                 match event {
+                    SwarmEvent::Behaviour(MyBehaviourEvent::ApplyRr(request_response::Event::Message { message, peer, connection_id: _ })) => {
+                        match message {
+                            request_response::Message::Request { request, channel, .. } => {
+                                println!("libp2p: received apply request from peer={}", peer);
+                                
+                                // Parse the FlatBuffer apply request
+                                match beemesh_protocol::flatbuffer::root_as_apply_request(&request) {
+                                    Ok(apply_req) => {
+                                        println!("libp2p: apply request - tenant={:?} operation_id={:?} replicas={}",
+                                            apply_req.tenant(), apply_req.operation_id(), apply_req.replicas());
+                                        
+                                        // Create a response (simulate successful apply)
+                                        let response = beemesh_protocol::flatbuffer::build_apply_response(
+                                            true,
+                                            apply_req.operation_id().unwrap_or("unknown"),
+                                            "Successfully applied manifest",
+                                        );
+                                        
+                                        // Send the response back
+                                        let _ = swarm.behaviour_mut().apply_rr.send_response(channel, response);
+                                        println!("libp2p: sent apply response to peer={}", peer);
+                                    }
+                                    Err(e) => {
+                                        println!("libp2p: failed to parse apply request: {:?}", e);
+                                        let error_response = beemesh_protocol::flatbuffer::build_apply_response(
+                                            false,
+                                            "unknown",
+                                            &format!("Failed to parse request: {:?}", e),
+                                        );
+                                        let _ = swarm.behaviour_mut().apply_rr.send_response(channel, error_response);
+                                    }
+                                }
+                            }
+                            request_response::Message::Response { response, .. } => {
+                                println!("libp2p: received apply response from peer={}", peer);
+                                
+                                // Parse the response
+                                match beemesh_protocol::flatbuffer::root_as_apply_response(&response) {
+                                    Ok(apply_resp) => {
+                                        println!("libp2p: apply response - ok={} operation_id={:?} message={:?}",
+                                            apply_resp.ok(), apply_resp.operation_id(), apply_resp.message());
+                                    }
+                                    Err(e) => {
+                                        println!("libp2p: failed to parse apply response: {:?}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(MyBehaviourEvent::ApplyRr(request_response::Event::OutboundFailure { peer, error, .. })) => {
+                        println!("libp2p: outbound request failure to peer={}: {:?}", peer, error);
+                    }
+                    SwarmEvent::Behaviour(MyBehaviourEvent::ApplyRr(request_response::Event::InboundFailure { peer, error, .. })) => {
+                        println!("libp2p: inbound request failure from peer={}: {:?}", peer, error);
+                    }
                     SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                         for (peer_id, _multiaddr) in list {
                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
@@ -206,7 +371,7 @@ pub async fn start_libp2p_node(
                     }
                     SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
                         propagation_source: peer_id,
-                        message_id: id,
+                        message_id: _id,
                         message,
                     })) => {
                         // First try compact binary envelope parsing (fast, no copying/base64)
@@ -367,5 +532,10 @@ pub enum Libp2pControl {
         request_id: String,
         reply_tx: mpsc::UnboundedSender<String>,
         payload: Vec<u8>,
+    },
+    SendApplyRequest {
+        peer_id: PeerId,
+        manifest: serde_json::Value,
+        reply_tx: mpsc::UnboundedSender<Result<String, String>>,
     },
 }

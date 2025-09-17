@@ -19,3 +19,4 @@ beemesh-protocol = { path = "../beemesh-protocol" }
 uuid = { version = "1", features = ["v4"] }
 flatbuffers = "25.2.10"
 base64 = "0.21"
+async-trait = "0.1"

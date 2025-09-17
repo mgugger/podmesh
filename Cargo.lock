@@ -1448,6 +1448,7 @@ dependencies = [
 name = "host"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "axum-server",
  "base64 0.21.7",
