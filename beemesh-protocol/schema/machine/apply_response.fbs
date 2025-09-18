@@ -1,4 +1,4 @@
-namespace beemesh;
+namespace beemesh.machine;
 
 table ApplyResponse {
   ok:bool;

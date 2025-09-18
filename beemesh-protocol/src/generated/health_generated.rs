@@ -17,6 +17,14 @@ pub mod beemesh {
 
   extern crate flatbuffers;
   use self::flatbuffers::{EndianScalar, Follow};
+#[allow(unused_imports, dead_code)]
+pub mod machine {
+
+  use core::mem;
+  use core::cmp::Ordering;
+
+  extern crate flatbuffers;
+  use self::flatbuffers::{EndianScalar, Follow};
 
 pub enum HealthOffset {}
 #[derive(Copy, Clone, PartialEq)]
@@ -203,5 +211,6 @@ pub fn finish_health_buffer<'a, 'b, A: flatbuffers::Allocator + 'a>(
 pub fn finish_size_prefixed_health_buffer<'a, 'b, A: flatbuffers::Allocator + 'a>(fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>, root: flatbuffers::WIPOffset<Health<'a>>) {
   fbb.finish_size_prefixed(root, None);
 }
+}  // pub mod machine
 }  // pub mod beemesh
 

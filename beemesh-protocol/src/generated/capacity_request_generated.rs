@@ -17,6 +17,14 @@ pub mod beemesh {
 
   extern crate flatbuffers;
   use self::flatbuffers::{EndianScalar, Follow};
+#[allow(unused_imports, dead_code)]
+pub mod machine {
+
+  use core::mem;
+  use core::cmp::Ordering;
+
+  extern crate flatbuffers;
+  use self::flatbuffers::{EndianScalar, Follow};
 
 pub enum CapacityRequestOffset {}
 #[derive(Copy, Clone, PartialEq)]
@@ -34,10 +42,11 @@ impl<'a> flatbuffers::Follow<'a> for CapacityRequest<'a> {
 }
 
 impl<'a> CapacityRequest<'a> {
-  pub const VT_CPU_MILLI: flatbuffers::VOffsetT = 4;
-  pub const VT_MEMORY_BYTES: flatbuffers::VOffsetT = 6;
-  pub const VT_STORAGE_BYTES: flatbuffers::VOffsetT = 8;
-  pub const VT_REPLICAS: flatbuffers::VOffsetT = 10;
+  pub const VT_REQUEST_ID: flatbuffers::VOffsetT = 4;
+  pub const VT_CPU_MILLI: flatbuffers::VOffsetT = 6;
+  pub const VT_MEMORY_BYTES: flatbuffers::VOffsetT = 8;
+  pub const VT_STORAGE_BYTES: flatbuffers::VOffsetT = 10;
+  pub const VT_REPLICAS: flatbuffers::VOffsetT = 12;
 
   #[inline]
   pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -46,17 +55,25 @@ impl<'a> CapacityRequest<'a> {
   #[allow(unused_mut)]
   pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: flatbuffers::Allocator + 'bldr>(
     _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr, A>,
-    args: &'args CapacityRequestArgs
+    args: &'args CapacityRequestArgs<'args>
   ) -> flatbuffers::WIPOffset<CapacityRequest<'bldr>> {
     let mut builder = CapacityRequestBuilder::new(_fbb);
     builder.add_storage_bytes(args.storage_bytes);
     builder.add_memory_bytes(args.memory_bytes);
     builder.add_replicas(args.replicas);
     builder.add_cpu_milli(args.cpu_milli);
+    if let Some(x) = args.request_id { builder.add_request_id(x); }
     builder.finish()
   }
 
 
+  #[inline]
+  pub fn request_id(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(CapacityRequest::VT_REQUEST_ID, None)}
+  }
   #[inline]
   pub fn cpu_milli(&self) -> u32 {
     // Safety:
@@ -94,6 +111,7 @@ impl flatbuffers::Verifiable for CapacityRequest<'_> {
   ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
     use self::flatbuffers::Verifiable;
     v.visit_table(pos)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("request_id", Self::VT_REQUEST_ID, false)?
      .visit_field::<u32>("cpu_milli", Self::VT_CPU_MILLI, false)?
      .visit_field::<u64>("memory_bytes", Self::VT_MEMORY_BYTES, false)?
      .visit_field::<u64>("storage_bytes", Self::VT_STORAGE_BYTES, false)?
@@ -102,16 +120,18 @@ impl flatbuffers::Verifiable for CapacityRequest<'_> {
     Ok(())
   }
 }
-pub struct CapacityRequestArgs {
+pub struct CapacityRequestArgs<'a> {
+    pub request_id: Option<flatbuffers::WIPOffset<&'a str>>,
     pub cpu_milli: u32,
     pub memory_bytes: u64,
     pub storage_bytes: u64,
     pub replicas: u32,
 }
-impl<'a> Default for CapacityRequestArgs {
+impl<'a> Default for CapacityRequestArgs<'a> {
   #[inline]
   fn default() -> Self {
     CapacityRequestArgs {
+      request_id: None,
       cpu_milli: 0,
       memory_bytes: 0,
       storage_bytes: 0,
@@ -125,6 +145,10 @@ pub struct CapacityRequestBuilder<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> {
   start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
 }
 impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> CapacityRequestBuilder<'a, 'b, A> {
+  #[inline]
+  pub fn add_request_id(&mut self, request_id: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(CapacityRequest::VT_REQUEST_ID, request_id);
+  }
   #[inline]
   pub fn add_cpu_milli(&mut self, cpu_milli: u32) {
     self.fbb_.push_slot::<u32>(CapacityRequest::VT_CPU_MILLI, cpu_milli, 0);
@@ -159,6 +183,7 @@ impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> CapacityRequestBuilder<'a, 'b, 
 impl core::fmt::Debug for CapacityRequest<'_> {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     let mut ds = f.debug_struct("CapacityRequest");
+      ds.field("request_id", &self.request_id());
       ds.field("cpu_milli", &self.cpu_milli());
       ds.field("memory_bytes", &self.memory_bytes());
       ds.field("storage_bytes", &self.storage_bytes());
@@ -237,5 +262,6 @@ pub fn finish_capacity_request_buffer<'a, 'b, A: flatbuffers::Allocator + 'a>(
 pub fn finish_size_prefixed_capacity_request_buffer<'a, 'b, A: flatbuffers::Allocator + 'a>(fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>, root: flatbuffers::WIPOffset<CapacityRequest<'a>>) {
   fbb.finish_size_prefixed(root, None);
 }
+}  // pub mod machine
 }  // pub mod beemesh
 

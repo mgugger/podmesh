@@ -37,53 +37,9 @@ pub fn build_router(
     };
     Router::new()
         .route("/health", get(|| async { "ok" }))
-        .route("/tenants/{tenant}/apply", post(apply_manifest))
-        .route("/{peer_id}/{pod_name}/health", get(peer_pod_health))
-        .route("/nodes", get(get_nodes))
-        // routes for testing
-        .route("/start_pod", post(start_pod))
-        .route("/stop_pod", post(stop_pod))
+        .route("/tenants/{tenant}/apply", post(apply_manifest))   
         // state
         .with_state(state)
-}
-
-// pub async fn init_raft(
-//     Path((peer_id, pod_name)): Path<(String, String)>,
-// ) -> Json<serde_json::Value> {
-//     // If peer_id indicates local host, perform the unix-socket init_raft.
-//     if peer_id == "local" || peer_id == "self" || peer_id == "0" {
-//         // Gateway expects POST /init with a JSON array payload. For single-node init an empty
-//         // array (`[]`) is accepted and the gateway will initialize using its own id/addr.
-//         let body = serde_json::json!([]);
-//         match pod_communication::send_request::<serde_json::Value>(&pod_name, "POST", "/init", Some(&body)).await {
-//             Ok((status, _parsed, text)) => {
-//                 if status.is_success() {
-//                     Json(serde_json::json!({"ok": true, "status": "raft initialized", "body": text}))
-//                 } else {
-//                     Json(serde_json::json!({"ok": false, "error": format!("gateway returned {}", status), "body": text}))
-//                 }
-//             }
-//             Err(e) => Json(serde_json::json!({"ok": false, "error": e})),
-//         }
-//     } else {
-//         // Remote peer init_raft via libp2p are not implemented yet.
-//         Json(serde_json::json!({"ok": false, "error": "peer init_raft not implemented"}))
-//     }
-// }
-
-pub async fn peer_pod_health(
-    Path((peer_id, pod_name)): Path<(String, String)>,
-) -> Json<serde_json::Value> {
-    // If peer_id indicates local host, perform the unix-socket health check.
-    if peer_id == "local" || peer_id == "self" || peer_id == "0" {
-        match pod_communication::send_health_check(&pod_name).await {
-            Ok(ok) => Json(serde_json::json!({"ok": ok})),
-            Err(e) => Json(serde_json::json!({"ok": false, "error": e})),
-        }
-    } else {
-        // Remote peer checks via libp2p are not implemented yet.
-        Json(serde_json::json!({"ok": false, "error": "peer checks not implemented"}))
-    }
 }
 
 pub async fn apply_manifest(
@@ -112,7 +68,7 @@ pub async fn apply_manifest(
     // publish a QueryCapacity control message to the libp2p task and collect replies
     let request_id = format!("{}-{}", FREE_CAPACITY_PREFIX, uuid::Uuid::new_v4());
     // build a sample flatbuffer CapacityRequest (sample values for now)
-    let capacity_fb = beemesh_protocol::flatbuffer::build_capacity_request(
+    let capacity_fb = beemesh_protocol::machine::build_capacity_request(
         500u32,                    // cpu_milli
         512u64 * 1024 * 1024,      // memory_bytes (512MB)
         10u64 * 1024 * 1024 * 1024, // storage_bytes (10GB)
@@ -185,58 +141,4 @@ pub async fn apply_manifest(
         "assigned_peers": assigned,
         "per_peer": serde_json::Value::Object(per_peer),
     }))
-}
-
-#[derive(Deserialize)]
-pub struct InitPodRequest {
-    pub pod_name: String,
-}
-
-#[derive(Serialize)]
-pub struct InitPodResponse {
-    pub socket_path: String,
-    pub status: String,
-}
-
-pub async fn start_pod(Json(req): Json<InitPodRequest>) -> Json<InitPodResponse> {
-    match pod_communication::init_pod_listener(&req.pod_name).await {
-        Ok(socket_path) => {
-            // start gateway process and pass --host_socket
-            let host_socket = socket_path.clone();
-            // spawn the gateway using default binary location
-            match pod_communication::start_gateway_for_pod(&req.pod_name, None, &host_socket).await
-            {
-                Ok(_) => Json(InitPodResponse {
-                    socket_path,
-                    status: "listener and gateway started".to_string(),
-                }),
-                Err(e) => Json(InitPodResponse {
-                    socket_path,
-                    status: format!("listener started; gateway failed: {}", e),
-                }),
-            }
-        }
-        Err(e) => Json(InitPodResponse {
-            socket_path: "".to_string(),
-            status: e,
-        }),
-    }
-}
-
-#[derive(Deserialize)]
-pub struct StopPodRequest {
-    pub pod_name: String,
-}
-
-pub async fn stop_pod(Json(req): Json<StopPodRequest>) -> Json<InitPodResponse> {
-    match pod_communication::stop_gateway_for_pod(&req.pod_name).await {
-        Ok(_) => Json(InitPodResponse {
-            socket_path: "".to_string(),
-            status: "stopped gateway".to_string(),
-        }),
-        Err(e) => Json(InitPodResponse {
-            socket_path: "".to_string(),
-            status: format!("stop failed: {}", e),
-        }),
-    }
 }

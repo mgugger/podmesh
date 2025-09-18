@@ -3,7 +3,7 @@ use std::path::Path;
 
 fn main() {
     // Where the .fbs schema files live
-    let schema_dir = Path::new("schema");
+    let schema_dir = Path::new("schema/machine");
 
     // Ensure schema dir exists
     if !schema_dir.exists() {

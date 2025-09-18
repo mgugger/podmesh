@@ -1,6 +1,4 @@
-//! beemesh protocol crate — generated flatbuffers types live in `generated`.
 mod generated {
-    // Put each generated file into its own parent module to avoid duplicate nested `pub mod` names.
     pub mod generated_health {
         #![allow(
             dead_code,
@@ -74,14 +72,17 @@ mod generated {
     }
 }
 
-pub mod flatbuffer {
+pub mod machine {
     // Avoid glob imports; re-export specific items below.
-    pub use crate::generated::generated_health::beemesh::{Health, root_as_health};
-    pub use crate::generated::generated_capacity_reply::beemesh::{ CapacityReply, root_as_capacity_reply};
-    pub use crate::generated::generated_capacity_request::beemesh::{ CapacityRequest, root_as_capacity_request};
-    pub use crate::generated::generated_apply_request::beemesh::{ ApplyRequest, root_as_apply_request };
-    pub use crate::generated::generated_apply_response::beemesh::{ ApplyResponse, root_as_apply_response };
-    pub use crate::generated::generated_handshake::beemesh::{ Handshake, root_as_handshake };
+    pub use crate::generated::generated_health::beemesh::machine::{Health, root_as_health};
+    pub use crate::generated::generated_capacity_reply::beemesh::machine::{ CapacityReply, root_as_capacity_reply, finish_capacity_reply_buffer };
+    pub use crate::generated::generated_capacity_request::beemesh::machine::{ CapacityRequest, root_as_capacity_request, finish_capacity_request_buffer };
+    // Re-export Args to allow building nested FB objects in other modules
+    pub use crate::generated::generated_capacity_request::beemesh::machine::CapacityRequestArgs;
+    pub use crate::generated::generated_capacity_reply::beemesh::machine::CapacityReplyArgs;
+    pub use crate::generated::generated_apply_request::beemesh::machine::{ ApplyRequest, root_as_apply_request };
+    pub use crate::generated::generated_apply_response::beemesh::machine::{ ApplyResponse, root_as_apply_response };
+    pub use crate::generated::generated_handshake::beemesh::machine::{ Handshake, root_as_handshake };
 
     use flatbuffers::FlatBufferBuilder;
 
@@ -138,45 +139,45 @@ pub mod flatbuffer {
     }
 
     fb_builder!(build_health,
-        crate::generated::generated_health::beemesh::HealthArgs,
-        crate::generated::generated_health::beemesh::Health,
+        crate::generated::generated_health::beemesh::machine::HealthArgs,
+        crate::generated::generated_health::beemesh::machine::Health,
         [ok: bool],
         [status: &str]
     );
 
     fb_builder!(build_capacity_request,
-        crate::generated::generated_capacity_request::beemesh::CapacityRequestArgs,
-        crate::generated::generated_capacity_request::beemesh::CapacityRequest,
+        crate::generated::generated_capacity_request::beemesh::machine::CapacityRequestArgs,
+        crate::generated::generated_capacity_request::beemesh::machine::CapacityRequest,
         [cpu_milli: u32, memory_bytes: u64, storage_bytes: u64, replicas: u32],
         []
     );
 
     fb_builder!(build_capacity_reply,
-        crate::generated::generated_capacity_reply::beemesh::CapacityReplyArgs,
-        crate::generated::generated_capacity_reply::beemesh::CapacityReply,
+        crate::generated::generated_capacity_reply::beemesh::machine::CapacityReplyArgs,
+        crate::generated::generated_capacity_reply::beemesh::machine::CapacityReply,
         [ok: bool, cpu_available_milli: u32, memory_available_bytes: u64, storage_available_bytes: u64],
-        [node_id: &str, region: &str],
+        [request_id: &str, node_id: &str, region: &str],
         [capabilities: &[&str]]
     );
 
     fb_builder!(build_apply_request,
-        crate::generated::generated_apply_request::beemesh::ApplyRequestArgs,
-        crate::generated::generated_apply_request::beemesh::ApplyRequest,
+        crate::generated::generated_apply_request::beemesh::machine::ApplyRequestArgs,
+        crate::generated::generated_apply_request::beemesh::machine::ApplyRequest,
         [replicas: u32],
         [tenant: &str, operation_id: &str, manifest_json: &str, origin_peer: &str]
     );
 
     fb_builder!(build_apply_response,
-        crate::generated::generated_apply_response::beemesh::ApplyResponseArgs,
-        crate::generated::generated_apply_response::beemesh::ApplyResponse,
+        crate::generated::generated_apply_response::beemesh::machine::ApplyResponseArgs,
+        crate::generated::generated_apply_response::beemesh::machine::ApplyResponse,
         [ok: bool],
         [operation_id: &str, message: &str]
     );
 
     // Custom handshake builder since it only has string fields
     fb_builder!(build_handshake,
-        crate::generated::generated_handshake::beemesh::HandshakeArgs,
-        crate::generated::generated_handshake::beemesh::Handshake,
+        crate::generated::generated_handshake::beemesh::machine::HandshakeArgs,
+        crate::generated::generated_handshake::beemesh::machine::Handshake,
         [nonce: u32, timestamp: u64],
         [protocol_version: &str, signature: &str]
     );
@@ -186,15 +187,13 @@ pub mod libp2p_constants;
 
 #[cfg(test)]
 mod test {
-    use crate::flatbuffer::build_health;
-
-    use super::*;
+    use crate::machine::{ build_health, root_as_health };
 
     #[test]
     fn flatbuffers_health_roundtrip() {
         let buf = build_health(true, "healthy");
         // parse and verify
-        let health = flatbuffer::root_as_health(&buf).unwrap();
+        let health = root_as_health(&buf).unwrap();
         assert!(health.ok());
         assert_eq!(health.status().unwrap(), "healthy");
     }

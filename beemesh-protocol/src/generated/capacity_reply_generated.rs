@@ -17,6 +17,14 @@ pub mod beemesh {
 
   extern crate flatbuffers;
   use self::flatbuffers::{EndianScalar, Follow};
+#[allow(unused_imports, dead_code)]
+pub mod machine {
+
+  use core::mem;
+  use core::cmp::Ordering;
+
+  extern crate flatbuffers;
+  use self::flatbuffers::{EndianScalar, Follow};
 
 pub enum CapacityReplyOffset {}
 #[derive(Copy, Clone, PartialEq)]
@@ -34,13 +42,14 @@ impl<'a> flatbuffers::Follow<'a> for CapacityReply<'a> {
 }
 
 impl<'a> CapacityReply<'a> {
-  pub const VT_OK: flatbuffers::VOffsetT = 4;
-  pub const VT_NODE_ID: flatbuffers::VOffsetT = 6;
-  pub const VT_REGION: flatbuffers::VOffsetT = 8;
-  pub const VT_CAPABILITIES: flatbuffers::VOffsetT = 10;
-  pub const VT_CPU_AVAILABLE_MILLI: flatbuffers::VOffsetT = 12;
-  pub const VT_MEMORY_AVAILABLE_BYTES: flatbuffers::VOffsetT = 14;
-  pub const VT_STORAGE_AVAILABLE_BYTES: flatbuffers::VOffsetT = 16;
+  pub const VT_REQUEST_ID: flatbuffers::VOffsetT = 4;
+  pub const VT_OK: flatbuffers::VOffsetT = 6;
+  pub const VT_NODE_ID: flatbuffers::VOffsetT = 8;
+  pub const VT_REGION: flatbuffers::VOffsetT = 10;
+  pub const VT_CAPABILITIES: flatbuffers::VOffsetT = 12;
+  pub const VT_CPU_AVAILABLE_MILLI: flatbuffers::VOffsetT = 14;
+  pub const VT_MEMORY_AVAILABLE_BYTES: flatbuffers::VOffsetT = 16;
+  pub const VT_STORAGE_AVAILABLE_BYTES: flatbuffers::VOffsetT = 18;
 
   #[inline]
   pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -58,11 +67,19 @@ impl<'a> CapacityReply<'a> {
     if let Some(x) = args.capabilities { builder.add_capabilities(x); }
     if let Some(x) = args.region { builder.add_region(x); }
     if let Some(x) = args.node_id { builder.add_node_id(x); }
+    if let Some(x) = args.request_id { builder.add_request_id(x); }
     builder.add_ok(args.ok);
     builder.finish()
   }
 
 
+  #[inline]
+  pub fn request_id(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(CapacityReply::VT_REQUEST_ID, None)}
+  }
   #[inline]
   pub fn ok(&self) -> bool {
     // Safety:
@@ -121,6 +138,7 @@ impl flatbuffers::Verifiable for CapacityReply<'_> {
   ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
     use self::flatbuffers::Verifiable;
     v.visit_table(pos)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("request_id", Self::VT_REQUEST_ID, false)?
      .visit_field::<bool>("ok", Self::VT_OK, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<&str>>("node_id", Self::VT_NODE_ID, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<&str>>("region", Self::VT_REGION, false)?
@@ -133,6 +151,7 @@ impl flatbuffers::Verifiable for CapacityReply<'_> {
   }
 }
 pub struct CapacityReplyArgs<'a> {
+    pub request_id: Option<flatbuffers::WIPOffset<&'a str>>,
     pub ok: bool,
     pub node_id: Option<flatbuffers::WIPOffset<&'a str>>,
     pub region: Option<flatbuffers::WIPOffset<&'a str>>,
@@ -145,6 +164,7 @@ impl<'a> Default for CapacityReplyArgs<'a> {
   #[inline]
   fn default() -> Self {
     CapacityReplyArgs {
+      request_id: None,
       ok: false,
       node_id: None,
       region: None,
@@ -161,6 +181,10 @@ pub struct CapacityReplyBuilder<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> {
   start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
 }
 impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> CapacityReplyBuilder<'a, 'b, A> {
+  #[inline]
+  pub fn add_request_id(&mut self, request_id: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(CapacityReply::VT_REQUEST_ID, request_id);
+  }
   #[inline]
   pub fn add_ok(&mut self, ok: bool) {
     self.fbb_.push_slot::<bool>(CapacityReply::VT_OK, ok, false);
@@ -207,6 +231,7 @@ impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> CapacityReplyBuilder<'a, 'b, A>
 impl core::fmt::Debug for CapacityReply<'_> {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     let mut ds = f.debug_struct("CapacityReply");
+      ds.field("request_id", &self.request_id());
       ds.field("ok", &self.ok());
       ds.field("node_id", &self.node_id());
       ds.field("region", &self.region());
@@ -288,5 +313,6 @@ pub fn finish_capacity_reply_buffer<'a, 'b, A: flatbuffers::Allocator + 'a>(
 pub fn finish_size_prefixed_capacity_reply_buffer<'a, 'b, A: flatbuffers::Allocator + 'a>(fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>, root: flatbuffers::WIPOffset<CapacityReply<'a>>) {
   fbb.finish_size_prefixed(root, None);
 }
+}  // pub mod machine
 }  // pub mod beemesh
 
