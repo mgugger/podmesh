@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (swarm, topic, peer_rx, peer_tx) = libp2p_beemesh::setup_libp2p_node()?;
 
     // control channel for libp2p (from REST handlers to libp2p task)
-    let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel::<libp2p_beemesh::Libp2pControl>();
+    let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel::<libp2p_beemesh::control::Libp2pControl>();
 
     let libp2p_handle = tokio::spawn(async move {
         if let Err(e) = libp2p_beemesh::start_libp2p_node(swarm, topic, peer_tx, control_rx).await {

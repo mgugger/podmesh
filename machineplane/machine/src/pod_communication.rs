@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 pub async fn send_apply_to_peer(
     peer: &str, 
     manifest: &serde_json::Value,
-    control_tx: &mpsc::UnboundedSender<crate::libp2p_beemesh::Libp2pControl>
+    control_tx: &mpsc::UnboundedSender<crate::libp2p_beemesh::control::Libp2pControl>
 ) -> Result<(), String> {
     println!("send_apply_to_peer: sending manifest to peer {}: {}", peer, manifest);
     
@@ -20,7 +20,7 @@ pub async fn send_apply_to_peer(
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Result<String, String>>();
     
     // Send the apply request via libp2p
-    let control_msg = crate::libp2p_beemesh::Libp2pControl::SendApplyRequest {
+    let control_msg = crate::libp2p_beemesh::control::Libp2pControl::SendApplyRequest {
         peer_id,
         manifest: manifest.clone(),
         reply_tx,

@@ -1,8 +1,8 @@
-use libp2p::{gossipsub, Swarm};
+use libp2p::{gossipsub, PeerId, Swarm};
 use std::collections::HashMap as StdHashMap;
 use tokio::sync::mpsc;
 
-use crate::libp2p_beemesh::{Libp2pControl, behaviour::MyBehaviour};
+use crate::libp2p_beemesh::{behaviour::MyBehaviour};
 
 mod query_capacity;
 mod send_apply_request;
@@ -25,4 +25,19 @@ pub async fn handle_control_message(
             handle_send_apply_request(peer_id, manifest, reply_tx, swarm).await;
         }
     }
+}
+
+/// Control messages sent from the rest API or other parts of the host to the libp2p task.
+#[derive(Debug)]
+pub enum Libp2pControl {
+    QueryCapacityWithPayload {
+        request_id: String,
+        reply_tx: mpsc::UnboundedSender<String>,
+        payload: Vec<u8>,
+    },
+    SendApplyRequest {
+        peer_id: PeerId,
+        manifest: serde_json::Value,
+        reply_tx: mpsc::UnboundedSender<Result<String, String>>,
+    },
 }

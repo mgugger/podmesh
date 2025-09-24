@@ -24,12 +24,12 @@ async fn get_nodes(State(state): State<RestState>) -> Json<NodesResponse> {
 #[derive(Clone)]
 pub struct RestState {
     pub peer_rx: watch::Receiver<Vec<String>>,
-    pub control_tx: mpsc::UnboundedSender<crate::libp2p_beemesh::Libp2pControl>,
+    pub control_tx: mpsc::UnboundedSender<crate::libp2p_beemesh::control::Libp2pControl>,
 }
 
 pub fn build_router(
     peer_rx: watch::Receiver<Vec<String>>,
-    control_tx: mpsc::UnboundedSender<crate::libp2p_beemesh::Libp2pControl>,
+    control_tx: mpsc::UnboundedSender<crate::libp2p_beemesh::control::Libp2pControl>,
 ) -> Router {
     let state = RestState {
         peer_rx,
@@ -79,7 +79,7 @@ pub async fn apply_manifest(
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<String>();
     let _ = state
         .control_tx
-        .send(crate::libp2p_beemesh::Libp2pControl::QueryCapacityWithPayload {
+        .send(crate::libp2p_beemesh::control::Libp2pControl::QueryCapacityWithPayload {
             request_id: request_id.clone(),
             reply_tx: reply_tx.clone(),
             payload: capacity_fb,

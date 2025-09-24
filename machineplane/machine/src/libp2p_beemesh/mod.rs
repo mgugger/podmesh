@@ -18,9 +18,9 @@ use protocol::libp2p_constants::BEEMESH_CLUSTER;
 mod request_response_codec;
 pub use request_response_codec::{ApplyCodec, HandshakeCodec};
 
-use crate::libp2p_beemesh::behaviour::{MyBehaviour, MyBehaviourEvent};
+use crate::libp2p_beemesh::{behaviour::{MyBehaviour, MyBehaviourEvent}, control::Libp2pControl};
 
-mod control;
+pub mod control;
 mod behaviour;
 
 // Handshake state used by the handshake behaviour handlers
@@ -235,19 +235,4 @@ pub async fn start_libp2p_node(
     }
 
     Ok(())
-}
-
-/// Control messages sent from the rest API or other parts of the host to the libp2p task.
-#[derive(Debug)]
-pub enum Libp2pControl {
-    QueryCapacityWithPayload {
-        request_id: String,
-        reply_tx: mpsc::UnboundedSender<String>,
-        payload: Vec<u8>,
-    },
-    SendApplyRequest {
-        peer_id: PeerId,
-        manifest: serde_json::Value,
-        reply_tx: mpsc::UnboundedSender<Result<String, String>>,
-    },
 }
