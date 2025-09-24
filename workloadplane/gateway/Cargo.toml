@@ -1,0 +1,30 @@
+[package]
+name = "gateway"
+version = "0.1.0"
+edition = "2021"
+description = "Gateway service for beemesh"
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
+[dependencies]
+openraft = { git = "https://github.com/databendlabs/openraft.git" , features = ["serde", "type-alias"] }
+clap = { version = "4.1.11", features = ["derive", "env"] }
+reqwest = { version = "0.12.5", features = ["json"] }
+serde = { version = "1.0.114", features = ["derive"] }
+serde_json = "1.0.57"
+tokio = { version = "1.0", default-features = false, features = ["rt-multi-thread", "macros", "sync", "net"] }
+tracing = "0.1.29"
+tracing-subscriber = { version = "0.3.0", features = ["env-filter"] }
+tokio-util = "0.7"
+futures = "0.3"
+beemesh-protocol = { path = "../beemesh-protocol"}
+
+[dev-dependencies]
+anyhow = "1.0.63"
+maplit = "1.0.2"
+
+[features]
+default = []
+raft = []

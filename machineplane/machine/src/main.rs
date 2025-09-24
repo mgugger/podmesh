@@ -3,7 +3,6 @@ use clap::Parser;
 mod hostapi;
 mod libp2p_beemesh;
 mod pod_communication;
-mod podman;
 mod restapi;
 
 /// beemesh Host Agent
@@ -77,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(socket_path) = cli.api_socket.clone() {
             // remove stale
             let _ = std::fs::remove_file(&socket_path);
-            let app2 = hostapi::build_router().merge(podman::build_router());
+            let app2 = hostapi::build_router(); //.merge(podman::build_router());
             let socket = socket_path.clone();
             handles.push(tokio::spawn(async move {
                 // bind a unix domain socket and serve the axum app on it
