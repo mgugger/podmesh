@@ -1,7 +1,7 @@
 use futures::stream::StreamExt;
 use libp2p::{
     gossipsub, mdns, noise, request_response,
-    swarm::{NetworkBehaviour, SwarmEvent},
+    swarm::{SwarmEvent},
     tcp, yamux, PeerId, Swarm,
 };
 use std::collections::HashMap as StdHashMap;
@@ -18,15 +18,17 @@ use protocol::libp2p_constants::BEEMESH_CLUSTER;
 mod request_response_codec;
 pub use request_response_codec::{ApplyCodec, HandshakeCodec};
 
-// Varint helpers (unsigned LEB128-like) for encoding arbitrary-length integers.
-// No envelope varint helpers needed — we now embed request_id inside FlatBuffers and wrap
+use crate::libp2p_beemesh::behaviour::{MyBehaviour, MyBehaviourEvent};
 
-#[derive(NetworkBehaviour)]
-pub struct MyBehaviour {
-    gossipsub: gossipsub::Behaviour,
-    mdns: mdns::tokio::Behaviour,
-    apply_rr: request_response::Behaviour<ApplyCodec>,
-    handshake_rr: request_response::Behaviour<HandshakeCodec>,
+mod control;
+mod behaviour;
+
+// Handshake state used by the handshake behaviour handlers
+#[derive(Debug)]
+pub struct HandshakeState {
+    pub attempts: u8,
+    pub last_attempt: tokio::time::Instant,
+    pub confirmed: bool,
 }
 
 pub fn setup_libp2p_node() -> Result<
@@ -122,12 +124,6 @@ pub async fn start_libp2p_node(
     use std::collections::HashMap;
     use tokio::time::Instant;
 
-    struct HandshakeState {
-        attempts: u8,
-        last_attempt: Instant,
-        confirmed: bool,
-    }
-
     // pending queries: map request_id -> vec of reply_senders
     let mut pending_queries: StdHashMap<String, Vec<mpsc::UnboundedSender<String>>> =
         StdHashMap::new();
@@ -141,73 +137,7 @@ pub async fn start_libp2p_node(
             // control messages from other parts of the host (REST handlers)
             maybe_msg = control_rx.recv() => {
                 if let Some(msg) = maybe_msg {
-                    match msg {
-                        Libp2pControl::QueryCapacityWithPayload { request_id, reply_tx, payload } => {
-                            // register the reply channel so incoming reply messages can be forwarded
-                            println!("libp2p: control QueryCapacityWithPayload received request_id={} payload_len={}", request_id, payload.len());
-                            pending_queries.entry(request_id.clone()).or_insert_with(Vec::new).push(reply_tx);
-
-                            // Parse the provided payload as a CapacityRequest FlatBuffer and rebuild it into a TopicMessage wrapper
-                            match protocol::machine::root_as_capacity_request(&payload) {
-                                Ok(cap_req) => {
-                                    // Rebuild a CapacityRequest flatbuffer embedding the request_id, and publish it directly (no wrapper)
-                                    let mut fbb = flatbuffers::FlatBufferBuilder::new();
-                                    let req_id_off = fbb.create_string(&request_id);
-                                    let cpu = cap_req.cpu_milli();
-                                    let mem = cap_req.memory_bytes();
-                                    let stor = cap_req.storage_bytes();
-                                    let reps = cap_req.replicas();
-                                    let cap_args = protocol::machine::CapacityRequestArgs {
-                                        request_id: Some(req_id_off),
-                                        cpu_milli: cpu,
-                                        memory_bytes: mem,
-                                        storage_bytes: stor,
-                                        replicas: reps,
-                                    };
-                                    let cap_off = protocol::machine::CapacityRequest::create(&mut fbb, &cap_args);
-                                    protocol::machine::finish_capacity_request_buffer(&mut fbb, cap_off);
-                                    let finished = fbb.finished_data().to_vec();
-                                    let res = swarm.behaviour_mut().gossipsub.publish(topic.clone(), finished.as_slice());
-                                    println!("libp2p: published capreq request_id={} publish_res={:?}", request_id, res);
-
-                                    // Also notify local pending senders directly so the originator is always considered
-                                    // a potential responder. This ensures single-node operation and makes the
-                                    // origining host countable when collecting responders.
-                                    if let Some(senders) = pending_queries.get_mut(&request_id) {
-                                        for tx in senders.iter() {
-                                            let _ = tx.send(swarm.local_peer_id().to_string());
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    println!("libp2p: failed to parse provided capacity payload: {:?}", e);
-                                }
-                            }
-                        }
-                        Libp2pControl::SendApplyRequest { peer_id, manifest, reply_tx } => {
-                            println!("libp2p: control SendApplyRequest received for peer={}", peer_id);
-
-                            // Create apply request FlatBuffer
-                            let operation_id = uuid::Uuid::new_v4().to_string();
-                            let manifest_json = manifest.to_string();
-                            let local_peer = swarm.local_peer_id().to_string();
-
-                            let apply_request = protocol::machine::build_apply_request(
-                                1, // replicas
-                                "default", // tenant
-                                &operation_id,
-                                &manifest_json,
-                                &local_peer,
-                            );
-
-                            // Send the request via request-response
-                            let request_id = swarm.behaviour_mut().apply_rr.send_request(&peer_id, apply_request);
-                            println!("libp2p: sent apply request to peer={} request_id={:?}", peer_id, request_id);
-
-                            // For now, just send success immediately - we'll handle proper response tracking later
-                            let _ = reply_tx.send(Ok(format!("Apply request sent to {}", peer_id)));
-                        }
-                    }
+                    control::handle_control_message(msg, &mut swarm, &topic, &mut pending_queries).await;
                 } else {
                     // sender was dropped, exit loop
                     println!("control channel closed");
@@ -217,206 +147,41 @@ pub async fn start_libp2p_node(
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::Behaviour(MyBehaviourEvent::HandshakeRr(request_response::Event::Message { message, peer, connection_id: _ })) => {
-                        match message {
-                            request_response::Message::Request { request, channel, .. } => {
-                                println!("libp2p: received handshake request from peer={}", peer);
-
-                                // Parse the FlatBuffer handshake request
-                                match protocol::machine::root_as_handshake(&request) {
-                                    Ok(handshake_req) => {
-                                        println!("libp2p: handshake request - signature={:?}", handshake_req.signature());
-
-                                        // Mark this peer as confirmed
-                                        let state = handshake_states.entry(peer.clone()).or_insert(HandshakeState {
-                                            attempts: 0,
-                                            last_attempt: Instant::now() - Duration::from_secs(3),
-                                            confirmed: false,
-                                        });
-                                        state.confirmed = true;
-
-                                        // Create a response with our own signature
-                                        //let local_peer_id = swarm.local_peer_id().to_string();
-                                        let response = protocol::machine::build_handshake(0, 0, "TODO", "TODO");
-
-                                        // Send the response back
-                                        let _ = swarm.behaviour_mut().handshake_rr.send_response(channel, response);
-                                        println!("libp2p: sent handshake response to peer={}", peer);
-                                    }
-                                    Err(e) => {
-                                        println!("libp2p: failed to parse handshake request: {:?}", e);
-                                        // Send empty response on parse error
-                                        let error_response = protocol::machine::build_handshake(0, 0, "TODO", "TODO");
-                                        let _ = swarm.behaviour_mut().handshake_rr.send_response(channel, error_response);
-                                    }
-                                }
-                            }
-                            request_response::Message::Response { response, .. } => {
-                                println!("libp2p: received handshake response from peer={}", peer);
-
-                                // Parse the response
-                                match protocol::machine::root_as_handshake(&response) {
-                                    Ok(handshake_resp) => {
-                                        println!("libp2p: handshake response - signature={:?}", handshake_resp.signature());
-
-                                        // Mark this peer as confirmed
-                                        let state = handshake_states.entry(peer.clone()).or_insert(HandshakeState {
-                                            attempts: 0,
-                                            last_attempt: Instant::now() - Duration::from_secs(3),
-                                            confirmed: false,
-                                        });
-                                        state.confirmed = true;
-                                    }
-                                    Err(e) => {
-                                        println!("libp2p: failed to parse handshake response: {:?}", e);
-                                    }
-                                }
-                            }
-                        }
+                        behaviour::handshake_message_event(message, peer, &mut swarm, &mut handshake_states);
                     }
                     SwarmEvent::Behaviour(MyBehaviourEvent::HandshakeRr(request_response::Event::OutboundFailure { peer, error, .. })) => {
-                        println!("libp2p: handshake outbound failure to peer={}: {:?}", peer, error);
+                        behaviour::handshake_outbound_failure(peer, error);
                     }
                     SwarmEvent::Behaviour(MyBehaviourEvent::HandshakeRr(request_response::Event::InboundFailure { peer, error, .. })) => {
-                        println!("libp2p: handshake inbound failure from peer={}: {:?}", peer, error);
+                        behaviour::handshake_inbound_failure(peer, error);
                     }
                     SwarmEvent::Behaviour(MyBehaviourEvent::ApplyRr(request_response::Event::Message { message, peer, connection_id: _ })) => {
-                        match message {
-                            request_response::Message::Request { request, channel, .. } => {
-                                println!("libp2p: received apply request from peer={}", peer);
-
-                                // Parse the FlatBuffer apply request
-                                match protocol::machine::root_as_apply_request(&request) {
-                                    Ok(apply_req) => {
-                                        println!("libp2p: apply request - tenant={:?} operation_id={:?} replicas={}",
-                                            apply_req.tenant(), apply_req.operation_id(), apply_req.replicas());
-
-                                        // Create a response (simulate successful apply)
-                                        let response = protocol::machine::build_apply_response(
-                                            true,
-                                            apply_req.operation_id().unwrap_or("unknown"),
-                                            "Successfully applied manifest",
-                                        );
-
-                                        // Send the response back
-                                        let _ = swarm.behaviour_mut().apply_rr.send_response(channel, response);
-                                        println!("libp2p: sent apply response to peer={}", peer);
-                                    }
-                                    Err(e) => {
-                                        println!("libp2p: failed to parse apply request: {:?}", e);
-                                        let error_response = protocol::machine::build_apply_response(
-                                            false,
-                                            "unknown",
-                                            &format!("Failed to parse request: {:?}", e),
-                                        );
-                                        let _ = swarm.behaviour_mut().apply_rr.send_response(channel, error_response);
-                                    }
-                                }
-                            }
-                            request_response::Message::Response { response, .. } => {
-                                println!("libp2p: received apply response from peer={}", peer);
-
-                                // Parse the response
-                                match protocol::machine::root_as_apply_response(&response) {
-                                    Ok(apply_resp) => {
-                                        println!("libp2p: apply response - ok={} operation_id={:?} message={:?}",
-                                            apply_resp.ok(), apply_resp.operation_id(), apply_resp.message());
-                                    }
-                                    Err(e) => {
-                                        println!("libp2p: failed to parse apply response: {:?}", e);
-                                    }
-                                }
-                            }
-                        }
+                        behaviour::apply_message(message, peer, &mut swarm);
                     }
                     SwarmEvent::Behaviour(MyBehaviourEvent::ApplyRr(request_response::Event::OutboundFailure { peer, error, .. })) => {
-                        println!("libp2p: outbound request failure to peer={}: {:?}", peer, error);
+                        behaviour::apply_outbound_failure(peer, error);
                     }
                     SwarmEvent::Behaviour(MyBehaviourEvent::ApplyRr(request_response::Event::InboundFailure { peer, error, .. })) => {
-                        println!("libp2p: inbound request failure from peer={}: {:?}", peer, error);
+                        behaviour::apply_inbound_failure(peer, error);
                     }
                     SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                        for (peer_id, _multiaddr) in list {
-                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                            handshake_states.entry(peer_id.clone()).or_insert(HandshakeState {
-                                attempts: 0,
-                                last_attempt: Instant::now() - Duration::from_secs(3),
-                                confirmed: false,
-                            });
-                        }
-                        // Update peer list in channel
-                        let topic = gossipsub::IdentTopic::new(BEEMESH_CLUSTER);
-                        let peers: Vec<String> = swarm.behaviour().gossipsub.mesh_peers(&topic.hash()).map(|p| p.to_string()).collect();
-                        let _ = peer_tx.send(peers);
+                        behaviour::mdns_discovered(list, &mut swarm, &mut handshake_states, &peer_tx);
                     }
                     SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
-                        for (peer_id, _multiaddr) in list {
-                            swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                            handshake_states.remove(&peer_id);
-                        }
-                        // Update peer list in channel
-                        let topic = gossipsub::IdentTopic::new(BEEMESH_CLUSTER);
-                        let peers: Vec<String> = swarm.behaviour().gossipsub.mesh_peers(&topic.hash()).map(|p| p.to_string()).collect();
-                        let _ = peer_tx.send(peers);
+                        behaviour::mdns_expired(list, &mut swarm, &mut handshake_states, &peer_tx);
                     }
                     SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
                         propagation_source: peer_id,
                         message_id: _id,
                         message,
                     })) => {
-                        // Try parse the message as a CapacityRequest or CapacityReply (flatbuffers). If that fails, ignore.
-                        println!("received message");
-                        // First try CapacityRequest
-                        if let Ok(cap_req) = protocol::machine::root_as_capacity_request(&message.data) {
-                            let orig_request_id = cap_req.request_id().unwrap_or("").to_string();
-                            println!("libp2p: received capreq id={} from peer={} payload_bytes={}", orig_request_id, peer_id, message.data.len());
-                            // Build a capacity reply and publish it (include request_id inside the reply)
-                            let mut fbb = flatbuffers::FlatBufferBuilder::new();
-                            let req_id_off = fbb.create_string(&orig_request_id);
-                            let node_id_off = fbb.create_string(&peer_id.to_string());
-                            let region_off = fbb.create_string("local");
-                            // capabilities vector
-                            let caps_vec = {
-                                let mut tmp: Vec<flatbuffers::WIPOffset<&str>> = Vec::new();
-                                tmp.push(fbb.create_string("default"));
-                                fbb.create_vector(&tmp)
-                            };
-                            let reply_args = protocol::machine::CapacityReplyArgs {
-                                request_id: Some(req_id_off),
-                                ok: true,
-                                node_id: Some(node_id_off),
-                                region: Some(region_off),
-                                capabilities: Some(caps_vec),
-                                cpu_available_milli: 1000u32,
-                                memory_available_bytes: 1024u64 * 1024 * 512,
-                                storage_available_bytes: 1024u64 * 1024 * 1024,
-                            };
-                            let reply_off = protocol::machine::CapacityReply::create(&mut fbb, &reply_args);
-                            protocol::machine::finish_capacity_reply_buffer(&mut fbb, reply_off);
-                            let finished = fbb.finished_data().to_vec();
-                            let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), finished.as_slice());
-                            println!("libp2p: published capreply for id={} ({} bytes)", orig_request_id, finished.len());
-                            continue;
-                        }
-
-                        // Then try CapacityReply
-                        if let Ok(cap_reply) = protocol::machine::root_as_capacity_reply(&message.data) {
-                            let request_part = cap_reply.request_id().unwrap_or("").to_string();
-                            println!("libp2p: received capreply for id={} from peer={}", request_part, peer_id);
-                            if let Some(senders) = pending_queries.get_mut(&request_part) {
-                                for tx in senders.iter() {
-                                    let _ = tx.send(peer_id.to_string());
-                                }
-                            }
-                            continue;
-                        }
-
-                        println!("Received non-savvy message ({} bytes) from peer {} — ignoring", message.data.len(), peer_id);
+                        behaviour::gossipsub_message(peer_id, message, topic.hash().clone(), &mut swarm, &mut pending_queries);
                     }
                     SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
-                        println!("Peer {peer_id} subscribed to topic: {topic}");
+                        behaviour::gossipsub_subscribed(peer_id, topic);
                     }
                     SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic })) => {
-                        println!("Peer {peer_id} unsubscribed from topic: {topic}");
+                        behaviour::gossipsub_unsubscribed(peer_id, topic);
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
                         println!("Local node is listening on {address}");
