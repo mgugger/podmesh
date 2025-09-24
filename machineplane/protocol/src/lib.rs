@@ -83,6 +83,10 @@ pub mod machine {
     pub use crate::generated::generated_apply_request::beemesh::machine::{ ApplyRequest, root_as_apply_request };
     pub use crate::generated::generated_apply_response::beemesh::machine::{ ApplyResponse, root_as_apply_response };
     pub use crate::generated::generated_handshake::beemesh::machine::{ Handshake, root_as_handshake };
+    
+    // AppliedManifest for DHT storage
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/generated/applied_manifest_generated.rs"));
+    pub use self::beemesh::machine::{AppliedManifest, root_as_applied_manifest, AppliedManifestArgs, SignatureScheme, OperationType, KeyValue, KeyValueArgs};
 
     use flatbuffers::FlatBufferBuilder;
 
@@ -181,6 +185,71 @@ pub mod machine {
         [nonce: u32, timestamp: u64],
         [protocol_version: &str, signature: &str]
     );
+
+    // Custom builder for AppliedManifest with byte vectors and custom types
+    pub fn build_applied_manifest(
+        id: &str,
+        tenant: &str,
+        operation_id: &str,
+        origin_peer: &str,
+        owner_pubkey: &[u8],
+        signature_scheme: SignatureScheme,
+        signature: &[u8],
+        manifest_json: &str,
+        manifest_kind: &str,
+        labels: Vec<(String, String)>,
+        timestamp: u64,
+        operation: OperationType,
+        ttl_secs: u32,
+        content_hash: &str,
+    ) -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::with_capacity(1024);
+        
+        // Create string offsets
+        let id_offset = fbb.create_string(id);
+        let tenant_offset = fbb.create_string(tenant);
+        let operation_id_offset = fbb.create_string(operation_id);
+        let origin_peer_offset = fbb.create_string(origin_peer);
+        let manifest_json_offset = fbb.create_string(manifest_json);
+        let manifest_kind_offset = fbb.create_string(manifest_kind);
+        let content_hash_offset = fbb.create_string(content_hash);
+        
+        // Create byte vectors
+        let owner_pubkey_offset = fbb.create_vector(owner_pubkey);
+        let signature_offset = fbb.create_vector(signature);
+        
+        // Create labels vector
+        let label_offsets: Vec<_> = labels.iter().map(|(k, v)| {
+            let key_offset = fbb.create_string(k);
+            let value_offset = fbb.create_string(v);
+            KeyValue::create(&mut fbb, &KeyValueArgs {
+                key: Some(key_offset),
+                value: Some(value_offset),
+            })
+        }).collect();
+        let labels_offset = fbb.create_vector(&label_offsets);
+        
+        let args = AppliedManifestArgs {
+            id: Some(id_offset),
+            tenant: Some(tenant_offset),
+            operation_id: Some(operation_id_offset),
+            origin_peer: Some(origin_peer_offset),
+            owner_pubkey: Some(owner_pubkey_offset),
+            signature_scheme,
+            signature: Some(signature_offset),
+            manifest_json: Some(manifest_json_offset),
+            manifest_kind: Some(manifest_kind_offset),
+            labels: Some(labels_offset),
+            timestamp,
+            operation,
+            ttl_secs,
+            content_hash: Some(content_hash_offset),
+        };
+        
+        let manifest = AppliedManifest::create(&mut fbb, &args);
+        fbb.finish(manifest, None);
+        fbb.finished_data().to_vec()
+    }
 }
 
 pub mod libp2p_constants;

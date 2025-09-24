@@ -24,6 +24,19 @@ pub async fn handle_control_message(
         Libp2pControl::SendApplyRequest { peer_id, manifest, reply_tx } => {
             handle_send_apply_request(peer_id, manifest, reply_tx, swarm).await;
         }
+        Libp2pControl::StoreAppliedManifest { manifest_data: _, reply_tx } => {
+            // For now, just acknowledge - full implementation would require DHT manager integration
+            let _ = reply_tx.send(Ok(()));
+        }
+        Libp2pControl::GetManifestFromDht { manifest_id: _, reply_tx } => {
+            // For now, return None - full implementation would require DHT manager integration
+            let _ = reply_tx.send(Ok(None));
+        }
+        Libp2pControl::BootstrapDht { reply_tx } => {
+            // Bootstrap the Kademlia DHT
+            let _ = swarm.behaviour_mut().kademlia.bootstrap();
+            let _ = reply_tx.send(Ok(()));
+        }
     }
 }
 
@@ -39,5 +52,19 @@ pub enum Libp2pControl {
         peer_id: PeerId,
         manifest: serde_json::Value,
         reply_tx: mpsc::UnboundedSender<Result<String, String>>,
+    },
+    /// Store an applied manifest in the DHT after successful deployment
+    StoreAppliedManifest {
+        manifest_data: Vec<u8>,
+        reply_tx: mpsc::UnboundedSender<Result<(), String>>,
+    },
+    /// Retrieve a manifest from the DHT by its ID
+    GetManifestFromDht {
+        manifest_id: String,
+        reply_tx: mpsc::UnboundedSender<Result<Option<Vec<u8>>, String>>,
+    },
+    /// Bootstrap the DHT by connecting to known peers
+    BootstrapDht {
+        reply_tx: mpsc::UnboundedSender<Result<(), String>>,
     },
 }

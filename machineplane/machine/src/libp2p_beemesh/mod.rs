@@ -1,6 +1,6 @@
 use futures::stream::StreamExt;
 use libp2p::{
-    gossipsub, mdns, noise, request_response,
+    gossipsub, kad, mdns, noise, request_response,
     swarm::{SwarmEvent},
     tcp, yamux, PeerId, Swarm,
 };
@@ -22,6 +22,10 @@ use crate::libp2p_beemesh::{behaviour::{MyBehaviour, MyBehaviourEvent}, control:
 
 pub mod control;
 mod behaviour;
+pub mod dht_manager;
+pub mod dht_helpers;
+#[allow(dead_code)]
+pub mod dht_usage_example;
 
 // Handshake state used by the handshake behaviour handlers
 #[derive(Debug)]
@@ -88,11 +92,16 @@ pub fn setup_libp2p_node() -> Result<
                 request_response::Config::default(),
             );
 
+            // Create Kademlia DHT behavior
+            let store = kad::store::MemoryStore::new(key.public().to_peer_id());
+            let kademlia = kad::Behaviour::new(key.public().to_peer_id(), store);
+
             Ok(MyBehaviour {
                 gossipsub,
                 mdns,
                 apply_rr,
                 handshake_rr,
+                kademlia,
             })
         })?
         .build();
@@ -156,7 +165,8 @@ pub async fn start_libp2p_node(
                         behaviour::handshake_inbound_failure(peer, error);
                     }
                     SwarmEvent::Behaviour(MyBehaviourEvent::ApplyRr(request_response::Event::Message { message, peer, connection_id: _ })) => {
-                        behaviour::apply_message(message, peer, &mut swarm);
+                        let local_peer = *swarm.local_peer_id();
+                        behaviour::apply_message(message, peer, &mut swarm, local_peer);
                     }
                     SwarmEvent::Behaviour(MyBehaviourEvent::ApplyRr(request_response::Event::OutboundFailure { peer, error, .. })) => {
                         behaviour::apply_outbound_failure(peer, error);
@@ -182,6 +192,9 @@ pub async fn start_libp2p_node(
                     }
                     SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic })) => {
                         behaviour::gossipsub_unsubscribed(peer_id, topic);
+                    }
+                    SwarmEvent::Behaviour(MyBehaviourEvent::Kademlia(event)) => {
+                        behaviour::kademlia_event(event, None);
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
                         println!("Local node is listening on {address}");
