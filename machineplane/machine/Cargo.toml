@@ -27,3 +27,4 @@ dirs = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
+p2p = { workspace = true }

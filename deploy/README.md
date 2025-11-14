@@ -1,10 +1,11 @@
-Ensure that podman.sock is available
+Ensure that podman.sock is available and create the podman network
 ```
 systemctl start podman.socket
+podman network create beemesh
 ```
 Then run
 ```
-    podman kube play deploy/machine.yml
+podman kube play deploy/complete.yml --network beemesh
 ```
 The machine agent expects an explicit Podman socket argument. Make sure each container spec includes `--podman-socket /run/podman/podman.sock` (or your chosen socket path) so the runtime uses only the mounted socket.
 

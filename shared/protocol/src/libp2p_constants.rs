@@ -49,7 +49,7 @@ pub const DEFAULT_SELECTION_WINDOW_MS: u64 = 250;
 
 /// Default lease TTL in milliseconds
 pub const DEFAULT_LEASE_TTL_MS: u64 = 3000;
-    
+
 // === MANIFEST FIELDS ===
 
 /// JSON field name used for replica count in manifests (top-level `replicas`).

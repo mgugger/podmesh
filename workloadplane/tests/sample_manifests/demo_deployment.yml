@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: test-namespace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: docker.io/library/nginx:1.27
+          ports:
+            - name: http
+              containerPort: 80
+        - name: workload-gateway
+          image: sample_repo.io/beemesh/workload-gateway:latest
+          env:
+            - name: BEEMESH_NAMESPACE
+              value: test-namespace
+            - name: BEEMESH_WORKLOAD
+              value: nginx
+            - name: MANIFEST_ID
+              value: test-namespace/nginx

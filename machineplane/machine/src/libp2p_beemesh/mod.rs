@@ -9,7 +9,6 @@ use libp2p::{autonat, identify, relay};
 use log::{debug, info, warn};
 use once_cell::sync::OnceCell;
 use std::collections::HashMap as StdHashMap;
-use std::net::IpAddr;
 use std::sync::Mutex;
 use std::{
     collections::hash_map::DefaultHasher,
@@ -18,6 +17,7 @@ use std::{
 };
 use tokio::sync::{mpsc, watch};
 
+use p2p::NodeConfig;
 use protocol::libp2p_constants::BEEMESH_CLUSTER;
 
 // Global control sender for distributed operations
@@ -93,159 +93,104 @@ pub fn setup_libp2p_node(
     watch::Receiver<Vec<String>>,
     watch::Sender<Vec<String>>,
 )> {
-    let mut swarm = libp2p::SwarmBuilder::with_new_identity()
-        .with_tokio()
-        .with_quic()
-        .with_dns()?
-        .with_behaviour(|key| {
-            debug!("Local PeerId: {}", key.public().to_peer_id());
-            let message_id_fn = |message: &gossipsub::Message| {
-                let mut s = DefaultHasher::new();
-                message.data.hash(&mut s);
-                gossipsub::MessageId::from(s.finish().to_string())
-            };
-            let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_secs(10))
-                // require validation so we have an opportunity to reject invalid messages early
-                .validation_mode(gossipsub::ValidationMode::Strict)
-                .mesh_n_low(1) // minimum peers in mesh
-                .mesh_n(3) // target mesh size
-                .mesh_n_high(6) // maximum peers in mesh
-                .mesh_outbound_min(1) // minimum outbound connections
-                .message_id_fn(message_id_fn)
-                .allow_self_origin(true)
-                .build()
-                .map_err(|e| std::io::Error::other(e))?;
-            let gossipsub = gossipsub::Behaviour::new(
-                gossipsub::MessageAuthenticity::Signed(key.clone()),
-                gossipsub_config,
-            )?;
+    let node_config = NodeConfig::new(quic_port, host.to_string(), BEEMESH_CLUSTER);
+    let (swarm, topic, peer_rx, peer_tx) = p2p::setup_swarm(node_config, |key| {
+        debug!("Local PeerId: {}", key.public().to_peer_id());
+        let message_id_fn = |message: &gossipsub::Message| {
+            let mut s = DefaultHasher::new();
+            message.data.hash(&mut s);
+            gossipsub::MessageId::from(s.finish().to_string())
+        };
+        let gossipsub_config = gossipsub::ConfigBuilder::default()
+            .heartbeat_interval(Duration::from_secs(10))
+            .validation_mode(gossipsub::ValidationMode::Strict)
+            .mesh_n_low(1)
+            .mesh_n(3)
+            .mesh_n_high(6)
+            .mesh_outbound_min(1)
+            .message_id_fn(message_id_fn)
+            .allow_self_origin(true)
+            .build()
+            .expect("valid gossipsub config");
+        let gossipsub = gossipsub::Behaviour::new(
+            gossipsub::MessageAuthenticity::Signed(key.clone()),
+            gossipsub_config,
+        )
+        .expect("create gossipsub behaviour");
 
-            // Create the request-response behavior for apply protocol
-            let apply_rr = request_response::Behaviour::new(
-                std::iter::once((
-                    "/beemesh/apply/1.0.0",
-                    request_response::ProtocolSupport::Full,
-                )),
-                request_response::Config::default(),
-            );
+        let apply_rr = request_response::Behaviour::new(
+            std::iter::once((
+                "/beemesh/apply/1.0.0",
+                request_response::ProtocolSupport::Full,
+            )),
+            request_response::Config::default(),
+        );
 
-            // Create the request-response behavior for handshake protocol
-            let handshake_rr = request_response::Behaviour::new(
-                std::iter::once((
-                    "/beemesh/handshake/1.0.0",
-                    request_response::ProtocolSupport::Full,
-                )),
-                request_response::Config::default(),
-            );
+        let handshake_rr = request_response::Behaviour::new(
+            std::iter::once((
+                "/beemesh/handshake/1.0.0",
+                request_response::ProtocolSupport::Full,
+            )),
+            request_response::Config::default(),
+        );
 
-            // Create the request-response behavior for scheduler (capacity/proposals)
-            let scheduler_rr = request_response::Behaviour::new(
-                std::iter::once((
-                    "/beemesh/scheduler-tasks/1.0.0",
-                    request_response::ProtocolSupport::Full,
-                )),
-                request_response::Config::default(),
-            );
+        let scheduler_rr = request_response::Behaviour::new(
+            std::iter::once((
+                "/beemesh/scheduler-tasks/1.0.0",
+                request_response::ProtocolSupport::Full,
+            )),
+            request_response::Config::default(),
+        );
 
-            // Create the request-response behavior for delete protocol
-            let delete_rr = request_response::Behaviour::new(
-                std::iter::once((
-                    "/beemesh/delete/1.0.0",
-                    request_response::ProtocolSupport::Full,
-                )),
-                request_response::Config::default(),
-            );
+        let delete_rr = request_response::Behaviour::new(
+            std::iter::once((
+                "/beemesh/delete/1.0.0",
+                request_response::ProtocolSupport::Full,
+            )),
+            request_response::Config::default(),
+        );
 
-            // Create the request-response behavior for manifest fetch protocol
-            let manifest_fetch_rr = request_response::Behaviour::new(
-                std::iter::once((
-                    "/beemesh/manifest-fetch/1.0.0",
-                    request_response::ProtocolSupport::Full,
-                )),
-                request_response::Config::default(),
-            );
+        let manifest_fetch_rr = request_response::Behaviour::new(
+            std::iter::once((
+                "/beemesh/manifest-fetch/1.0.0",
+                request_response::ProtocolSupport::Full,
+            )),
+            request_response::Config::default(),
+        );
 
-            // Create Kademlia DHT behavior with configuration suitable for small networks
-            let store = kad::store::MemoryStore::new(key.public().to_peer_id());
-            let mut kademlia_config = kad::Config::default();
+        let store = kad::store::MemoryStore::new(key.public().to_peer_id());
+        let mut kademlia_config = kad::Config::default();
+        kademlia_config.set_replication_factor(std::num::NonZeroUsize::new(1).unwrap());
+        kademlia_config.set_max_packet_size(1024 * 1024);
+        kademlia_config.set_parallelism(std::num::NonZeroUsize::new(3).unwrap());
+        kademlia_config.set_query_timeout(std::time::Duration::from_secs(15));
+        kademlia_config.set_provider_record_ttl(Some(std::time::Duration::from_secs(30)));
+        kademlia_config.set_provider_publication_interval(Some(std::time::Duration::from_secs(5)));
 
-            kademlia_config.set_replication_factor(std::num::NonZeroUsize::new(1).unwrap()); // Minimum replication
-            kademlia_config.set_max_packet_size(1024 * 1024); // Allow larger packets
+        let kademlia =
+            kad::Behaviour::with_config(key.public().to_peer_id(), store, kademlia_config);
 
-            // Configure timeouts and parallelism for small networks
-            kademlia_config.set_parallelism(std::num::NonZeroUsize::new(3).unwrap()); // Increase parallelism for local tests
-            kademlia_config.set_query_timeout(std::time::Duration::from_secs(15)); // Longer timeout for local tests
+        let relay = relay::Behaviour::new(key.public().to_peer_id(), Default::default());
+        let autonat = autonat::Behaviour::new(key.public().to_peer_id(), Default::default());
+        let identify =
+            identify::Behaviour::new(identify::Config::new("/beemesh/0.1.0".into(), key.public()));
 
-            // Configure provider record settings for better local discovery
-            kademlia_config.set_provider_record_ttl(Some(std::time::Duration::from_secs(30))); // Shorter TTL for local tests
-            kademlia_config
-                .set_provider_publication_interval(Some(std::time::Duration::from_secs(5))); // More frequent republishing
-
-            let kademlia =
-                kad::Behaviour::with_config(key.public().to_peer_id(), store, kademlia_config);
-
-            let relay = relay::Behaviour::new(key.public().to_peer_id(), Default::default());
-            let autonat = autonat::Behaviour::new(key.public().to_peer_id(), Default::default());
-            let identify = identify::Behaviour::new(identify::Config::new(
-                "/beemesh/0.1.0".into(), // protocol version
-                key.public(),
-            ));
-
-            Ok(MyBehaviour {
-                gossipsub,
-                apply_rr,
-                handshake_rr,
-                scheduler_rr,
-                delete_rr,
-                manifest_fetch_rr,
-                kademlia,
-                relay,
-                autonat,
-                identify,
-            })
-        })?
-        .build();
+        MyBehaviour {
+            gossipsub,
+            apply_rr,
+            handshake_rr,
+            scheduler_rr,
+            delete_rr,
+            manifest_fetch_rr,
+            kademlia,
+            relay,
+            autonat,
+            identify,
+        }
+    })?;
 
     register_scheduling_preference(swarm.local_peer_id().clone(), disable_scheduling);
 
-    let topic = gossipsub::IdentTopic::new(BEEMESH_CLUSTER);
-    debug!("Subscribing to topic: {}", topic.hash());
-    swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
-    // Ensure local host is an explicit mesh peer for the topic so publish() finds at least one subscriber
-    let local_peer = swarm.local_peer_id().clone();
-    swarm
-        .behaviour_mut()
-        .gossipsub
-        .add_explicit_peer(&local_peer);
-
-    let listen_addr: Multiaddr = match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ipv4)) => {
-            let mut addr = Multiaddr::empty();
-            addr.push(Protocol::Ip4(ipv4));
-            addr.push(Protocol::Udp(quic_port));
-            addr.push(Protocol::QuicV1);
-            addr
-        }
-        Ok(IpAddr::V6(ipv6)) => {
-            let mut addr = Multiaddr::empty();
-            addr.push(Protocol::Ip6(ipv6));
-            addr.push(Protocol::Udp(quic_port));
-            addr.push(Protocol::QuicV1);
-            addr
-        }
-        Err(_) => {
-            debug!(
-                "libp2p host '{}' is not an IP literal; falling back to IPv4 multiaddr string",
-                host
-            );
-            format!("/ip4/{}/udp/{}/quic-v1", host, quic_port).parse()?
-        }
-    };
-
-    swarm.listen_on(listen_addr)?;
-
-    let (peer_tx, peer_rx) = watch::channel(Vec::new());
     Ok((swarm, topic, peer_rx, peer_tx))
 }
 

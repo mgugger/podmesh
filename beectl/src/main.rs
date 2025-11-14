@@ -1,5 +1,5 @@
-use clap::{Parser, Subcommand};
 use beectl::{apply_file, delete_file};
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]

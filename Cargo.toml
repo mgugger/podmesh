@@ -3,10 +3,13 @@ resolver = "2"
 members = [
     "machineplane/machine",
     "machineplane/tests",
-    "workplane",
+    "workloadplane/workload",
+    "workloadplane/gateway",
+    "workloadplane/tests",
     "beectl",
     "shared/crypto",
     "shared/protocol",
+    "shared/p2p",
 ]
 
 [workspace.dependencies]
@@ -31,7 +34,9 @@ clap = { version = "4", features = ["derive"] }
 beectl = { path = "./beectl" }
 crypto = { path = "./shared/crypto" }
 protocol = { path = "./shared/protocol" }
+p2p = { path = "./shared/p2p" }
 scheduler = { path = "./machineplane/scheduler" }
 machine = { path = "./machineplane/machine" }
-workplane = { path = "./workplane" }
+workplane = { path = "./workloadplane/workload" }
+workplane-gateway = { path = "./workloadplane/gateway" }
 flatbuffers = "25.2.10"

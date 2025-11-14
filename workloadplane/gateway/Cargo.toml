@@ -1,0 +1,15 @@
+[package]
+name = "workplane-gateway"
+version = "0.1.0"
+edition = "2024"
+
+authors = ["Beemesh"]
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+futures = { workspace = true }
+libp2p = { workspace = true }
+tokio = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

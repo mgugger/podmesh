@@ -1,0 +1,14 @@
+[package]
+name = "workplane-integration"
+version = "0.1.0"
+edition = "2024"
+description = "Integration tests for Beemesh workload plane"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+workplane = { workspace = true }
+workplane-gateway = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

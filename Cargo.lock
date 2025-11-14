@@ -2315,6 +2315,7 @@ dependencies = [
  "libp2p",
  "log",
  "once_cell",
+ "p2p",
  "protocol",
  "rand 0.8.5",
  "saorsa-pqc",
@@ -2632,6 +2633,18 @@ checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
 dependencies = [
  "elliptic-curve",
  "primeorder",
+]
+
+[[package]]
+name = "p2p"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libp2p",
+ "log",
+ "once_cell",
+ "protocol",
+ "tokio",
 ]
 
 [[package]]
@@ -3455,7 +3468,6 @@ version = "1.0.145"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "402a6f66d8c709116cf22f558eab210f5a50187f702eb4d7e5ef38d9a7f1c79c"
 dependencies = [
- "indexmap",
  "itoa",
  "memchr",
  "ryu",
@@ -4548,18 +4560,41 @@ name = "workplane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.21.7",
+ "axum",
  "clap",
+ "futures",
  "libp2p",
- "once_cell",
- "reqwest",
+ "p2p",
+ "protocol",
  "serde",
- "serde_json",
- "serde_yaml",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "uuid",
+]
+
+[[package]]
+name = "workplane-gateway"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures",
+ "libp2p",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "workplane-integration"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "workplane",
+ "workplane-gateway",
 ]
 
 [[package]]
