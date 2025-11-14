@@ -1,0 +1,8 @@
+{
+  "name": "beemesh-dev",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "runArgs": ["--privileged"],
+  "postCreateCommand": "chmod +x .devcontainer/setup-podman-storage.sh && .devcontainer/setup-podman-storage.sh"
+}

@@ -1,0 +1,1 @@
+podman build -t beemesh-machine -f machineplane/Dockerfile .
