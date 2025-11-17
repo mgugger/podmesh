@@ -5,6 +5,8 @@ pub struct Config {
     pub libp2p_host: String,
     pub rest_host: String,
     pub rest_port: u16,
+    pub disable_rest_api: bool,
+    pub enable_proxy_provider: bool,
 }
 
 impl Config {

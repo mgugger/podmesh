@@ -17,8 +17,11 @@ use std::{
 };
 use tokio::sync::{mpsc, watch};
 
-use p2p::NodeConfig;
-use protocol::libp2p_constants::BEEMESH_CLUSTER;
+use p2p::{
+    NodeConfig,
+    handshake::{self, HandshakeDriveConfig, HandshakeState},
+};
+use protocol::libp2p_constants::MACHINE_CLUSTER_TOPIC;
 
 // Global control sender for distributed operations
 static CONTROL_SENDER: OnceCell<mpsc::UnboundedSender<control::Libp2pControl>> = OnceCell::new();
@@ -75,14 +78,6 @@ pub mod reply;
 pub mod security;
 pub mod utils;
 
-// Handshake state used by the handshake behaviour handlers
-#[derive(Debug)]
-pub struct HandshakeState {
-    pub attempts: u8,
-    pub last_attempt: tokio::time::Instant,
-    pub confirmed: bool,
-}
-
 pub fn setup_libp2p_node(
     quic_port: u16,
     host: &str,
@@ -93,7 +88,7 @@ pub fn setup_libp2p_node(
     watch::Receiver<Vec<String>>,
     watch::Sender<Vec<String>>,
 )> {
-    let node_config = NodeConfig::new(quic_port, host.to_string(), BEEMESH_CLUSTER);
+    let node_config = NodeConfig::new(quic_port, host.to_string(), MACHINE_CLUSTER_TOPIC);
     let (swarm, topic, peer_rx, peer_tx) = p2p::setup_swarm(node_config, |key| {
         debug!("Local PeerId: {}", key.public().to_peer_id());
         let message_id_fn = |message: &gossipsub::Message| {
@@ -247,7 +242,17 @@ pub async fn start_libp2p_node(
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::Behaviour(MyBehaviourEvent::HandshakeRr(request_response::Event::Message { message, peer, connection_id: _ })) => {
-                        behaviour::handshake_message_event(message, peer, &mut swarm, &mut handshake_states);
+                        handshake::handle_request_response_message(
+                            message,
+                            peer,
+                            &mut handshake_states,
+                            |resp, channel| {
+                                let _ = swarm
+                                    .behaviour_mut()
+                                    .handshake_rr
+                                    .send_response(channel, resp);
+                            },
+                        );
                     }
                     SwarmEvent::Behaviour(MyBehaviourEvent::HandshakeRr(request_response::Event::OutboundFailure { peer, error, .. })) => {
                         behaviour::handshake_outbound_failure(peer, error);
@@ -324,6 +329,7 @@ pub async fn start_libp2p_node(
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, connection_id: _, endpoint, num_established: _, concurrent_dial_errors: _, established_in: _ } => {
                         info!("DHT: Connection established with peer {}, adding to Kademlia", peer_id);
+                        handshake::track_peer(&mut handshake_states, &peer_id);
                         // Add the connected peer to Kademlia DHT for provider announcements
                         // Use the connection endpoint address for Kademlia
                         let addr = endpoint.get_remote_address();
@@ -340,6 +346,7 @@ pub async fn start_libp2p_node(
                         if num_established == 0 {
                             info!("DHT: All connections to peer {} closed, removing from Kademlia", peer_id);
                             swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
+                            handshake::untrack_peer(&mut handshake_states, &peer_id);
                         }
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
@@ -353,94 +360,44 @@ pub async fn start_libp2p_node(
                 }
             }
             _ = handshake_interval.tick() => {
-                let mut to_remove = Vec::new();
-                for (peer_id, state) in handshake_states.iter_mut() {
-                    if state.confirmed {
-                        continue;
-                    }
-                    if state.attempts >= 3 {
-                        warn!("Removing non-responsive peer: {peer_id}");
-                        swarm
-                            .behaviour_mut()
-                            .gossipsub
-                            .remove_explicit_peer(peer_id);
-                        to_remove.push(peer_id.clone());
-                        continue;
-                    }
-                    if state.last_attempt.elapsed() >= Duration::from_secs(2) {
-                        // Send handshake request using request-response protocol with FlatBuffer
-                        let timestamp = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                        let nonce = rand::random::<u32>();
-
-                        // Generate proper cryptographic signature for handshake request
-                        match crypto::ensure_keypair_on_disk() {
-                            Ok((pub_bytes, sk_bytes)) => {
-                                let protocol_version = "beemesh/1.0";
-                                let local_peer_id = swarm.local_peer_id().to_string();
-
-
-                                // Build simple handshake request
-                                let handshake_request = protocol::machine::build_handshake(
-                                    nonce,
-                                    timestamp,
-                                    protocol_version,
-                                    &local_peer_id,
-                                );
-
-                                // Create nonce for envelope
-                                let envelope_nonce = format!("handshake_req_{}", nonce);
-
-                                // Build canonical envelope bytes
-                                let canonical_bytes = protocol::machine::build_envelope_canonical(
-                                    &handshake_request,
-                                    "handshake",
-                                    &envelope_nonce,
-                                    timestamp,
-                                    "ml-dsa-65",
-                                    None,
-                                );
-
-                                match crypto::sign_envelope(&sk_bytes, &pub_bytes, &canonical_bytes) {
-                                    Ok((sig_b64, pub_b64)) => {
-                                        // Create signed envelope
-                                        let signed_envelope = protocol::machine::build_envelope_signed(
-                                            &handshake_request,
-                                            "handshake",
-                                            &envelope_nonce,
-                                            timestamp,
-                                            "ml-dsa-65",
-                                            "ml-dsa-65",
-                                            &sig_b64,
-                                            &pub_b64,
-                                            None,
-                                        );
-
-                                        let request_id = swarm.behaviour_mut().handshake_rr.send_request(peer_id, signed_envelope);
-                                        debug!("libp2p: sent handshake request to peer={} request_id={:?} attempt={}",
-                                            peer_id, request_id, state.attempts + 1);
-
-                                        state.attempts += 1;
-                                        state.last_attempt = Instant::now();
-                                    }
-                                    Err(e) => {
-                                        warn!("failed to sign handshake request for peer {}: {:?}", peer_id, e);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!("failed to load keypair for handshake request to peer {}: {:?}", peer_id, e);
-                            }
-                        }
-                    }
+                let local_peer = swarm.local_peer_id().clone();
+                let mut pending_requests: Vec<(PeerId, Vec<u8>)> = Vec::new();
+                let mut dropped_peers: Vec<PeerId> = Vec::new();
+                if let Err(err) = handshake::drive_handshakes(
+                    &mut handshake_states,
+                    &local_peer,
+                    &HandshakeDriveConfig::default(),
+                    |peer, payload| {
+                        pending_requests.push((peer.clone(), payload));
+                        true
+                    },
+                    |peer| dropped_peers.push(peer.clone()),
+                ) {
+                    warn!("handshake drive failed: {err:?}");
                 }
-                for peer_id in to_remove {
-                    handshake_states.remove(&peer_id);
+
+                for (peer, payload) in pending_requests {
+                    let request_id = swarm
+                        .behaviour_mut()
+                        .handshake_rr
+                        .send_request(&peer, payload);
+                    debug!("libp2p: sent handshake request to peer={} request_id={:?}", peer, request_id);
                 }
+
+                for peer in dropped_peers {
+                    swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .remove_explicit_peer(&peer);
+                }
+
                 // Update peer list in channel after handshake changes
-                let all_peers: Vec<String> = swarm.behaviour().gossipsub.all_peers().map(|(p, _topics)| p.to_string()).collect();
+                let all_peers: Vec<String> = swarm
+                    .behaviour()
+                    .gossipsub
+                    .all_peers()
+                    .map(|(p, _topics)| p.to_string())
+                    .collect();
                 let _ = peer_tx.send(all_peers);
             }
             _ = renew_interval.tick() => {

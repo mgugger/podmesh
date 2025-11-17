@@ -2,8 +2,11 @@
 //!
 //! This module contains all protocol constants to eliminate duplication across crates.
 
-/// Ident topic used for gossipsub in the beemesh cluster.
-pub const BEEMESH_CLUSTER: &str = "beemesh-cluster";
+/// Ident topic used for workload-plane gossipsub exchanges.
+pub const WORKLOAD_CLUSTER_TOPIC: &str = "beemesh-workload";
+
+/// Ident topic used for machine-plane gossipsub exchanges.
+pub const MACHINE_CLUSTER_TOPIC: &str = "beemesh-machine";
 
 // === GOSSIPSUB TOPICS ===
 

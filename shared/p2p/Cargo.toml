@@ -10,3 +10,10 @@ log = { workspace = true }
 once_cell = { workspace = true }
 tokio = { workspace = true }
 protocol = { path = "../protocol" }
+crypto = { path = "../crypto" }
+base64 = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+async-trait = "0.1"

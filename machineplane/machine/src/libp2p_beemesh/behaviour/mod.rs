@@ -3,7 +3,6 @@ pub mod failure_handlers;
 pub mod gossipsub_message;
 pub mod gossipsub_subscribed;
 pub mod gossipsub_unsubscribed;
-pub mod handshake_message;
 pub mod message_verifier;
 
 pub mod scheduler_message;
@@ -18,7 +17,6 @@ pub use failure_handlers::{
 pub use gossipsub_message::gossipsub_message;
 pub use gossipsub_subscribed::gossipsub_subscribed;
 pub use gossipsub_unsubscribed::gossipsub_unsubscribed;
-pub use handshake_message::handshake_message_event;
 use libp2p::{autonat, identify, relay};
 use libp2p::{gossipsub, kad, request_response, swarm::NetworkBehaviour};
 use p2p::CoreBehaviourAccess;

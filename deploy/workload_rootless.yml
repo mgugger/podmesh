@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: beemesh-workload
+  labels:
+    app: beemesh-workload
+spec:
+  restartPolicy: Always
+  containers:
+    - name: bootstrap
+      image: beemesh/workload:latest
+      env:
+      - name: RUST_LOG
+        value: "debug"
+      args:
+        - "--libp2p-quic-port"
+        - "7001"
+      ports:
+        - containerPort: 7001
+          hostPort: 7001
+          protocol: UDP
+        - containerPort: 7001
+          hostPort: 7001
+          protocol: TCP
+        - containerPort: 6000
+          hostPort: 6000
+          protocol: TCP
+        - containerPort: 6000
+          hostPort: 6000
+          protocol: UDP
+    - name: peer1-with-localhost
+      image: beemesh/workload:latest
+      env:
+      - name: RUST_LOG
+        value: "debug"
+      args:
+        - "--bootstrap-peer"
+        - "/ip4/127.0.0.1/udp/7001/quic-v1"
+        - "--disable-rest-api"
+    - name: peer2-with-localhost
+      image: beemesh/workload:latest
+      env:
+      - name: RUST_LOG
+        value: "debug"
+      args:
+        - "--bootstrap-peer"
+        - "/ip4/127.0.0.1/udp/7001/quic-v1"
+        - "--disable-rest-api"

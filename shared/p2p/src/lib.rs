@@ -1,3 +1,9 @@
+pub mod envelope;
+pub mod handshake;
+pub mod message_verifier;
+pub mod request_response;
+pub mod security;
+
 use anyhow::Result;
 use libp2p::{
     Swarm, gossipsub, kad,

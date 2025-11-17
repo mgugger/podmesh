@@ -9,16 +9,32 @@ use workplane::{Config, Workload};
 #[derive(Parser, Debug)]
 #[command(name = "workplane", author, version, about = "Beemesh Workplane agent")]
 struct Args {
-    #[arg(long, env = "bootstrap_peers")]
-    bootstrap_peers: Option<String>,
+    #[arg(long = "bootstrap-peer", env = "bootstrap_peer", value_delimiter = ',')]
+    bootstrap_peer: Vec<String>,
     #[arg(long = "libp2p-host", env = "libp2p_host", default_value = "0.0.0.0")]
     libp2p_host: String,
-    #[arg(long = "libp2p-port", env = "libp2p_port", default_value_t = 0)]
+    #[arg(
+        long = "libp2p-quic-port",
+        env = "libp2p_quic_port",
+        default_value_t = 0
+    )]
     libp2p_quic_port: u16,
-    #[arg(long = "rest-host", env = "rest_host", default_value = "0.0.0.0")]
+    #[arg(
+        long = "rest-api-host",
+        env = "rest_api_host",
+        default_value = "0.0.0.0"
+    )]
     rest_host: String,
-    #[arg(long = "rest-port", env = "rest_port", default_value_t = 7100)]
+    #[arg(long = "rest-api-port", env = "rest_api_port", default_value_t = 7100)]
     rest_port: u16,
+    #[arg(long = "disable-rest-api", default_value_t = false)]
+    disable_rest_api: bool,
+    #[arg(
+        long = "enable-proxy-provider",
+        env = "enable_proxy_provider",
+        default_value_t = false
+    )]
+    enable_proxy_provider: bool,
 }
 
 #[tokio::main]
@@ -32,16 +48,24 @@ async fn main() {
 async fn run() -> Result<()> {
     init_tracing();
 
-    let args = Args::parse();
-
-    let bootstrap_peers = split_csv(args.bootstrap_peers);
+    let Args {
+        bootstrap_peer,
+        libp2p_host,
+        libp2p_quic_port,
+        rest_host,
+        rest_port,
+        disable_rest_api,
+        enable_proxy_provider,
+    } = Args::parse();
 
     let mut cfg = Config {
-        bootstrap_peer_strings: bootstrap_peers,
-        libp2p_host: args.libp2p_host,
-        libp2p_quic_port: args.libp2p_quic_port,
-        rest_host: args.rest_host,
-        rest_port: args.rest_port,
+        bootstrap_peer_strings: bootstrap_peer,
+        libp2p_host,
+        libp2p_quic_port,
+        rest_host,
+        rest_port,
+        disable_rest_api,
+        enable_proxy_provider,
     };
     cfg.apply_defaults();
 
@@ -66,13 +90,4 @@ fn init_tracing() {
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(false)
         .try_init();
-}
-
-fn split_csv(input: Option<String>) -> Vec<String> {
-    input
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
 }

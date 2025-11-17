@@ -46,10 +46,7 @@ impl TryFrom<Args> for GatewayConfig {
         let label = if let Some(key) = args.provider_key.filter(|s| !s.is_empty()) {
             key
         } else {
-            let ns = args
-                .namespace
-                .filter(|s| !s.is_empty())
-                .unwrap_or_default();
+            let ns = args.namespace.filter(|s| !s.is_empty()).unwrap_or_default();
             let workload = args
                 .workload_name
                 .filter(|s| !s.is_empty())
@@ -65,6 +62,7 @@ impl TryFrom<Args> for GatewayConfig {
             announce_interval: Duration::from_secs(args.announce_interval_secs.max(1)),
             libp2p_host: args.libp2p_host,
             libp2p_port: args.libp2p_port,
+            announce_providers: true,
         })
     }
 }

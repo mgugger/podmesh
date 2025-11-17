@@ -2640,11 +2640,18 @@ name = "p2p"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "base64 0.21.7",
+ "crypto",
+ "futures",
  "libp2p",
  "log",
  "once_cell",
  "protocol",
+ "rand 0.8.5",
+ "thiserror 1.0.69",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -4566,6 +4573,7 @@ dependencies = [
  "libp2p",
  "p2p",
  "protocol",
+ "reqwest",
  "serde",
  "tokio",
  "tracing",
@@ -4580,6 +4588,7 @@ dependencies = [
  "clap",
  "futures",
  "libp2p",
+ "p2p",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -7,7 +7,7 @@ metadata:
 spec:
   restartPolicy: Always
   containers:
-    - name: bootstrap
+    - name: machine-bootstrap
       image: beemesh/machine:latest
       env:
       - name: RUST_LOG
@@ -48,7 +48,7 @@ spec:
       args:
         - "--disable-rest-api"
         - "--bootstrap-peer"
-        - "/dns4/bootstrap/udp/4001/quic-v1"
+        - "/dns4/machine-bootstrap/udp/4001/quic-v1"
         - "--podman-socket"
         - "/run/podman/podman.sock"
       volumeMounts:
@@ -98,7 +98,7 @@ spec:
       args:
         - "--disable-rest-api"
         - "--bootstrap-peer"
-        - "/dns4/bootstrap/udp/4001/quic-v1"
+        - "/dns4/machine-bootstrap/udp/4001/quic-v1"
         - "--podman-socket"
         - "/run/podman/podman.sock"
       volumeMounts:
@@ -134,13 +134,13 @@ spec:
 apiVersion: v1
 kind: Pod
 metadata:
-  name: workload
+  name: workload-bootstrap
   labels:
-    app: workload
+    app: workload-bootstrap
 spec:
   restartPolicy: Always
   containers:
-    - name: workload
+    - name: workload-bootstrap
       image: beemesh/workload:latest
       env:
         - name: libp2p_port
@@ -162,3 +162,41 @@ spec:
         - containerPort: 3001
           hostPort: 3001
           protocol: UDP
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: workload-1
+  labels:
+    app: workload-1
+spec:
+  restartPolicy: Always
+  containers:
+    - name: workload-1
+      image: beemesh/workload:latest
+      env:
+      - name: RUST_LOG
+        value: "debug"
+      args:
+        - "--bootstrap-peer"
+        - "/dns4/workload-bootstrap/udp/7001/quic-v1"
+        - "--disable-rest-api"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: workload-2
+  labels:
+    app: workload-2
+spec:
+  restartPolicy: Always
+  containers:
+    - name: workload-2
+      image: beemesh/workload:latest
+      env:
+      - name: RUST_LOG
+        value: "debug"
+      args:
+        - "--bootstrap-peer"
+        - "/dns4/workload-bootstrap/udp/7001/quic-v1"
+        - "--disable-rest-api"
