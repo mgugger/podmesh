@@ -5,7 +5,11 @@ use clap::Parser;
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
-use workplane_gateway::{GatewayConfig, run_gateway, split_csv};
+use protocol::{
+    libp2p_constants::DEFAULT_INGRESS_MANIFEST_ID,
+    machine::GatewayRouteSpec,
+};
+use workplane_gateway::{GatewayConfig, run_gateway, split_csv, DEFAULT_GATEWAY_APP_PORT};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -63,6 +67,13 @@ impl TryFrom<Args> for GatewayConfig {
             libp2p_host: args.libp2p_host,
             libp2p_port: args.libp2p_port,
             announce_providers: true,
+            manifest_id: DEFAULT_INGRESS_MANIFEST_ID.to_string(),
+            ingress_host: format!("{}.mesh.local", DEFAULT_INGRESS_MANIFEST_ID),
+            app_port: DEFAULT_GATEWAY_APP_PORT,
+            routes: vec![GatewayRouteSpec {
+                path_prefix: "/".to_string(),
+                target_port: DEFAULT_GATEWAY_APP_PORT,
+            }],
         })
     }
 }

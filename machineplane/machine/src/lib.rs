@@ -1,4 +1,7 @@
 // logging macros are used in submodules; keep root lean
+use axum_support::spawn_tcp_listener;
+#[cfg(unix)]
+use axum_support::spawn_unix_listener;
 use base64::Engine;
 use clap::Parser;
 use env_logger::Env;
@@ -298,11 +301,7 @@ pub async fn start_machine(cli: Cli) -> anyhow::Result<Vec<tokio::task::JoinHand
         let bind_addr = format!("{}:{}", cli.rest_api_host, cli.rest_api_port);
         let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
         log::info!("rest api listening on {}", listener.local_addr().unwrap());
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app.clone().into_make_service()).await {
-                log::error!("axum server error: {}", e);
-            }
-        }));
+        handles.push(spawn_tcp_listener(listener, app, "machine-rest-api"));
     } else {
         log::info!("REST API disabled");
     }
@@ -344,18 +343,12 @@ pub async fn start_machine(cli: Cli) -> anyhow::Result<Vec<tokio::task::JoinHand
                 // remove stale socket file if present
                 let _ = std::fs::remove_file(&socket);
                 let app2 = hostapi::build_router(); //.merge(podman::build_router());
-                let socket_clone = socket.clone();
-                handles.push(tokio::spawn(async move {
-                    // bind a unix domain socket and serve the axum app on it
-                    match tokio::net::UnixListener::bind(&socket_clone) {
-                        Ok(listener) => {
-                            if let Err(e) = axum::serve(listener, app2.into_make_service()).await {
-                                log::error!("axum UDS server error: {}", e);
-                            }
-                        }
-                        Err(e) => log::error!("failed to bind UDS {}: {}", socket_clone, e),
+                match tokio::net::UnixListener::bind(&socket) {
+                    Ok(listener) => {
+                        handles.push(spawn_unix_listener(listener, app2, "machine-host-api"))
                     }
-                }));
+                    Err(e) => log::error!("failed to bind UDS {}: {}", socket, e),
+                }
             }
         }
     }

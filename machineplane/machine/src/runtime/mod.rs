@@ -270,6 +270,11 @@ impl RuntimeRegistry {
             .and_then(|name| self.get_engine(name))
     }
 
+    /// Return the name of the default runtime engine, if configured
+    pub fn default_engine_name(&self) -> Option<&str> {
+        self.default_engine.as_deref()
+    }
+
     /// Set the default runtime engine
     pub fn set_default_engine(&mut self, name: &str) -> RuntimeResult<()> {
         if self.engines.contains_key(name) {

@@ -1,10 +1,9 @@
-#[cfg(debug_assertions)]
-use crate::runtime::RuntimeEngine;
+use crate::runtime::{PortMapping, RuntimeEngine, RuntimeError, WorkloadInfo, WorkloadStatus};
 use axum::{
     Router,
     body::Bytes,
     extract::{Extension, Path, Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     middleware,
     routing::{delete, get, post},
 };
@@ -13,6 +12,7 @@ use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 use protocol::libp2p_constants::{FREE_CAPACITY_PREFIX, FREE_CAPACITY_TIMEOUT_MS};
 
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -144,6 +144,16 @@ pub fn build_router(
         .route("/tasks/{task_id}/candidates", post(get_candidates))
         .route("/apply_direct/{peer_id}", post(apply_direct))
         .route("/nodes", get(get_nodes))
+        .route("/runtime/engines", get(runtime_engines))
+        .route("/runtime/workloads", get(list_runtime_workloads))
+        .route(
+            "/runtime/workloads/{workload_id}",
+            get(get_runtime_workload),
+        )
+        .route(
+            "/runtime/workloads/{workload_id}/logs",
+            get(get_runtime_workload_logs),
+        )
         // Add envelope middleware to decrypt incoming requests and extract peer keys
         .layer(middleware::from_fn_with_state(
             state.envelope_handler.clone(),
@@ -1181,4 +1191,259 @@ pub async fn apply_direct(
 
     // Return response (simplified - no encryption needed for this case)
     create_response_with_fallback(&result).await
+}
+
+#[derive(Serialize)]
+struct RuntimeEngineStatus {
+    name: String,
+    available: bool,
+    is_default: bool,
+}
+
+#[derive(Serialize)]
+struct RuntimeEnginesResponse {
+    default_engine: Option<String>,
+    engines: Vec<RuntimeEngineStatus>,
+}
+
+#[derive(Serialize)]
+struct RuntimeWorkloadsResponse {
+    runtime_engine: String,
+    workloads: Vec<RuntimeWorkloadView>,
+}
+
+#[derive(Serialize)]
+struct RuntimeWorkloadView {
+    workload_id: String,
+    manifest_id: String,
+    status: RuntimeWorkloadStatusView,
+    runtime_engine: String,
+    metadata: HashMap<String, String>,
+    ports: Vec<PortMapping>,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+#[derive(Serialize)]
+struct RuntimeWorkloadStatusView {
+    phase: String,
+    message: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RuntimeLogResponse {
+    runtime_engine: String,
+    workload_id: String,
+    tail: Option<usize>,
+    logs: String,
+}
+
+struct EngineSelection<'a> {
+    name: String,
+    engine: &'a dyn RuntimeEngine,
+}
+
+async fn runtime_engines() -> axum::Json<RuntimeEnginesResponse> {
+    let availability = crate::workload_integration::get_runtime_registry_stats().await;
+    let default_engine = crate::workload_integration::get_default_runtime_engine_name().await;
+    let mut engines: Vec<RuntimeEngineStatus> = availability
+        .into_iter()
+        .map(|(name, available)| RuntimeEngineStatus {
+            is_default: default_engine
+                .as_ref()
+                .map(|default_name| default_name == &name)
+                .unwrap_or(false),
+            name,
+            available,
+        })
+        .collect();
+    engines.sort_by(|a, b| a.name.cmp(&b.name));
+
+    axum::Json(RuntimeEnginesResponse {
+        default_engine,
+        engines,
+    })
+}
+
+async fn list_runtime_workloads(
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<axum::Json<RuntimeWorkloadsResponse>, StatusCode> {
+    let engine_name = params.get("engine").cloned();
+    let registry_guard = crate::workload_integration::get_global_runtime_registry()
+        .await
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let registry = registry_guard
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let selection = select_runtime_engine(registry, engine_name.as_deref())?;
+
+    let workloads = selection.engine.list_workloads().await.map_err(|err| {
+        warn!(
+            "failed to list runtime workloads for engine {}: {:?}",
+            selection.name, err
+        );
+        runtime_error_to_status(err)
+    })?;
+
+    let response = RuntimeWorkloadsResponse {
+        runtime_engine: selection.name.clone(),
+        workloads: workloads
+            .into_iter()
+            .map(|info| RuntimeWorkloadView::from_info(info, &selection.name))
+            .collect(),
+    };
+
+    Ok(axum::Json(response))
+}
+
+async fn get_runtime_workload(
+    Path(workload_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<axum::Json<RuntimeWorkloadView>, StatusCode> {
+    let engine_name = params.get("engine").cloned();
+    let registry_guard = crate::workload_integration::get_global_runtime_registry()
+        .await
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let registry = registry_guard
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let selection = select_runtime_engine(registry, engine_name.as_deref())?;
+
+    let engine_label = selection.name.clone();
+    let workload_label = workload_id.clone();
+    let info = selection
+        .engine
+        .get_workload_status(&workload_id)
+        .await
+        .map_err(|err| {
+            warn!(
+                "failed to fetch workload state (engine={}, workload={}): {:?}",
+                engine_label, workload_label, err
+            );
+            runtime_error_to_status(err)
+        })?;
+
+    Ok(axum::Json(RuntimeWorkloadView::from_info(
+        info,
+        &selection.name,
+    )))
+}
+
+async fn get_runtime_workload_logs(
+    Path(workload_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<axum::Json<RuntimeLogResponse>, StatusCode> {
+    let engine_name = params.get("engine").cloned();
+    let tail = params
+        .get("tail")
+        .and_then(|value| value.parse::<usize>().ok());
+    let registry_guard = crate::workload_integration::get_global_runtime_registry()
+        .await
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let registry = registry_guard
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let selection = select_runtime_engine(registry, engine_name.as_deref())?;
+
+    let engine_label = selection.name.clone();
+    let workload_label = workload_id.clone();
+    let logs = selection
+        .engine
+        .get_workload_logs(&workload_id, tail)
+        .await
+        .map_err(|err| {
+            warn!(
+                "failed to fetch workload logs (engine={}, workload={}, tail={:?}): {:?}",
+                engine_label, workload_label, tail, err
+            );
+            runtime_error_to_status(err)
+        })?;
+
+    Ok(axum::Json(RuntimeLogResponse {
+        runtime_engine: selection.name.clone(),
+        workload_id,
+        tail,
+        logs,
+    }))
+}
+
+impl RuntimeWorkloadView {
+    fn from_info(info: WorkloadInfo, runtime_engine: &str) -> Self {
+        let WorkloadInfo {
+            id,
+            manifest_id,
+            status,
+            metadata,
+            created_at,
+            updated_at,
+            ports,
+        } = info;
+
+        Self {
+            workload_id: id,
+            manifest_id,
+            status: runtime_status_view(&status),
+            runtime_engine: runtime_engine.to_string(),
+            metadata,
+            ports,
+            created_at_ms: system_time_ms(created_at),
+            updated_at_ms: system_time_ms(updated_at),
+        }
+    }
+}
+
+fn runtime_status_view(status: &WorkloadStatus) -> RuntimeWorkloadStatusView {
+    let (phase, message) = match status {
+        WorkloadStatus::Starting => ("starting", None),
+        WorkloadStatus::Running => ("running", None),
+        WorkloadStatus::Stopped => ("stopped", None),
+        WorkloadStatus::Unknown => ("unknown", None),
+        WorkloadStatus::Failed(reason) => ("failed", Some(reason.clone())),
+    };
+
+    RuntimeWorkloadStatusView {
+        phase: phase.to_string(),
+        message,
+    }
+}
+
+fn system_time_ms(ts: SystemTime) -> i64 {
+    match ts.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis() as i64,
+        Err(err) => -(err.duration().as_millis() as i64),
+    }
+}
+
+fn select_runtime_engine<'a>(
+    registry: &'a crate::runtime::RuntimeRegistry,
+    requested: Option<&str>,
+) -> Result<EngineSelection<'a>, StatusCode> {
+    if let Some(name) = requested {
+        registry
+            .get_engine(name)
+            .map(|engine| EngineSelection {
+                name: name.to_string(),
+                engine,
+            })
+            .ok_or(StatusCode::NOT_FOUND)
+    } else {
+        let engine = registry
+            .get_default_engine()
+            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        let name = registry
+            .default_engine_name()
+            .unwrap_or("unknown")
+            .to_string();
+        Ok(EngineSelection { name, engine })
+    }
+}
+
+fn runtime_error_to_status(err: RuntimeError) -> StatusCode {
+    match err {
+        RuntimeError::WorkloadNotFound(_) => StatusCode::NOT_FOUND,
+        RuntimeError::EngineNotAvailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        RuntimeError::InvalidManifest(_) => StatusCode::BAD_REQUEST,
+        RuntimeError::DeploymentFailed(_) => StatusCode::BAD_GATEWAY,
+        RuntimeError::IoError(_) | RuntimeError::CommandFailed(_) => StatusCode::BAD_GATEWAY,
+    }
 }

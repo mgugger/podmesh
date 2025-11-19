@@ -1,5 +1,6 @@
 pub mod envelope;
 pub mod handshake;
+pub mod http_proxy;
 pub mod message_verifier;
 pub mod request_response;
 pub mod security;

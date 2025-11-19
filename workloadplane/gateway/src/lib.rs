@@ -1,12 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use futures::{StreamExt, future};
 use libp2p::{
     Multiaddr, PeerId, Swarm,
-    kad::{self, RecordKey},
+    kad::{self, Quorum, Record, RecordKey},
     multiaddr::Protocol,
     request_response,
     swarm::{NetworkBehaviour, SwarmEvent},
@@ -15,11 +15,19 @@ use p2p::{
     handshake::{self, HandshakeDriveConfig, HandshakeState},
     request_response::ByteCodec,
 };
+use p2p::http_proxy::{ProxyCodec, ProxyHttpRequest, ProxyHttpResponse};
+use protocol::libp2p_constants::{INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX};
+use protocol::machine::{GatewayRouteSpec, build_gateway_provider_record};
+use reqwest::{Client, Method, header::{HeaderName, HeaderValue}};
 use tokio::signal;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 type HandshakeCodec = ByteCodec;
+
+pub const DEFAULT_GATEWAY_APP_PORT: u16 = 18080;
+const MANIFEST_RECORD_TTL_MS: u32 = 30_000;
+const MANIFEST_RECORD_VERSION: u16 = 1;
 
 #[derive(Clone, Debug)]
 pub struct GatewayConfig {
@@ -31,6 +39,10 @@ pub struct GatewayConfig {
     pub libp2p_host: String,
     pub libp2p_port: u16,
     pub announce_providers: bool,
+    pub manifest_id: String,
+    pub ingress_host: String,
+    pub app_port: u16,
+    pub routes: Vec<GatewayRouteSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,13 +95,20 @@ pub async fn run_gateway_with_shutdown(
         None
     };
 
-    let mut state = GatewayState::default();
+    let http_client = Client::builder()
+        .build()
+        .context("build gateway http client")?;
+    let mut state = GatewayState::new(http_client);
+    let (proxy_resp_tx, mut proxy_resp_rx) = mpsc::unbounded_channel();
     let mut handshake_ticker = tokio::time::interval(Duration::from_secs(1));
     handshake_ticker.tick().await;
+    let mut manifest_ticker = tokio::time::interval(cfg.announce_interval);
+    manifest_ticker.tick().await;
+    publish_manifest_record(&mut swarm, &cfg);
     loop {
         tokio::select! {
             event = swarm.select_next_some() => {
-                handle_swarm_event(&mut swarm, event, &cfg, &mut state, event_tx.as_ref())
+                handle_swarm_event(&mut swarm, event, &cfg, &mut state, event_tx.as_ref(), &proxy_resp_tx)
             },
             _ = lookup_ticker.tick() => trigger_lookup(&mut swarm, &cfg),
             _ = async {
@@ -109,6 +128,14 @@ pub async fn run_gateway_with_shutdown(
             }
             _ = handshake_ticker.tick() => {
                 drive_handshakes(&mut swarm, &mut state);
+            },
+            _ = manifest_ticker.tick() => {
+                publish_manifest_record(&mut swarm, &cfg);
+            },
+            Some(pending) = proxy_resp_rx.recv() => {
+                if let Err(err) = swarm.behaviour_mut().proxy_rr.send_response(pending.channel, pending.response) {
+                    warn!(error = ?err, "failed to send proxy response to workload");
+                }
             }
         }
     }
@@ -119,6 +146,11 @@ pub async fn run_gateway_with_shutdown(
 impl GatewayConfig {
     pub fn record_key(&self) -> RecordKey {
         RecordKey::new(&self.provider_label)
+    }
+
+    pub fn manifest_record_key(&self) -> RecordKey {
+        let key = format!("{}{}", MANIFEST_RECORD_PREFIX, self.manifest_id);
+        RecordKey::new(&key)
     }
 
     pub fn listen_addr(&self) -> Option<Multiaddr> {
@@ -196,13 +228,30 @@ impl GatewayConfig {
 struct GatewayBehaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     handshake_rr: request_response::Behaviour<HandshakeCodec>,
+    proxy_rr: request_response::Behaviour<ProxyCodec>,
 }
 
-#[derive(Default)]
 struct GatewayState {
     known_providers: HashSet<String>,
     handshake_states: HashMap<PeerId, HandshakeState>,
     kad_bootstrapped: bool,
+    http_client: Client,
+}
+
+impl GatewayState {
+    fn new(http_client: Client) -> Self {
+        Self {
+            known_providers: HashSet::new(),
+            handshake_states: HashMap::new(),
+            kad_bootstrapped: false,
+            http_client,
+        }
+    }
+}
+
+struct PendingProxyResponse {
+    channel: request_response::ResponseChannel<ProxyHttpResponse>,
+    response: ProxyHttpResponse,
 }
 
 fn build_swarm(_cfg: &GatewayConfig) -> Result<Swarm<GatewayBehaviour>> {
@@ -220,9 +269,17 @@ fn build_swarm(_cfg: &GatewayConfig) -> Result<Swarm<GatewayBehaviour>> {
                 )),
                 request_response::Config::default(),
             );
+            let proxy_rr = request_response::Behaviour::new(
+                std::iter::once((
+                    INGRESS_PROXY_PROTOCOL,
+                    request_response::ProtocolSupport::Full,
+                )),
+                request_response::Config::default(),
+            );
             let mut behaviour = GatewayBehaviour {
                 kademlia: kad::Behaviour::new(peer_id, store),
                 handshake_rr,
+                proxy_rr,
             };
             behaviour.kademlia.set_mode(Some(kad::Mode::Client));
             behaviour
@@ -276,12 +333,45 @@ fn announce_provider(swarm: &mut Swarm<GatewayBehaviour>, cfg: &GatewayConfig) {
     }
 }
 
+fn publish_manifest_record(swarm: &mut Swarm<GatewayBehaviour>, cfg: &GatewayConfig) {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|dur| dur.as_millis() as u64)
+        .unwrap_or_default();
+    let payload = build_gateway_provider_record(
+        &cfg.manifest_id,
+        &swarm.local_peer_id().to_string(),
+        &cfg.ingress_host,
+        &cfg.routes,
+        MANIFEST_RECORD_TTL_MS,
+        timestamp_ms,
+        MANIFEST_RECORD_VERSION,
+    );
+
+    let record = Record {
+        key: cfg.manifest_record_key(),
+        value: payload,
+        publisher: Some(*swarm.local_peer_id()),
+        expires: Some(Instant::now() + Duration::from_millis(MANIFEST_RECORD_TTL_MS as u64)),
+    };
+
+    match swarm
+        .behaviour_mut()
+        .kademlia
+        .put_record(record, Quorum::One)
+    {
+        Ok(query_id) => debug!(?query_id, manifest = %cfg.manifest_id, "gateway published manifest record"),
+        Err(err) => warn!(manifest = %cfg.manifest_id, error = %err, "gateway failed to publish manifest record"),
+    }
+}
+
 fn handle_swarm_event(
     swarm: &mut Swarm<GatewayBehaviour>,
     event: SwarmEvent<GatewayBehaviourEvent>,
     cfg: &GatewayConfig,
     state: &mut GatewayState,
     event_tx: Option<&mpsc::UnboundedSender<GatewayEvent>>,
+    proxy_resp_tx: &mpsc::UnboundedSender<PendingProxyResponse>,
 ) {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
@@ -331,6 +421,9 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(GatewayBehaviourEvent::HandshakeRr(event)) => {
             handle_handshake_event(swarm, event, state);
         }
+        SwarmEvent::Behaviour(GatewayBehaviourEvent::ProxyRr(event)) => {
+            handle_proxy_event(cfg, state, event, proxy_resp_tx);
+        }
         _ => {}
     }
 }
@@ -371,6 +464,101 @@ fn handle_handshake_event(
             debug!(%peer, "gateway handshake response sent");
         }
     }
+}
+
+fn handle_proxy_event(
+    cfg: &GatewayConfig,
+    state: &GatewayState,
+    event: request_response::Event<ProxyHttpRequest, ProxyHttpResponse>,
+    proxy_resp_tx: &mpsc::UnboundedSender<PendingProxyResponse>,
+) {
+    match event {
+        request_response::Event::Message { peer, message, connection_id: _ } => match message {
+            request_response::Message::Request { mut request, channel, request_id: _ } => {
+                if request.target_port == 0 {
+                    request.target_port = cfg.app_port;
+                }
+                debug!(%peer, manifest = %request.manifest_id, "gateway received proxy request");
+                spawn_local_http_request(state.http_client.clone(), request, channel, proxy_resp_tx.clone());
+            }
+            request_response::Message::Response { response, .. } => {
+                debug!(%peer, status = response.status_code, "gateway received proxy response acknowledgement");
+            }
+        },
+        request_response::Event::OutboundFailure { peer, error, .. } => {
+            warn!(%peer, ?error, "gateway proxy outbound failure");
+        }
+        request_response::Event::InboundFailure { peer, error, .. } => {
+            warn!(%peer, ?error, "gateway proxy inbound failure");
+        }
+        request_response::Event::ResponseSent { peer, .. } => {
+            debug!(%peer, "gateway proxy response sent");
+        }
+    }
+}
+
+fn spawn_local_http_request(
+    client: Client,
+    request: ProxyHttpRequest,
+    channel: request_response::ResponseChannel<ProxyHttpResponse>,
+    proxy_resp_tx: mpsc::UnboundedSender<PendingProxyResponse>,
+) {
+    tokio::spawn(async move {
+        let response = match execute_local_http_request(client, request).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                warn!(error = ?err, "gateway local http request failed");
+                ProxyHttpResponse {
+                    status_code: 502,
+                    headers: vec![("x-beemesh-error".into(), err.to_string())],
+                    body: Vec::new(),
+                }
+            }
+        };
+
+        let _ = proxy_resp_tx.send(PendingProxyResponse { channel, response });
+    });
+}
+
+async fn execute_local_http_request(client: Client, request: ProxyHttpRequest) -> Result<ProxyHttpResponse> {
+    let target_port = request.target_port;
+    let method = Method::from_bytes(request.method.as_bytes()).unwrap_or(Method::GET);
+    let mut path = if request.path_and_query.is_empty() {
+        "/".to_string()
+    } else {
+        request.path_and_query.clone()
+    };
+    if !path.starts_with('/') {
+        path = format!("/{}", path);
+    }
+    let url = format!("http://127.0.0.1:{}{}", target_port, path);
+
+    let mut builder = client.request(method, &url);
+    for (name, value) in request.headers {
+        if let (Ok(header_name), Ok(header_value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            builder = builder.header(header_name, header_value);
+        }
+    }
+
+    let response = builder.body(request.body).send().await?;
+    let status_code = response.status().as_u16();
+    let mut headers = Vec::new();
+    for (name, value) in response.headers().iter() {
+        headers.push((
+            name.as_str().to_string(),
+            value.to_str().unwrap_or_default().to_string(),
+        ));
+    }
+    let body = response.bytes().await?.to_vec();
+
+    Ok(ProxyHttpResponse {
+        status_code,
+        headers,
+        body,
+    })
 }
 
 fn drive_handshakes(swarm: &mut Swarm<GatewayBehaviour>, state: &mut GatewayState) {

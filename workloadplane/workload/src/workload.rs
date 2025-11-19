@@ -1,14 +1,19 @@
+use std::net::SocketAddr;
+
 use anyhow::Result;
 use tokio::{sync::watch, task::JoinHandle};
 use tracing::info;
 
-use crate::{config::Config, p2p, restapi};
+use crate::{config::Config, ingress, p2p, restapi};
+
+const DEFAULT_INGRESS_PORT: u16 = 8080;
 
 pub struct Workload {
     cfg: Config,
     p2p_node: Option<p2p::P2pNodeHandle>,
     rest_handle: Option<JoinHandle<()>>,
     peer_id: Option<String>,
+    ingress: Option<ingress::IngressServer>,
 }
 
 impl Workload {
@@ -18,6 +23,7 @@ impl Workload {
             p2p_node: None,
             rest_handle: None,
             peer_id: None,
+            ingress: None,
         })
     }
 
@@ -28,6 +34,7 @@ impl Workload {
 
         let node = p2p::spawn(&self.cfg)?;
         let peer_rx = node.peer_rx();
+        let proxy_client = node.proxy_client();
         let peer_id = node.peer_id().to_string();
         let rest_handle = if self.cfg.disable_rest_api {
             info!(
@@ -47,6 +54,13 @@ impl Workload {
         self.rest_handle = rest_handle;
         self.p2p_node = Some(node);
         self.peer_id = Some(peer_id);
+
+        let ingress_server = ingress::IngressServer::spawn(
+            self.cfg.rest_host.clone(),
+            DEFAULT_INGRESS_PORT,
+            ingress::proxy_gateway_client(proxy_client),
+        )?;
+        self.ingress = Some(ingress_server);
         Ok(())
     }
 
@@ -54,6 +68,9 @@ impl Workload {
         if let Some(handle) = self.rest_handle.take() {
             handle.abort();
             let _ = handle.await;
+        }
+        if let Some(ingress_handle) = self.ingress.take() {
+            ingress_handle.shutdown().await;
         }
         if let Some(node) = self.p2p_node.take() {
             node.shutdown().await;
@@ -72,5 +89,13 @@ impl Workload {
         self.p2p_node
             .as_ref()
             .map(|node| node.proxy_provider_announced_rx())
+    }
+
+    pub fn ingress_address(&self) -> Option<SocketAddr> {
+        self.ingress.as_ref().map(|server| server.listen_addr())
+    }
+
+    pub fn ingress_routes(&self) -> Option<ingress::IngressRoutes> {
+        self.ingress.as_ref().map(|server| server.routes())
     }
 }

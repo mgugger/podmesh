@@ -1,13 +1,12 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
 use axum::{Json, Router, extract::State, routing::get};
+use axum_support::{parse_socket_addr, spawn_tcp_server};
 use serde::Serialize;
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct PeerSnapshot {
@@ -45,7 +44,7 @@ pub fn spawn_rest_server(
     port: u16,
     peer_rx: watch::Receiver<Vec<String>>,
 ) -> Result<JoinHandle<()>> {
-    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+    let addr = parse_socket_addr(&host, port)?;
     let state = RestState {
         started_at: Instant::now(),
         peers: PeerSnapshot::new(peer_rx),
@@ -55,22 +54,7 @@ pub fn spawn_rest_server(
         .route("/healthz", get(healthz))
         .with_state(state);
 
-    let handle = tokio::spawn(async move {
-        match tokio::net::TcpListener::bind(addr).await {
-            Ok(listener) => {
-                info!(
-                    "workload rest api listening on {}",
-                    listener.local_addr().unwrap()
-                );
-                if let Err(err) = axum::serve(listener, app).await {
-                    warn!("workload rest api stopped: {}", err);
-                }
-            }
-            Err(err) => warn!("failed to bind workload rest api {}: {}", addr, err),
-        }
-    });
-
-    Ok(handle)
+    Ok(spawn_tcp_server(addr, app, "workload-rest-api"))
 }
 
 async fn healthz(State(state): State<RestState>) -> Json<HealthResponse> {

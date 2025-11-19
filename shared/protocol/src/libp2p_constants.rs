@@ -8,6 +8,15 @@ pub const WORKLOAD_CLUSTER_TOPIC: &str = "beemesh-workload";
 /// Ident topic used for machine-plane gossipsub exchanges.
 pub const MACHINE_CLUSTER_TOPIC: &str = "beemesh-machine";
 
+/// Record key prefix for manifest->gateway announcements on the workload DHT.
+pub const MANIFEST_RECORD_PREFIX: &str = "beemesh/manifest/";
+
+/// Default manifest identifier used by the ingress e2e test.
+pub const DEFAULT_INGRESS_MANIFEST_ID: &str = "demo-app";
+
+/// Protocol ID for the ingress proxy libp2p request-response stream.
+pub const INGRESS_PROXY_PROTOCOL: &str = "/beemesh/ingress-proxy/1.0.0";
+
 // === GOSSIPSUB TOPICS ===
 
 /// Protocol name for request-response RPCs (ApplyRequest/ApplyResponse).

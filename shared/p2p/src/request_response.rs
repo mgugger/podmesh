@@ -19,7 +19,7 @@ impl request_response::Codec for ByteCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_length_prefixed(io).await
+            read_length_prefixed_bytes(io).await
     }
 
     async fn read_response<T>(
@@ -30,7 +30,7 @@ impl request_response::Codec for ByteCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_length_prefixed(io).await
+            read_length_prefixed_bytes(io).await
     }
 
     async fn write_request<T>(
@@ -42,7 +42,7 @@ impl request_response::Codec for ByteCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_length_prefixed(io, &req).await
+            write_length_prefixed_bytes(io, &req).await
     }
 
     async fn write_response<T>(
@@ -54,11 +54,11 @@ impl request_response::Codec for ByteCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_length_prefixed(io, &res).await
+            write_length_prefixed_bytes(io, &res).await
     }
 }
 
-async fn read_length_prefixed<T>(io: &mut T) -> std::io::Result<Vec<u8>>
+pub async fn read_length_prefixed_bytes<T>(io: &mut T) -> std::io::Result<Vec<u8>>
 where
     T: AsyncRead + Unpin + Send,
 {
@@ -71,7 +71,7 @@ where
     Ok(buf)
 }
 
-async fn write_length_prefixed<T>(io: &mut T, data: &[u8]) -> std::io::Result<()>
+pub async fn write_length_prefixed_bytes<T>(io: &mut T, data: &[u8]) -> std::io::Result<()>
 where
     T: AsyncWrite + Unpin + Send,
 {

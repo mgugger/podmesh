@@ -1,8 +1,8 @@
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use futures::StreamExt;
 use libp2p::{
     Multiaddr, PeerId, Swarm, autonat, gossipsub, identify, kad, relay, request_response,
@@ -11,10 +11,12 @@ use libp2p::{
 use p2p::{
     CoreBehaviourAccess, NodeConfig,
     handshake::{self, HandshakeDriveConfig, HandshakeState},
+    http_proxy::{ProxyCodec, ProxyHttpRequest, ProxyHttpResponse},
     request_response::ByteCodec,
 };
-use protocol::libp2p_constants::WORKLOAD_CLUSTER_TOPIC;
-use tokio::sync::watch;
+use protocol::libp2p_constants::{INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX, WORKLOAD_CLUSTER_TOPIC};
+use protocol::machine::{decode_gateway_provider_record, GatewayProviderRecordOwned};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -23,6 +25,29 @@ use crate::config::Config;
 type HandshakeCodec = ByteCodec;
 
 const PROXY_PROVIDER_KEY: &str = "beemesh-proxy-node";
+const DEFAULT_MANIFEST_RECORD_TTL_MS: u64 = 30_000;
+
+enum P2pCommand {
+    ProxyHttp {
+        request: ProxyHttpRequest,
+        respond_to: oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
+    },
+}
+
+struct ProxyPendingRequest {
+    request: ProxyHttpRequest,
+    respond_to: oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
+}
+
+struct GatewayCacheEntry {
+    record: GatewayProviderRecordOwned,
+    expires_at: Instant,
+}
+
+struct ManifestQueryState {
+    waiters: Vec<ProxyPendingRequest>,
+    query_id: kad::QueryId,
+}
 
 fn announce_proxy_provider(
     swarm: &mut Swarm<WorkloadBehaviour>,
@@ -56,6 +81,7 @@ pub struct WorkloadBehaviour {
     pub relay: relay::Behaviour,
     pub autonat: autonat::Behaviour,
     pub identify: identify::Behaviour,
+    pub proxy_rr: request_response::Behaviour<ProxyCodec>,
 }
 
 impl CoreBehaviourAccess for WorkloadBehaviour {
@@ -75,6 +101,7 @@ pub struct P2pNodeHandle {
     kad_ready_rx: watch::Receiver<bool>,
     proxy_provider_announced_rx: watch::Receiver<bool>,
     _proxy_provider_announced_tx: watch::Sender<bool>,
+    command_tx: mpsc::UnboundedSender<P2pCommand>,
 }
 
 impl P2pNodeHandle {
@@ -94,9 +121,33 @@ impl P2pNodeHandle {
         self.proxy_provider_announced_rx.clone()
     }
 
+    pub fn proxy_client(&self) -> ProxyClient {
+        ProxyClient {
+            tx: self.command_tx.clone(),
+        }
+    }
+
     pub async fn shutdown(self) {
         self.task.abort();
         let _ = self.task.await;
+    }
+}
+
+#[derive(Clone)]
+pub struct ProxyClient {
+    tx: mpsc::UnboundedSender<P2pCommand>,
+}
+
+impl ProxyClient {
+    pub async fn forward(&self, request: ProxyHttpRequest) -> Result<ProxyHttpResponse> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(P2pCommand::ProxyHttp {
+                request,
+                respond_to: tx,
+            })
+            .map_err(|_| anyhow!("p2p node shut down"))?;
+        rx.await.map_err(|_| anyhow!("proxy response channel closed"))?
     }
 }
 
@@ -136,6 +187,13 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
             )),
             request_response::Config::default(),
         );
+        let proxy_rr = request_response::Behaviour::new(
+            std::iter::once((
+                INGRESS_PROXY_PROTOCOL,
+                request_response::ProtocolSupport::Full,
+            )),
+            request_response::Config::default(),
+        );
 
         let store = kad::store::MemoryStore::new(key.public().to_peer_id());
         let mut kademlia_config = kad::Config::default();
@@ -161,6 +219,7 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
             relay,
             autonat,
             identify,
+            proxy_rr,
         }
     })?;
 
@@ -206,7 +265,9 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
     let mut peer_tx = peer_tx;
     let local_peer_id = swarm.local_peer_id().to_string();
     let kad_ready_tx = kad_ready_tx;
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let task = tokio::spawn({
+        let mut cmd_rx = cmd_rx;
         let mut handshake_states = handshake_states;
         let mut peer_protocols = peer_protocols;
         let mut kad_bootstrapped = false;
@@ -214,6 +275,10 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
         let proxy_announced_tx = runtime_proxy_announced_tx;
         let enable_proxy_provider = enable_proxy_provider;
         let single_node_mode = single_node_mode;
+        let mut gateway_cache: HashMap<String, GatewayCacheEntry> = HashMap::new();
+        let mut manifest_queries: HashMap<String, ManifestQueryState> = HashMap::new();
+        let mut query_manifest: HashMap<kad::QueryId, String> = HashMap::new();
+        let mut pending_proxy_requests: HashMap<request_response::OutboundRequestId, oneshot::Sender<anyhow::Result<ProxyHttpResponse>>> = HashMap::new();
         async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             let mut handshake_interval = tokio::time::interval(Duration::from_secs(1));
@@ -250,6 +315,14 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
                                         }
                                     }
                                 }
+                                handle_manifest_queries(
+                                    &mut swarm,
+                                    event,
+                                    &mut gateway_cache,
+                                    &mut manifest_queries,
+                                    &mut query_manifest,
+                                    &mut pending_proxy_requests,
+                                );
                             }
                             SwarmEvent::Behaviour(WorkloadBehaviourEvent::HandshakeRr(request_response::Event::Message { message, peer, connection_id: _ })) => {
                                 handshake::handle_request_response_message(
@@ -270,6 +343,9 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
                             }
                             SwarmEvent::Behaviour(WorkloadBehaviourEvent::HandshakeRr(request_response::Event::InboundFailure { peer, error, .. })) => {
                                 warn!(%peer, ?error, "workload handshake inbound failure");
+                            }
+                            SwarmEvent::Behaviour(WorkloadBehaviourEvent::ProxyRr(event)) => {
+                                handle_proxy_rr_event(event, &mut pending_proxy_requests);
                             }
                             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                                 warn!("connection established with {}", peer_id);
@@ -309,6 +385,16 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
                             }
                             _ => {}
                         }
+                    }
+                    Some(cmd) = cmd_rx.recv() => {
+                        handle_command(
+                            &mut swarm,
+                            cmd,
+                            &mut gateway_cache,
+                            &mut manifest_queries,
+                            &mut query_manifest,
+                            &mut pending_proxy_requests,
+                        );
                     }
                     _ = handshake_interval.tick() => {
                         let local_peer = swarm.local_peer_id().clone();
@@ -357,6 +443,7 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
         kad_ready_rx,
         proxy_provider_announced_rx,
         _proxy_provider_announced_tx: proxy_announced_tx,
+        command_tx: cmd_tx,
     })
 }
 
@@ -371,6 +458,255 @@ fn publish_peer_snapshot(
         .map(|(peer, _)| peer.to_string())
         .collect();
     let _ = peer_tx.send(peers);
+}
+
+fn handle_command(
+    swarm: &mut Swarm<WorkloadBehaviour>,
+    cmd: P2pCommand,
+    gateway_cache: &mut HashMap<String, GatewayCacheEntry>,
+    manifest_queries: &mut HashMap<String, ManifestQueryState>,
+    query_manifest: &mut HashMap<kad::QueryId, String>,
+    pending_proxy_requests: &mut HashMap<request_response::OutboundRequestId, oneshot::Sender<anyhow::Result<ProxyHttpResponse>>>,
+) {
+    match cmd {
+        P2pCommand::ProxyHttp { request, respond_to } => {
+            let pending = ProxyPendingRequest { request, respond_to };
+            process_proxy_command(
+                swarm,
+                pending,
+                gateway_cache,
+                manifest_queries,
+                query_manifest,
+                pending_proxy_requests,
+            );
+        }
+    }
+}
+
+fn process_proxy_command(
+    swarm: &mut Swarm<WorkloadBehaviour>,
+    pending: ProxyPendingRequest,
+    gateway_cache: &mut HashMap<String, GatewayCacheEntry>,
+    manifest_queries: &mut HashMap<String, ManifestQueryState>,
+    query_manifest: &mut HashMap<kad::QueryId, String>,
+    pending_proxy_requests: &mut HashMap<request_response::OutboundRequestId, oneshot::Sender<anyhow::Result<ProxyHttpResponse>>>,
+) {
+    let manifest_id = pending.request.manifest_id.clone();
+    let now = Instant::now();
+    if let Some(entry) = gateway_cache.get(&manifest_id) {
+        if entry.expires_at > now {
+            match dispatch_proxy_request(
+                swarm,
+                pending,
+                &entry.record,
+                pending_proxy_requests,
+            ) {
+                Ok(()) => return,
+                Err((pending, err)) => {
+                    let _ = pending.respond_to.send(Err(err));
+                    return;
+                }
+            }
+        } else {
+            gateway_cache.remove(&manifest_id);
+        }
+    }
+
+    if let Some(state) = manifest_queries.get_mut(&manifest_id) {
+        state.waiters.push(pending);
+        return;
+    }
+
+    let key = format!("{}{}", MANIFEST_RECORD_PREFIX, manifest_id);
+    let query_id = swarm
+        .behaviour_mut()
+        .kademlia
+        .get_record(kad::RecordKey::new(&key));
+    manifest_queries.insert(
+        manifest_id.clone(),
+        ManifestQueryState {
+            waiters: vec![pending],
+            query_id,
+        },
+    );
+    query_manifest.insert(query_id, manifest_id);
+}
+
+fn handle_manifest_queries(
+    swarm: &mut Swarm<WorkloadBehaviour>,
+    event: kad::Event,
+    gateway_cache: &mut HashMap<String, GatewayCacheEntry>,
+    manifest_queries: &mut HashMap<String, ManifestQueryState>,
+    query_manifest: &mut HashMap<kad::QueryId, String>,
+    pending_proxy_requests: &mut HashMap<request_response::OutboundRequestId, oneshot::Sender<anyhow::Result<ProxyHttpResponse>>>,
+) {
+    if let kad::Event::OutboundQueryProgressed { id, result, .. } = event {
+        if let Some(manifest_id) = query_manifest.get(&id).cloned() {
+            match result {
+                kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(peer_record))) => {
+                    complete_manifest_query_success(
+                        swarm,
+                        manifest_id,
+                        peer_record.record.value,
+                        gateway_cache,
+                        manifest_queries,
+                        query_manifest,
+                        pending_proxy_requests,
+                    );
+                }
+                kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. })) => {
+                    complete_manifest_query_error(
+                        manifest_id,
+                        "manifest record not found".to_string(),
+                        manifest_queries,
+                        query_manifest,
+                    );
+                }
+                kad::QueryResult::GetRecord(Err(err)) => {
+                    complete_manifest_query_error(
+                        manifest_id,
+                        format!("kad get_record failed: {err}"),
+                        manifest_queries,
+                        query_manifest,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn complete_manifest_query_success(
+    swarm: &mut Swarm<WorkloadBehaviour>,
+    manifest_id: String,
+    data: Vec<u8>,
+    gateway_cache: &mut HashMap<String, GatewayCacheEntry>,
+    manifest_queries: &mut HashMap<String, ManifestQueryState>,
+    query_manifest: &mut HashMap<kad::QueryId, String>,
+    pending_proxy_requests: &mut HashMap<request_response::OutboundRequestId, oneshot::Sender<anyhow::Result<ProxyHttpResponse>>>,
+) {
+    if let Some(state) = manifest_queries.remove(&manifest_id) {
+        query_manifest.remove(&state.query_id);
+        match decode_gateway_provider_record(&data) {
+            Ok(record) => {
+                let ttl_ms = if record.ttl_ms == 0 {
+                    DEFAULT_MANIFEST_RECORD_TTL_MS
+                } else {
+                    record.ttl_ms as u64
+                };
+                let expires_at = Instant::now() + Duration::from_millis(ttl_ms);
+                gateway_cache.insert(
+                    manifest_id.clone(),
+                    GatewayCacheEntry {
+                        record: record.clone(),
+                        expires_at,
+                    },
+                );
+                for pending in state.waiters {
+                    if let Err((pending, err)) = dispatch_proxy_request(
+                        swarm,
+                        pending,
+                        &record,
+                        pending_proxy_requests,
+                    ) {
+                        let _ = pending.respond_to.send(Err(err));
+                    }
+                }
+            }
+            Err(err) => {
+                complete_manifest_query_error(
+                    manifest_id,
+                    format!("failed to decode manifest record: {err}"),
+                    manifest_queries,
+                    query_manifest,
+                );
+            }
+        }
+    }
+}
+
+fn complete_manifest_query_error(
+    manifest_id: String,
+    message: String,
+    manifest_queries: &mut HashMap<String, ManifestQueryState>,
+    query_manifest: &mut HashMap<kad::QueryId, String>,
+) {
+    if let Some(state) = manifest_queries.remove(&manifest_id) {
+        query_manifest.remove(&state.query_id);
+        for pending in state.waiters {
+            let _ = pending
+                .respond_to
+                .send(Err(anyhow!(message.clone())));
+        }
+    }
+}
+
+fn handle_proxy_rr_event(
+    event: request_response::Event<ProxyHttpRequest, ProxyHttpResponse>,
+    pending_proxy_requests: &mut HashMap<request_response::OutboundRequestId, oneshot::Sender<anyhow::Result<ProxyHttpResponse>>>,
+) {
+    match event {
+        request_response::Event::Message { message, .. } => match message {
+            request_response::Message::Response { request_id, response, .. } => {
+                if let Some(tx) = pending_proxy_requests.remove(&request_id) {
+                    let _ = tx.send(Ok(response));
+                }
+            }
+            request_response::Message::Request { .. } => {
+                warn!("unexpected proxy request from gateway");
+            }
+        },
+        request_response::Event::OutboundFailure { request_id, error, .. } => {
+            if let Some(tx) = pending_proxy_requests.remove(&request_id) {
+                let _ = tx.send(Err(anyhow!("proxy request failed: {error}")));
+            }
+        }
+        request_response::Event::ResponseSent { .. } => {}
+        request_response::Event::InboundFailure { .. } => {}
+    }
+}
+
+fn dispatch_proxy_request(
+    swarm: &mut Swarm<WorkloadBehaviour>,
+    mut pending: ProxyPendingRequest,
+    record: &GatewayProviderRecordOwned,
+    pending_proxy_requests: &mut HashMap<request_response::OutboundRequestId, oneshot::Sender<anyhow::Result<ProxyHttpResponse>>>,
+) -> Result<(), (ProxyPendingRequest, anyhow::Error)> {
+    if let Some(port) = select_route_port(record, &pending.request.path_and_query) {
+        pending.request.target_port = port;
+    } else if pending.request.target_port == 0 {
+        return Err((pending, anyhow!("no matching route for path")));
+    }
+
+    let peer_id = match record.peer_id.parse::<PeerId>() {
+        Ok(peer) => peer,
+        Err(err) => return Err((pending, anyhow!("invalid peer id: {err}"))),
+    };
+
+    let request_id = swarm
+        .behaviour_mut()
+        .proxy_rr
+        .send_request(&peer_id, pending.request);
+    pending_proxy_requests.insert(request_id, pending.respond_to);
+    Ok(())
+}
+
+fn select_route_port(record: &GatewayProviderRecordOwned, path: &str) -> Option<u16> {
+    let mut normalized = if path.is_empty() {
+        "/".to_string()
+    } else {
+        path.to_string()
+    };
+    if !normalized.starts_with('/') {
+        normalized = format!("/{}", normalized);
+    }
+
+    record
+        .routes
+        .iter()
+        .filter(|route| normalized.starts_with(&route.path_prefix))
+        .max_by_key(|route| route.path_prefix.len())
+        .map(|route| route.target_port)
 }
 
 fn trace_kad(event: &kad::Event) {

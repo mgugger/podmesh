@@ -692,6 +692,18 @@ pub async fn list_available_engines() -> Vec<String> {
     }
 }
 
+/// Fetch the name of the default runtime engine, if configured
+pub async fn get_default_runtime_engine_name() -> Option<String> {
+    if let Some(registry_guard) = get_global_runtime_registry().await {
+        registry_guard
+            .as_ref()
+            .and_then(|registry| registry.default_engine_name())
+            .map(|name| name.to_string())
+    } else {
+        None
+    }
+}
+
 /// Remove a workload by ID (requires engine name)
 pub async fn remove_workload_by_id(
     workload_id: &str,

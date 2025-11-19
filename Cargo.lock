@@ -302,6 +302,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "axum-support"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "log",
+ "tokio",
+]
+
+[[package]]
 name = "base-x"
 version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2305,6 +2315,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "axum-support",
  "base64 0.21.7",
  "clap",
  "crypto",
@@ -2649,6 +2660,8 @@ dependencies = [
  "once_cell",
  "protocol",
  "rand 0.8.5",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "uuid",
@@ -4567,14 +4580,18 @@ name = "workplane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
+ "axum-support",
  "clap",
  "futures",
  "libp2p",
  "p2p",
+ "parking_lot",
  "protocol",
  "reqwest",
  "serde",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4589,6 +4606,8 @@ dependencies = [
  "futures",
  "libp2p",
  "p2p",
+ "protocol",
+ "reqwest",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4599,6 +4618,10 @@ name = "workplane-integration"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "axum-support",
+ "protocol",
+ "reqwest",
  "tokio",
  "tracing",
  "tracing-subscriber",

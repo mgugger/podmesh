@@ -1,10 +1,23 @@
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use tokio::sync::{mpsc, oneshot, watch};
+use axum::{Router, routing::get};
+use axum_support::spawn_tcp_listener;
+use reqwest::Client;
+use tokio::{net::TcpListener, sync::{mpsc, oneshot, watch}, task::JoinHandle};
 use workplane::{Config, Workload};
-use workplane_gateway::{GatewayConfig, GatewayEvent, run_gateway_with_shutdown};
+use workplane::ingress::IngressRouteSpec;
+use protocol::{
+    libp2p_constants::DEFAULT_INGRESS_MANIFEST_ID,
+    machine::GatewayRouteSpec,
+};
+use workplane_gateway::{
+    GatewayConfig,
+    GatewayEvent,
+    DEFAULT_GATEWAY_APP_PORT,
+    run_gateway_with_shutdown,
+};
 
 use workplane_integration::support::{allocate_tcp_port, allocate_udp_port, init_tracing};
 
@@ -54,8 +67,10 @@ async fn gateway_discovers_workload_provider() -> Result<()> {
                 .await?;
         }
 
-        let gateway_bootstrap_peers: Vec<String> =
-            workloads.iter().map(|node| node.bootstrap_addr.clone()).collect();
+        let gateway_bootstrap_peers: Vec<String> = workloads
+            .iter()
+            .map(|node| node.bootstrap_addr.clone())
+            .collect();
 
         tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -68,6 +83,13 @@ async fn gateway_discovers_workload_provider() -> Result<()> {
             libp2p_host: "0.0.0.0".to_string(),
             libp2p_port: 0,
             announce_providers: false,
+            manifest_id: DEFAULT_INGRESS_MANIFEST_ID.to_string(),
+            ingress_host: format!("{}.mesh.local", DEFAULT_INGRESS_MANIFEST_ID),
+            app_port: DEFAULT_GATEWAY_APP_PORT,
+            routes: vec![GatewayRouteSpec {
+                path_prefix: "/".to_string(),
+                target_port: DEFAULT_GATEWAY_APP_PORT,
+            }],
         };
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -132,6 +154,86 @@ async fn gateway_discovers_workload_provider() -> Result<()> {
     test_result
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingress_proxies_requests_via_gateway() -> Result<()> {
+    init_tracing();
+    let mut handle = start_workload(Vec::new(), true)?;
+    let mut gateway_shutdown: Option<oneshot::Sender<()>> = None;
+    let mut gateway_task: Option<JoinHandle<()>> = None;
+    let mut app_server: Option<JoinHandle<()>> = None;
+    let test_result: Result<()> = async {
+        wait_for_kad_ready(handle.kad_rx(), Duration::from_secs(10)).await?;
+        wait_for_proxy_provider(handle.proxy_provider_rx(), Duration::from_secs(10)).await?;
+
+        let app_port = allocate_tcp_port();
+        let ingress_routes = handle
+            .workload
+            .ingress_routes()
+            .ok_or_else(|| anyhow!("ingress routes unavailable"))?;
+        ingress_routes.register(
+            DEFAULT_INGRESS_MANIFEST_ID,
+            IngressRouteSpec {
+                path_prefix: "/".to_string(),
+                target_port: app_port,
+            },
+        );
+
+        let app_body = "hello-from-proxied-app".to_string();
+        app_server = Some(spawn_test_app(app_port, app_body.clone()).await?);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        gateway_shutdown = Some(shutdown_tx);
+        let gateway_cfg = GatewayConfig {
+            provider_label: PROXY_PROVIDER_LABEL.to_string(),
+            bootstrap_peers: vec![handle.bootstrap_addr.clone()],
+            bootstrap_peer_ip: None,
+            lookup_interval: Duration::from_secs(2),
+            announce_interval: Duration::from_secs(5),
+            libp2p_host: "0.0.0.0".to_string(),
+            libp2p_port: 0,
+            announce_providers: false,
+            manifest_id: DEFAULT_INGRESS_MANIFEST_ID.to_string(),
+            ingress_host: format!("{}.mesh.local", DEFAULT_INGRESS_MANIFEST_ID),
+            app_port,
+            routes: vec![GatewayRouteSpec {
+                path_prefix: "/".to_string(),
+                target_port: app_port,
+            }],
+        };
+
+        gateway_task = Some(tokio::spawn(async move {
+            run_gateway_with_shutdown(gateway_cfg, shutdown_rx, None)
+                .await
+                .expect("gateway run");
+        }));
+
+        let ingress_addr = handle
+            .workload
+            .ingress_address()
+            .ok_or_else(|| anyhow!("ingress listen address unavailable"))?;
+        let client = Client::new();
+        let url = format!("http://{ingress_addr}/hello");
+        let host_header = format!("{}.mesh.local", DEFAULT_INGRESS_MANIFEST_ID);
+        let body = wait_for_ingress_response(&client, &url, &host_header, Duration::from_secs(20)).await?;
+        assert_eq!(body, app_body);
+        Ok(())
+    }
+    .await;
+
+    if let Some(tx) = gateway_shutdown.take() {
+        let _ = tx.send(());
+    }
+    if let Some(task) = gateway_task.take() {
+        let _ = task.await;
+    }
+    if let Some(server) = app_server.take() {
+        server.abort();
+        let _ = server.await;
+    }
+    handle.workload.close().await;
+    test_result
+}
+
 struct WorkloadHandle {
     workload: Workload,
     peer_id: String,
@@ -148,6 +250,7 @@ impl WorkloadHandle {
     fn proxy_provider_rx(&self) -> watch::Receiver<bool> {
         self.proxy_provider_rx.clone()
     }
+
 }
 
 fn start_workload(
@@ -156,7 +259,12 @@ fn start_workload(
 ) -> Result<WorkloadHandle> {
     let libp2p_port = allocate_udp_port();
     let rest_port = allocate_tcp_port();
-    let config = build_workload_config(libp2p_port, rest_port, bootstrap_peers, enable_proxy_provider);
+    let config = build_workload_config(
+        libp2p_port,
+        rest_port,
+        bootstrap_peers,
+        enable_proxy_provider,
+    );
     let mut workload = Workload::new(config)?;
     workload.start()?;
 
@@ -164,9 +272,7 @@ fn start_workload(
         .peer_id()
         .map(|id| id.to_string())
         .ok_or_else(|| anyhow!("workload peer id unavailable"))?;
-    let bootstrap_addr = format!(
-        "/ip4/127.0.0.1/udp/{libp2p_port}/quic-v1/p2p/{peer_id}"
-    );
+    let bootstrap_addr = format!("/ip4/127.0.0.1/udp/{libp2p_port}/quic-v1/p2p/{peer_id}");
     let kad_rx = workload
         .kad_bootstrap_rx()
         .ok_or_else(|| anyhow!("kad bootstrap channel missing"))?;
@@ -223,4 +329,39 @@ async fn wait_for_proxy_provider(mut rx: watch::Receiver<bool>, timeout: Duratio
     .map_err(|_| anyhow!("proxy provider announcement never observed"))??;
 
     Ok(())
+}
+
+async fn spawn_test_app(port: u16, response_body: String) -> Result<JoinHandle<()>> {
+    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+    let router = Router::new().route(
+        "/hello",
+        get({
+            let response_body = response_body.clone();
+            move || {
+                let body = response_body.clone();
+                async move { body }
+            }
+        }),
+    );
+    Ok(spawn_tcp_listener(listener, router, "workplane-test-app"))
+}
+
+async fn wait_for_ingress_response(
+    client: &Client,
+    url: &str,
+    host: &str,
+    timeout: Duration,
+) -> Result<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(response) = client.get(url).header("host", host).send().await {
+            if response.status().is_success() {
+                return Ok(response.text().await?);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!("ingress proxy response timed out"));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }

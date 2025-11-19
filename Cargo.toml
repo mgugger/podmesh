@@ -7,6 +7,7 @@ members = [
     "workloadplane/gateway",
     "workloadplane/tests",
     "beectl",
+    "shared/axum_support",
     "shared/crypto",
     "shared/protocol",
     "shared/p2p",
@@ -35,6 +36,7 @@ beectl = { path = "./beectl" }
 crypto = { path = "./shared/crypto" }
 protocol = { path = "./shared/protocol" }
 p2p = { path = "./shared/p2p" }
+axum-support = { path = "./shared/axum_support" }
 scheduler = { path = "./machineplane/scheduler" }
 machine = { path = "./machineplane/machine" }
 workplane = { path = "./workloadplane/workload" }

@@ -14,3 +14,5 @@ tokio = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 p2p = { workspace = true }
+protocol = { workspace = true }
+reqwest = { workspace = true }

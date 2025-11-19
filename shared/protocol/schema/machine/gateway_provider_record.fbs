@@ -1,0 +1,18 @@
+namespace beemesh.machine;
+
+table GatewayRoute {
+  path_prefix:string;
+  target_port:uint16;
+}
+
+table GatewayProviderRecord {
+  manifest_id:string;
+  peer_id:string;
+  ingress_host:string;
+  routes:[GatewayRoute];
+  ttl_ms:uint32;
+  last_updated_ms:uint64;
+  version:uint16;
+}
+
+root_type GatewayProviderRecord;
