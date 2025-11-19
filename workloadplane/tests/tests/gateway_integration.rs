@@ -4,19 +4,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use axum::{Router, routing::get};
 use axum_support::spawn_tcp_listener;
+use protocol::{libp2p_constants::DEFAULT_INGRESS_MANIFEST_ID, machine::GatewayRouteSpec};
 use reqwest::Client;
-use tokio::{net::TcpListener, sync::{mpsc, oneshot, watch}, task::JoinHandle};
-use workplane::{Config, Workload};
-use workplane::ingress::IngressRouteSpec;
-use protocol::{
-    libp2p_constants::DEFAULT_INGRESS_MANIFEST_ID,
-    machine::GatewayRouteSpec,
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, oneshot, watch},
+    task::JoinHandle,
 };
+use workplane::ingress::IngressRouteSpec;
+use workplane::{Config, Workload};
 use workplane_gateway::{
-    GatewayConfig,
-    GatewayEvent,
-    DEFAULT_GATEWAY_APP_PORT,
-    run_gateway_with_shutdown,
+    DEFAULT_GATEWAY_APP_PORT, GatewayConfig, GatewayEvent, run_gateway_with_shutdown,
 };
 
 use workplane_integration::support::{allocate_tcp_port, allocate_udp_port, init_tracing};
@@ -214,7 +212,8 @@ async fn ingress_proxies_requests_via_gateway() -> Result<()> {
         let client = Client::new();
         let url = format!("http://{ingress_addr}/hello");
         let host_header = format!("{}.mesh.local", DEFAULT_INGRESS_MANIFEST_ID);
-        let body = wait_for_ingress_response(&client, &url, &host_header, Duration::from_secs(20)).await?;
+        let body =
+            wait_for_ingress_response(&client, &url, &host_header, Duration::from_secs(20)).await?;
         assert_eq!(body, app_body);
         Ok(())
     }
@@ -250,7 +249,6 @@ impl WorkloadHandle {
     fn proxy_provider_rx(&self) -> watch::Receiver<bool> {
         self.proxy_provider_rx.clone()
     }
-
 }
 
 fn start_workload(

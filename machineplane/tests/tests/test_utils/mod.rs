@@ -1,4 +1,7 @@
-use machine::{Cli, start_machine};
+use machine::{
+    Cli, gateway_sidecar::DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR,
+    gateway_sidecar::DEFAULT_GATEWAY_IMAGE, start_machine,
+};
 use std::sync::Once;
 use std::time::Duration;
 use tokio::process::{Child, Command};
@@ -107,6 +110,8 @@ pub fn make_test_cli(
         signing_ephemeral: true,
         kem_ephemeral: true,
         ephemeral_keys: true,
+        gateway_bootstrap_peer: DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR.to_string(),
+        gateway_image: DEFAULT_GATEWAY_IMAGE.to_string(),
     }
 }
 

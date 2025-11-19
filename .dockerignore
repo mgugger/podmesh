@@ -6,3 +6,6 @@
 .git/
 /target/
 **/*.log
+target/
+.devcontainer/
+.github

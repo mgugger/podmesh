@@ -81,7 +81,7 @@ spec:
   volumes:
     - name: podman-socket
       hostPath:
-        path: /run/user/1000/podman/podman.sock
+        path: /run/podman/podman.sock
         type: Socket
     - name: host-proc-cpuinfo
       hostPath:

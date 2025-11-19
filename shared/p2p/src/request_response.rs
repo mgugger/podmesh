@@ -19,7 +19,7 @@ impl request_response::Codec for ByteCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-            read_length_prefixed_bytes(io).await
+        read_length_prefixed_bytes(io).await
     }
 
     async fn read_response<T>(
@@ -30,7 +30,7 @@ impl request_response::Codec for ByteCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-            read_length_prefixed_bytes(io).await
+        read_length_prefixed_bytes(io).await
     }
 
     async fn write_request<T>(
@@ -42,7 +42,7 @@ impl request_response::Codec for ByteCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-            write_length_prefixed_bytes(io, &req).await
+        write_length_prefixed_bytes(io, &req).await
     }
 
     async fn write_response<T>(
@@ -54,7 +54,7 @@ impl request_response::Codec for ByteCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-            write_length_prefixed_bytes(io, &res).await
+        write_length_prefixed_bytes(io, &res).await
     }
 }
 

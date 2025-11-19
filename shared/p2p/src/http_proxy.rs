@@ -37,7 +37,8 @@ impl request_response::Codec for ProxyCodec {
         T: AsyncRead + Unpin + Send,
     {
         let bytes = read_length_prefixed_bytes(io).await?;
-        serde_json::from_slice(&bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+        serde_json::from_slice(&bytes)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
     }
 
     async fn read_response<T>(
@@ -49,7 +50,8 @@ impl request_response::Codec for ProxyCodec {
         T: AsyncRead + Unpin + Send,
     {
         let bytes = read_length_prefixed_bytes(io).await?;
-        serde_json::from_slice(&bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+        serde_json::from_slice(&bytes)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
     }
 
     async fn write_request<T>(

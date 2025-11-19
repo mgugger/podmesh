@@ -102,6 +102,23 @@ pub struct DeploymentConfig {
     pub env: HashMap<String, String>,
     /// Additional runtime-specific options
     pub runtime_options: HashMap<String, String>,
+    /// Optional gateway sidecar injection data
+    pub gateway: Option<GatewayInjectionConfig>,
+}
+
+/// Metadata required to inject and configure the workload gateway sidecar
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayInjectionConfig {
+    /// Container image reference to run for the gateway sidecar
+    pub image: String,
+    /// Bootstrap peer multiaddr for the workload DHT
+    pub bootstrap_peer: String,
+    /// Manifest identifier associated with this deployment
+    pub manifest_id: String,
+    /// Original manifest bytes (as submitted by the workload owner)
+    pub manifest_bytes: Vec<u8>,
+    /// Owner public key extracted from the envelope (may be empty if unknown)
+    pub owner_public_key: Vec<u8>,
 }
 
 /// Resource limits for a workload
@@ -126,6 +143,7 @@ impl Default for DeploymentConfig {
             },
             env: HashMap::new(),
             runtime_options: HashMap::new(),
+            gateway: None,
         }
     }
 }

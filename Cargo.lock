@@ -4608,6 +4608,8 @@ dependencies = [
  "p2p",
  "protocol",
  "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

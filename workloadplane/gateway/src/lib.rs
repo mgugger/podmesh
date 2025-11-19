@@ -11,14 +11,17 @@ use libp2p::{
     request_response,
     swarm::{NetworkBehaviour, SwarmEvent},
 };
+use p2p::http_proxy::{ProxyCodec, ProxyHttpRequest, ProxyHttpResponse};
 use p2p::{
     handshake::{self, HandshakeDriveConfig, HandshakeState},
     request_response::ByteCodec,
 };
-use p2p::http_proxy::{ProxyCodec, ProxyHttpRequest, ProxyHttpResponse};
 use protocol::libp2p_constants::{INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX};
 use protocol::machine::{GatewayRouteSpec, build_gateway_provider_record};
-use reqwest::{Client, Method, header::{HeaderName, HeaderValue}};
+use reqwest::{
+    Client, Method,
+    header::{HeaderName, HeaderValue},
+};
 use tokio::signal;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -72,9 +75,31 @@ pub async fn run_gateway_with_shutdown(
     mut shutdown: oneshot::Receiver<()>,
     event_tx: Option<mpsc::UnboundedSender<GatewayEvent>>,
 ) -> Result<()> {
-    info!(has_events = event_tx.is_some(), "gateway runtime starting");
+    let listen_addr = cfg.listen_addr();
+    let listen_addr_display = listen_addr
+        .as_ref()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    info!(
+        has_events = event_tx.is_some(),
+        provider = %cfg.provider_label,
+        manifest = %cfg.manifest_id,
+        ingress_host = %cfg.ingress_host,
+        libp2p_host = %cfg.libp2p_host,
+        libp2p_port = cfg.libp2p_port,
+        announce_providers = cfg.announce_providers,
+        lookup_interval_ms = cfg.lookup_interval.as_millis() as u64,
+        announce_interval_ms = cfg.announce_interval.as_millis() as u64,
+        bootstrap_peers = ?cfg.bootstrap_peers,
+        bootstrap_peer_ip = %cfg.bootstrap_peer_ip.as_deref().unwrap_or("none"),
+        listen_addr = %listen_addr_display,
+        app_port = cfg.app_port,
+        routes = cfg.routes.len(),
+        "gateway runtime starting with config"
+    );
+
     let mut swarm = build_swarm(&cfg)?;
-    if let Some(addr) = cfg.listen_addr() {
+    if let Some(addr) = listen_addr {
         swarm
             .listen_on(addr)
             .context("start gateway libp2p listener")?;
@@ -360,8 +385,12 @@ fn publish_manifest_record(swarm: &mut Swarm<GatewayBehaviour>, cfg: &GatewayCon
         .kademlia
         .put_record(record, Quorum::One)
     {
-        Ok(query_id) => debug!(?query_id, manifest = %cfg.manifest_id, "gateway published manifest record"),
-        Err(err) => warn!(manifest = %cfg.manifest_id, error = %err, "gateway failed to publish manifest record"),
+        Ok(query_id) => {
+            debug!(?query_id, manifest = %cfg.manifest_id, "gateway published manifest record")
+        }
+        Err(err) => {
+            warn!(manifest = %cfg.manifest_id, error = %err, "gateway failed to publish manifest record")
+        }
     }
 }
 
@@ -473,13 +502,26 @@ fn handle_proxy_event(
     proxy_resp_tx: &mpsc::UnboundedSender<PendingProxyResponse>,
 ) {
     match event {
-        request_response::Event::Message { peer, message, connection_id: _ } => match message {
-            request_response::Message::Request { mut request, channel, request_id: _ } => {
+        request_response::Event::Message {
+            peer,
+            message,
+            connection_id: _,
+        } => match message {
+            request_response::Message::Request {
+                mut request,
+                channel,
+                request_id: _,
+            } => {
                 if request.target_port == 0 {
                     request.target_port = cfg.app_port;
                 }
                 debug!(%peer, manifest = %request.manifest_id, "gateway received proxy request");
-                spawn_local_http_request(state.http_client.clone(), request, channel, proxy_resp_tx.clone());
+                spawn_local_http_request(
+                    state.http_client.clone(),
+                    request,
+                    channel,
+                    proxy_resp_tx.clone(),
+                );
             }
             request_response::Message::Response { response, .. } => {
                 debug!(%peer, status = response.status_code, "gateway received proxy response acknowledgement");
@@ -520,7 +562,10 @@ fn spawn_local_http_request(
     });
 }
 
-async fn execute_local_http_request(client: Client, request: ProxyHttpRequest) -> Result<ProxyHttpResponse> {
+async fn execute_local_http_request(
+    client: Client,
+    request: ProxyHttpRequest,
+) -> Result<ProxyHttpResponse> {
     let target_port = request.target_port;
     let method = Method::from_bytes(request.method.as_bytes()).unwrap_or(Method::GET);
     let mut path = if request.path_and_query.is_empty() {

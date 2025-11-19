@@ -7,6 +7,11 @@ use clap::Parser;
 use env_logger::Env;
 use std::io::Write;
 
+use crate::gateway_sidecar::{
+    DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR, DEFAULT_GATEWAY_IMAGE, GatewaySidecarSettings,
+};
+
+pub mod gateway_sidecar;
 pub mod hostapi;
 pub mod libp2p_beemesh;
 mod pod_communication;
@@ -86,6 +91,14 @@ pub struct Cli {
     /// Host address for libp2p listeners (IPv4 or IPv6 literal, default: 0.0.0.0)
     #[arg(long, default_value = "0.0.0.0")]
     pub libp2p_host: String,
+
+    /// Bootstrap peer multiaddr for injected gateway sidecars to join the workload DHT
+    #[arg(long, default_value = DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR)]
+    pub gateway_bootstrap_peer: String,
+
+    /// Container image to use for the injected gateway sidecar
+    #[arg(long, default_value = DEFAULT_GATEWAY_IMAGE)]
+    pub gateway_image: String,
 }
 
 impl Default for Cli {
@@ -108,6 +121,8 @@ impl Default for Cli {
             bootstrap_peer: Vec::new(),
             libp2p_quic_port: 0,
             libp2p_host: "0.0.0.0".to_string(),
+            gateway_bootstrap_peer: DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR.to_string(),
+            gateway_image: DEFAULT_GATEWAY_IMAGE.to_string(),
         }
     }
 }
@@ -117,6 +132,12 @@ impl Default for Cli {
 pub async fn start_machine(cli: Cli) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     // initialize logger but don't panic if already initialized
     let _ = env_logger::Builder::from_env(Env::default().default_filter_or("warn")).try_init();
+
+    gateway_sidecar::set_gateway_sidecar_settings(GatewaySidecarSettings {
+        image: cli.gateway_image.clone(),
+        bootstrap_peer: cli.gateway_bootstrap_peer.clone(),
+    })
+    .await;
 
     let scheduling_enabled = !cli.disable_scheduling;
 

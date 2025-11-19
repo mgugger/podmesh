@@ -14,8 +14,10 @@ use p2p::{
     http_proxy::{ProxyCodec, ProxyHttpRequest, ProxyHttpResponse},
     request_response::ByteCodec,
 };
-use protocol::libp2p_constants::{INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX, WORKLOAD_CLUSTER_TOPIC};
-use protocol::machine::{decode_gateway_provider_record, GatewayProviderRecordOwned};
+use protocol::libp2p_constants::{
+    INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX, WORKLOAD_CLUSTER_TOPIC,
+};
+use protocol::machine::{GatewayProviderRecordOwned, decode_gateway_provider_record};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -147,7 +149,8 @@ impl ProxyClient {
                 respond_to: tx,
             })
             .map_err(|_| anyhow!("p2p node shut down"))?;
-        rx.await.map_err(|_| anyhow!("proxy response channel closed"))?
+        rx.await
+            .map_err(|_| anyhow!("proxy response channel closed"))?
     }
 }
 
@@ -278,7 +281,10 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
         let mut gateway_cache: HashMap<String, GatewayCacheEntry> = HashMap::new();
         let mut manifest_queries: HashMap<String, ManifestQueryState> = HashMap::new();
         let mut query_manifest: HashMap<kad::QueryId, String> = HashMap::new();
-        let mut pending_proxy_requests: HashMap<request_response::OutboundRequestId, oneshot::Sender<anyhow::Result<ProxyHttpResponse>>> = HashMap::new();
+        let mut pending_proxy_requests: HashMap<
+            request_response::OutboundRequestId,
+            oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
+        > = HashMap::new();
         async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             let mut handshake_interval = tokio::time::interval(Duration::from_secs(1));
@@ -466,11 +472,20 @@ fn handle_command(
     gateway_cache: &mut HashMap<String, GatewayCacheEntry>,
     manifest_queries: &mut HashMap<String, ManifestQueryState>,
     query_manifest: &mut HashMap<kad::QueryId, String>,
-    pending_proxy_requests: &mut HashMap<request_response::OutboundRequestId, oneshot::Sender<anyhow::Result<ProxyHttpResponse>>>,
+    pending_proxy_requests: &mut HashMap<
+        request_response::OutboundRequestId,
+        oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
+    >,
 ) {
     match cmd {
-        P2pCommand::ProxyHttp { request, respond_to } => {
-            let pending = ProxyPendingRequest { request, respond_to };
+        P2pCommand::ProxyHttp {
+            request,
+            respond_to,
+        } => {
+            let pending = ProxyPendingRequest {
+                request,
+                respond_to,
+            };
             process_proxy_command(
                 swarm,
                 pending,
@@ -489,18 +504,16 @@ fn process_proxy_command(
     gateway_cache: &mut HashMap<String, GatewayCacheEntry>,
     manifest_queries: &mut HashMap<String, ManifestQueryState>,
     query_manifest: &mut HashMap<kad::QueryId, String>,
-    pending_proxy_requests: &mut HashMap<request_response::OutboundRequestId, oneshot::Sender<anyhow::Result<ProxyHttpResponse>>>,
+    pending_proxy_requests: &mut HashMap<
+        request_response::OutboundRequestId,
+        oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
+    >,
 ) {
     let manifest_id = pending.request.manifest_id.clone();
     let now = Instant::now();
     if let Some(entry) = gateway_cache.get(&manifest_id) {
         if entry.expires_at > now {
-            match dispatch_proxy_request(
-                swarm,
-                pending,
-                &entry.record,
-                pending_proxy_requests,
-            ) {
+            match dispatch_proxy_request(swarm, pending, &entry.record, pending_proxy_requests) {
                 Ok(()) => return,
                 Err((pending, err)) => {
                     let _ = pending.respond_to.send(Err(err));
@@ -538,7 +551,10 @@ fn handle_manifest_queries(
     gateway_cache: &mut HashMap<String, GatewayCacheEntry>,
     manifest_queries: &mut HashMap<String, ManifestQueryState>,
     query_manifest: &mut HashMap<kad::QueryId, String>,
-    pending_proxy_requests: &mut HashMap<request_response::OutboundRequestId, oneshot::Sender<anyhow::Result<ProxyHttpResponse>>>,
+    pending_proxy_requests: &mut HashMap<
+        request_response::OutboundRequestId,
+        oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
+    >,
 ) {
     if let kad::Event::OutboundQueryProgressed { id, result, .. } = event {
         if let Some(manifest_id) = query_manifest.get(&id).cloned() {
@@ -554,7 +570,9 @@ fn handle_manifest_queries(
                         pending_proxy_requests,
                     );
                 }
-                kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. })) => {
+                kad::QueryResult::GetRecord(Ok(
+                    kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. },
+                )) => {
                     complete_manifest_query_error(
                         manifest_id,
                         "manifest record not found".to_string(),
@@ -583,7 +601,10 @@ fn complete_manifest_query_success(
     gateway_cache: &mut HashMap<String, GatewayCacheEntry>,
     manifest_queries: &mut HashMap<String, ManifestQueryState>,
     query_manifest: &mut HashMap<kad::QueryId, String>,
-    pending_proxy_requests: &mut HashMap<request_response::OutboundRequestId, oneshot::Sender<anyhow::Result<ProxyHttpResponse>>>,
+    pending_proxy_requests: &mut HashMap<
+        request_response::OutboundRequestId,
+        oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
+    >,
 ) {
     if let Some(state) = manifest_queries.remove(&manifest_id) {
         query_manifest.remove(&state.query_id);
@@ -603,12 +624,9 @@ fn complete_manifest_query_success(
                     },
                 );
                 for pending in state.waiters {
-                    if let Err((pending, err)) = dispatch_proxy_request(
-                        swarm,
-                        pending,
-                        &record,
-                        pending_proxy_requests,
-                    ) {
+                    if let Err((pending, err)) =
+                        dispatch_proxy_request(swarm, pending, &record, pending_proxy_requests)
+                    {
                         let _ = pending.respond_to.send(Err(err));
                     }
                 }
@@ -634,20 +652,25 @@ fn complete_manifest_query_error(
     if let Some(state) = manifest_queries.remove(&manifest_id) {
         query_manifest.remove(&state.query_id);
         for pending in state.waiters {
-            let _ = pending
-                .respond_to
-                .send(Err(anyhow!(message.clone())));
+            let _ = pending.respond_to.send(Err(anyhow!(message.clone())));
         }
     }
 }
 
 fn handle_proxy_rr_event(
     event: request_response::Event<ProxyHttpRequest, ProxyHttpResponse>,
-    pending_proxy_requests: &mut HashMap<request_response::OutboundRequestId, oneshot::Sender<anyhow::Result<ProxyHttpResponse>>>,
+    pending_proxy_requests: &mut HashMap<
+        request_response::OutboundRequestId,
+        oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
+    >,
 ) {
     match event {
         request_response::Event::Message { message, .. } => match message {
-            request_response::Message::Response { request_id, response, .. } => {
+            request_response::Message::Response {
+                request_id,
+                response,
+                ..
+            } => {
                 if let Some(tx) = pending_proxy_requests.remove(&request_id) {
                     let _ = tx.send(Ok(response));
                 }
@@ -656,7 +679,9 @@ fn handle_proxy_rr_event(
                 warn!("unexpected proxy request from gateway");
             }
         },
-        request_response::Event::OutboundFailure { request_id, error, .. } => {
+        request_response::Event::OutboundFailure {
+            request_id, error, ..
+        } => {
             if let Some(tx) = pending_proxy_requests.remove(&request_id) {
                 let _ = tx.send(Err(anyhow!("proxy request failed: {error}")));
             }
@@ -670,7 +695,10 @@ fn dispatch_proxy_request(
     swarm: &mut Swarm<WorkloadBehaviour>,
     mut pending: ProxyPendingRequest,
     record: &GatewayProviderRecordOwned,
-    pending_proxy_requests: &mut HashMap<request_response::OutboundRequestId, oneshot::Sender<anyhow::Result<ProxyHttpResponse>>>,
+    pending_proxy_requests: &mut HashMap<
+        request_response::OutboundRequestId,
+        oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
+    >,
 ) -> Result<(), (ProxyPendingRequest, anyhow::Error)> {
     if let Some(port) = select_route_port(record, &pending.request.path_and_query) {
         pending.request.target_port = port;

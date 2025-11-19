@@ -225,6 +225,8 @@ mod generated {
     }
 }
 
+pub mod gateway_metadata;
+
 pub mod machine {
     // Avoid glob imports; re-export specific items below.
     pub use crate::generated::generated_capacity_reply::beemesh::machine::{
@@ -419,101 +421,98 @@ pub mod machine {
         fbb.finished_data().to_vec()
     }
 
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub struct GatewayRouteSpec {
-            pub path_prefix: String,
-            pub target_port: u16,
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct GatewayRouteSpec {
+        pub path_prefix: String,
+        pub target_port: u16,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct GatewayProviderRecordOwned {
+        pub manifest_id: String,
+        pub peer_id: String,
+        pub ingress_host: String,
+        pub routes: Vec<GatewayRouteSpec>,
+        pub ttl_ms: u32,
+        pub last_updated_ms: u64,
+        pub version: u16,
+    }
+
+    pub fn build_gateway_provider_record(
+        manifest_id: &str,
+        peer_id: &str,
+        ingress_host: &str,
+        routes: &[GatewayRouteSpec],
+        ttl_ms: u32,
+        last_updated_ms: u64,
+        version: u16,
+    ) -> Vec<u8> {
+        let mut fbb = FlatBufferBuilder::with_capacity(256);
+        let manifest_off = fbb.create_string(manifest_id);
+        let peer_off = fbb.create_string(peer_id);
+        let ingress_off = fbb.create_string(ingress_host);
+
+        let mut route_offsets = Vec::with_capacity(routes.len());
+        for route in routes {
+            let path_off = fbb.create_string(&route.path_prefix);
+            let mut args = GatewayRouteArgs::default();
+            args.path_prefix = Some(path_off);
+            args.target_port = route.target_port;
+            route_offsets.push(GatewayRoute::create(&mut fbb, &args));
         }
+        let routes_vec = fbb.create_vector(&route_offsets);
 
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub struct GatewayProviderRecordOwned {
-            pub manifest_id: String,
-            pub peer_id: String,
-            pub ingress_host: String,
-            pub routes: Vec<GatewayRouteSpec>,
-            pub ttl_ms: u32,
-            pub last_updated_ms: u64,
-            pub version: u16,
-        }
+        let mut args = GatewayProviderRecordArgs::default();
+        args.manifest_id = Some(manifest_off);
+        args.peer_id = Some(peer_off);
+        args.ingress_host = Some(ingress_off);
+        args.routes = Some(routes_vec);
+        args.ttl_ms = ttl_ms;
+        args.last_updated_ms = last_updated_ms;
+        args.version = version;
 
-        pub fn build_gateway_provider_record(
-            manifest_id: &str,
-            peer_id: &str,
-            ingress_host: &str,
-            routes: &[GatewayRouteSpec],
-            ttl_ms: u32,
-            last_updated_ms: u64,
-            version: u16,
-        ) -> Vec<u8> {
-            let mut fbb = FlatBufferBuilder::with_capacity(256);
-            let manifest_off = fbb.create_string(manifest_id);
-            let peer_off = fbb.create_string(peer_id);
-            let ingress_off = fbb.create_string(ingress_host);
+        let off = GatewayProviderRecord::create(&mut fbb, &args);
+        fbb.finish(off, None);
+        fbb.finished_data().to_vec()
+    }
 
-            let mut route_offsets = Vec::with_capacity(routes.len());
-            for route in routes {
-                let path_off = fbb.create_string(&route.path_prefix);
-                let mut args = GatewayRouteArgs::default();
-                args.path_prefix = Some(path_off);
-                args.target_port = route.target_port;
-                route_offsets.push(GatewayRoute::create(&mut fbb, &args));
+    pub fn decode_gateway_provider_record(
+        data: &[u8],
+    ) -> anyhow::Result<GatewayProviderRecordOwned> {
+        let record = root_as_gateway_provider_record(data)?;
+        let manifest_id = record
+            .manifest_id()
+            .ok_or_else(|| anyhow::anyhow!("gateway record missing manifest_id"))?
+            .to_string();
+        let peer_id = record
+            .peer_id()
+            .ok_or_else(|| anyhow::anyhow!("gateway record missing peer_id"))?
+            .to_string();
+        let ingress_host = record
+            .ingress_host()
+            .ok_or_else(|| anyhow::anyhow!("gateway record missing ingress_host"))?
+            .to_string();
+
+        let mut routes = Vec::new();
+        if let Some(fb_routes) = record.routes() {
+            for fb_route in fb_routes {
+                routes.push(GatewayRouteSpec {
+                    path_prefix: fb_route.path_prefix().unwrap_or_default().to_string(),
+                    target_port: fb_route.target_port(),
+                });
             }
-            let routes_vec = fbb.create_vector(&route_offsets);
-
-            let mut args = GatewayProviderRecordArgs::default();
-            args.manifest_id = Some(manifest_off);
-            args.peer_id = Some(peer_off);
-            args.ingress_host = Some(ingress_off);
-            args.routes = Some(routes_vec);
-            args.ttl_ms = ttl_ms;
-            args.last_updated_ms = last_updated_ms;
-            args.version = version;
-
-            let off = GatewayProviderRecord::create(&mut fbb, &args);
-            fbb.finish(off, None);
-            fbb.finished_data().to_vec()
         }
 
-        pub fn decode_gateway_provider_record(
-            data: &[u8],
-        ) -> anyhow::Result<GatewayProviderRecordOwned> {
-            let record = root_as_gateway_provider_record(data)?;
-            let manifest_id = record
-                .manifest_id()
-                .ok_or_else(|| anyhow::anyhow!("gateway record missing manifest_id"))?
-                .to_string();
-            let peer_id = record
-                .peer_id()
-                .ok_or_else(|| anyhow::anyhow!("gateway record missing peer_id"))?
-                .to_string();
-            let ingress_host = record
-                .ingress_host()
-                .ok_or_else(|| anyhow::anyhow!("gateway record missing ingress_host"))?
-                .to_string();
-
-            let mut routes = Vec::new();
-            if let Some(fb_routes) = record.routes() {
-                for fb_route in fb_routes {
-                    routes.push(GatewayRouteSpec {
-                        path_prefix: fb_route
-                            .path_prefix()
-                            .unwrap_or_default()
-                            .to_string(),
-                        target_port: fb_route.target_port(),
-                    });
-                }
-            }
-
-            Ok(GatewayProviderRecordOwned {
-                manifest_id,
-                peer_id,
-                ingress_host,
-                routes,
-                ttl_ms: record.ttl_ms(),
-                last_updated_ms: record.last_updated_ms(),
-                version: record.version(),
-            })
-        }
+        Ok(GatewayProviderRecordOwned {
+            manifest_id,
+            peer_id,
+            ingress_host,
+            routes,
+            ttl_ms: record.ttl_ms(),
+            last_updated_ms: record.last_updated_ms(),
+            version: record.version(),
+        })
+    }
 
     pub fn build_delete_request(
         manifest_id: &str,

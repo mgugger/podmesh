@@ -14,9 +14,10 @@ Verify peers
 curl localhost:3000/debug/dht/peers
 ```
 
-Apply manifest via Kubernetes compatibility layer
+Build beectl & Apply manifest via beectl
 ```
-kubectl --server http://localhost:3000 apply -f tests/sample_manifests/nginx.yml
+cargo build -p beectl
+./target/debug/beectl --api-url http://localhost:3000 apply -f machineplane/tests/sample_manifests/nginx.yml
 ```
 
 Verify status for a "beemesh-${id}-pod"
@@ -26,5 +27,5 @@ podman pod ls
 
 Delete manifest
 ```
-kubectl --server http://localhost:3000 delete -f tests/sample_manifests/nginx.yml
+./target/debug/beectl --api-url http://localhost:3000 delete -f machineplane/tests/sample_manifests/nginx.yml
 ```

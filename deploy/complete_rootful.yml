@@ -11,7 +11,7 @@ spec:
       image: beemesh/machine:latest
       env:
       - name: RUST_LOG
-        value: "debug"
+        value: "info"
       args:
         - "--libp2p-quic-port"
         - "4001"
@@ -44,7 +44,7 @@ spec:
       image: beemesh/machine:latest
       env:
       - name: RUST_LOG
-        value: "debug"
+        value: "info"
       args:
         - "--disable-rest-api"
         - "--bootstrap-peer"
@@ -66,7 +66,7 @@ spec:
   volumes:
     - name: podman-socket
       hostPath:
-        path: /run/user/1000/podman/podman.sock
+        path: /run/podman/podman.sock
         type: Socket
     - name: host-proc-cpuinfo
       hostPath:
@@ -94,7 +94,7 @@ spec:
       image: beemesh/machine:latest
       env:
       - name: RUST_LOG
-        value: "debug"
+        value: "info"
       args:
         - "--disable-rest-api"
         - "--bootstrap-peer"
@@ -143,7 +143,7 @@ spec:
     - name: workload-bootstrap
       image: beemesh/workload:latest
       env:
-        - name: libp2p_port
+        - name: libp2p_quic_port
           value: "4002"
         - name: rest_port
           value: "3001"
@@ -162,6 +162,13 @@ spec:
         - containerPort: 3001
           hostPort: 3001
           protocol: UDP
+        ## ingress-port
+        - containerPort: 8080
+          hostPort: 8080
+          protocol: UDP
+        - containerPort: 8080
+          hostPort: 8080
+          protocol: TCP
 ---
 apiVersion: v1
 kind: Pod
@@ -176,10 +183,10 @@ spec:
       image: beemesh/workload:latest
       env:
       - name: RUST_LOG
-        value: "debug"
+        value: "info"
       args:
         - "--bootstrap-peer"
-        - "/dns4/workload-bootstrap/udp/7001/quic-v1"
+        - "/dns4/workload-bootstrap/udp/4002/quic-v1"
         - "--disable-rest-api"
 ---
 apiVersion: v1
@@ -195,8 +202,8 @@ spec:
       image: beemesh/workload:latest
       env:
       - name: RUST_LOG
-        value: "debug"
+        value: "info"
       args:
         - "--bootstrap-peer"
-        - "/dns4/workload-bootstrap/udp/7001/quic-v1"
+        - "/dns4/workload-bootstrap/udp/4002/quic-v1"
         - "--disable-rest-api"

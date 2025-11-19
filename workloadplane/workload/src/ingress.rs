@@ -282,14 +282,13 @@ impl GatewayForwarder for ProxyGatewayForwarder {
             .forward(proxy_request)
             .await
             .map_err(|err| GatewayError::ForwardFailed(err.to_string()))?;
-        let status = StatusCode::from_u16(proxy_response.status_code)
-            .unwrap_or(StatusCode::BAD_GATEWAY);
+        let status =
+            StatusCode::from_u16(proxy_response.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
         let mut builder = Response::builder().status(status);
         for (name, value) in proxy_response.headers {
-            if let (Ok(header_name), Ok(header_value)) = (
-                HeaderName::from_str(&name),
-                HeaderValue::from_str(&value),
-            ) {
+            if let (Ok(header_name), Ok(header_value)) =
+                (HeaderName::from_str(&name), HeaderValue::from_str(&value))
+            {
                 builder = builder.header(header_name, header_value);
             }
         }

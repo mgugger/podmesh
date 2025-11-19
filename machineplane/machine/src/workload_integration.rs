@@ -4,10 +4,17 @@
 //! and the new workload manager system. It updates the apply message handler to use
 //! the runtime engines and provider announcement system.
 
+use crate::gateway_sidecar::{
+    GATEWAY_BOOTSTRAP_ENV, GATEWAY_LOG_ENV, GATEWAY_LOG_LEVEL, GATEWAY_METADATA_ENV,
+    GATEWAY_METADATA_MOUNT_PATH, GATEWAY_SIDECAR_CONTAINER_NAME, GATEWAY_VOLUME_NAME,
+    GatewaySidecarSettings, gateway_sidecar_settings, metadata_container_path, metadata_host_dir,
+};
 use crate::libp2p_beemesh::behaviour::MyBehaviour;
 use crate::provider::{ProviderConfig, ProviderManager};
 use crate::resource_verifier::ResourceVerifier;
-use crate::runtime::{DeploymentConfig, RuntimeRegistry, create_default_registry};
+use crate::runtime::{
+    DeploymentConfig, GatewayInjectionConfig, RuntimeRegistry, create_default_registry,
+};
 use base64::Engine;
 use libp2p::Swarm;
 use libp2p::request_response;
@@ -332,12 +339,24 @@ async fn process_manifest_deployment(
         record_manifest_owner(&manifest_id, owner_pubkey).await;
     }
 
-    // Modify manifest to set replicas=1 for this node deployment
+    // Keep the original manifest for metadata/sidecar purposes
+    let original_manifest_content = manifest_content.clone();
+
+    let gateway_settings = gateway_sidecar_settings().await;
+
+    // Modify manifest to set replicas=1 and inject required gateway sidecar
     // The original manifest is stored in DHT, but each node deploys with replicas=1
-    let modified_manifest_content = modify_manifest_replicas(&manifest_content)?;
+    let modified_manifest_content =
+        prepare_manifest_for_node(&manifest_id, &manifest_content, &gateway_settings)?;
 
     // Create deployment configuration
-    let deployment_config = create_deployment_config(apply_req);
+    let deployment_config = create_deployment_config(
+        apply_req,
+        &manifest_id,
+        &original_manifest_content,
+        owner_pubkey,
+        &gateway_settings,
+    );
 
     // Select appropriate runtime engine based on manifest type
     let engine_name = select_runtime_engine(&modified_manifest_content).await?;
@@ -427,43 +446,258 @@ async fn process_manifest_deployment(
     Ok(workload_info.id)
 }
 
-/// Modify the manifest to set replicas=1 for single-node deployment
-/// Each node in the cluster will deploy one replica of the workload
-fn modify_manifest_replicas(
+/// Prepare manifest for node execution (replicas=1, gateway sidecar injection)
+fn prepare_manifest_for_node(
+    manifest_id: &str,
     manifest_content: &[u8],
+    gateway_settings: &GatewaySidecarSettings,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let manifest_str = String::from_utf8_lossy(manifest_content);
+    let mut doc: serde_yaml::Value = serde_yaml::from_slice(manifest_content)
+        .map_err(|e| format!("failed to parse manifest for transformation: {}", e))?;
 
-    // Try to parse as YAML/JSON and modify replicas field
-    if let Ok(mut doc) = serde_yaml::from_str::<serde_yaml::Value>(&manifest_str) {
-        // Check for spec.replicas field (Kubernetes-style)
-        if let Some(spec) = doc.get_mut("spec") {
-            if let Some(spec_map) = spec.as_mapping_mut() {
-                spec_map.insert(
-                    serde_yaml::Value::String("replicas".to_string()),
-                    serde_yaml::Value::Number(serde_yaml::Number::from(1)),
-                );
-            }
-        }
-        // Check for top-level replicas field
-        else if doc.get("replicas").is_some() {
-            if let Some(doc_map) = doc.as_mapping_mut() {
-                doc_map.insert(
-                    serde_yaml::Value::String("replicas".to_string()),
-                    serde_yaml::Value::Number(serde_yaml::Number::from(1)),
-                );
-            }
-        }
+    enforce_single_replica(&mut doc);
+    inject_gateway_sidecar(&mut doc, manifest_id, gateway_settings)?;
 
-        // Convert back to YAML bytes
-        let modified_yaml = serde_yaml::to_string(&doc)?;
-        info!("Modified manifest to set replicas=1 for single-node deployment");
-        Ok(modified_yaml.into_bytes())
-    } else {
-        // If parsing fails, return original content unchanged
-        warn!("Failed to parse manifest for replica modification, using original");
-        Ok(manifest_content.to_vec())
+    let modified_yaml = serde_yaml::to_string(&doc)
+        .map_err(|e| format!("failed to serialize modified manifest: {}", e))?;
+    info!(
+        "Prepared manifest {} for single-node deployment with gateway sidecar",
+        manifest_id
+    );
+    Ok(modified_yaml.into_bytes())
+}
+
+fn enforce_single_replica(doc: &mut serde_yaml::Value) {
+    if let Some(mapping) = doc.as_mapping_mut() {
+        mapping.insert(
+            serde_yaml::Value::String("replicas".to_string()),
+            serde_yaml::Value::Number(serde_yaml::Number::from(1)),
+        );
     }
+
+    if let Some(spec) = get_or_insert_mapping(doc, &["spec"]) {
+        spec.insert(
+            serde_yaml::Value::String("replicas".to_string()),
+            serde_yaml::Value::Number(serde_yaml::Number::from(1)),
+        );
+    }
+}
+
+fn inject_gateway_sidecar(
+    doc: &mut serde_yaml::Value,
+    manifest_id: &str,
+    gateway_settings: &GatewaySidecarSettings,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pod_spec = get_or_insert_pod_spec(doc).ok_or_else(|| {
+        format!(
+            "manifest kind missing supported pod spec for gateway injection (manifest_id={})",
+            manifest_id
+        )
+    })?;
+
+    let containers_key = serde_yaml::Value::String("containers".to_string());
+    if !pod_spec.contains_key(&containers_key) {
+        pod_spec.insert(
+            containers_key.clone(),
+            serde_yaml::Value::Sequence(Vec::new()),
+        );
+    }
+
+    let containers_seq = pod_spec
+        .get_mut(&containers_key)
+        .and_then(|value| value.as_sequence_mut())
+        .ok_or_else(|| "spec.containers must be a sequence".to_string())?;
+
+    let already_present = containers_seq.iter().any(|container| {
+        container
+            .as_mapping()
+            .and_then(|mapping| mapping.get(&serde_yaml::Value::String("name".to_string())))
+            .and_then(|value| value.as_str())
+            .map(|name| name == GATEWAY_SIDECAR_CONTAINER_NAME)
+            .unwrap_or(false)
+    });
+
+    if already_present {
+        warn!(
+            "Manifest {} already declares a {} container; skipping duplicate injection",
+            manifest_id, GATEWAY_SIDECAR_CONTAINER_NAME
+        );
+    } else {
+        containers_seq.push(build_gateway_container_spec(gateway_settings));
+    }
+
+    ensure_gateway_volume(pod_spec, manifest_id)?;
+    Ok(())
+}
+
+fn build_gateway_container_spec(gateway_settings: &GatewaySidecarSettings) -> serde_yaml::Value {
+    let mut container = serde_yaml::Mapping::new();
+    container.insert(
+        serde_yaml::Value::String("name".to_string()),
+        serde_yaml::Value::String(GATEWAY_SIDECAR_CONTAINER_NAME.to_string()),
+    );
+    container.insert(
+        serde_yaml::Value::String("image".to_string()),
+        serde_yaml::Value::String(gateway_settings.image.clone()),
+    );
+    container.insert(
+        serde_yaml::Value::String("imagePullPolicy".to_string()),
+        serde_yaml::Value::String("IfNotPresent".to_string()),
+    );
+
+    let mut env_entries = Vec::new();
+    env_entries.push(build_env_var(
+        GATEWAY_METADATA_ENV,
+        &metadata_container_path(),
+    ));
+    env_entries.push(build_env_var(
+        GATEWAY_BOOTSTRAP_ENV,
+        &gateway_settings.bootstrap_peer,
+    ));
+    env_entries.push(build_env_var(GATEWAY_LOG_ENV, GATEWAY_LOG_LEVEL));
+    container.insert(
+        serde_yaml::Value::String("env".to_string()),
+        serde_yaml::Value::Sequence(env_entries),
+    );
+
+    let mut mount = serde_yaml::Mapping::new();
+    mount.insert(
+        serde_yaml::Value::String("name".to_string()),
+        serde_yaml::Value::String(GATEWAY_VOLUME_NAME.to_string()),
+    );
+    mount.insert(
+        serde_yaml::Value::String("mountPath".to_string()),
+        serde_yaml::Value::String(GATEWAY_METADATA_MOUNT_PATH.to_string()),
+    );
+    mount.insert(
+        serde_yaml::Value::String("readOnly".to_string()),
+        serde_yaml::Value::Bool(true),
+    );
+    container.insert(
+        serde_yaml::Value::String("volumeMounts".to_string()),
+        serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(mount)]),
+    );
+
+    serde_yaml::Value::Mapping(container)
+}
+
+fn build_env_var(name: &str, value: &str) -> serde_yaml::Value {
+    let mut entry = serde_yaml::Mapping::new();
+    entry.insert(
+        serde_yaml::Value::String("name".to_string()),
+        serde_yaml::Value::String(name.to_string()),
+    );
+    entry.insert(
+        serde_yaml::Value::String("value".to_string()),
+        serde_yaml::Value::String(value.to_string()),
+    );
+    serde_yaml::Value::Mapping(entry)
+}
+
+fn ensure_gateway_volume(
+    pod_spec: &mut serde_yaml::Mapping,
+    manifest_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let volumes_key = serde_yaml::Value::String("volumes".to_string());
+    if !pod_spec.contains_key(&volumes_key) {
+        pod_spec.insert(volumes_key.clone(), serde_yaml::Value::Sequence(Vec::new()));
+    }
+
+    let volumes_seq = pod_spec
+        .get_mut(&volumes_key)
+        .and_then(|value| value.as_sequence_mut())
+        .ok_or_else(|| "spec.volumes must be a sequence".to_string())?;
+
+    let volume_exists = volumes_seq.iter().any(|volume| {
+        volume
+            .as_mapping()
+            .and_then(|mapping| mapping.get(&serde_yaml::Value::String("name".to_string())))
+            .and_then(|value| value.as_str())
+            .map(|name| name == GATEWAY_VOLUME_NAME)
+            .unwrap_or(false)
+    });
+
+    if volume_exists {
+        return Ok(());
+    }
+
+    let host_dir = metadata_host_dir(manifest_id);
+    let host_dir_str = host_dir
+        .to_str()
+        .ok_or_else(|| format!("invalid metadata host directory for {}", manifest_id))?
+        .to_string();
+
+    let mut host_path = serde_yaml::Mapping::new();
+    host_path.insert(
+        serde_yaml::Value::String("path".to_string()),
+        serde_yaml::Value::String(host_dir_str),
+    );
+    host_path.insert(
+        serde_yaml::Value::String("type".to_string()),
+        serde_yaml::Value::String("DirectoryOrCreate".to_string()),
+    );
+
+    let mut volume_entry = serde_yaml::Mapping::new();
+    volume_entry.insert(
+        serde_yaml::Value::String("name".to_string()),
+        serde_yaml::Value::String(GATEWAY_VOLUME_NAME.to_string()),
+    );
+    volume_entry.insert(
+        serde_yaml::Value::String("hostPath".to_string()),
+        serde_yaml::Value::Mapping(host_path),
+    );
+
+    volumes_seq.push(serde_yaml::Value::Mapping(volume_entry));
+    Ok(())
+}
+
+fn get_or_insert_pod_spec(doc: &mut serde_yaml::Value) -> Option<&mut serde_yaml::Mapping> {
+    let kind_value = doc
+        .as_mapping()
+        .and_then(|mapping| mapping.get(&serde_yaml::Value::String("kind".to_string())))
+        .and_then(|value| value.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "Pod".to_string());
+
+    match kind_value.as_str() {
+        "Pod" => get_or_insert_mapping(doc, &["spec"]),
+        "Deployment" | "ReplicaSet" | "DaemonSet" | "StatefulSet" => {
+            get_or_insert_mapping(doc, &["spec", "template", "spec"])
+        }
+        _ => None,
+    }
+}
+
+fn get_or_insert_mapping<'a>(
+    root: &'a mut serde_yaml::Value,
+    path: &[&str],
+) -> Option<&'a mut serde_yaml::Mapping> {
+    let mut current = root;
+
+    for key in path.iter() {
+        if !current.is_mapping() {
+            *current = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        }
+
+        let mapping = current.as_mapping_mut()?;
+        let yaml_key = serde_yaml::Value::String((*key).to_string());
+
+        let needs_replacement = match mapping.get(&yaml_key) {
+            Some(existing) => !existing.is_mapping(),
+            None => true,
+        };
+
+        if needs_replacement {
+            mapping.insert(
+                yaml_key.clone(),
+                serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+            );
+        }
+
+        current = mapping.get_mut(&yaml_key).unwrap();
+    }
+
+    current.as_mapping_mut()
 }
 
 /// Select the appropriate runtime engine based on manifest content and annotations
@@ -574,7 +808,13 @@ async fn decrypt_manifest_content(
 }
 
 /// Create deployment configuration from apply request
-fn create_deployment_config(apply_req: &machine::ApplyRequest) -> DeploymentConfig {
+fn create_deployment_config(
+    apply_req: &machine::ApplyRequest,
+    manifest_id: &str,
+    original_manifest: &[u8],
+    owner_pubkey: &[u8],
+    gateway_settings: &GatewaySidecarSettings,
+) -> DeploymentConfig {
     let mut config = DeploymentConfig::default();
 
     // Set replicas
@@ -586,6 +826,14 @@ fn create_deployment_config(apply_req: &machine::ApplyRequest) -> DeploymentConf
             .env
             .insert("BEEMESH_OPERATION_ID".to_string(), operation_id.to_string());
     }
+
+    config.gateway = Some(GatewayInjectionConfig {
+        image: gateway_settings.image.clone(),
+        bootstrap_peer: gateway_settings.bootstrap_peer.clone(),
+        manifest_id: manifest_id.to_string(),
+        manifest_bytes: original_manifest.to_vec(),
+        owner_public_key: owner_pubkey.to_vec(),
+    });
 
     config
 }
@@ -921,5 +1169,75 @@ services:
         let config = DeploymentConfig::default();
         assert_eq!(config.replicas, 1);
         assert!(config.env.is_empty());
+    }
+
+    #[test]
+    fn test_prepare_manifest_injects_gateway_sidecar() {
+        let manifest = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo
+spec:
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: demo
+    spec:
+      containers:
+      - name: web
+        image: nginx:latest
+"#;
+
+        let settings = GatewaySidecarSettings {
+            image: "beemesh/gateway:test".to_string(),
+            bootstrap_peer: "/ip4/10.0.0.1/udp/7001/quic-v1".to_string(),
+        };
+
+        let modified = prepare_manifest_for_node("demo", manifest.as_bytes(), &settings)
+            .expect("manifest transforms");
+        let doc: serde_yaml::Value = serde_yaml::from_slice(&modified).expect("yaml parse");
+
+        let containers = doc
+            .get("spec")
+            .and_then(|spec| spec.get("template"))
+            .and_then(|template| template.get("spec"))
+            .and_then(|spec| spec.get("containers"))
+            .and_then(|value| value.as_sequence())
+            .expect("containers sequence present");
+
+        assert!(containers.iter().any(|container| {
+            container.get("name").and_then(|value| value.as_str())
+                == Some(crate::gateway_sidecar::GATEWAY_SIDECAR_CONTAINER_NAME)
+        }));
+
+        let volumes = doc
+            .get("spec")
+            .and_then(|spec| spec.get("template"))
+            .and_then(|template| template.get("spec"))
+            .and_then(|spec| spec.get("volumes"))
+            .and_then(|value| value.as_sequence())
+            .expect("volumes sequence present");
+
+        assert!(volumes.iter().any(|volume| {
+            volume.get("name").and_then(|value| value.as_str())
+                == Some(crate::gateway_sidecar::GATEWAY_VOLUME_NAME)
+        }));
+
+        let volume_entry = volumes
+            .iter()
+            .find(|volume| {
+                volume.get("name").and_then(|value| value.as_str())
+                    == Some(crate::gateway_sidecar::GATEWAY_VOLUME_NAME)
+            })
+            .expect("gateway volume present");
+
+        let host_path = volume_entry
+            .get("hostPath")
+            .and_then(|value| value.get("path"))
+            .and_then(|value| value.as_str())
+            .expect("hostPath path");
+        assert!(host_path.contains("/var/lib/beemesh/gateway/demo"));
     }
 }

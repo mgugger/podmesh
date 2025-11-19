@@ -3,18 +3,24 @@
 //! This module provides a runtime engine that uses Podman to deploy and manage
 //! Kubernetes manifests via `podman kube play`.
 
+use crate::gateway_sidecar::{metadata_file_path, metadata_host_dir};
 use crate::runtime::{
-    DeploymentConfig, PortMapping, RuntimeEngine, RuntimeError, RuntimeResult, WorkloadInfo,
-    WorkloadStatus,
+    DeploymentConfig, GatewayInjectionConfig, PortMapping, RuntimeEngine, RuntimeError,
+    RuntimeResult, WorkloadInfo, WorkloadStatus,
 };
 use async_trait::async_trait;
+use base64::Engine;
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
+use protocol::gateway_metadata::GatewaySidecarMetadata;
 use serde_yaml::Value;
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::RwLock;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+
+const BEEMESH_NETWORK_NAME: &str = "beemesh";
 
 /// Podman runtime engine
 pub struct PodmanEngine {
@@ -347,6 +353,52 @@ impl PodmanEngine {
             debug!("Cleaned up temporary file: {:?}", path);
         }
     }
+
+    async fn ensure_gateway_metadata(
+        &self,
+        gateway_cfg: &GatewayInjectionConfig,
+    ) -> RuntimeResult<()> {
+        let dir = metadata_host_dir(&gateway_cfg.manifest_id);
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(RuntimeError::IoError)?;
+
+        let metadata = GatewaySidecarMetadata {
+            manifest_id: gateway_cfg.manifest_id.clone(),
+            manifest_b64: base64::engine::general_purpose::STANDARD
+                .encode(&gateway_cfg.manifest_bytes),
+            owner_public_key_b64: if gateway_cfg.owner_public_key.is_empty() {
+                None
+            } else {
+                Some(
+                    base64::engine::general_purpose::STANDARD.encode(&gateway_cfg.owner_public_key),
+                )
+            },
+            bootstrap_peer: gateway_cfg.bootstrap_peer.clone(),
+        };
+
+        let metadata_bytes = serde_json::to_vec_pretty(&metadata).map_err(|e| {
+            RuntimeError::CommandFailed(format!(
+                "failed to serialize gateway metadata for {}: {}",
+                gateway_cfg.manifest_id, e
+            ))
+        })?;
+
+        let file_path = metadata_file_path(&gateway_cfg.manifest_id);
+        let mut file = tokio::fs::File::create(&file_path)
+            .await
+            .map_err(RuntimeError::IoError)?;
+        file.write_all(&metadata_bytes)
+            .await
+            .map_err(RuntimeError::IoError)?;
+        file.flush().await.map_err(RuntimeError::IoError)?;
+
+        debug!(
+            "wrote gateway metadata for manifest {} to {:?}",
+            gateway_cfg.manifest_id, file_path
+        );
+        Ok(())
+    }
 }
 
 impl Default for PodmanEngine {
@@ -422,6 +474,10 @@ impl RuntimeEngine for PodmanEngine {
         // Validate manifest first
         self.validate_manifest(manifest_content).await?;
 
+        if let Some(gateway_cfg) = &config.gateway {
+            self.ensure_gateway_metadata(gateway_cfg).await?;
+        }
+
         // Generate unique workload ID
         let workload_id = self.generate_workload_id(manifest_id, manifest_content);
 
@@ -435,6 +491,9 @@ impl RuntimeEngine for PodmanEngine {
 
         // Add --replace flag to overwrite existing pods
         args.push("--replace");
+
+        // Always ensure workloads run inside the beemesh network
+        args.extend(["--network", BEEMESH_NETWORK_NAME]);
 
         // Add replicas if specified and > 1
         let replicas_str;
@@ -468,7 +527,14 @@ impl RuntimeEngine for PodmanEngine {
         // Add runtime-specific options
         for (key, value) in &config.runtime_options {
             match key.as_str() {
-                "network" => args.extend(&["--network", value]),
+                "network" => {
+                    if value != BEEMESH_NETWORK_NAME {
+                        warn!(
+                            "Ignoring runtime network override '{}' for manifest {}; using {}",
+                            value, manifest_id, BEEMESH_NETWORK_NAME
+                        );
+                    }
+                }
                 "volume" => args.extend(&["--volume", value]),
                 "security-opt" => args.extend(&["--security-opt", value]),
                 _ => debug!("Ignoring unknown runtime option: {}={}", key, value),
@@ -545,6 +611,10 @@ impl RuntimeEngine for PodmanEngine {
         // Validate the manifest first
         self.validate_manifest(manifest_content).await?;
 
+        if let Some(gateway_cfg) = &config.gateway {
+            self.ensure_gateway_metadata(gateway_cfg).await?;
+        }
+
         // Generate unique workload ID
         let workload_id = self.generate_workload_id(manifest_id, manifest_content);
 
@@ -558,6 +628,9 @@ impl RuntimeEngine for PodmanEngine {
 
         // Add --replace flag to overwrite existing pods
         args.push("--replace");
+
+        // Always ensure workloads run inside the beemesh network
+        args.extend(["--network", BEEMESH_NETWORK_NAME]);
 
         // Add environment variables
         let mut env_strings = Vec::new();
@@ -573,6 +646,23 @@ impl RuntimeEngine for PodmanEngine {
 
         // Add the manifest file
         args.push(temp_file.to_str().unwrap());
+
+        // Add runtime-specific options (excluding network override)
+        for (key, value) in &config.runtime_options {
+            match key.as_str() {
+                "network" => {
+                    if value != BEEMESH_NETWORK_NAME {
+                        warn!(
+                            "Ignoring runtime network override '{}' for manifest {}; using {}",
+                            value, manifest_id, BEEMESH_NETWORK_NAME
+                        );
+                    }
+                }
+                "volume" => args.extend(&["--volume", value]),
+                "security-opt" => args.extend(&["--security-opt", value]),
+                _ => debug!("Ignoring unknown runtime option: {}={}", key, value),
+            }
+        }
 
         // Execute the deployment
         match self.execute_command(&args).await {
