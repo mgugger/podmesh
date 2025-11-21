@@ -1,8 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "machineplane/machine",
-    "machineplane/tests",
+    "machineplane",
     "workloadplane/workload",
     "workloadplane/gateway",
     "workloadplane/tests",
@@ -37,8 +36,7 @@ crypto = { path = "./shared/crypto" }
 protocol = { path = "./shared/protocol" }
 p2p = { path = "./shared/p2p" }
 axum-support = { path = "./shared/axum_support" }
-scheduler = { path = "./machineplane/scheduler" }
-machine = { path = "./machineplane/machine" }
+machine = { path = "./machineplane" }
 workplane = { path = "./workloadplane/workload" }
 workplane-gateway = { path = "./workloadplane/gateway" }
 flatbuffers = "25.2.10"

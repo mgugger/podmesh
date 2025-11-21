@@ -1,4 +1,7 @@
 use crate::runtime::{PortMapping, RuntimeEngine, RuntimeError, WorkloadInfo, WorkloadStatus};
+use crate::scheduler::{
+    NodeCandidate, NodeCapabilities, Scheduler, SchedulerConfig, SchedulingStrategy,
+};
 use axum::{
     Router,
     body::Bytes,
@@ -165,6 +168,7 @@ pub fn build_router(
 
 pub async fn get_candidates(
     Path(task_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
     State(state): State<RestState>,
     Extension(envelope_metadata): Extension<crate::restapi::envelope_handler::EnvelopeMetadata>,
     _headers: HeaderMap,
@@ -176,6 +180,12 @@ pub async fn get_candidates(
     );
 
     // For direct delivery, simply query available nodes with their public keys
+    let requested_replicas = params
+        .get("replicas")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
+
     let request_id = format!(
         "{}:{}:{}",
         FREE_CAPACITY_PREFIX,
@@ -186,7 +196,7 @@ pub async fn get_candidates(
         500u32,
         512u64 * 1024 * 1024,
         10u64 * 1024 * 1024 * 1024,
-        1u32, // Just need 1 winning node
+        requested_replicas as u32,
     );
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<String>();
     let _ = state.control_tx.send(
@@ -270,13 +280,80 @@ pub async fn get_candidates(
         }
     }
 
-    let response_data = protocol::machine::build_candidates_response_with_keys(true, &candidates);
+    if candidates.is_empty() {
+        log::warn!(
+            "get_candidates: no eligible candidates discovered for task_id={}",
+            task_id
+        );
+        let response_data = protocol::machine::build_candidates_response_with_keys(false, &[]);
+        return create_response_for_candidates(&state, &response_data, &envelope_metadata).await;
+    }
 
-    // Use KEM key from envelope metadata for secure response encryption if available
+    let scheduler = Scheduler::new(SchedulerConfig {
+        strategy: SchedulingStrategy::RoundRobin,
+        max_candidates: Some(requested_replicas),
+        enable_load_balancing: false,
+    });
+
+    let node_candidates: Vec<NodeCandidate> = candidates
+        .iter()
+        .map(|(peer_id, _)| NodeCandidate {
+            node_id: peer_id.clone(),
+            load_factor: 0.0,
+            available: true,
+            capabilities: NodeCapabilities::default(),
+        })
+        .collect();
+
+    let scheduling_plan = match scheduler.schedule_workload(&node_candidates, requested_replicas) {
+        Ok(plan) => plan,
+        Err(err) => {
+            log::warn!(
+                "get_candidates: scheduler failed for task_id={} replicas={} err={:?}",
+                task_id,
+                requested_replicas,
+                err
+            );
+            let response_data = protocol::machine::build_candidates_response_with_keys(false, &[]);
+            return create_response_for_candidates(&state, &response_data, &envelope_metadata)
+                .await;
+        }
+    };
+
+    let mut selected_nodes: Vec<(String, String)> = Vec::new();
+    for candidate_idx in scheduling_plan.selected_candidates {
+        if let Some(entry) = candidates.get(candidate_idx) {
+            selected_nodes.push(entry.clone());
+        }
+    }
+
+    {
+        let mut store = state.task_store.write().await;
+        if let Some(record) = store.get_mut(&task_id) {
+            record.assigned_peers = Some(
+                selected_nodes
+                    .iter()
+                    .map(|(peer_id, _)| peer_id.clone())
+                    .collect(),
+            );
+        }
+    }
+
+    let response_data =
+        protocol::machine::build_candidates_response_with_keys(true, &selected_nodes);
+
+    create_response_for_candidates(&state, &response_data, &envelope_metadata).await
+}
+
+async fn create_response_for_candidates(
+    state: &RestState,
+    response_data: &[u8],
+    envelope_metadata: &crate::restapi::envelope_handler::EnvelopeMetadata,
+) -> Result<axum::response::Response<axum::body::Body>, axum::http::StatusCode> {
     if !envelope_metadata.kem_pubkey.is_empty() {
         create_encrypted_response_with_key(
             &state.envelope_handler,
-            &response_data,
+            response_data,
             "candidates_response",
             envelope_metadata.peer_id.as_deref(),
             &envelope_metadata.kem_pubkey,
@@ -284,7 +361,7 @@ pub async fn get_candidates(
         .await
     } else {
         // No KEM key in metadata, return unencrypted response
-        create_response_with_fallback(&response_data).await
+        create_response_with_fallback(response_data).await
     }
 }
 

@@ -26,6 +26,7 @@ fn build_workload_config(
     rest_port: u16,
     bootstrap_peer_strings: Vec<String>,
     enable_proxy_provider: bool,
+    enable_ingress: bool,
 ) -> Config {
     Config {
         bootstrap_peer_strings,
@@ -35,6 +36,7 @@ fn build_workload_config(
         rest_port,
         disable_rest_api: false,
         enable_proxy_provider,
+        enable_ingress,
     }
 }
 
@@ -44,16 +46,16 @@ async fn gateway_discovers_workload_provider() -> Result<()> {
     let mut workloads = Vec::new();
 
     let test_result: Result<()> = async {
-        let first = start_workload(Vec::new(), true)?;
+        let first = start_workload(Vec::new(), true, false)?;
         let provider_peer_id = first.peer_id.clone();
         let first_bootstrap = first.bootstrap_addr.clone();
         workloads.push(first);
 
-        let second = start_workload(vec![first_bootstrap.clone()], false)?;
+        let second = start_workload(vec![first_bootstrap.clone()], false, false)?;
         let second_bootstrap = second.bootstrap_addr.clone();
         workloads.push(second);
 
-        let third = start_workload(vec![first_bootstrap, second_bootstrap], false)?;
+        let third = start_workload(vec![first_bootstrap, second_bootstrap], false, false)?;
         workloads.push(third);
 
         for node in &workloads {
@@ -155,7 +157,7 @@ async fn gateway_discovers_workload_provider() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingress_proxies_requests_via_gateway() -> Result<()> {
     init_tracing();
-    let mut handle = start_workload(Vec::new(), true)?;
+    let mut handle = start_workload(Vec::new(), true, true)?;
     let mut gateway_shutdown: Option<oneshot::Sender<()>> = None;
     let mut gateway_task: Option<JoinHandle<()>> = None;
     let mut app_server: Option<JoinHandle<()>> = None;
@@ -254,6 +256,7 @@ impl WorkloadHandle {
 fn start_workload(
     bootstrap_peers: Vec<String>,
     enable_proxy_provider: bool,
+    enable_ingress: bool,
 ) -> Result<WorkloadHandle> {
     let libp2p_port = allocate_udp_port();
     let rest_port = allocate_tcp_port();
@@ -262,6 +265,7 @@ fn start_workload(
         rest_port,
         bootstrap_peers,
         enable_proxy_provider,
+        enable_ingress,
     );
     let mut workload = Workload::new(config)?;
     workload.start()?;

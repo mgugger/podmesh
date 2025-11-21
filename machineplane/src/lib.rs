@@ -19,8 +19,14 @@ pub mod provider;
 pub mod resource_verifier;
 pub mod restapi;
 pub mod runtime;
+pub mod scheduler;
 pub mod workload_integration;
 pub mod workload_manager;
+
+pub use scheduler::{
+    NodeCandidate, NodeCapabilities, Scheduler, SchedulerConfig, SchedulerStats, SchedulingError,
+    SchedulingPlan, SchedulingStrategy,
+};
 
 /// beemesh Host Agent
 #[derive(Parser, Debug)]

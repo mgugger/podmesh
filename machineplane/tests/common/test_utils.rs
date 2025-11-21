@@ -1,7 +1,10 @@
 use machine::{
-    Cli, gateway_sidecar::DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR,
-    gateway_sidecar::DEFAULT_GATEWAY_IMAGE, start_machine,
+    gateway_sidecar::DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR,
+    gateway_sidecar::DEFAULT_GATEWAY_IMAGE,
+    start_machine,
+    Cli,
 };
+use std::path::PathBuf;
 use std::sync::Once;
 use std::time::Duration;
 use tokio::process::{Child, Command};
@@ -77,6 +80,15 @@ impl Drop for NodeGuard {
     }
 }
 
+fn workspace_root() -> PathBuf {
+    // machine crate now lives in <workspace>/machineplane, so one parent up is workspace.
+    let machine_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    machine_dir
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 #[allow(dead_code)]
 pub fn make_test_cli(
     rest_api_port: u16,
@@ -126,18 +138,8 @@ pub async fn start_nodes_as_processes(clis: Vec<Cli>, startup_delay: Duration) -
         cleaned_up: false,
     };
 
-    // Build the machine binary path - it should be available in the workspace root target/debug/
-    let current_dir = std::env::current_dir().expect("failed to get current dir");
-    let machine_binary = if current_dir.ends_with("tests") {
-        // We're running from tests/ directory, go up to workspace root
-        current_dir
-            .parent()
-            .expect("no parent dir")
-            .join("target/debug/machine")
-    } else {
-        // We're running from workspace root
-        current_dir.join("target/debug/machine")
-    };
+    // Build the machine binary path - assume `cargo test` runs from workspace root
+    let machine_binary = workspace_root().join("target/debug/machine");
 
     if !machine_binary.exists() {
         panic!(
@@ -147,7 +149,6 @@ pub async fn start_nodes_as_processes(clis: Vec<Cli>, startup_delay: Duration) -
     }
 
     for cli in clis {
-        // Spawn machine process with CLI args
         let mut cmd = Command::new(&machine_binary);
         cmd.arg("--ephemeral")
             .arg("--rest-api-host")
@@ -193,10 +194,8 @@ pub async fn start_nodes_as_processes(clis: Vec<Cli>, startup_delay: Duration) -
             cmd.arg("--bootstrap-peer").arg(bootstrap);
         }
 
-        // Set environment variables for this process
         cmd.env("RUST_LOG", "info,libp2p=warn,quinn=warn");
 
-        //println!("Starting machine process on port {}", cli.rest_api_port);
         match cmd.spawn() {
             Ok(child) => {
                 guard.processes.push(child);
@@ -211,8 +210,7 @@ pub async fn start_nodes_as_processes(clis: Vec<Cli>, startup_delay: Duration) -
 }
 
 /// Start a list of nodes given their CLIs. Returns a NodeGuard which will abort
-/// the spawned background tasks on cleanup. `startup_delay` is awaited after
-/// each node start to give it a moment to initialize before starting the next.
+/// the spawned background tasks on cleanup.
 #[allow(dead_code)]
 pub async fn start_nodes(clis: Vec<Cli>, startup_delay: Duration) -> NodeGuard {
     let mut guard = NodeGuard {
@@ -238,7 +236,6 @@ pub fn setup_cleanup_hook() {
     CLEANUP_HOOK_INIT.call_once(|| {
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            // Run cleanup before original panic handling
             eprintln!("Test panic detected, running global cleanup...");
             global_cleanup();
             default_hook(info);
@@ -250,21 +247,17 @@ pub fn setup_cleanup_hook() {
 pub fn global_cleanup() {
     eprintln!("Running global cleanup: pkill + rm commands");
 
-    // Kill any remaining machine processes - be more specific about the pattern
     let pkill_result = std::process::Command::new("pkill")
         .args(["-f", "target/debug/machine"])
         .output();
 
-    match pkill_result {
-        Ok(output) => {
-            if !output.stdout.is_empty() {
-                eprintln!("pkill stdout: {}", String::from_utf8_lossy(&output.stdout));
-            }
-            if !output.stderr.is_empty() {
-                eprintln!("pkill stderr: {}", String::from_utf8_lossy(&output.stderr));
-            }
+    if let Ok(output) = pkill_result {
+        if !output.stdout.is_empty() {
+            eprintln!("pkill stdout: {}", String::from_utf8_lossy(&output.stdout));
         }
-        Err(e) => eprintln!("pkill command failed: {}", e),
+        if !output.stderr.is_empty() {
+            eprintln!("pkill stderr: {}", String::from_utf8_lossy(&output.stderr));
+        }
     }
 
     eprintln!("Global cleanup completed");

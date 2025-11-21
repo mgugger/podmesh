@@ -21,7 +21,6 @@ dirs = { workspace = true }
 saorsa-pqc = { workspace = true }
 crypto = { workspace = true }
 protocol = { workspace = true }
-scheduler = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 uuid = { workspace = true }

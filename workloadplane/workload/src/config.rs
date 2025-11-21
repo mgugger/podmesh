@@ -7,6 +7,7 @@ pub struct Config {
     pub rest_port: u16,
     pub disable_rest_api: bool,
     pub enable_proxy_provider: bool,
+    pub enable_ingress: bool,
 }
 
 impl Config {

@@ -1,11 +1,14 @@
 use serial_test::serial;
-
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::sleep;
 
-use integration::apply_common::{
-    check_workload_deployment, get_peer_ids, setup_test_environment, start_cluster_nodes,
+mod common;
+use common::apply_common::{
+    check_workload_deployment,
+    get_peer_ids,
+    setup_test_environment,
+    start_cluster_nodes,
     wait_for_mesh_formation,
 };
 
@@ -22,7 +25,7 @@ async fn test_disabled_nodes_do_not_schedule_workloads() {
     }
 
     let manifest_path = PathBuf::from(format!(
-        "{}/sample_manifests/nginx.yml",
+        "{}/tests/sample_manifests/nginx.yml",
         env!("CARGO_MANIFEST_DIR")
     ));
 
@@ -79,7 +82,7 @@ async fn test_scheduling_fails_when_all_nodes_disabled() {
     }
 
     let manifest_path = PathBuf::from(format!(
-        "{}/sample_manifests/nginx.yml",
+        "{}/tests/sample_manifests/nginx.yml",
         env!("CARGO_MANIFEST_DIR")
     ));
 
@@ -92,7 +95,7 @@ async fn test_scheduling_fails_when_all_nodes_disabled() {
 
     let err_msg = apply_result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("No candidate nodes available for scheduling"),
+        err_msg.contains("Machine returned no nodes for scheduling"),
         "Expected error mentioning missing candidate nodes, got: {}",
         err_msg
     );

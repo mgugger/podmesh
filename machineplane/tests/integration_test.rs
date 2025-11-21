@@ -1,22 +1,16 @@
 use env_logger::Env;
 use log::info;
-
 use std::time::Duration;
 use tokio::time::sleep;
 
-mod test_utils;
-use test_utils::{make_test_cli, setup_cleanup_hook, start_nodes};
-
-// We will start machines directly in this process by calling `start_machine(cli).await`.
+mod common;
+use common::test_utils::{make_test_cli, setup_cleanup_hook, start_nodes};
 
 #[tokio::test]
 async fn test_run_host_application() {
-    // Setup cleanup hook and initialize logger
     setup_cleanup_hook();
     let _ = env_logger::Builder::from_env(Env::default().default_filter_or("warn")).try_init();
 
-    // start three nodes using the reusable helper (first node runs REST+machine, others disabled APIs)
-    // node_3000 gets fixed libp2p port 4001, node_3100 gets port 4002, both serve as bootstrap peers
     let cli1 = make_test_cli(3000, false, true, None, vec![], 4001, false);
     let cli2 = make_test_cli(
         3100,
@@ -27,7 +21,6 @@ async fn test_run_host_application() {
         4002,
         false,
     );
-    // node_3200 uses both nodes as bootstrap peers for resilience
     let bootstrap_peers = vec![
         "/ip4/127.0.0.1/udp/4001/quic-v1".to_string(),
         "/ip4/127.0.0.1/udp/4002/quic-v1".to_string(),
@@ -36,11 +29,9 @@ async fn test_run_host_application() {
 
     let mut guard = start_nodes(vec![cli1, cli2, cli3], Duration::from_secs(1)).await;
 
-    // wait for the mesh to form (poll until peers appear or timeout)
     let verify_peers = wait_for_peers(Duration::from_secs(15)).await;
     let health = check_health().await;
 
-    // Test the pubkey endpoint
     let kem_pubkey_result = check_pubkey("kem_pubkey").await;
     let signing_pubkey_result = check_pubkey("signing_pubkey").await;
 
@@ -51,19 +42,18 @@ async fn test_run_host_application() {
         verify_peers["peers"]
             .as_array()
             .expect("peers should be an array")
-            .to_vec()
             .len()
             == 2,
         "Expected at least two peers in the mesh, got {:?}",
         verify_peers
     );
     assert!(
-        kem_pubkey_result.is_empty() == false,
+        !kem_pubkey_result.is_empty(),
         "Expected kem_pubkey field in response, got: {}",
         kem_pubkey_result
     );
     assert!(
-        signing_pubkey_result.is_empty() == false,
+        !signing_pubkey_result.is_empty(),
         "Expected signing_pubkey field in response, got: {}",
         signing_pubkey_result
     );
@@ -103,8 +93,7 @@ async fn verify_peers() -> serde_json::Value {
         .unwrap();
     let json = resp.json().await;
     info!("{:?}", json);
-    let nodes: serde_json::Value = json.unwrap_or_default();
-    nodes
+    json.unwrap_or_default()
 }
 
 async fn wait_for_peers(timeout: Duration) -> serde_json::Value {

@@ -366,7 +366,6 @@ dependencies = [
  "rand 0.8.5",
  "reqwest",
  "saorsa-pqc",
- "scheduler",
  "serde_json",
  "serde_yaml",
  "tokio",
@@ -1765,24 +1764,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "integration"
-version = "0.1.0"
-dependencies = [
- "beectl",
- "crypto",
- "env_logger",
- "futures",
- "log",
- "machine",
- "reqwest",
- "scheduler",
- "serde_json",
- "serde_yaml",
- "serial_test",
- "tokio",
-]
-
-[[package]]
 name = "ipconfig"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2317,6 +2298,7 @@ dependencies = [
  "axum",
  "axum-support",
  "base64 0.21.7",
+ "beectl",
  "clap",
  "crypto",
  "dirs",
@@ -2329,11 +2311,12 @@ dependencies = [
  "p2p",
  "protocol",
  "rand 0.8.5",
+ "reqwest",
  "saorsa-pqc",
- "scheduler",
  "serde",
  "serde_json",
  "serde_yaml",
+ "serial_test",
  "thiserror 1.0.69",
  "tokio",
  "uuid",
@@ -3401,14 +3384,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46e6f046b7fef48e2660c57ed794263155d713de679057f2d0c169bfc6e756cc"
 dependencies = [
  "sdd",
-]
-
-[[package]]
-name = "scheduler"
-version = "0.1.0"
-dependencies = [
- "log",
- "tokio",
 ]
 
 [[package]]

@@ -377,12 +377,18 @@ impl FlatbufferClient {
     }
 
     /// Get candidates using flatbuffer capacity request
-    pub async fn get_candidates(&self, task_id: &str) -> Result<Vec<String>> {
-        log::debug!("get_candidates: called with task_id={}", task_id);
+    pub async fn get_candidates(&self, task_id: &str, replicas: usize) -> Result<Vec<String>> {
+        let requested = std::cmp::max(1, replicas);
+        log::debug!(
+            "get_candidates: called with task_id={} replicas={}",
+            task_id,
+            requested
+        );
         let url = format!(
-            "{}/tasks/{}/candidates",
+            "{}/tasks/{}/candidates?replicas={}",
             self.base_url.trim_end_matches('/'),
-            task_id
+            task_id,
+            requested
         );
         log::debug!("get_candidates: requesting URL: {}", url);
         println!("CLI: get_candidates requesting URL: {}", url);

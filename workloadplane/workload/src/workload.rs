@@ -55,12 +55,16 @@ impl Workload {
         self.p2p_node = Some(node);
         self.peer_id = Some(peer_id);
 
-        let ingress_server = ingress::IngressServer::spawn(
-            self.cfg.rest_host.clone(),
-            DEFAULT_INGRESS_PORT,
-            ingress::proxy_gateway_client(proxy_client),
-        )?;
-        self.ingress = Some(ingress_server);
+        if self.cfg.enable_ingress {
+            let ingress_server = ingress::IngressServer::spawn(
+                self.cfg.rest_host.clone(),
+                DEFAULT_INGRESS_PORT,
+                ingress::proxy_gateway_client(proxy_client),
+            )?;
+            self.ingress = Some(ingress_server);
+        } else {
+            info!("workload ingress disabled");
+        }
         Ok(())
     }
 

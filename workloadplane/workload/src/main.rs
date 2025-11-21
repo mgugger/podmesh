@@ -35,6 +35,12 @@ struct Args {
         default_value_t = false
     )]
     enable_proxy_provider: bool,
+    #[arg(
+        long = "enable-ingress",
+        env = "enable_ingress",
+        default_value_t = false
+    )]
+    enable_ingress: bool,
 }
 
 #[tokio::main]
@@ -56,6 +62,7 @@ async fn run() -> Result<()> {
         rest_port,
         disable_rest_api,
         enable_proxy_provider,
+        enable_ingress,
     } = Args::parse();
 
     let mut cfg = Config {
@@ -66,6 +73,7 @@ async fn run() -> Result<()> {
         rest_port,
         disable_rest_api,
         enable_proxy_provider,
+        enable_ingress,
     };
     cfg.apply_defaults();
 

@@ -1,6 +1,6 @@
 //! Workload Scheduler
 //!
-//! This crate provides scheduling strategies for placing workloads on available nodes
+//! This module provides scheduling strategies for placing workloads on available nodes
 //! in a decentralized environment. The scheduler focuses on optimal node selection
 //! for workload placement rather than cryptographic distribution.
 

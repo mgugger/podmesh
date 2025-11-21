@@ -3,12 +3,10 @@ use crypto::{encrypt_payload_for_recipient, ensure_keypair_on_disk};
 use log::debug;
 use log::error;
 use log::info;
-use scheduler::{NodeCandidate, NodeCapabilities, Scheduler, SchedulerConfig, SchedulingStrategy};
 use uuid::Uuid;
 
 use serde_json::Value as JsonValue;
 use serde_yaml;
-use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 
@@ -24,6 +22,24 @@ fn extract_manifest_name_from_json(manifest_json: &serde_json::Value) -> Option<
         .get("name")?
         .as_str()
         .map(|s| s.to_string())
+}
+
+fn parse_selected_nodes(peers: &[String]) -> anyhow::Result<Vec<(String, String)>> {
+    let mut nodes = Vec::with_capacity(peers.len());
+    for entry in peers {
+        if let Some((peer_id, pubkey_b64)) = entry.split_once(':') {
+            if peer_id.is_empty() || pubkey_b64.is_empty() {
+                anyhow::bail!("Invalid candidate format (empty fields): '{}'", entry);
+            }
+            nodes.push((peer_id.to_string(), pubkey_b64.to_string()));
+        } else {
+            anyhow::bail!(
+                "Invalid candidate format: expected 'peer_id:pubkey_b64', got '{}'",
+                entry
+            );
+        }
+    }
+    Ok(nodes)
 }
 
 pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> anyhow::Result<String> {
@@ -107,94 +123,40 @@ pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> anyhow::Result
 
     // 1) Get candidates for node selection
     debug!("About to call get_candidates...");
-    let peers = fb_client.get_candidates(&manifest_id).await?;
+    let peers = fb_client.get_candidates(&manifest_id, replicas).await?;
     debug!(
         "apply_file: get_candidates completed successfully, found {} peers",
         peers.len()
     );
 
     if peers.is_empty() {
-        anyhow::bail!("No candidate nodes available for scheduling");
+        anyhow::bail!("Machine returned no nodes for scheduling");
     }
 
-    // Ensure we have enough peers for the requested replicas
     if peers.len() < replicas {
         anyhow::bail!(
-            "Not enough candidate nodes available: need {}, got {}",
+            "Machine returned insufficient nodes: need {}, got {}",
             replicas,
             peers.len()
         );
     }
 
-    // 2) Parse peer IDs and public keys from candidates response and use scheduler
-    // Expected format: "peer_id:pubkey_b64"
-    let mut node_candidates = Vec::new();
-    let mut peer_info_map = HashMap::new();
-
-    for peer in &peers {
-        if let Some(colon_pos) = peer.find(':') {
-            let peer_id = &peer[..colon_pos];
-            let pubkey_b64 = &peer[colon_pos + 1..];
-
-            // Store peer info for later lookup
-            peer_info_map.insert(peer_id.to_string(), pubkey_b64.to_string());
-
-            // Create NodeCandidate for scheduler
-            let candidate = NodeCandidate {
-                node_id: peer_id.to_string(),
-                load_factor: 0.0, // We don't have load info, assume available
-                available: true,
-                capabilities: NodeCapabilities::default(),
-            };
-            node_candidates.push(candidate);
-        } else {
-            anyhow::bail!(
-                "Invalid candidate format: expected 'peer_id:pubkey_b64', got '{}'",
-                peer
-            );
-        }
+    let mut selected_nodes = parse_selected_nodes(&peers)?;
+    if selected_nodes.len() > replicas {
+        selected_nodes.truncate(replicas);
     }
 
-    debug!(
-        "Parsed {} node candidates from peers",
-        node_candidates.len()
-    );
-
-    // 3) Use scheduler to select candidates with round-robin strategy
-    let scheduler_config = SchedulerConfig {
-        strategy: SchedulingStrategy::RoundRobin,
-        max_candidates: None,
-        enable_load_balancing: false,
-    };
-    let scheduler = Scheduler::new(scheduler_config);
-
-    debug!(
-        "Using scheduler with round-robin strategy to select {} replicas from {} candidates",
-        replicas,
-        node_candidates.len()
-    );
-    let scheduling_plan = scheduler.schedule_workload(&node_candidates, replicas)?;
-    debug!(
-        "Scheduler selected candidate indices: {:?}",
-        scheduling_plan.selected_candidates
-    );
-
-    // 4) Build selected_nodes list from scheduling plan
-    let mut selected_nodes: Vec<(String, String)> = Vec::new();
-    for candidate_idx in scheduling_plan.selected_candidates {
-        let candidate = &node_candidates[candidate_idx];
-        let node_id = &candidate.node_id;
-        let pubkey_b64 = peer_info_map
-            .get(node_id)
-            .ok_or_else(|| anyhow::anyhow!("Missing pubkey for node: {}", node_id))?;
-        selected_nodes.push((node_id.clone(), pubkey_b64.clone()));
+    if selected_nodes.len() < replicas {
+        anyhow::bail!(
+            "Machine returned invalid node assignments (expected {} entries)",
+            replicas
+        );
     }
 
     info!(
-        "Scheduled {} nodes for {} replicas using {:?} strategy: {:?}",
+        "Scheduled {} nodes for {} replicas via machine selection: {:?}",
         selected_nodes.len(),
         replicas,
-        scheduling_plan.strategy_used,
         selected_nodes.iter().map(|(id, _)| id).collect::<Vec<_>>()
     );
     debug!("Selected nodes with pubkeys: {:?}", selected_nodes);
@@ -419,90 +381,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_candidate_parsing_and_scheduling() {
-        // Test data in the format returned by get_candidates
-        let peers = vec![
-            "peer1:dGVzdF9wdWJrZXlfMQ==".to_string(),
-            "peer2:dGVzdF9wdWJrZXlfMg==".to_string(),
-            "peer3:dGVzdF9wdWJrZXlfMw==".to_string(),
-            "peer4:dGVzdF9wdWJrZXlfNA==".to_string(),
-        ];
+    fn test_parse_selected_nodes_success() {
+        let peers = vec!["peer1:dGVzdDE=".to_string(), "peer2:dGVzdDI=".to_string()];
 
-        // Parse candidates
-        let mut node_candidates = Vec::new();
-        let mut peer_info_map = HashMap::new();
-
-        for peer in &peers {
-            if let Some(colon_pos) = peer.find(':') {
-                let peer_id = &peer[..colon_pos];
-                let pubkey_b64 = &peer[colon_pos + 1..];
-
-                peer_info_map.insert(peer_id.to_string(), pubkey_b64.to_string());
-
-                let candidate = NodeCandidate {
-                    node_id: peer_id.to_string(),
-                    load_factor: 0.0,
-                    available: true,
-                    capabilities: NodeCapabilities::default(),
-                };
-                node_candidates.push(candidate);
-            }
-        }
-
-        // Test scheduler with round-robin
-        let scheduler_config = SchedulerConfig {
-            strategy: SchedulingStrategy::RoundRobin,
-            max_candidates: None,
-            enable_load_balancing: false,
-        };
-        let scheduler = Scheduler::new(scheduler_config);
-
-        // Schedule 2 replicas
-        let replicas = 2;
-        let scheduling_plan = scheduler
-            .schedule_workload(&node_candidates, replicas)
-            .unwrap();
-
-        assert_eq!(scheduling_plan.selected_candidates.len(), replicas);
-        assert_eq!(scheduling_plan.total_candidates, peers.len());
-        assert_eq!(
-            scheduling_plan.strategy_used,
-            SchedulingStrategy::RoundRobin
-        );
-
-        // Verify selected nodes can be mapped back to peer info
-        for candidate_idx in &scheduling_plan.selected_candidates {
-            let candidate = &node_candidates[*candidate_idx];
-            assert!(peer_info_map.contains_key(&candidate.node_id));
-        }
+        let parsed = parse_selected_nodes(&peers).expect("parse should succeed");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0, "peer1");
+        assert_eq!(parsed[0].1, "dGVzdDE=");
+        assert_eq!(parsed[1].0, "peer2");
     }
 
     #[test]
-    fn test_invalid_peer_format() {
-        let peers = vec!["invalid_peer_format".to_string()];
-
-        // This should result in a format error when parsing
-        let mut node_candidates = Vec::new();
-        let mut has_error = false;
-
-        for peer in &peers {
-            if let Some(colon_pos) = peer.find(':') {
-                let peer_id = &peer[..colon_pos];
-                let _pubkey_b64 = &peer[colon_pos + 1..];
-
-                let candidate = NodeCandidate {
-                    node_id: peer_id.to_string(),
-                    load_factor: 0.0,
-                    available: true,
-                    capabilities: NodeCapabilities::default(),
-                };
-                node_candidates.push(candidate);
-            } else {
-                has_error = true;
-            }
-        }
-
-        assert!(has_error);
-        assert!(node_candidates.is_empty());
+    fn test_parse_selected_nodes_invalid_format() {
+        let peers = vec!["invalid".to_string()];
+        let result = parse_selected_nodes(&peers);
+        assert!(result.is_err());
     }
 }
