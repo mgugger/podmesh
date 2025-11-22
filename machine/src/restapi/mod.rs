@@ -926,11 +926,13 @@ pub async fn delete_task(
 
     // Get our local peer ID for comparison
     let (local_peer_tx, mut local_peer_rx) = mpsc::unbounded_channel();
-    if let Err(e) = state.control_tx.send(
-        crate::podmesh_p2p::control::Libp2pControl::GetLocalPeerId {
-            reply_tx: local_peer_tx,
-        },
-    ) {
+    if let Err(e) =
+        state
+            .control_tx
+            .send(crate::podmesh_p2p::control::Libp2pControl::GetLocalPeerId {
+                reply_tx: local_peer_tx,
+            })
+    {
         error!("Failed to get local peer ID: {}", e);
         let error_response = protocol::machine::build_delete_response(
             false,

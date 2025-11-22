@@ -5,9 +5,9 @@
 //! the runtime engines and provider announcement system.
 
 use crate::gateway_sidecar::{
-    GATEWAY_BOOTSTRAP_ENV, GATEWAY_LOG_ENV, GATEWAY_LOG_LEVEL, GATEWAY_METADATA_ENV,
-    GATEWAY_METADATA_MOUNT_PATH, GATEWAY_SIDECAR_CONTAINER_NAME, GATEWAY_VOLUME_NAME,
-    GatewaySidecarSettings, gateway_sidecar_settings, metadata_container_path, metadata_host_dir,
+    GATEWAY_BOOTSTRAP_ENV, GATEWAY_LOG_ENV, GATEWAY_LOG_LEVEL, GATEWAY_METADATA_BLOB_ENV,
+    GATEWAY_SIDECAR_CONTAINER_NAME, GatewaySidecarSettings, build_inline_metadata_blob,
+    gateway_sidecar_settings,
 };
 use crate::podmesh_p2p::behaviour::MyBehaviour;
 use crate::provider::{ProviderConfig, ProviderManager};
@@ -15,6 +15,7 @@ use crate::resource_verifier::ResourceVerifier;
 use crate::runtime::{
     DeploymentConfig, GatewayInjectionConfig, RuntimeRegistry, create_default_registry,
 };
+use crate::yaml_utils::{parse_yaml_documents_from_slice, serialize_yaml_documents};
 use base64::Engine;
 use libp2p::Swarm;
 use libp2p::request_response;
@@ -344,10 +345,20 @@ async fn process_manifest_deployment(
 
     let gateway_settings = gateway_sidecar_settings().await;
 
-    // Modify manifest to set replicas=1 and inject required gateway sidecar
-    // The original manifest is stored in DHT, but each node deploys with replicas=1
-    let modified_manifest_content =
-        prepare_manifest_for_node(&manifest_id, &manifest_content, &gateway_settings)?;
+    // Build inline metadata for the injected gateway sidecar and update the manifest to run on a single node.
+    let metadata_blob_b64 = build_inline_metadata_blob(
+        &manifest_id,
+        original_manifest_content.as_slice(),
+        owner_pubkey,
+        &gateway_settings.bootstrap_peer,
+    )?;
+
+    let modified_manifest_content = prepare_manifest_for_node(
+        &manifest_id,
+        &manifest_content,
+        &gateway_settings,
+        &metadata_blob_b64,
+    )?;
 
     // Create deployment configuration
     let deployment_config = create_deployment_config(
@@ -451,14 +462,33 @@ fn prepare_manifest_for_node(
     manifest_id: &str,
     manifest_content: &[u8],
     gateway_settings: &GatewaySidecarSettings,
+    metadata_blob_b64: &str,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut doc: serde_yaml::Value = serde_yaml::from_slice(manifest_content)
+    let mut docs = parse_yaml_documents_from_slice(manifest_content)
         .map_err(|e| format!("failed to parse manifest for transformation: {}", e))?;
 
-    enforce_single_replica(&mut doc);
-    inject_gateway_sidecar(&mut doc, manifest_id, gateway_settings)?;
+    if docs.is_empty() {
+        return Err("manifest did not contain any YAML documents".into());
+    }
 
-    let modified_yaml = serde_yaml::to_string(&doc)
+    let mut injected = 0usize;
+    for doc in docs.iter_mut() {
+        if supports_workload_resource(doc) {
+            enforce_single_replica(doc);
+            if inject_gateway_sidecar(doc, manifest_id, gateway_settings, metadata_blob_b64)? {
+                injected += 1;
+            }
+        }
+    }
+
+    if injected == 0 {
+        warn!(
+            "Manifest {} did not include a pod-spec workload; gateway sidecar injection skipped",
+            manifest_id
+        );
+    }
+
+    let modified_yaml = serialize_yaml_documents(&docs)
         .map_err(|e| format!("failed to serialize modified manifest: {}", e))?;
     info!(
         "Prepared manifest {} for single-node deployment with gateway sidecar",
@@ -467,7 +497,31 @@ fn prepare_manifest_for_node(
     Ok(modified_yaml.into_bytes())
 }
 
+fn manifest_kind<'a>(doc: &'a serde_yaml::Value) -> Option<&'a str> {
+    doc.as_mapping()
+        .and_then(|mapping| mapping.get(&serde_yaml::Value::String("kind".to_string())))
+        .and_then(|value| value.as_str())
+}
+
+fn supports_workload_resource(doc: &serde_yaml::Value) -> bool {
+    matches!(
+        manifest_kind(doc),
+        Some("Pod" | "Deployment" | "ReplicaSet" | "DaemonSet" | "StatefulSet")
+    )
+}
+
+fn supports_replica_scaling(doc: &serde_yaml::Value) -> bool {
+    matches!(
+        manifest_kind(doc),
+        Some("Deployment" | "ReplicaSet" | "StatefulSet")
+    )
+}
+
 fn enforce_single_replica(doc: &mut serde_yaml::Value) {
+    if !supports_replica_scaling(doc) {
+        return;
+    }
+
     if let Some(mapping) = doc.as_mapping_mut() {
         mapping.insert(
             serde_yaml::Value::String("replicas".to_string()),
@@ -487,13 +541,11 @@ fn inject_gateway_sidecar(
     doc: &mut serde_yaml::Value,
     manifest_id: &str,
     gateway_settings: &GatewaySidecarSettings,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let pod_spec = get_or_insert_pod_spec(doc).ok_or_else(|| {
-        format!(
-            "manifest kind missing supported pod spec for gateway injection (manifest_id={})",
-            manifest_id
-        )
-    })?;
+    metadata_blob_b64: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(pod_spec) = get_or_insert_pod_spec(doc) else {
+        return Ok(false);
+    };
 
     let containers_key = serde_yaml::Value::String("containers".to_string());
     if !pod_spec.contains_key(&containers_key) {
@@ -522,15 +574,20 @@ fn inject_gateway_sidecar(
             "Manifest {} already declares a {} container; skipping duplicate injection",
             manifest_id, GATEWAY_SIDECAR_CONTAINER_NAME
         );
-    } else {
-        containers_seq.push(build_gateway_container_spec(gateway_settings));
+        return Ok(false);
     }
 
-    ensure_gateway_volume(pod_spec, manifest_id)?;
-    Ok(())
+    containers_seq.push(build_gateway_container_spec(
+        gateway_settings,
+        metadata_blob_b64,
+    ));
+    Ok(true)
 }
 
-fn build_gateway_container_spec(gateway_settings: &GatewaySidecarSettings) -> serde_yaml::Value {
+fn build_gateway_container_spec(
+    gateway_settings: &GatewaySidecarSettings,
+    metadata_blob_b64: &str,
+) -> serde_yaml::Value {
     let mut container = serde_yaml::Mapping::new();
     container.insert(
         serde_yaml::Value::String("name".to_string()),
@@ -546,10 +603,7 @@ fn build_gateway_container_spec(gateway_settings: &GatewaySidecarSettings) -> se
     );
 
     let mut env_entries = Vec::new();
-    env_entries.push(build_env_var(
-        GATEWAY_METADATA_ENV,
-        &metadata_container_path(),
-    ));
+    env_entries.push(build_env_var(GATEWAY_METADATA_BLOB_ENV, metadata_blob_b64));
     env_entries.push(build_env_var(
         GATEWAY_BOOTSTRAP_ENV,
         &gateway_settings.bootstrap_peer,
@@ -558,24 +612,6 @@ fn build_gateway_container_spec(gateway_settings: &GatewaySidecarSettings) -> se
     container.insert(
         serde_yaml::Value::String("env".to_string()),
         serde_yaml::Value::Sequence(env_entries),
-    );
-
-    let mut mount = serde_yaml::Mapping::new();
-    mount.insert(
-        serde_yaml::Value::String("name".to_string()),
-        serde_yaml::Value::String(GATEWAY_VOLUME_NAME.to_string()),
-    );
-    mount.insert(
-        serde_yaml::Value::String("mountPath".to_string()),
-        serde_yaml::Value::String(GATEWAY_METADATA_MOUNT_PATH.to_string()),
-    );
-    mount.insert(
-        serde_yaml::Value::String("readOnly".to_string()),
-        serde_yaml::Value::Bool(true),
-    );
-    container.insert(
-        serde_yaml::Value::String("volumeMounts".to_string()),
-        serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(mount)]),
     );
 
     serde_yaml::Value::Mapping(container)
@@ -592,63 +628,6 @@ fn build_env_var(name: &str, value: &str) -> serde_yaml::Value {
         serde_yaml::Value::String(value.to_string()),
     );
     serde_yaml::Value::Mapping(entry)
-}
-
-fn ensure_gateway_volume(
-    pod_spec: &mut serde_yaml::Mapping,
-    manifest_id: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let volumes_key = serde_yaml::Value::String("volumes".to_string());
-    if !pod_spec.contains_key(&volumes_key) {
-        pod_spec.insert(volumes_key.clone(), serde_yaml::Value::Sequence(Vec::new()));
-    }
-
-    let volumes_seq = pod_spec
-        .get_mut(&volumes_key)
-        .and_then(|value| value.as_sequence_mut())
-        .ok_or_else(|| "spec.volumes must be a sequence".to_string())?;
-
-    let volume_exists = volumes_seq.iter().any(|volume| {
-        volume
-            .as_mapping()
-            .and_then(|mapping| mapping.get(&serde_yaml::Value::String("name".to_string())))
-            .and_then(|value| value.as_str())
-            .map(|name| name == GATEWAY_VOLUME_NAME)
-            .unwrap_or(false)
-    });
-
-    if volume_exists {
-        return Ok(());
-    }
-
-    let host_dir = metadata_host_dir(manifest_id);
-    let host_dir_str = host_dir
-        .to_str()
-        .ok_or_else(|| format!("invalid metadata host directory for {}", manifest_id))?
-        .to_string();
-
-    let mut host_path = serde_yaml::Mapping::new();
-    host_path.insert(
-        serde_yaml::Value::String("path".to_string()),
-        serde_yaml::Value::String(host_dir_str),
-    );
-    host_path.insert(
-        serde_yaml::Value::String("type".to_string()),
-        serde_yaml::Value::String("DirectoryOrCreate".to_string()),
-    );
-
-    let mut volume_entry = serde_yaml::Mapping::new();
-    volume_entry.insert(
-        serde_yaml::Value::String("name".to_string()),
-        serde_yaml::Value::String(GATEWAY_VOLUME_NAME.to_string()),
-    );
-    volume_entry.insert(
-        serde_yaml::Value::String("hostPath".to_string()),
-        serde_yaml::Value::Mapping(host_path),
-    );
-
-    volumes_seq.push(serde_yaml::Value::Mapping(volume_entry));
-    Ok(())
 }
 
 fn get_or_insert_pod_spec(doc: &mut serde_yaml::Value) -> Option<&mut serde_yaml::Mapping> {
@@ -704,39 +683,34 @@ fn get_or_insert_mapping<'a>(
 async fn select_runtime_engine(
     manifest_content: &[u8],
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let manifest_str = String::from_utf8_lossy(manifest_content);
-
-    // Try to parse as YAML and look for annotations
-    if let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&manifest_str) {
-        // Check for runtime engine annotation
-        if let Some(metadata) = doc.get("metadata") {
-            if let Some(annotations) = metadata.get("annotations") {
-                if let Some(engine) = annotations
-                    .get("podmesh.io/runtime-engine")
-                    .and_then(|v| v.as_str())
-                {
-                    info!("Found runtime engine annotation: {}", engine);
-                    return Ok(engine.to_string());
+    if let Ok(docs) = parse_yaml_documents_from_slice(manifest_content) {
+        for doc in &docs {
+            if let Some(metadata) = doc.get("metadata") {
+                if let Some(annotations) = metadata.get("annotations") {
+                    if let Some(engine) = annotations
+                        .get("podmesh.io/runtime-engine")
+                        .and_then(|v| v.as_str())
+                    {
+                        info!("Found runtime engine annotation: {}", engine);
+                        return Ok(engine.to_string());
+                    }
                 }
             }
-        }
 
-        // Check manifest type - note preferences, but don't hardcode
-        if let Some(kind) = doc.get("kind").and_then(|k| k.as_str()) {
-            match kind {
-                "Pod" | "Deployment" | "Service" | "ConfigMap" | "Secret" => {
-                    // Kubernetes resources - will prefer Podman below if available
-                    debug!("Detected Kubernetes manifest kind: {}", kind);
+            if let Some(kind) = doc.get("kind").and_then(|k| k.as_str()) {
+                match kind {
+                    "Pod" | "Deployment" | "Service" | "ConfigMap" | "Secret" => {
+                        debug!("Detected Kubernetes manifest kind: {}", kind);
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
 
-        // Check for Docker Compose format and warn because only Podman is supported
-        if doc.get("services").is_some() && doc.get("version").is_some() {
-            warn!(
-                "Detected Docker Compose manifest but only Podman runtime is supported; attempting deployment via Podman"
-            );
+            if doc.get("services").is_some() && doc.get("version").is_some() {
+                warn!(
+                    "Detected Docker Compose manifest but only Podman runtime is supported; attempting deployment via Podman"
+                );
+            }
         }
     }
 
@@ -1112,6 +1086,7 @@ pub async fn discover_manifest_providers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::yaml_utils::parse_yaml_documents_from_slice;
 
     #[tokio::test]
     async fn test_runtime_registry_initialization() {
@@ -1148,8 +1123,8 @@ spec:
         let engine_name = engine.unwrap();
         assert!(engine_name == "mock" || engine_name == "podman");
 
-                // Test Docker Compose manifest (should still fall back to Podman/mock)
-                let compose_manifest = r#"
+        // Test Docker Compose manifest (should still fall back to Podman/mock)
+        let compose_manifest = r#"
 version: '3.8'
 services:
   web:
@@ -1157,10 +1132,10 @@ services:
     ports:
       - "80:80"
 "#;
-                let engine = select_runtime_engine(compose_manifest.as_bytes()).await;
-                assert!(engine.is_ok());
-                let compose_engine = engine.unwrap();
-                assert!(compose_engine == "mock" || compose_engine == "podman");
+        let engine = select_runtime_engine(compose_manifest.as_bytes()).await;
+        assert!(engine.is_ok());
+        let compose_engine = engine.unwrap();
+        assert!(compose_engine == "mock" || compose_engine == "podman");
     }
 
     #[test]
@@ -1195,9 +1170,19 @@ spec:
             bootstrap_peer: "/ip4/10.0.0.1/udp/7001/quic-v1".to_string(),
         };
 
-        let modified = prepare_manifest_for_node("demo", manifest.as_bytes(), &settings)
-            .expect("manifest transforms");
-        let doc: serde_yaml::Value = serde_yaml::from_slice(&modified).expect("yaml parse");
+        let metadata_blob =
+            build_inline_metadata_blob("demo", manifest.as_bytes(), &[], &settings.bootstrap_peer)
+                .expect("metadata blob");
+
+        let modified =
+            prepare_manifest_for_node("demo", manifest.as_bytes(), &settings, &metadata_blob)
+                .expect("manifest transforms");
+        let docs =
+            parse_yaml_documents_from_slice(&modified).expect("yaml parse stream for deployment");
+        let doc = docs
+            .iter()
+            .find(|value| manifest_kind(value) == Some("Deployment"))
+            .expect("deployment document present");
 
         let containers = doc
             .get("spec")
@@ -1212,32 +1197,74 @@ spec:
                 == Some(crate::gateway_sidecar::GATEWAY_SIDECAR_CONTAINER_NAME)
         }));
 
+        let sidecar_container = containers
+            .iter()
+            .find(|container| {
+                container.get("name").and_then(|value| value.as_str())
+                    == Some(crate::gateway_sidecar::GATEWAY_SIDECAR_CONTAINER_NAME)
+            })
+            .expect("gateway container present");
+
+        let env_entries = sidecar_container
+            .get("env")
+            .and_then(|value| value.as_sequence())
+            .expect("env entries present");
+
+        assert!(env_entries.iter().any(|entry| {
+            entry.get("name").and_then(|value| value.as_str())
+                == Some(crate::gateway_sidecar::GATEWAY_METADATA_BLOB_ENV)
+        }));
+
         let volumes = doc
             .get("spec")
             .and_then(|spec| spec.get("template"))
             .and_then(|template| template.get("spec"))
             .and_then(|spec| spec.get("volumes"))
-            .and_then(|value| value.as_sequence())
-            .expect("volumes sequence present");
+            .and_then(|value| value.as_sequence());
 
-        assert!(volumes.iter().any(|volume| {
-            volume.get("name").and_then(|value| value.as_str())
-                == Some(crate::gateway_sidecar::GATEWAY_VOLUME_NAME)
-        }));
-
-        let volume_entry = volumes
-            .iter()
-            .find(|volume| {
+        if let Some(volumes) = volumes {
+            assert!(volumes.iter().all(|volume| {
                 volume.get("name").and_then(|value| value.as_str())
-                    == Some(crate::gateway_sidecar::GATEWAY_VOLUME_NAME)
-            })
-            .expect("gateway volume present");
+                    != Some("podmesh-sidecar-metadata")
+            }));
+        }
+    }
 
-        let host_path = volume_entry
-            .get("hostPath")
-            .and_then(|value| value.get("path"))
-            .and_then(|value| value.as_str())
-            .expect("hostPath path");
-        assert!(host_path.contains("/var/lib/podmesh/sidecar/demo"));
+    #[test]
+    fn test_prepare_manifest_handles_demo_deployment_yaml() {
+        let manifest = include_str!("../../tests/sample_manifests/demo_deployment.yml");
+        let settings = GatewaySidecarSettings {
+            image: "podmesh/sidecar:test".to_string(),
+            bootstrap_peer: "/ip4/10.0.0.1/udp/7001/quic-v1".to_string(),
+        };
+
+        let metadata_blob =
+            build_inline_metadata_blob("demo", manifest.as_bytes(), &[], &settings.bootstrap_peer)
+                .expect("metadata blob");
+
+        let modified =
+            prepare_manifest_for_node("demo", manifest.as_bytes(), &settings, &metadata_blob)
+                .expect("demo manifest transforms");
+
+        let docs = parse_yaml_documents_from_slice(&modified).expect("yaml parse stream for demo");
+        assert!(docs.len() >= 2);
+
+        let deployment_doc = docs
+            .iter()
+            .find(|value| manifest_kind(value) == Some("Deployment"))
+            .expect("deployment doc present");
+
+        let containers = deployment_doc
+            .get("spec")
+            .and_then(|spec| spec.get("template"))
+            .and_then(|template| template.get("spec"))
+            .and_then(|spec| spec.get("containers"))
+            .and_then(|value| value.as_sequence())
+            .expect("containers sequence present");
+
+        assert!(containers.iter().any(|container| {
+            container.get("name").and_then(|value| value.as_str())
+                == Some(crate::gateway_sidecar::GATEWAY_SIDECAR_CONTAINER_NAME)
+        }));
     }
 }

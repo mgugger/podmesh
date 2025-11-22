@@ -5,8 +5,9 @@ use log::error;
 use log::info;
 use uuid::Uuid;
 
+use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use serde_yaml;
+use serde_yaml::{self, Value as YamlValue};
 use std::env;
 use std::path::PathBuf;
 
@@ -17,11 +18,41 @@ mod flatbuffer_envelope;
 
 // Helper function to extract manifest name from JSON
 fn extract_manifest_name_from_json(manifest_json: &serde_json::Value) -> Option<String> {
-    manifest_json
-        .get("metadata")?
-        .get("name")?
-        .as_str()
-        .map(|s| s.to_string())
+    match manifest_json {
+        serde_json::Value::Object(_) => manifest_json
+            .get("metadata")?
+            .get("name")?
+            .as_str()
+            .map(|s| s.to_string()),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(extract_manifest_name_from_json)
+            .next(),
+        _ => None,
+    }
+}
+
+fn parse_manifest_documents(contents: &str) -> anyhow::Result<JsonValue> {
+    let mut docs = Vec::new();
+
+    for document in serde_yaml::Deserializer::from_str(contents) {
+        let yaml_value = YamlValue::deserialize(document)?;
+        if yaml_value.is_null() {
+            continue;
+        }
+        let json_value = serde_json::to_value(yaml_value)?;
+        docs.push(json_value);
+    }
+
+    if docs.is_empty() {
+        anyhow::bail!("manifest file did not contain any YAML documents");
+    }
+
+    if docs.len() == 1 {
+        Ok(docs.into_iter().next().unwrap())
+    } else {
+        Ok(JsonValue::Array(docs))
+    }
 }
 
 fn parse_selected_nodes(peers: &[String]) -> anyhow::Result<Vec<(String, String)>> {
@@ -61,10 +92,8 @@ pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> anyhow::Result
     );
 
     // Parse manifest to JSON if possible, else wrap raw
-    let manifest_json: JsonValue = match serde_yaml::from_str(&contents) {
-        Ok(v) => v,
-        Err(_) => serde_json::json!({"raw": contents}),
-    };
+    let manifest_json = parse_manifest_documents(&contents)
+        .unwrap_or_else(|_| serde_json::json!({"raw": contents}));
     debug!("apply_file: manifest parsed successfully");
 
     // Extract replicas count from manifest (check spec.replicas or top-level replicas, default to 1)
@@ -170,7 +199,7 @@ pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> anyhow::Result
 
     // Create and assign tasks for each node sequentially to avoid store conflicts
     // Send the original manifest without modification - each node will handle replica count
-    let original_manifest_str = serde_json::to_string(&manifest_json)?;
+    let original_manifest_str = contents.clone();
 
     for (node_id, node_pubkey) in &selected_nodes {
         debug!("Creating encrypted task for node: {}", node_id);
@@ -283,10 +312,8 @@ pub async fn delete_file(
     );
 
     // Parse manifest to JSON if possible
-    let manifest_json: JsonValue = match serde_yaml::from_str(&contents) {
-        Ok(v) => v,
-        Err(_) => serde_json::json!({"raw": contents}),
-    };
+    let manifest_json = parse_manifest_documents(&contents)
+        .unwrap_or_else(|_| serde_json::json!({"raw": contents}));
     debug!("delete_file: manifest parsed successfully");
 
     // Ensure CLI keypair - always use persistent keypairs for consistency
@@ -395,5 +422,40 @@ mod tests {
         let peers = vec!["invalid".to_string()];
         let result = parse_selected_nodes(&peers);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_manifest_name_multi_doc_first_manifest() {
+        let manifest = r#"---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+    name: first
+---
+apiVersion: v1
+kind: Pod
+metadata:
+    name: second
+"#;
+
+        let value = parse_manifest_documents(manifest).expect("parse yaml");
+        let name = extract_manifest_name_from_json(&value);
+        assert_eq!(name.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn test_extract_manifest_name_multi_doc_skips_missing_metadata() {
+        let manifest = r#"---
+kind: List
+---
+apiVersion: v1
+kind: Pod
+metadata:
+    name: actual
+"#;
+
+        let value = parse_manifest_documents(manifest).expect("parse yaml");
+        let name = extract_manifest_name_from_json(&value);
+        assert_eq!(name.as_deref(), Some("actual"));
     }
 }

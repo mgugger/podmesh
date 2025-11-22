@@ -14,7 +14,7 @@ use axum::{
 use axum_support::{parse_socket_addr, spawn_tcp_listener};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
 
 use crate::p2p::ProxyClient;
 use p2p::http_proxy::ProxyHttpRequest;
@@ -73,10 +73,22 @@ async fn ingress_entry(
         return status_response(StatusCode::BAD_REQUEST, "missing host header");
     };
 
+    let method = request.method().to_string();
+    let path = request
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+    info!(app_id = %app_id, method = %method, path = %path, "ingress proxy forwarding request via gateway");
+
     match state.gateway.forward(&app_id, request).await {
-        Ok(response) => response,
+        Ok(response) => {
+            let status = response.status().as_u16();
+            info!(app_id = %app_id, method = %method, path = %path, status, "ingress proxy received response from gateway");
+            response
+        }
         Err(err) => {
-            warn!(app_id = %app_id, error = %err, "gateway forward failed");
+            error!(app_id = %app_id, error = %err, "gateway forward failed");
             status_response(StatusCode::BAD_GATEWAY, "gateway forwarding failed")
         }
     }

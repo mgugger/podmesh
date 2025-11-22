@@ -24,5 +24,7 @@ pub const DEFAULT_METADATA_FILENAME: &str = "metadata.json";
 pub const DEFAULT_METADATA_FILE: &str = "/var/run/podmesh/gateway/metadata.json";
 /// Environment variable that conveys the metadata file path to the gateway process.
 pub const METADATA_PATH_ENV_VAR: &str = "PODMESH_GATEWAY_METADATA_PATH";
+/// Environment variable that conveys an inline base64-encoded metadata blob to the gateway.
+pub const METADATA_BLOB_ENV_VAR: &str = "PODMESH_GATEWAY_METADATA_B64";
 /// Environment variable that optionally overrides the bootstrap peer from metadata.
 pub const BOOTSTRAP_ENV_VAR: &str = "PODMESH_GATEWAY_BOOTSTRAP_PEER";

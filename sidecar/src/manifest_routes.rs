@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use protocol::machine::{GatewayRouteKind, GatewayRouteSpec};
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
+use tracing::warn;
 
 const SERVICE_DOMAIN_SUFFIX: &str = "mesh.local";
 
@@ -115,9 +116,9 @@ pub fn extract_gateway_routes(manifest: &[u8], manifest_id: &str) -> Result<Rout
     }
 
     if routes.is_empty() {
-        bail!(
-            "manifest {} does not define any services or ingress routes",
-            manifest_id
+        warn!(
+            manifest = manifest_id,
+            "manifest does not define services or ingress routes; starting gateway without routes"
         );
     }
 

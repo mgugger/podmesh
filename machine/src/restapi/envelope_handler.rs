@@ -35,8 +35,7 @@ impl EnvelopeHandler {
         // relying on filesystem keys in ephemeral/test environments. If no in-memory
         // keypair is present, fall back to loading the on-disk keypair. If that
         // also fails, leave the signing key as None.
-        let signing_private_key = if let Some(opt_pair) = crate::podmesh_p2p::NODE_KEYPAIR.get()
-        {
+        let signing_private_key = if let Some(opt_pair) = crate::podmesh_p2p::NODE_KEYPAIR.get() {
             // NODE_KEYPAIR holds Option<(pub, priv)>; prefer it when present
             if let Some((_pub_bytes, priv_bytes)) = opt_pair.as_ref() {
                 log::debug!("EnvelopeHandler::new: using in-memory NODE_KEYPAIR for signing");

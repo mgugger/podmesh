@@ -8,6 +8,7 @@ use crate::runtime::{
     DeploymentConfig, PortMapping, RuntimeEngine, RuntimeError, RuntimeResult, WorkloadInfo,
     WorkloadStatus,
 };
+use crate::yaml_utils::parse_yaml_documents_from_str;
 use async_trait::async_trait;
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
@@ -306,8 +307,10 @@ impl RuntimeEngine for MockEngine {
             return Err(RuntimeError::InvalidManifest("Empty manifest".to_string()));
         }
 
-        // Try to parse as YAML to ensure it's valid
-        if serde_yaml::from_str::<serde_yaml::Value>(&manifest_str).is_err() {
+        if parse_yaml_documents_from_str(&manifest_str)
+            .map(|docs| docs.is_empty())
+            .unwrap_or(true)
+        {
             return Err(RuntimeError::InvalidManifest(
                 "Invalid YAML format".to_string(),
             ));

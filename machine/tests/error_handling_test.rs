@@ -332,14 +332,8 @@ fn test_nonce_validation_errors() {
     }
 
     {
-        let canonical_empty_nonce = build_envelope_canonical(
-            payload,
-            "test",
-            "",
-            1234567890,
-            "ml-dsa-65",
-            None,
-        );
+        let canonical_empty_nonce =
+            build_envelope_canonical(payload, "test", "", 1234567890, "ml-dsa-65", None);
 
         let (sig_b64, pub_b64) = sign_envelope(&privb, &pubb, &canonical_empty_nonce)
             .expect("Failed to sign envelope with empty nonce");
@@ -412,14 +406,8 @@ fn test_timestamp_edge_cases() {
     let payload = b"timestamp test payload";
 
     {
-        let canonical_zero_ts = build_envelope_canonical(
-            payload,
-            "test",
-            "zero-ts-nonce",
-            0,
-            "ml-dsa-65",
-            None,
-        );
+        let canonical_zero_ts =
+            build_envelope_canonical(payload, "test", "zero-ts-nonce", 0, "ml-dsa-65", None);
 
         let (sig_b64, pub_b64) = sign_envelope(&privb, &pubb, &canonical_zero_ts)
             .expect("Failed to sign envelope with zero timestamp");

@@ -1,5 +1,5 @@
-use podctl::{apply_file, delete_file};
 use clap::{Parser, Subcommand};
+use podctl::{apply_file, delete_file};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]

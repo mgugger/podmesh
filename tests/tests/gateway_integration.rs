@@ -4,17 +4,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use axum::{Router, routing::get};
 use axum_support::spawn_tcp_listener;
+use meshproxy::{Config, Workload};
 use protocol::machine::{GatewayRouteKind, GatewayRouteSpec};
 use reqwest::Client;
+use sidecar::{
+    DEFAULT_GATEWAY_APP_PORT, GatewayConfig, GatewayEvent, manifest_routes::extract_gateway_routes,
+    run_gateway_with_shutdown,
+};
 use tokio::{
     net::TcpListener,
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
-};
-use meshproxy::{Config, Workload};
-use sidecar::{
-    DEFAULT_GATEWAY_APP_PORT, GatewayConfig, GatewayEvent, manifest_routes::extract_gateway_routes,
-    run_gateway_with_shutdown,
 };
 
 use podmesh_integration_tests::support::{allocate_tcp_port, allocate_udp_port, init_tracing};
@@ -161,12 +161,19 @@ async fn ingress_proxies_requests_via_gateway() -> Result<()> {
         gateway_shutdown = Some(shutdown_tx);
         let (gateway_cfg, ingress_host, service_host) =
             build_gateway_config(vec![handle.bootstrap_addr.clone()], app_port)?;
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let provider_peer_id = handle.peer_id.clone();
 
         gateway_task = Some(tokio::spawn(async move {
-            run_gateway_with_shutdown(gateway_cfg, shutdown_rx, None)
+            run_gateway_with_shutdown(gateway_cfg, shutdown_rx, Some(event_tx))
                 .await
                 .expect("gateway run");
         }));
+
+        wait_for_gateway_peer_ready(&mut event_rx, &provider_peer_id, Duration::from_secs(20))
+            .await?;
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
 
         let ingress_addr = handle
             .workload
@@ -330,6 +337,44 @@ async fn wait_for_ingress_response(
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+async fn wait_for_gateway_peer_ready(
+    rx: &mut mpsc::UnboundedReceiver<GatewayEvent>,
+    expected_peer_id: &str,
+    timeout: Duration,
+) -> Result<()> {
+    tokio::time::timeout(timeout, async {
+        let mut connected = false;
+        let mut provider_seen = false;
+        while !(connected && provider_seen) {
+            match rx.recv().await {
+                Some(GatewayEvent::Connected { peer_id }) => {
+                    if peer_id == expected_peer_id {
+                        connected = true;
+                    }
+                }
+                Some(GatewayEvent::ProviderDiscovered { peer_id }) => {
+                    if peer_id == expected_peer_id {
+                        provider_seen = true;
+                    }
+                }
+                None => {
+                    return Err(anyhow!("gateway event channel closed before readiness"));
+                }
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "gateway did not become ready for provider {}",
+            expected_peer_id
+        )
+    })??;
+
+    Ok(())
 }
 
 fn build_gateway_config(

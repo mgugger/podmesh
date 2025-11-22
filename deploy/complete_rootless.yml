@@ -1,0 +1,143 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: podmesh-complete-rootless
+  labels:
+    app: podmesh-complete-rootless
+spec:
+  restartPolicy: Always
+  containers:
+    - name: machine-bootstrap
+      image: podmesh/machine:latest
+      env:
+      - name: RUST_LOG
+        value: "info"
+      args:
+        - "--libp2p-quic-port"
+        - "4001"
+        - "--disable-scheduling"
+        - "--disable-machine-api"
+      ports:
+        - containerPort: 4001
+          hostPort: 4001
+          protocol: UDP
+        - containerPort: 4001
+          hostPort: 4001
+          protocol: TCP
+        - containerPort: 3000
+          hostPort: 3000
+          protocol: TCP
+        - containerPort: 3000
+          hostPort: 3000
+          protocol: UDP
+    - name: machine-1
+      image: podmesh/machine:latest
+      env:
+      - name: RUST_LOG
+        value: "info"
+      args:
+        - "--disable-rest-api"
+        - "--disable-machine-api"
+        - "--bootstrap-peer"
+        - "/ip4/127.0.0.1/udp/4001/quic-v1"
+        - "--podman-socket"
+        - "/run/podman/podman.sock"
+      volumeMounts:
+        - name: podman-socket
+          mountPath: /run/podman/podman.sock
+        - name: host-proc-cpuinfo
+          mountPath: /host-proc/cpuinfo
+          readOnly: true
+        - name: host-proc-meminfo
+          mountPath: /host-proc/meminfo
+          readOnly: true
+        - name: host-containers-storage
+          mountPath: /var/lib/containers/storage
+          readOnly: true
+    - name: machine-2
+      image: podmesh/machine:latest
+      env:
+      - name: RUST_LOG
+        value: "info"
+      args:
+        - "--disable-rest-api"
+        - "--disable-machine-api"
+        - "--bootstrap-peer"
+        - "/ip4/127.0.0.1/udp/4001/quic-v1"
+        - "--podman-socket"
+        - "/run/podman/podman.sock"
+      volumeMounts:
+        - name: podman-socket
+          mountPath: /run/podman/podman.sock
+        - name: host-proc-cpuinfo
+          mountPath: /host-proc/cpuinfo
+          readOnly: true
+        - name: host-proc-meminfo
+          mountPath: /host-proc/meminfo
+          readOnly: true
+        - name: host-containers-storage
+          mountPath: /var/lib/containers/storage
+          readOnly: true
+    - name: workload-bootstrap
+      image: podmesh/workload:latest
+      env:
+        - name: libp2p_quic_port
+          value: "4002"
+        - name: rest_port
+          value: "3001"
+        - name: RUST_LOG
+          value: "info"
+      ports:
+        - containerPort: 4002
+          hostPort: 4002
+          protocol: UDP
+        - containerPort: 4002
+          hostPort: 4002
+          protocol: TCP
+        - containerPort: 3001
+          hostPort: 3001
+          protocol: TCP
+        - containerPort: 3001
+          hostPort: 3001
+          protocol: UDP
+        - containerPort: 8080
+          hostPort: 8080
+          protocol: UDP
+        - containerPort: 8080
+          hostPort: 8080
+          protocol: TCP
+    - name: workload-1
+      image: podmesh/workload:latest
+      env:
+      - name: RUST_LOG
+        value: "info"
+      args:
+        - "--bootstrap-peer"
+        - "/ip4/127.0.0.1/udp/4002/quic-v1"
+        - "--disable-rest-api"
+    - name: workload-2
+      image: podmesh/workload:latest
+      env:
+      - name: RUST_LOG
+        value: "info"
+      args:
+        - "--bootstrap-peer"
+        - "/ip4/127.0.0.1/udp/4002/quic-v1"
+        - "--disable-rest-api"
+  volumes:
+    - name: podman-socket
+      hostPath:
+        path: /run/user/1000/podman/podman.sock
+        type: Socket
+    - name: host-proc-cpuinfo
+      hostPath:
+        path: /proc/cpuinfo
+        type: File
+    - name: host-proc-meminfo
+      hostPath:
+        path: /proc/meminfo
+        type: File
+    - name: host-containers-storage
+      hostPath:
+        path: /var/lib/containers/storage
+        type: Directory

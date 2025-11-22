@@ -519,7 +519,14 @@ fn handle_proxy_event(
                 if request.target_port == 0 {
                     request.target_port = cfg.app_port;
                 }
-                debug!(%peer, manifest = %request.manifest_id, "gateway received proxy request");
+                info!(
+                    %peer,
+                    manifest = %request.manifest_id,
+                    method = %request.method,
+                    path = %request.path_and_query,
+                    target_port = request.target_port,
+                    "gateway received proxy request"
+                );
                 spawn_local_http_request(
                     state.http_client.clone(),
                     request,
@@ -550,10 +557,35 @@ fn spawn_local_http_request(
     proxy_resp_tx: mpsc::UnboundedSender<PendingProxyResponse>,
 ) {
     tokio::spawn(async move {
+        let manifest_id = request.manifest_id.clone();
+        let method = request.method.clone();
+        let path = if request.path_and_query.is_empty() {
+            "/".to_string()
+        } else {
+            request.path_and_query.clone()
+        };
+        let target_port = request.target_port;
         let response = match execute_local_http_request(client, request).await {
-            Ok(resp) => resp,
+            Ok(resp) => {
+                info!(
+                    manifest = %manifest_id,
+                    method = %method,
+                    path = %path,
+                    target_port,
+                    status = resp.status_code,
+                    "gateway forwarded request to application"
+                );
+                resp
+            }
             Err(err) => {
-                warn!(error = ?err, "gateway local http request failed");
+                warn!(
+                    manifest = %manifest_id,
+                    method = %method,
+                    path = %path,
+                    target_port,
+                    error = ?err,
+                    "gateway local http request failed"
+                );
                 ProxyHttpResponse {
                     status_code: 502,
                     headers: vec![("x-podmesh-error".into(), err.to_string())],

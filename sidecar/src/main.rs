@@ -13,12 +13,7 @@ use sidecar::{
 };
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "sidecar",
-    author,
-    version,
-    about = " Podmesh sidecar"
-)]
+#[command(name = "sidecar", author, version, about = " Podmesh sidecar")]
 struct Args {
     #[arg(long, env = "namespace")]
     namespace: Option<String>,
@@ -52,6 +47,8 @@ struct Args {
         default_value = "/var/run/podmesh/gateway/metadata.json"
     )]
     metadata_path: String,
+    #[arg(long = "metadata-b64", env = "PODMESH_GATEWAY_METADATA_B64")]
+    metadata_b64: Option<String>,
 }
 
 impl TryFrom<Args> for GatewayConfig {
@@ -69,8 +66,17 @@ impl TryFrom<Args> for GatewayConfig {
             format!("{ns}/{workload}")
         };
 
-        let metadata = load_metadata(&args.metadata_path)?
-            .ok_or_else(|| anyhow::anyhow!("gateway metadata missing at {}", args.metadata_path))?;
+        let metadata = if let Some(blob) = args
+            .metadata_b64
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            decode_inline_metadata(blob)?
+        } else {
+            load_metadata(&args.metadata_path)?.ok_or_else(|| {
+                anyhow::anyhow!("gateway metadata missing at {}", args.metadata_path)
+            })?
+        };
 
         let manifest_bytes = base64::engine::general_purpose::STANDARD
             .decode(&metadata.manifest_b64)
@@ -115,6 +121,21 @@ async fn run() -> Result<()> {
     let args = Args::parse();
     let cfg = GatewayConfig::try_from(args)?;
     run_gateway(cfg).await
+}
+
+fn decode_inline_metadata(blob: &str) -> Result<GatewaySidecarMetadata> {
+    let trimmed = blob.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::anyhow!("inline gateway metadata blob is empty"));
+    }
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(trimmed)
+        .context("failed to decode inline gateway metadata blob")?;
+
+    let metadata: GatewaySidecarMetadata =
+        serde_json::from_slice(&decoded).context("failed to parse inline gateway metadata blob")?;
+    Ok(metadata)
 }
 
 fn load_metadata(path: &str) -> Result<Option<GatewaySidecarMetadata>> {

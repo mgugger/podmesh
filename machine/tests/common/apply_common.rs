@@ -3,9 +3,9 @@ use futures::future::join_all;
 use machine::Cli;
 use std::collections::HashMap as StdHashMap;
 use std::time::Duration;
-use tokio::time::{sleep, Instant};
+use tokio::time::{Instant, sleep};
 
-use super::test_utils::{make_test_cli, setup_cleanup_hook, start_nodes, NodeGuard};
+use super::test_utils::{NodeGuard, make_test_cli, setup_cleanup_hook, start_nodes};
 
 pub const TEST_PORTS: [u16; 3] = [3000u16, 3100u16, 3200u16];
 

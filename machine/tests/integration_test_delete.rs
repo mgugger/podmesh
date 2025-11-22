@@ -5,13 +5,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 mod common;
-use common::test_utils::{
-    make_test_cli,
-    set_env_var,
-    setup_cleanup_hook,
-    start_nodes,
-    NodeGuard,
-};
+use common::test_utils::{NodeGuard, make_test_cli, set_env_var, setup_cleanup_hook, start_nodes};
 
 fn manifest_path() -> PathBuf {
     PathBuf::from(format!(

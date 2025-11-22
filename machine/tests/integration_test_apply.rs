@@ -1,18 +1,16 @@
 use env_logger::Env;
+use machine::gateway_sidecar::GATEWAY_SIDECAR_CONTAINER_NAME;
 use serial_test::serial;
-use std::{env, path::PathBuf};
 use std::time::Duration;
+use std::{env, path::PathBuf};
 use tokio::time::sleep;
 
 mod common;
 use common::apply_common::{
-    check_workload_deployment,
-    get_peer_ids,
-    setup_test_environment,
-    start_cluster_nodes,
+    check_workload_deployment, get_peer_ids, setup_test_environment, start_cluster_nodes,
     wait_for_mesh_formation,
 };
-use common::test_utils::{make_test_cli, setup_cleanup_hook, start_nodes, NodeGuard};
+use common::test_utils::{NodeGuard, make_test_cli, setup_cleanup_hook, start_nodes};
 
 fn manifest_path(file: &str) -> PathBuf {
     PathBuf::from(format!(
@@ -85,36 +83,88 @@ async fn test_apply_with_real_podman() {
 
     sleep(Duration::from_secs(3)).await;
 
-    let manifest_path = manifest_path("nginx.yml");
-    let original_content = tokio::fs::read_to_string(manifest_path.clone())
-        .await
-        .expect("Failed to read original manifest file for verification");
-
-    let task_id = podctl::apply_file(manifest_path.clone(), None)
+    let nginx_manifest_path = manifest_path("nginx.yml");
+    let task_id = podctl::apply_file(nginx_manifest_path.clone(), None)
         .await
         .expect("apply_file should succeed with real Podman");
 
     sleep(Duration::from_secs(5)).await;
 
-    let podman_verification_successful =
-        verify_podman_deployment(&task_id, &original_content).await;
-
+    let nginx_status = verify_podman_deployment(&task_id).await;
+    if !nginx_status.workload_found {
+        log::warn!(
+            "Podman deployment verification failed for nginx task {}",
+            task_id
+        );
+    }
     assert!(
-        podman_verification_successful,
+        nginx_status.workload_found,
         "Podman deployment verification failed - no matching pods found"
     );
+    assert!(
+        nginx_status.sidecar_running,
+        "Gateway sidecar '{}' for task {} not running (state={:?})",
+        GATEWAY_SIDECAR_CONTAINER_NAME, task_id, nginx_status.sidecar_state
+    );
 
-    let _delete_result = podctl::delete_file(manifest_path, true, None).await;
+    let _delete_result = podctl::delete_file(nginx_manifest_path, true, None).await;
     sleep(Duration::from_secs(5)).await;
 
-    let podman_verification_successful =
-        verify_podman_deployment(&task_id, &original_content).await;
+    let nginx_removed = verify_podman_deployment(&task_id).await;
+    if nginx_removed.workload_found {
+        log::warn!(
+            "Podman deployment still running for nginx task {} during cleanup",
+            task_id
+        );
+    }
     assert!(
-        !podman_verification_successful,
+        !nginx_removed.workload_found,
         "Podman deployment still exists after deletion attempt"
     );
 
     cleanup_podman_resources(&task_id).await;
+
+    let demo_manifest_path = manifest_path("demo_deployment.yml");
+    let demo_task_id = podctl::apply_file(demo_manifest_path.clone(), None)
+        .await
+        .expect("apply_file should succeed for demo manifest");
+
+    sleep(Duration::from_secs(5)).await;
+
+    let demo_status = verify_podman_deployment(&demo_task_id).await;
+    if !demo_status.workload_found {
+        log::warn!(
+            "Demo deployment verification failed for task {}",
+            demo_task_id
+        );
+    }
+    assert!(
+        demo_status.workload_found,
+        "Demo deployment verification failed for task {}",
+        demo_task_id
+    );
+    assert!(
+        demo_status.sidecar_running,
+        "Gateway sidecar '{}' for task {} not running (state={:?})",
+        GATEWAY_SIDECAR_CONTAINER_NAME, demo_task_id, demo_status.sidecar_state
+    );
+
+    let _delete_demo = podctl::delete_file(demo_manifest_path, true, None).await;
+    sleep(Duration::from_secs(5)).await;
+
+    let demo_removed = verify_podman_deployment(&demo_task_id).await;
+    if demo_removed.workload_found {
+        log::warn!(
+            "Demo deployment still running for task {} during cleanup",
+            demo_task_id
+        );
+    }
+    assert!(
+        !demo_removed.workload_found,
+        "Demo deployment still exists after deletion attempt"
+    );
+
+    cleanup_podman_resources(&demo_task_id).await;
     guard.cleanup().await;
 }
 
@@ -226,18 +276,7 @@ async fn start_test_nodes_for_podman() -> NodeGuard {
     start_nodes(vec![cli1, cli2, cli3], Duration::from_secs(1)).await
 }
 
-fn podman_tests_opted_in() -> bool {
-    match env::var("PODMESH_ENABLE_PODMAN_TESTS") {
-        Ok(val) if matches!(val.to_ascii_lowercase().as_str(), "1" | "true" | "yes") => true,
-        _ => false,
-    }
-}
-
 async fn is_podman_available() -> bool {
-    if !podman_tests_opted_in() {
-        return false;
-    }
-
     match tokio::process::Command::new("podman")
         .args(["--version"])
         .stdout(std::process::Stdio::null())
@@ -250,56 +289,102 @@ async fn is_podman_available() -> bool {
     }
 }
 
-async fn verify_podman_deployment(task_id: &str, _original_content: &str) -> bool {
-    let expected_pod_name = format!("podmesh-{}-pod", task_id);
+#[derive(Debug, Default)]
+struct PodmanDeploymentStatus {
+    pod_name: Option<String>,
+    workload_found: bool,
+    sidecar_found: bool,
+    sidecar_running: bool,
+    sidecar_state: Option<String>,
+}
 
-    let output = tokio::process::Command::new("podman")
+impl PodmanDeploymentStatus {
+    fn new() -> Self {
+        Self::default()
+    }
+}
+
+async fn verify_podman_deployment(task_id: &str) -> PodmanDeploymentStatus {
+    let mut status = PodmanDeploymentStatus::new();
+    let expected_prefix = format!("podmesh-{}", task_id);
+    let expected_pod_names = [format!("{}-pod", expected_prefix), expected_prefix.clone()];
+
+    match tokio::process::Command::new("podman")
         .args(["pod", "ls", "--format", "json"])
         .output()
-        .await;
-
-    if let Ok(output) = output {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-
-            if let Ok(pods) = serde_json::from_str::<serde_json::Value>(&stdout) {
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            if let Ok(pods) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
                 if let Some(pods_array) = pods.as_array() {
                     for pod in pods_array {
                         if let Some(name) = pod.get("Name").and_then(|n| n.as_str()) {
-                            if name == expected_pod_name {
-                                log::info!("Found matching Podman pod: {}", name);
-                                return true;
+                            if expected_pod_names.iter().any(|expected| expected == name) {
+                                status.workload_found = true;
+                                status.pod_name = Some(name.to_string());
+                                log::info!(
+                                    "Found matching Podman pod '{}' for task {}",
+                                    name,
+                                    task_id
+                                );
+                                break;
                             }
                         }
                     }
                 }
             }
+        }
+        Ok(output) => {
+            log::warn!(
+                "'podman pod ls' exited with status {:?} for task {}",
+                output.status.code(),
+                task_id
+            );
+        }
+        Err(err) => {
+            log::warn!("Failed to execute 'podman pod ls': {}", err);
+        }
+    }
 
-            let container_output = tokio::process::Command::new("podman")
-                .args(["ps", "-a", "--format", "json"])
-                .output()
-                .await;
+    match tokio::process::Command::new("podman")
+        .args(["ps", "-a", "--format", "json"])
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            if let Ok(containers) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                if let Some(containers_array) = containers.as_array() {
+                    for container in containers_array {
+                        let container_state = container
+                            .get("State")
+                            .and_then(|state| state.as_str())
+                            .map(|state| state.to_string());
 
-            if let Ok(container_output) = container_output {
-                if container_output.status.success() {
-                    let container_stdout = String::from_utf8_lossy(&container_output.stdout);
-                    if let Ok(containers) =
-                        serde_json::from_str::<serde_json::Value>(&container_stdout)
-                    {
-                        if let Some(containers_array) = containers.as_array() {
-                            for container in containers_array {
-                                if let Some(names) =
-                                    container.get("Names").and_then(|n| n.as_array())
-                                {
-                                    for name in names {
-                                        if let Some(name_str) = name.as_str() {
-                                            if name_str.contains(&format!("podmesh-{}", task_id)) {
-                                                log::info!(
-                                                    "Found matching Podman container: {}",
-                                                    name_str
-                                                );
-                                                return true;
+                        if let Some(names) = container.get("Names").and_then(|n| n.as_array()) {
+                            for name in names {
+                                if let Some(name_str) = name.as_str() {
+                                    if name_str.contains(&expected_prefix) {
+                                        status.workload_found = true;
+                                        if name_str
+                                            .to_ascii_lowercase()
+                                            .contains(GATEWAY_SIDECAR_CONTAINER_NAME)
+                                        {
+                                            status.sidecar_found = true;
+                                            status.sidecar_state = container_state.clone();
+                                            if status
+                                                .sidecar_state
+                                                .as_deref()
+                                                .map(|state| state.eq_ignore_ascii_case("running"))
+                                                .unwrap_or(false)
+                                            {
+                                                status.sidecar_running = true;
                                             }
+                                            log::info!(
+                                                "Found gateway sidecar container '{}' for task {} (state={:?})",
+                                                name_str,
+                                                task_id,
+                                                status.sidecar_state
+                                            );
                                         }
                                     }
                                 }
@@ -309,11 +394,19 @@ async fn verify_podman_deployment(task_id: &str, _original_content: &str) -> boo
                 }
             }
         }
-    } else {
-        log::warn!("Failed to execute 'podman pod ls' command");
+        Ok(output) => {
+            log::warn!(
+                "'podman ps -a' exited with status {:?} for task {}",
+                output.status.code(),
+                task_id
+            );
+        }
+        Err(err) => {
+            log::warn!("Failed to execute 'podman ps -a': {}", err);
+        }
     }
 
-    false
+    status
 }
 
 async fn cleanup_podman_resources(task_id: &str) {

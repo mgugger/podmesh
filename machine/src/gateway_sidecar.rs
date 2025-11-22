@@ -1,28 +1,19 @@
+use base64::Engine;
 use once_cell::sync::Lazy;
 use protocol::gateway_metadata::{
-    BOOTSTRAP_ENV_VAR, DEFAULT_METADATA_FILE, DEFAULT_METADATA_FILENAME,
-    DEFAULT_METADATA_MOUNT_PATH, METADATA_PATH_ENV_VAR,
+    BOOTSTRAP_ENV_VAR, GatewaySidecarMetadata, METADATA_BLOB_ENV_VAR,
 };
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{io, sync::Arc};
 use tokio::sync::RwLock;
 
 pub use protocol::gateway_metadata::DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR;
 
 /// Default container image used for gateway sidecars injected into workloads.
-pub const DEFAULT_GATEWAY_IMAGE: &str = "podmesh/gateway";
-/// Host-side directory prefix where gateway metadata files are written.
-pub const GATEWAY_METADATA_HOST_ROOT: &str = "/var/lib/podmesh/sidecar";
-/// Container path where the metadata volume is mounted.
-pub const GATEWAY_METADATA_MOUNT_PATH: &str = DEFAULT_METADATA_MOUNT_PATH;
-/// File name placed inside the metadata mount for the gateway runtime to read.
-pub const GATEWAY_METADATA_FILENAME: &str = DEFAULT_METADATA_FILENAME;
+pub const DEFAULT_GATEWAY_IMAGE: &str = "podmesh/sidecar";
 /// Name assigned to the gateway sidecar container inside injected pods.
 pub const GATEWAY_SIDECAR_CONTAINER_NAME: &str = "podmesh-sidecar";
-/// Volume name used for the gateway metadata mount.
-pub const GATEWAY_VOLUME_NAME: &str = "podmesh-sidecar-metadata";
-/// Environment variable that provides the metadata file path to the gateway.
-pub const GATEWAY_METADATA_ENV: &str = METADATA_PATH_ENV_VAR;
+/// Environment variable that provides the inline metadata blob to the gateway.
+pub const GATEWAY_METADATA_BLOB_ENV: &str = METADATA_BLOB_ENV_VAR;
 /// Environment variable that provides a direct bootstrap peer override to the gateway.
 pub const GATEWAY_BOOTSTRAP_ENV: &str = BOOTSTRAP_ENV_VAR;
 /// Environment variable configuring the gateway's log verbosity.
@@ -62,30 +53,33 @@ pub async fn gateway_sidecar_settings() -> GatewaySidecarSettings {
     SETTINGS.read().await.clone()
 }
 
-/// Compute the host directory used to store gateway metadata for a manifest.
-pub fn metadata_host_dir(manifest_id: &str) -> PathBuf {
-    PathBuf::from(GATEWAY_METADATA_HOST_ROOT).join(sanitize_manifest_id(manifest_id))
-}
+/// Build an inline metadata blob that can be injected directly into the workload manifest.
+pub fn build_inline_metadata_blob(
+    manifest_id: &str,
+    manifest_bytes: &[u8],
+    owner_public_key: &[u8],
+    bootstrap_peer: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let metadata = GatewaySidecarMetadata {
+        manifest_id: manifest_id.to_string(),
+        manifest_b64: base64::engine::general_purpose::STANDARD.encode(manifest_bytes),
+        owner_public_key_b64: if owner_public_key.is_empty() {
+            None
+        } else {
+            Some(base64::engine::general_purpose::STANDARD.encode(owner_public_key))
+        },
+        bootstrap_peer: bootstrap_peer.to_string(),
+    };
 
-/// Compute the host file path for the gateway metadata JSON.
-pub fn metadata_file_path(manifest_id: &str) -> PathBuf {
-    metadata_host_dir(manifest_id).join(GATEWAY_METADATA_FILENAME)
-}
+    let serialized = serde_json::to_vec(&metadata).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "failed to serialize gateway metadata for manifest {}: {}",
+                manifest_id, err
+            ),
+        )
+    })?;
 
-/// Compute the container path for the gateway metadata JSON file.
-pub fn metadata_container_path() -> String {
-    DEFAULT_METADATA_FILE.to_string()
-}
-
-fn sanitize_manifest_id(manifest_id: &str) -> String {
-    manifest_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect()
+    Ok(base64::engine::general_purpose::STANDARD.encode(serialized))
 }

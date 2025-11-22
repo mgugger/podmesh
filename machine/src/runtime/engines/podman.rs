@@ -3,16 +3,16 @@
 //! This module provides a runtime engine that uses Podman to deploy and manage
 //! Kubernetes manifests via `podman kube play`.
 
-use crate::gateway_sidecar::{metadata_file_path, metadata_host_dir};
 use crate::runtime::{
-    DeploymentConfig, GatewayInjectionConfig, PortMapping, RuntimeEngine, RuntimeError,
-    RuntimeResult, WorkloadInfo, WorkloadStatus,
+    DeploymentConfig, PortMapping, RuntimeEngine, RuntimeError, RuntimeResult, WorkloadInfo,
+    WorkloadStatus,
+};
+use crate::yaml_utils::{
+    parse_yaml_documents_from_slice, parse_yaml_documents_from_str, serialize_yaml_documents,
 };
 use async_trait::async_trait;
-use base64::Engine;
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
-use protocol::gateway_metadata::GatewaySidecarMetadata;
 use serde_yaml::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -20,7 +20,6 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::RwLock;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 const PODMESH_NETWORK_NAME: &str = "podmesh";
@@ -104,7 +103,10 @@ impl PodmanEngine {
             stripped
         } else if socket_url.contains("://") {
             // Non-unix socket URLs (tcp://, http://, etc.) can't be validated locally
-            debug!("Socket URL {} is not a unix socket, skipping filesystem validation", socket_url);
+            debug!(
+                "Socket URL {} is not a unix socket, skipping filesystem validation",
+                socket_url
+            );
             return true;
         } else {
             socket_url
@@ -125,11 +127,14 @@ impl PodmanEngine {
                 // Check if we have read/write permissions
                 // For Unix sockets, we need to be able to connect to them
                 let mode = metadata.mode();
-                let is_readable = mode & 0o400 != 0;  // Owner read
-                let is_writable = mode & 0o200 != 0;  // Owner write
-                
+                let is_readable = mode & 0o400 != 0; // Owner read
+                let is_writable = mode & 0o200 != 0; // Owner write
+
                 if !is_readable || !is_writable {
-                    warn!("Socket {} exists but lacks read/write permissions (mode: {:o})", path_str, mode);
+                    warn!(
+                        "Socket {} exists but lacks read/write permissions (mode: {:o})",
+                        path_str, mode
+                    );
                     return false;
                 }
 
@@ -159,7 +164,7 @@ impl PodmanEngine {
                         socket
                     )));
                 }
-                
+
                 info!(
                     "Podman socket {} is not available, falling back to local CLI",
                     socket
@@ -272,23 +277,27 @@ impl PodmanEngine {
         &self,
         manifest_content: &[u8],
     ) -> RuntimeResult<HashMap<String, String>> {
-        let manifest_str = String::from_utf8_lossy(manifest_content);
         let mut metadata = HashMap::new();
 
-        // Try to parse as YAML
-        if let Ok(doc) = serde_yaml::from_str::<Value>(&manifest_str) {
-            if let Some(kind) = doc.get("kind").and_then(|k| k.as_str()) {
-                metadata.insert("kind".to_string(), kind.to_string());
-            }
-            if let Some(api_version) = doc.get("apiVersion").and_then(|v| v.as_str()) {
-                metadata.insert("apiVersion".to_string(), api_version.to_string());
-            }
-            if let Some(meta) = doc.get("metadata") {
-                if let Some(name) = meta.get("name").and_then(|n| n.as_str()) {
-                    metadata.insert("name".to_string(), name.to_string());
+        if let Ok(docs) = parse_yaml_documents_from_slice(manifest_content) {
+            for doc in docs {
+                if let Some(kind) = doc.get("kind").and_then(|k| k.as_str()) {
+                    metadata.insert("kind".to_string(), kind.to_string());
                 }
-                if let Some(namespace) = meta.get("namespace").and_then(|n| n.as_str()) {
-                    metadata.insert("namespace".to_string(), namespace.to_string());
+                if let Some(api_version) = doc.get("apiVersion").and_then(|v| v.as_str()) {
+                    metadata.insert("apiVersion".to_string(), api_version.to_string());
+                }
+                if let Some(meta) = doc.get("metadata") {
+                    if let Some(name) = meta.get("name").and_then(|n| n.as_str()) {
+                        metadata.insert("name".to_string(), name.to_string());
+                    }
+                    if let Some(namespace) = meta.get("namespace").and_then(|n| n.as_str()) {
+                        metadata.insert("namespace".to_string(), namespace.to_string());
+                    }
+                }
+
+                if !metadata.is_empty() {
+                    break;
                 }
             }
         }
@@ -363,40 +372,32 @@ impl PodmanEngine {
         let temp_dir = std::env::temp_dir();
         let temp_file = temp_dir.join(format!("podmesh-manifest-{}.yaml", uuid::Uuid::new_v4()));
 
-        // Parse the manifest and modify the pod name
-        let manifest_str = String::from_utf8_lossy(manifest_content);
-        let mut doc: serde_yaml::Value = serde_yaml::from_str(&manifest_str)
+        let mut docs = parse_yaml_documents_from_slice(manifest_content)
             .map_err(|e| RuntimeError::InvalidManifest(format!("YAML parse error: {}", e)))?;
 
-        // Generate pod name based on manifest_id
+        if docs.is_empty() {
+            return Err(RuntimeError::InvalidManifest(
+                "Manifest did not contain any YAML documents".to_string(),
+            ));
+        }
+
         let pod_name = format!("podmesh-{}", manifest_id);
-
-        // Update metadata name to use our generated pod name
-        if let Some(metadata) = doc.get_mut("metadata") {
-            if let Some(metadata_map) = metadata.as_mapping_mut() {
-                metadata_map.insert(
-                    serde_yaml::Value::String("name".to_string()),
-                    serde_yaml::Value::String(pod_name.clone()),
-                );
+        let mut renamed = false;
+        for doc in docs.iter_mut() {
+            if rename_manifest_doc(doc, &pod_name) {
+                renamed = true;
+                break;
             }
         }
 
-        // For Deployments, also update the pod template metadata name if it exists
-        if let Some(spec) = doc.get_mut("spec") {
-            if let Some(template) = spec.get_mut("template") {
-                if let Some(template_metadata) = template.get_mut("metadata") {
-                    if let Some(template_metadata_map) = template_metadata.as_mapping_mut() {
-                        template_metadata_map.insert(
-                            serde_yaml::Value::String("name".to_string()),
-                            serde_yaml::Value::String(format!("{}-pod", pod_name)),
-                        );
-                    }
-                }
-            }
+        if !renamed {
+            warn!(
+                "No workload resource found while preparing manifest {}; pod name unchanged",
+                manifest_id
+            );
         }
 
-        // Serialize back to YAML
-        let modified_manifest = serde_yaml::to_string(&doc)
+        let modified_manifest = serialize_yaml_documents(&docs)
             .map_err(|e| RuntimeError::InvalidManifest(format!("YAML serialize error: {}", e)))?;
 
         let mut file = tokio::fs::File::create(&temp_file).await?;
@@ -419,51 +420,96 @@ impl PodmanEngine {
         }
     }
 
-    async fn ensure_gateway_metadata(
-        &self,
-        gateway_cfg: &GatewayInjectionConfig,
-    ) -> RuntimeResult<()> {
-        let dir = metadata_host_dir(&gateway_cfg.manifest_id);
-        tokio::fs::create_dir_all(&dir)
+    /// Ensure the dedicated podmesh podman network exists, creating it if needed
+    async fn ensure_podmesh_network(&self) -> RuntimeResult<()> {
+        if self
+            .execute_command(&["network", "exists", PODMESH_NETWORK_NAME])
             .await
-            .map_err(RuntimeError::IoError)?;
+            .is_ok()
+        {
+            return Ok(());
+        }
 
-        let metadata = GatewaySidecarMetadata {
-            manifest_id: gateway_cfg.manifest_id.clone(),
-            manifest_b64: base64::engine::general_purpose::STANDARD
-                .encode(&gateway_cfg.manifest_bytes),
-            owner_public_key_b64: if gateway_cfg.owner_public_key.is_empty() {
-                None
-            } else {
-                Some(
-                    base64::engine::general_purpose::STANDARD.encode(&gateway_cfg.owner_public_key),
-                )
-            },
-            bootstrap_peer: gateway_cfg.bootstrap_peer.clone(),
-        };
-
-        let metadata_bytes = serde_json::to_vec_pretty(&metadata).map_err(|e| {
-            RuntimeError::CommandFailed(format!(
-                "failed to serialize gateway metadata for {}: {}",
-                gateway_cfg.manifest_id, e
-            ))
-        })?;
-
-        let file_path = metadata_file_path(&gateway_cfg.manifest_id);
-        let mut file = tokio::fs::File::create(&file_path)
-            .await
-            .map_err(RuntimeError::IoError)?;
-        file.write_all(&metadata_bytes)
-            .await
-            .map_err(RuntimeError::IoError)?;
-        file.flush().await.map_err(RuntimeError::IoError)?;
-
-        debug!(
-            "wrote gateway metadata for manifest {} to {:?}",
-            gateway_cfg.manifest_id, file_path
+        info!(
+            "Podman network '{}' missing; attempting to create it",
+            PODMESH_NETWORK_NAME
         );
-        Ok(())
+
+        match self
+            .execute_command(&["network", "create", PODMESH_NETWORK_NAME])
+            .await
+        {
+            Ok(output) => {
+                info!(
+                    "Created podman network '{}': {}",
+                    PODMESH_NETWORK_NAME,
+                    output.trim()
+                );
+                Ok(())
+            }
+            Err(err) => {
+                error!(
+                    "Failed to create podman network '{}': {}",
+                    PODMESH_NETWORK_NAME, err
+                );
+                Err(err)
+            }
+        }
     }
+}
+
+fn rename_manifest_doc(doc: &mut Value, pod_name: &str) -> bool {
+    // Only rename pod-spec workloads so supporting resources (ConfigMaps, PVCs, etc.)
+    // retain their original names referenced by the workload.
+    let kind = doc
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+
+    if !matches!(
+        kind.as_str(),
+        "Pod" | "Deployment" | "ReplicaSet" | "DaemonSet" | "StatefulSet"
+    ) {
+        return false;
+    }
+
+    let mut updated = false;
+
+    if let Some(metadata) = doc
+        .get_mut("metadata")
+        .and_then(|value| value.as_mapping_mut())
+    {
+        metadata.insert(
+            Value::String("name".to_string()),
+            Value::String(pod_name.to_string()),
+        );
+        updated = true;
+    }
+
+    if kind == "Pod" {
+        return updated;
+    }
+
+    if let Some(spec) = doc.get_mut("spec").and_then(|value| value.as_mapping_mut()) {
+        if let Some(template) = spec
+            .get_mut(&Value::String("template".to_string()))
+            .and_then(|value| value.as_mapping_mut())
+        {
+            if let Some(template_metadata) = template
+                .get_mut(&Value::String("metadata".to_string()))
+                .and_then(|value| value.as_mapping_mut())
+            {
+                template_metadata.insert(
+                    Value::String("name".to_string()),
+                    Value::String(format!("{}-pod", pod_name)),
+                );
+                updated = true;
+            }
+        }
+    }
+
+    updated
 }
 
 impl Default for PodmanEngine {
@@ -485,10 +531,16 @@ impl RuntimeEngine for PodmanEngine {
             // Check if socket is accessible before trying to use it
             if !Self::validate_socket(socket) {
                 if self.force_remote {
-                    debug!("Podman socket {} not available and fallback disabled; marking unavailable", socket);
+                    debug!(
+                        "Podman socket {} not available and fallback disabled; marking unavailable",
+                        socket
+                    );
                     return false;
                 }
-                debug!("Podman socket {} not available, checking local availability", socket);
+                debug!(
+                    "Podman socket {} not available, checking local availability",
+                    socket
+                );
                 return self.execute_command_local(&check_args).await.is_ok();
             }
 
@@ -511,31 +563,32 @@ impl RuntimeEngine for PodmanEngine {
     }
 
     async fn validate_manifest(&self, manifest_content: &[u8]) -> RuntimeResult<()> {
-        let manifest_str = String::from_utf8_lossy(manifest_content);
+        let docs = parse_yaml_documents_from_str(&String::from_utf8_lossy(manifest_content))
+            .map_err(|e| RuntimeError::InvalidManifest(format!("YAML parse error: {}", e)))?;
 
-        // Basic YAML validation
-        match serde_yaml::from_str::<Value>(&manifest_str) {
-            Ok(doc) => {
-                // Check for required Kubernetes fields
-                if doc.get("apiVersion").is_none() {
-                    return Err(RuntimeError::InvalidManifest(
-                        "Missing apiVersion field".to_string(),
-                    ));
-                }
-                if doc.get("kind").is_none() {
-                    return Err(RuntimeError::InvalidManifest(
-                        "Missing kind field".to_string(),
-                    ));
-                }
-
-                info!("Manifest validation passed");
-                Ok(())
-            }
-            Err(e) => Err(RuntimeError::InvalidManifest(format!(
-                "YAML parse error: {}",
-                e
-            ))),
+        if docs.is_empty() {
+            return Err(RuntimeError::InvalidManifest(
+                "Manifest did not contain any YAML documents".to_string(),
+            ));
         }
+
+        for (idx, doc) in docs.iter().enumerate() {
+            if doc.get("apiVersion").is_none() {
+                return Err(RuntimeError::InvalidManifest(format!(
+                    "Document {} missing apiVersion field",
+                    idx + 1
+                )));
+            }
+            if doc.get("kind").is_none() {
+                return Err(RuntimeError::InvalidManifest(format!(
+                    "Document {} missing kind field",
+                    idx + 1
+                )));
+            }
+        }
+
+        info!("Manifest validation passed for {} documents", docs.len());
+        Ok(())
     }
 
     async fn deploy_workload(
@@ -549,10 +602,6 @@ impl RuntimeEngine for PodmanEngine {
         // Validate manifest first
         self.validate_manifest(manifest_content).await?;
 
-        if let Some(gateway_cfg) = &config.gateway {
-            self.ensure_gateway_metadata(gateway_cfg).await?;
-        }
-
         // Generate unique workload ID
         let workload_id = self.generate_workload_id(manifest_id, manifest_content);
 
@@ -560,6 +609,9 @@ impl RuntimeEngine for PodmanEngine {
         let temp_file = self
             .create_temp_manifest_file(manifest_content, manifest_id)
             .await?;
+
+        // Ensure the dedicated podmesh network exists before deployment
+        self.ensure_podmesh_network().await?;
 
         // Build podman kube play command
         let mut args = vec!["kube", "play"];
@@ -686,10 +738,6 @@ impl RuntimeEngine for PodmanEngine {
         // Validate the manifest first
         self.validate_manifest(manifest_content).await?;
 
-        if let Some(gateway_cfg) = &config.gateway {
-            self.ensure_gateway_metadata(gateway_cfg).await?;
-        }
-
         // Generate unique workload ID
         let workload_id = self.generate_workload_id(manifest_id, manifest_content);
 
@@ -697,6 +745,9 @@ impl RuntimeEngine for PodmanEngine {
         let temp_file = self
             .create_temp_manifest_file(manifest_content, manifest_id)
             .await?;
+
+        // Ensure the dedicated podmesh network exists before deployment
+        self.ensure_podmesh_network().await?;
 
         // Prepare podman command
         let mut args = vec!["kube", "play"];
@@ -1141,6 +1192,7 @@ impl RuntimeEngine for PodmanEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_yaml::Value;
 
     #[tokio::test]
     async fn test_podman_engine_creation() {
@@ -1240,5 +1292,67 @@ spec:
             engine.podman_socket.as_deref(),
             Some("unix:///run/podman/podman.sock")
         );
+    }
+
+    #[test]
+    fn test_rename_manifest_doc_skips_configmap() {
+        let mut config_map: Value = serde_yaml::from_str(
+            r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+    name: nginx-custom-content
+data:
+    index.html: hello
+"#,
+        )
+        .unwrap();
+
+        let renamed = super::rename_manifest_doc(&mut config_map, "podmesh-demo");
+
+        assert!(!renamed, "ConfigMap should not be renamed");
+        let name = config_map
+            .get("metadata")
+            .and_then(|meta| meta.get("name"))
+            .and_then(|name| name.as_str())
+            .unwrap();
+        assert_eq!(name, "nginx-custom-content");
+    }
+
+    #[test]
+    fn test_rename_manifest_doc_updates_deployment() {
+        let mut deployment: Value = serde_yaml::from_str(
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: my-nginx
+spec:
+    template:
+        metadata:
+            name: my-nginx-pod
+"#,
+        )
+        .unwrap();
+
+        let renamed = super::rename_manifest_doc(&mut deployment, "podmesh-demo");
+
+        assert!(renamed);
+
+        let top_name = deployment
+            .get("metadata")
+            .and_then(|meta| meta.get("name"))
+            .and_then(|name| name.as_str())
+            .unwrap();
+        assert_eq!(top_name, "podmesh-demo");
+
+        let template_name = deployment
+            .get("spec")
+            .and_then(|spec| spec.get("template"))
+            .and_then(|template| template.get("metadata"))
+            .and_then(|meta| meta.get("name"))
+            .and_then(|name| name.as_str())
+            .unwrap();
+        assert_eq!(template_name, "podmesh-demo-pod");
     }
 }

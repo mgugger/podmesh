@@ -3,10 +3,10 @@ use std::sync::Once;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use meshproxy::{Config, Workload};
 use serde::Deserialize;
 use tokio::sync::watch::Receiver;
 use tokio::time::{Instant, sleep};
-use meshproxy::{Config, Workload};
 
 static INIT_TRACING: Once = Once::new();
 

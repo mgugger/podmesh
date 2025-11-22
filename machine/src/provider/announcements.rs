@@ -515,10 +515,7 @@ mod tests {
         let metadata =
             AnnouncementManager::create_metadata(&capabilities, Some(&resources), &custom);
 
-        assert_eq!(
-            metadata.get("capabilities"),
-            Some(&"podman".to_string())
-        );
+        assert_eq!(metadata.get("capabilities"), Some(&"podman".to_string()));
         assert_eq!(metadata.get("resource.cpu"), Some(&"4".to_string()));
         assert_eq!(metadata.get("resource.memory"), Some(&"8GB".to_string()));
         assert_eq!(metadata.get("region"), Some(&"us-west".to_string()));
