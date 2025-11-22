@@ -732,10 +732,11 @@ async fn select_runtime_engine(
             }
         }
 
-        // Check for Docker Compose format - note preference, but don't hardcode
+        // Check for Docker Compose format and warn because only Podman is supported
         if doc.get("services").is_some() && doc.get("version").is_some() {
-            debug!("Detected Docker Compose manifest");
-            // Will prefer Docker below if available
+            warn!(
+                "Detected Docker Compose manifest but only Podman runtime is supported; attempting deployment via Podman"
+            );
         }
     }
 
@@ -743,11 +744,9 @@ async fn select_runtime_engine(
     if let Some(registry) = RUNTIME_REGISTRY.read().await.as_ref() {
         let available = registry.check_available_engines().await;
 
-        // Prefer Podman, then Docker, then mock for testing
+        // Prefer Podman, then mock for testing
         if *available.get("podman").unwrap_or(&false) {
             return Ok("podman".to_string());
-        } else if *available.get("docker").unwrap_or(&false) {
-            return Ok("docker".to_string());
         } else if *available.get("mock").unwrap_or(&false) {
             return Ok("mock".to_string());
         }
@@ -1149,8 +1148,8 @@ spec:
         let engine_name = engine.unwrap();
         assert!(engine_name == "mock" || engine_name == "podman");
 
-        // Test Docker Compose manifest
-        let docker_manifest = r#"
+                // Test Docker Compose manifest (should still fall back to Podman/mock)
+                let compose_manifest = r#"
 version: '3.8'
 services:
   web:
@@ -1158,9 +1157,10 @@ services:
     ports:
       - "80:80"
 "#;
-        let engine = select_runtime_engine(docker_manifest.as_bytes()).await;
-        assert!(engine.is_ok());
-        // Should prefer docker for compose files, but fall back to available engines
+                let engine = select_runtime_engine(compose_manifest.as_bytes()).await;
+                assert!(engine.is_ok());
+                let compose_engine = engine.unwrap();
+                assert!(compose_engine == "mock" || compose_engine == "podman");
     }
 
     #[test]

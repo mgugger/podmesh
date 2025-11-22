@@ -26,6 +26,8 @@ use tokio::signal;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
+pub mod manifest_routes;
+
 type HandshakeCodec = ByteCodec;
 
 pub const DEFAULT_GATEWAY_APP_PORT: u16 = 18080;
@@ -46,6 +48,7 @@ pub struct GatewayConfig {
     pub ingress_host: String,
     pub app_port: u16,
     pub routes: Vec<GatewayRouteSpec>,
+    pub owner_public_key_b64: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,6 +370,7 @@ fn publish_manifest_record(swarm: &mut Swarm<GatewayBehaviour>, cfg: &GatewayCon
         &cfg.manifest_id,
         &swarm.local_peer_id().to_string(),
         &cfg.ingress_host,
+        cfg.owner_public_key_b64.as_deref(),
         &cfg.routes,
         MANIFEST_RECORD_TTL_MS,
         timestamp_ms,

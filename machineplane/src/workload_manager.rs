@@ -1,8 +1,8 @@
 //! Workload Manager
 //!
 //! This module provides the main interface for managing workloads in the machine plane.
-//! It integrates runtime engines (Podman, Docker, etc.) with provider announcement
-//! and discovery systems to provide a unified workload management experience.
+//! It integrates the Podman runtime engine with provider announcement and discovery
+//! systems to provide a unified workload management experience.
 
 use crate::provider::{ProviderConfig, ProviderManager};
 use crate::runtime::{DeploymentConfig, RuntimeRegistry, WorkloadStatus, create_default_registry};
@@ -532,7 +532,7 @@ impl WorkloadManager {
 
     /// Export/generate a manifest from a running workload
     /// This is useful for debugging and testing to see what the actual runtime state looks like
-    /// as a Kubernetes/Docker Compose manifest.
+    /// as a generated Kubernetes manifest.
     pub async fn export_workload_manifest(
         &self,
         workload_id: &str,

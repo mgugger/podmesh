@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     fn test_create_metadata() {
-        let capabilities = vec!["podman".to_string(), "docker".to_string()];
+        let capabilities = vec!["podman".to_string()];
         let mut resources = HashMap::new();
         resources.insert("cpu".to_string(), "4".to_string());
         resources.insert("memory".to_string(), "8GB".to_string());
@@ -517,7 +517,7 @@ mod tests {
 
         assert_eq!(
             metadata.get("capabilities"),
-            Some(&"podman,docker".to_string())
+            Some(&"podman".to_string())
         );
         assert_eq!(metadata.get("resource.cpu"), Some(&"4".to_string()));
         assert_eq!(metadata.get("resource.memory"), Some(&"8GB".to_string()));

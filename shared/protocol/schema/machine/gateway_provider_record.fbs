@@ -1,14 +1,23 @@
 namespace beemesh.machine;
 
+enum GatewayRouteSource:byte {
+  SERVICE = 0,
+  INGRESS = 1,
+}
+
 table GatewayRoute {
   path_prefix:string;
   target_port:uint16;
+  service_name:string;
+  service_port:string;
+  source:GatewayRouteSource = SERVICE;
 }
 
 table GatewayProviderRecord {
   manifest_id:string;
   peer_id:string;
-  ingress_host:string;
+  host:string;
+  owner_public_key_b64:string;
   routes:[GatewayRoute];
   ttl_ms:uint32;
   last_updated_ms:uint64;

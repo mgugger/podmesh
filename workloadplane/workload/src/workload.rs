@@ -98,8 +98,4 @@ impl Workload {
     pub fn ingress_address(&self) -> Option<SocketAddr> {
         self.ingress.as_ref().map(|server| server.listen_addr())
     }
-
-    pub fn ingress_routes(&self) -> Option<ingress::IngressRoutes> {
-        self.ingress.as_ref().map(|server| server.routes())
-    }
 }

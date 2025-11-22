@@ -4,22 +4,24 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use axum::{Router, routing::get};
 use axum_support::spawn_tcp_listener;
-use protocol::{libp2p_constants::DEFAULT_INGRESS_MANIFEST_ID, machine::GatewayRouteSpec};
+use protocol::machine::{GatewayRouteKind, GatewayRouteSpec};
 use reqwest::Client;
 use tokio::{
     net::TcpListener,
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
-use workplane::ingress::IngressRouteSpec;
 use workplane::{Config, Workload};
 use workplane_gateway::{
-    DEFAULT_GATEWAY_APP_PORT, GatewayConfig, GatewayEvent, run_gateway_with_shutdown,
+    DEFAULT_GATEWAY_APP_PORT, GatewayConfig, GatewayEvent, manifest_routes::extract_gateway_routes,
+    run_gateway_with_shutdown,
 };
 
 use workplane_integration::support::{allocate_tcp_port, allocate_udp_port, init_tracing};
 
 const PROXY_PROVIDER_LABEL: &str = "beemesh-proxy-node";
+const DEMO_MANIFEST_ID: &str = "demo-nginx";
+const DEMO_MANIFEST: &[u8] = include_bytes!("../sample_manifests/demo_deployment.yml");
 
 fn build_workload_config(
     libp2p_port: u16,
@@ -74,23 +76,8 @@ async fn gateway_discovers_workload_provider() -> Result<()> {
 
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        let gateway_cfg = GatewayConfig {
-            provider_label: PROXY_PROVIDER_LABEL.to_string(),
-            bootstrap_peers: gateway_bootstrap_peers,
-            bootstrap_peer_ip: None,
-            lookup_interval: Duration::from_secs(2),
-            announce_interval: Duration::from_secs(5),
-            libp2p_host: "0.0.0.0".to_string(),
-            libp2p_port: 0,
-            announce_providers: false,
-            manifest_id: DEFAULT_INGRESS_MANIFEST_ID.to_string(),
-            ingress_host: format!("{}.mesh.local", DEFAULT_INGRESS_MANIFEST_ID),
-            app_port: DEFAULT_GATEWAY_APP_PORT,
-            routes: vec![GatewayRouteSpec {
-                path_prefix: "/".to_string(),
-                target_port: DEFAULT_GATEWAY_APP_PORT,
-            }],
-        };
+        let (gateway_cfg, _, _) =
+            build_gateway_config(gateway_bootstrap_peers, DEFAULT_GATEWAY_APP_PORT)?;
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -166,40 +153,14 @@ async fn ingress_proxies_requests_via_gateway() -> Result<()> {
         wait_for_proxy_provider(handle.proxy_provider_rx(), Duration::from_secs(10)).await?;
 
         let app_port = allocate_tcp_port();
-        let ingress_routes = handle
-            .workload
-            .ingress_routes()
-            .ok_or_else(|| anyhow!("ingress routes unavailable"))?;
-        ingress_routes.register(
-            DEFAULT_INGRESS_MANIFEST_ID,
-            IngressRouteSpec {
-                path_prefix: "/".to_string(),
-                target_port: app_port,
-            },
-        );
 
         let app_body = "hello-from-proxied-app".to_string();
         app_server = Some(spawn_test_app(app_port, app_body.clone()).await?);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         gateway_shutdown = Some(shutdown_tx);
-        let gateway_cfg = GatewayConfig {
-            provider_label: PROXY_PROVIDER_LABEL.to_string(),
-            bootstrap_peers: vec![handle.bootstrap_addr.clone()],
-            bootstrap_peer_ip: None,
-            lookup_interval: Duration::from_secs(2),
-            announce_interval: Duration::from_secs(5),
-            libp2p_host: "0.0.0.0".to_string(),
-            libp2p_port: 0,
-            announce_providers: false,
-            manifest_id: DEFAULT_INGRESS_MANIFEST_ID.to_string(),
-            ingress_host: format!("{}.mesh.local", DEFAULT_INGRESS_MANIFEST_ID),
-            app_port,
-            routes: vec![GatewayRouteSpec {
-                path_prefix: "/".to_string(),
-                target_port: app_port,
-            }],
-        };
+        let (gateway_cfg, ingress_host, service_host) =
+            build_gateway_config(vec![handle.bootstrap_addr.clone()], app_port)?;
 
         gateway_task = Some(tokio::spawn(async move {
             run_gateway_with_shutdown(gateway_cfg, shutdown_rx, None)
@@ -213,9 +174,12 @@ async fn ingress_proxies_requests_via_gateway() -> Result<()> {
             .ok_or_else(|| anyhow!("ingress listen address unavailable"))?;
         let client = Client::new();
         let url = format!("http://{ingress_addr}/hello");
-        let host_header = format!("{}.mesh.local", DEFAULT_INGRESS_MANIFEST_ID);
-        let body =
-            wait_for_ingress_response(&client, &url, &host_header, Duration::from_secs(20)).await?;
+        let body = wait_for_ingress_response(&client, &url, &ingress_host, Duration::from_secs(20))
+            .await?;
+        assert_eq!(body, app_body);
+
+        let body = wait_for_ingress_response(&client, &url, &service_host, Duration::from_secs(20))
+            .await?;
         assert_eq!(body, app_body);
         Ok(())
     }
@@ -366,4 +330,48 @@ async fn wait_for_ingress_response(
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+fn build_gateway_config(
+    bootstrap_peers: Vec<String>,
+    app_port: u16,
+) -> Result<(GatewayConfig, String, String)> {
+    let (routes, ingress_host, service_host) = demo_routes(app_port)?;
+    let cfg = GatewayConfig {
+        provider_label: PROXY_PROVIDER_LABEL.to_string(),
+        bootstrap_peers,
+        bootstrap_peer_ip: None,
+        lookup_interval: Duration::from_secs(2),
+        announce_interval: Duration::from_secs(5),
+        libp2p_host: "0.0.0.0".to_string(),
+        libp2p_port: 0,
+        announce_providers: false,
+        manifest_id: DEMO_MANIFEST_ID.to_string(),
+        ingress_host: ingress_host.clone(),
+        app_port,
+        routes,
+        owner_public_key_b64: None,
+    };
+    Ok((cfg, ingress_host, service_host))
+}
+
+fn demo_routes(app_port: u16) -> Result<(Vec<GatewayRouteSpec>, String, String)> {
+    let extraction = extract_gateway_routes(DEMO_MANIFEST, DEMO_MANIFEST_ID)?;
+    let mut routes = extraction.routes;
+    for route in routes.iter_mut() {
+        route.target_port = app_port;
+    }
+
+    let ingress_host = routes
+        .iter()
+        .find(|route| matches!(route.source, GatewayRouteKind::Ingress))
+        .map(|route| route.host.clone())
+        .ok_or_else(|| anyhow!("demo manifest missing ingress route"))?;
+    let service_host = routes
+        .iter()
+        .find(|route| matches!(route.source, GatewayRouteKind::Service))
+        .map(|route| route.host.clone())
+        .ok_or_else(|| anyhow!("demo manifest missing service route"))?;
+
+    Ok((routes, ingress_host, service_host))
 }

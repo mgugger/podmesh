@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -13,7 +12,6 @@ use axum::{
     routing::any,
 };
 use axum_support::{parse_socket_addr, spawn_tcp_listener};
-use parking_lot::RwLock;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -21,12 +19,11 @@ use tracing::{debug, info, warn};
 use crate::p2p::ProxyClient;
 use p2p::http_proxy::ProxyHttpRequest;
 
-const DEFAULT_DOMAIN_SUFFIX: &str = "mesh.com";
+const DEFAULT_DOMAIN_SUFFIX: &str = "mesh.local";
 const MAX_PROXY_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct IngressServer {
     join: JoinHandle<()>,
-    routes: IngressRoutes,
     listen_addr: SocketAddr,
 }
 
@@ -37,25 +34,15 @@ impl IngressServer {
         std_listener.set_nonblocking(true)?;
         let listener = TcpListener::from_std(std_listener)?;
 
-        let routes = IngressRoutes::default();
-        let state = IngressState {
-            routes: routes.clone(),
-            gateway,
-        };
-
+        let state = IngressState { gateway };
         let app = Router::new().fallback(any(ingress_entry)).with_state(state);
         let join = spawn_tcp_listener(listener, app, "workload-ingress");
 
         info!(addr = %addr, "ingress server listening");
         Ok(Self {
             join,
-            routes,
             listen_addr: addr,
         })
-    }
-
-    pub fn routes(&self) -> IngressRoutes {
-        self.routes.clone()
     }
 
     pub fn listen_addr(&self) -> SocketAddr {
@@ -68,62 +55,8 @@ impl IngressServer {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct IngressRoutes {
-    inner: Arc<RwLock<HashMap<String, Vec<RouteMapping>>>>,
-}
-
-impl IngressRoutes {
-    pub fn register(&self, app_id: impl Into<String>, spec: IngressRouteSpec) {
-        let mut map = self.inner.write();
-        let entry = map.entry(app_id.into()).or_default();
-        entry.push(RouteMapping::from(spec));
-        entry.sort_by(|a, b| b.path_prefix.len().cmp(&a.path_prefix.len()));
-    }
-
-    pub fn resolve(&self, app_id: &str, path: &str) -> Option<RouteMapping> {
-        let map = self.inner.read();
-        let routes = map.get(app_id)?;
-        routes.iter().find(|route| route.matches(path)).cloned()
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct IngressRouteSpec {
-    pub path_prefix: String,
-    pub target_port: u16,
-}
-
-#[derive(Clone, Debug)]
-pub struct RouteMapping {
-    pub path_prefix: String,
-    pub target_port: u16,
-}
-
-impl RouteMapping {
-    fn matches(&self, path: &str) -> bool {
-        path.starts_with(&self.path_prefix)
-    }
-}
-
-impl From<IngressRouteSpec> for RouteMapping {
-    fn from(value: IngressRouteSpec) -> Self {
-        let mut prefix = value.path_prefix;
-        if prefix.is_empty() {
-            prefix = "/".to_string();
-        } else if !prefix.starts_with('/') {
-            prefix = format!("/{}", prefix);
-        }
-        Self {
-            path_prefix: prefix,
-            target_port: value.target_port,
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct IngressState {
-    routes: IngressRoutes,
     gateway: GatewayClient,
 }
 
@@ -134,18 +67,13 @@ async fn ingress_entry(
     let host = request
         .headers()
         .get(axum::http::header::HOST)
-        .and_then(|value| parse_host(value));
+        .and_then(parse_host);
 
     let Some(app_id) = host else {
         return status_response(StatusCode::BAD_REQUEST, "missing host header");
     };
 
-    let path = request.uri().path().to_string();
-    let Some(route) = state.routes.resolve(&app_id, &path) else {
-        return status_response(StatusCode::NOT_FOUND, "no ingress route matched");
-    };
-
-    match state.gateway.forward(&app_id, route.clone(), request).await {
+    match state.gateway.forward(&app_id, request).await {
         Ok(response) => response,
         Err(err) => {
             warn!(app_id = %app_id, error = %err, "gateway forward failed");
@@ -161,19 +89,23 @@ fn parse_host(value: &HeaderValue) -> Option<String> {
         return None;
     }
     let suffix = format!(".{}", DEFAULT_DOMAIN_SUFFIX);
-    if let Some(stripped) = host_part.strip_suffix(&suffix) {
-        if !stripped.is_empty() {
-            return Some(stripped.to_string());
-        }
+    let stripped = if let Some(stripped) = host_part.strip_suffix(&suffix) {
+        stripped
     } else {
         debug!(
             host = host_part,
             expected_suffix = DEFAULT_DOMAIN_SUFFIX,
             "ingress host missing expected suffix"
         );
-        return host_part.split('.').next().map(|s| s.to_string());
-    }
-    None
+        host_part
+    };
+
+    stripped
+        .trim_matches('.')
+        .rsplit('.')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.to_string())
 }
 
 fn status_response(code: StatusCode, body: &str) -> Response<Body> {
@@ -194,7 +126,6 @@ pub trait GatewayForwarder {
     async fn forward(
         &self,
         app_id: &str,
-        route: RouteMapping,
         request: Request<Body>,
     ) -> Result<Response<Body>, GatewayError>;
 }
@@ -215,13 +146,9 @@ impl GatewayForwarder for NoopGatewayForwarder {
     async fn forward(
         &self,
         app_id: &str,
-        route: RouteMapping,
         _request: Request<Body>,
     ) -> Result<Response<Body>, GatewayError> {
-        let body = format!(
-            "gateway forwarding not implemented (app={}, port={}, path={})",
-            app_id, route.target_port, route.path_prefix
-        );
+        let body = format!("gateway forwarding not implemented (app={})", app_id);
         Ok(Response::builder()
             .status(StatusCode::NOT_IMPLEMENTED)
             .body(Body::from(body))
@@ -249,7 +176,6 @@ impl GatewayForwarder for ProxyGatewayForwarder {
     async fn forward(
         &self,
         app_id: &str,
-        route: RouteMapping,
         request: Request<Body>,
     ) -> Result<Response<Body>, GatewayError> {
         let (parts, body) = request.into_parts();
@@ -275,7 +201,7 @@ impl GatewayForwarder for ProxyGatewayForwarder {
             path_and_query,
             headers,
             body: body_bytes.to_vec(),
-            target_port: route.target_port,
+            target_port: 0,
         };
         let proxy_response = self
             .proxy

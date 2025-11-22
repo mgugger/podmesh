@@ -5,10 +5,13 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 mod common;
-use common::test_utils::{make_test_cli, set_env_var, setup_cleanup_hook, start_nodes, NodeGuard};
+use common::test_utils::{NodeGuard, make_test_cli, set_env_var, setup_cleanup_hook, start_nodes};
 
 fn manifest_path() -> PathBuf {
-    PathBuf::from(format!("{}/tests/sample_manifests/nginx.yml", env!("CARGO_MANIFEST_DIR")))
+    PathBuf::from(format!(
+        "{}/tests/sample_manifests/nginx.yml",
+        env!("CARGO_MANIFEST_DIR")
+    ))
 }
 
 async fn setup_test_environment() -> Vec<u16> {
@@ -51,7 +54,10 @@ async fn test_delete_task_endpoint() {
 
     match delete_result {
         Ok(manifest_id) => {
-            println!("Delete CLI command succeeded with manifest_id: {}", manifest_id);
+            println!(
+                "Delete CLI command succeeded with manifest_id: {}",
+                manifest_id
+            );
             assert!(!manifest_id.is_empty());
         }
         Err(e) => {

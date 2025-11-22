@@ -5,10 +5,7 @@ use tokio::time::sleep;
 
 mod common;
 use common::apply_common::{
-    check_workload_deployment,
-    get_peer_ids,
-    setup_test_environment,
-    start_cluster_nodes,
+    check_workload_deployment, get_peer_ids, setup_test_environment, start_cluster_nodes,
     wait_for_mesh_formation,
 };
 

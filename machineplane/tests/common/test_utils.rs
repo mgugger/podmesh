@@ -1,8 +1,6 @@
 use machine::{
-    gateway_sidecar::DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR,
-    gateway_sidecar::DEFAULT_GATEWAY_IMAGE,
-    start_machine,
-    Cli,
+    Cli, gateway_sidecar::DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR,
+    gateway_sidecar::DEFAULT_GATEWAY_IMAGE, start_machine,
 };
 use std::path::PathBuf;
 use std::sync::Once;

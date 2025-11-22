@@ -6,16 +6,17 @@ use tokio::time::sleep;
 
 mod common;
 use common::apply_common::{
-    check_workload_deployment,
-    get_peer_ids,
-    setup_test_environment,
-    start_cluster_nodes,
+    check_workload_deployment, get_peer_ids, setup_test_environment, start_cluster_nodes,
     wait_for_mesh_formation,
 };
-use common::test_utils::{make_test_cli, setup_cleanup_hook, start_nodes, NodeGuard};
+use common::test_utils::{NodeGuard, make_test_cli, setup_cleanup_hook, start_nodes};
 
 fn manifest_path(file: &str) -> PathBuf {
-    PathBuf::from(format!("{}/tests/sample_manifests/{}", env!("CARGO_MANIFEST_DIR"), file))
+    PathBuf::from(format!(
+        "{}/tests/sample_manifests/{}",
+        env!("CARGO_MANIFEST_DIR"),
+        file
+    ))
 }
 
 #[serial]

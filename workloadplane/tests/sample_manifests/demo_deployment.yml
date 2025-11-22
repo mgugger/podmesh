@@ -1,24 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-custom-content
+data:
+  index.html: |
+    <html>
+      <head><title>Beemesh NGINX</title></head>
+      <body>
+        <h1>Welcome to Beemesh</h1>
+      </body>
+    </html>
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: nginx
-  namespace: test-namespace
+  name: my-nginx
 spec:
-  replicas: 1
   selector:
     matchLabels:
-      app: nginx
+      run: my-nginx
+  replicas: 1
   template:
     metadata:
       labels:
-        app: nginx
+        run: my-nginx
     spec:
       containers:
-        - name: nginx
-          image: docker.io/library/nginx:1.27
+        - name: my-nginx
+          image: docker.io/library/nginx
           ports:
-            - name: http
-              containerPort: 80
+            - containerPort: 80
+          volumeMounts:
+            - name: custom-html
+              mountPath: /usr/share/nginx/html/index.html
+              subPath: index.html
+              - name: workload-gateway
         - name: workload-gateway
           image: sample_repo.io/beemesh/workload-gateway:latest
           env:
@@ -28,3 +44,40 @@ spec:
               value: nginx
             - name: MANIFEST_ID
               value: test-namespace/nginx
+      volumes:
+        - name: custom-html
+          configMap:
+            name: nginx-custom-content
+            items:
+              - key: index.html
+                path: index.html
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-nginx-svc
+spec:
+  selector:
+    run: my-nginx
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-nginx-ingress
+spec:
+  rules:
+    - host: demo-nginx.mesh.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-nginx-svc
+                port:
+                  number: 80

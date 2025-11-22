@@ -1,7 +1,7 @@
 //! Runtime engine abstraction for different container/virtualization technologies
 //!
 //! This module provides a pluggable system for executing workloads using different
-//! runtime engines like Podman, Docker, or future VM technologies.
+//! runtime engines like Podman or future VM technologies.
 
 use async_trait::async_trait;
 #[cfg(not(debug_assertions))]
@@ -331,9 +331,6 @@ pub async fn create_default_registry() -> RuntimeRegistry {
     // Register Podman engine
     registry.register(Box::new(engines::PodmanEngine::new()));
 
-    // Register Docker engine (for future use)
-    registry.register(Box::new(engines::DockerEngine::new()));
-
     // Register mock engine for testing and debug builds only
     #[cfg(debug_assertions)]
     {
@@ -343,11 +340,9 @@ pub async fn create_default_registry() -> RuntimeRegistry {
     // Try to set the best available engine as default
     let available = registry.check_available_engines().await;
 
-    // Prefer Podman if available, then Docker, then mock for testing
+    // Prefer Podman if available, otherwise fall back to mock (debug builds)
     if *available.get("podman").unwrap_or(&false) {
         let _ = registry.set_default_engine("podman");
-    } else if *available.get("docker").unwrap_or(&false) {
-        let _ = registry.set_default_engine("docker");
     } else {
         #[cfg(debug_assertions)]
         {

@@ -83,7 +83,7 @@ impl Default for NodeCapabilities {
             cpu_cores: 1,
             memory_mb: 1024,
             storage_mb: 10240,
-            container_runtimes: vec!["docker".to_string()],
+            container_runtimes: vec!["podman".to_string()],
         }
     }
 }

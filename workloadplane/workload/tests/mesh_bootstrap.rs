@@ -16,8 +16,14 @@ async fn workload_mesh_bootstraps_three_nodes() -> Result<()> {
 
     let mut nodes = Vec::new();
     let test_result: Result<()> = async {
-        let node1 =
-            start_node(allocate_udp_port(), allocate_tcp_port(), Vec::new(), false, false).await?;
+        let node1 = start_node(
+            allocate_udp_port(),
+            allocate_tcp_port(),
+            Vec::new(),
+            false,
+            false,
+        )
+        .await?;
         let bootstrap1 = node1.bootstrap_multiaddr();
         nodes.push(node1);
 
@@ -60,8 +66,14 @@ async fn workload_mesh_bootstraps_three_nodes() -> Result<()> {
 async fn workload_mesh_single_node_reports_zero_peers() -> Result<()> {
     init_tracing();
 
-    let mut node =
-        start_node(allocate_udp_port(), allocate_tcp_port(), Vec::new(), false, false).await?;
+    let mut node = start_node(
+        allocate_udp_port(),
+        allocate_tcp_port(),
+        Vec::new(),
+        false,
+        false,
+    )
+    .await?;
 
     let client = reqwest::Client::new();
     wait_for_peer_count(&node, 0, Duration::from_secs(10), &client).await?;

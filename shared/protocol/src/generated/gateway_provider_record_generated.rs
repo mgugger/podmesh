@@ -26,6 +26,91 @@ pub mod machine {
   extern crate flatbuffers;
   use self::flatbuffers::{EndianScalar, Follow};
 
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MIN_GATEWAY_ROUTE_SOURCE: i8 = 0;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MAX_GATEWAY_ROUTE_SOURCE: i8 = 1;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+#[allow(non_camel_case_types)]
+pub const ENUM_VALUES_GATEWAY_ROUTE_SOURCE: [GatewayRouteSource; 2] = [
+  GatewayRouteSource::SERVICE,
+  GatewayRouteSource::INGRESS,
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct GatewayRouteSource(pub i8);
+#[allow(non_upper_case_globals)]
+impl GatewayRouteSource {
+  pub const SERVICE: Self = Self(0);
+  pub const INGRESS: Self = Self(1);
+
+  pub const ENUM_MIN: i8 = 0;
+  pub const ENUM_MAX: i8 = 1;
+  pub const ENUM_VALUES: &'static [Self] = &[
+    Self::SERVICE,
+    Self::INGRESS,
+  ];
+  /// Returns the variant's name or "" if unknown.
+  pub fn variant_name(self) -> Option<&'static str> {
+    match self {
+      Self::SERVICE => Some("SERVICE"),
+      Self::INGRESS => Some("INGRESS"),
+      _ => None,
+    }
+  }
+}
+impl core::fmt::Debug for GatewayRouteSource {
+  fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    if let Some(name) = self.variant_name() {
+      f.write_str(name)
+    } else {
+      f.write_fmt(format_args!("<UNKNOWN {:?}>", self.0))
+    }
+  }
+}
+impl<'a> flatbuffers::Follow<'a> for GatewayRouteSource {
+  type Inner = Self;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    let b = unsafe { flatbuffers::read_scalar_at::<i8>(buf, loc) };
+    Self(b)
+  }
+}
+
+impl flatbuffers::Push for GatewayRouteSource {
+    type Output = GatewayRouteSource;
+    #[inline]
+    unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
+        unsafe { flatbuffers::emplace_scalar::<i8>(dst, self.0); }
+    }
+}
+
+impl flatbuffers::EndianScalar for GatewayRouteSource {
+  type Scalar = i8;
+  #[inline]
+  fn to_little_endian(self) -> i8 {
+    self.0.to_le()
+  }
+  #[inline]
+  #[allow(clippy::wrong_self_convention)]
+  fn from_little_endian(v: i8) -> Self {
+    let b = i8::from_le(v);
+    Self(b)
+  }
+}
+
+impl<'a> flatbuffers::Verifiable for GatewayRouteSource {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    i8::run_verifier(v, pos)
+  }
+}
+
+impl flatbuffers::SimpleToVerifyInSlice for GatewayRouteSource {}
 pub enum GatewayRouteOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -44,6 +129,9 @@ impl<'a> flatbuffers::Follow<'a> for GatewayRoute<'a> {
 impl<'a> GatewayRoute<'a> {
   pub const VT_PATH_PREFIX: flatbuffers::VOffsetT = 4;
   pub const VT_TARGET_PORT: flatbuffers::VOffsetT = 6;
+  pub const VT_SERVICE_NAME: flatbuffers::VOffsetT = 8;
+  pub const VT_SERVICE_PORT: flatbuffers::VOffsetT = 10;
+  pub const VT_SOURCE: flatbuffers::VOffsetT = 12;
 
   #[inline]
   pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -55,8 +143,11 @@ impl<'a> GatewayRoute<'a> {
     args: &'args GatewayRouteArgs<'args>
   ) -> flatbuffers::WIPOffset<GatewayRoute<'bldr>> {
     let mut builder = GatewayRouteBuilder::new(_fbb);
+    if let Some(x) = args.service_port { builder.add_service_port(x); }
+    if let Some(x) = args.service_name { builder.add_service_name(x); }
     if let Some(x) = args.path_prefix { builder.add_path_prefix(x); }
     builder.add_target_port(args.target_port);
+    builder.add_source(args.source);
     builder.finish()
   }
 
@@ -75,6 +166,27 @@ impl<'a> GatewayRoute<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<u16>(GatewayRoute::VT_TARGET_PORT, Some(0)).unwrap()}
   }
+  #[inline]
+  pub fn service_name(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(GatewayRoute::VT_SERVICE_NAME, None)}
+  }
+  #[inline]
+  pub fn service_port(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(GatewayRoute::VT_SERVICE_PORT, None)}
+  }
+  #[inline]
+  pub fn source(&self) -> GatewayRouteSource {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<GatewayRouteSource>(GatewayRoute::VT_SOURCE, Some(GatewayRouteSource::SERVICE)).unwrap()}
+  }
 }
 
 impl flatbuffers::Verifiable for GatewayRoute<'_> {
@@ -86,6 +198,9 @@ impl flatbuffers::Verifiable for GatewayRoute<'_> {
     v.visit_table(pos)?
      .visit_field::<flatbuffers::ForwardsUOffset<&str>>("path_prefix", Self::VT_PATH_PREFIX, false)?
      .visit_field::<u16>("target_port", Self::VT_TARGET_PORT, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("service_name", Self::VT_SERVICE_NAME, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("service_port", Self::VT_SERVICE_PORT, false)?
+     .visit_field::<GatewayRouteSource>("source", Self::VT_SOURCE, false)?
      .finish();
     Ok(())
   }
@@ -93,6 +208,9 @@ impl flatbuffers::Verifiable for GatewayRoute<'_> {
 pub struct GatewayRouteArgs<'a> {
     pub path_prefix: Option<flatbuffers::WIPOffset<&'a str>>,
     pub target_port: u16,
+    pub service_name: Option<flatbuffers::WIPOffset<&'a str>>,
+    pub service_port: Option<flatbuffers::WIPOffset<&'a str>>,
+    pub source: GatewayRouteSource,
 }
 impl<'a> Default for GatewayRouteArgs<'a> {
   #[inline]
@@ -100,6 +218,9 @@ impl<'a> Default for GatewayRouteArgs<'a> {
     GatewayRouteArgs {
       path_prefix: None,
       target_port: 0,
+      service_name: None,
+      service_port: None,
+      source: GatewayRouteSource::SERVICE,
     }
   }
 }
@@ -116,6 +237,18 @@ impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> GatewayRouteBuilder<'a, 'b, A> 
   #[inline]
   pub fn add_target_port(&mut self, target_port: u16) {
     self.fbb_.push_slot::<u16>(GatewayRoute::VT_TARGET_PORT, target_port, 0);
+  }
+  #[inline]
+  pub fn add_service_name(&mut self, service_name: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(GatewayRoute::VT_SERVICE_NAME, service_name);
+  }
+  #[inline]
+  pub fn add_service_port(&mut self, service_port: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(GatewayRoute::VT_SERVICE_PORT, service_port);
+  }
+  #[inline]
+  pub fn add_source(&mut self, source: GatewayRouteSource) {
+    self.fbb_.push_slot::<GatewayRouteSource>(GatewayRoute::VT_SOURCE, source, GatewayRouteSource::SERVICE);
   }
   #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> GatewayRouteBuilder<'a, 'b, A> {
@@ -137,6 +270,9 @@ impl core::fmt::Debug for GatewayRoute<'_> {
     let mut ds = f.debug_struct("GatewayRoute");
       ds.field("path_prefix", &self.path_prefix());
       ds.field("target_port", &self.target_port());
+      ds.field("service_name", &self.service_name());
+      ds.field("service_port", &self.service_port());
+      ds.field("source", &self.source());
       ds.finish()
   }
 }
@@ -158,11 +294,12 @@ impl<'a> flatbuffers::Follow<'a> for GatewayProviderRecord<'a> {
 impl<'a> GatewayProviderRecord<'a> {
   pub const VT_MANIFEST_ID: flatbuffers::VOffsetT = 4;
   pub const VT_PEER_ID: flatbuffers::VOffsetT = 6;
-  pub const VT_INGRESS_HOST: flatbuffers::VOffsetT = 8;
-  pub const VT_ROUTES: flatbuffers::VOffsetT = 10;
-  pub const VT_TTL_MS: flatbuffers::VOffsetT = 12;
-  pub const VT_LAST_UPDATED_MS: flatbuffers::VOffsetT = 14;
-  pub const VT_VERSION: flatbuffers::VOffsetT = 16;
+  pub const VT_HOST: flatbuffers::VOffsetT = 8;
+  pub const VT_OWNER_PUBLIC_KEY_B64: flatbuffers::VOffsetT = 10;
+  pub const VT_ROUTES: flatbuffers::VOffsetT = 12;
+  pub const VT_TTL_MS: flatbuffers::VOffsetT = 14;
+  pub const VT_LAST_UPDATED_MS: flatbuffers::VOffsetT = 16;
+  pub const VT_VERSION: flatbuffers::VOffsetT = 18;
 
   #[inline]
   pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -177,7 +314,8 @@ impl<'a> GatewayProviderRecord<'a> {
     builder.add_last_updated_ms(args.last_updated_ms);
     builder.add_ttl_ms(args.ttl_ms);
     if let Some(x) = args.routes { builder.add_routes(x); }
-    if let Some(x) = args.ingress_host { builder.add_ingress_host(x); }
+    if let Some(x) = args.owner_public_key_b64 { builder.add_owner_public_key_b64(x); }
+    if let Some(x) = args.host { builder.add_host(x); }
     if let Some(x) = args.peer_id { builder.add_peer_id(x); }
     if let Some(x) = args.manifest_id { builder.add_manifest_id(x); }
     builder.add_version(args.version);
@@ -200,11 +338,18 @@ impl<'a> GatewayProviderRecord<'a> {
     unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(GatewayProviderRecord::VT_PEER_ID, None)}
   }
   #[inline]
-  pub fn ingress_host(&self) -> Option<&'a str> {
+  pub fn host(&self) -> Option<&'a str> {
     // Safety:
     // Created from valid Table for this object
     // which contains a valid value in this slot
-    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(GatewayProviderRecord::VT_INGRESS_HOST, None)}
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(GatewayProviderRecord::VT_HOST, None)}
+  }
+  #[inline]
+  pub fn owner_public_key_b64(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(GatewayProviderRecord::VT_OWNER_PUBLIC_KEY_B64, None)}
   }
   #[inline]
   pub fn routes(&self) -> Option<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<GatewayRoute<'a>>>> {
@@ -245,7 +390,8 @@ impl flatbuffers::Verifiable for GatewayProviderRecord<'_> {
     v.visit_table(pos)?
      .visit_field::<flatbuffers::ForwardsUOffset<&str>>("manifest_id", Self::VT_MANIFEST_ID, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<&str>>("peer_id", Self::VT_PEER_ID, false)?
-     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("ingress_host", Self::VT_INGRESS_HOST, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("host", Self::VT_HOST, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("owner_public_key_b64", Self::VT_OWNER_PUBLIC_KEY_B64, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<GatewayRoute>>>>("routes", Self::VT_ROUTES, false)?
      .visit_field::<u32>("ttl_ms", Self::VT_TTL_MS, false)?
      .visit_field::<u64>("last_updated_ms", Self::VT_LAST_UPDATED_MS, false)?
@@ -257,7 +403,8 @@ impl flatbuffers::Verifiable for GatewayProviderRecord<'_> {
 pub struct GatewayProviderRecordArgs<'a> {
     pub manifest_id: Option<flatbuffers::WIPOffset<&'a str>>,
     pub peer_id: Option<flatbuffers::WIPOffset<&'a str>>,
-    pub ingress_host: Option<flatbuffers::WIPOffset<&'a str>>,
+    pub host: Option<flatbuffers::WIPOffset<&'a str>>,
+    pub owner_public_key_b64: Option<flatbuffers::WIPOffset<&'a str>>,
     pub routes: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<GatewayRoute<'a>>>>>,
     pub ttl_ms: u32,
     pub last_updated_ms: u64,
@@ -269,7 +416,8 @@ impl<'a> Default for GatewayProviderRecordArgs<'a> {
     GatewayProviderRecordArgs {
       manifest_id: None,
       peer_id: None,
-      ingress_host: None,
+      host: None,
+      owner_public_key_b64: None,
       routes: None,
       ttl_ms: 0,
       last_updated_ms: 0,
@@ -292,8 +440,12 @@ impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> GatewayProviderRecordBuilder<'a
     self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(GatewayProviderRecord::VT_PEER_ID, peer_id);
   }
   #[inline]
-  pub fn add_ingress_host(&mut self, ingress_host: flatbuffers::WIPOffset<&'b  str>) {
-    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(GatewayProviderRecord::VT_INGRESS_HOST, ingress_host);
+  pub fn add_host(&mut self, host: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(GatewayProviderRecord::VT_HOST, host);
+  }
+  #[inline]
+  pub fn add_owner_public_key_b64(&mut self, owner_public_key_b64: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(GatewayProviderRecord::VT_OWNER_PUBLIC_KEY_B64, owner_public_key_b64);
   }
   #[inline]
   pub fn add_routes(&mut self, routes: flatbuffers::WIPOffset<flatbuffers::Vector<'b , flatbuffers::ForwardsUOffset<GatewayRoute<'b >>>>) {
@@ -331,7 +483,8 @@ impl core::fmt::Debug for GatewayProviderRecord<'_> {
     let mut ds = f.debug_struct("GatewayProviderRecord");
       ds.field("manifest_id", &self.manifest_id());
       ds.field("peer_id", &self.peer_id());
-      ds.field("ingress_host", &self.ingress_host());
+      ds.field("host", &self.host());
+      ds.field("owner_public_key_b64", &self.owner_public_key_b64());
       ds.field("routes", &self.routes());
       ds.field("ttl_ms", &self.ttl_ms());
       ds.field("last_updated_ms", &self.last_updated_ms());

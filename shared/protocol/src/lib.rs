@@ -248,6 +248,9 @@ pub mod machine {
         root_as_gateway_provider_record,
     };
 
+    use crate::generated::generated_gateway_provider_record::beemesh::machine::GatewayRouteSource as FbGatewayRouteSource;
+    use serde::{Deserialize, Serialize};
+
     // Delete request/response
     pub use crate::generated::generated_delete_request::beemesh::machine::{
         DeleteRequest, root_as_delete_request,
@@ -421,27 +424,53 @@ pub mod machine {
         fbb.finished_data().to_vec()
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum GatewayRouteKind {
+        Service,
+        Ingress,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct GatewayRouteSpec {
+        pub host: String,
         pub path_prefix: String,
         pub target_port: u16,
+        pub service_name: String,
+        pub service_port: String,
+        pub source: GatewayRouteKind,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct GatewayProviderRecordOwned {
         pub manifest_id: String,
         pub peer_id: String,
-        pub ingress_host: String,
+        pub host: String,
+        pub owner_public_key_b64: Option<String>,
         pub routes: Vec<GatewayRouteSpec>,
         pub ttl_ms: u32,
         pub last_updated_ms: u64,
         pub version: u16,
     }
 
+    fn fb_route_source(kind: GatewayRouteKind) -> FbGatewayRouteSource {
+        match kind {
+            GatewayRouteKind::Service => FbGatewayRouteSource::SERVICE,
+            GatewayRouteKind::Ingress => FbGatewayRouteSource::INGRESS,
+        }
+    }
+
+    fn gateway_route_kind_from_fb(value: FbGatewayRouteSource) -> GatewayRouteKind {
+        match value {
+            FbGatewayRouteSource::INGRESS => GatewayRouteKind::Ingress,
+            _ => GatewayRouteKind::Service,
+        }
+    }
+
     pub fn build_gateway_provider_record(
         manifest_id: &str,
         peer_id: &str,
-        ingress_host: &str,
+        host: &str,
+        owner_public_key_b64: Option<&str>,
         routes: &[GatewayRouteSpec],
         ttl_ms: u32,
         last_updated_ms: u64,
@@ -450,14 +479,20 @@ pub mod machine {
         let mut fbb = FlatBufferBuilder::with_capacity(256);
         let manifest_off = fbb.create_string(manifest_id);
         let peer_off = fbb.create_string(peer_id);
-        let ingress_off = fbb.create_string(ingress_host);
+        let host_off = fbb.create_string(host);
+        let owner_off = fbb.create_string(owner_public_key_b64.unwrap_or(""));
 
         let mut route_offsets = Vec::with_capacity(routes.len());
         for route in routes {
             let path_off = fbb.create_string(&route.path_prefix);
+            let service_off = fbb.create_string(&route.service_name);
+            let svc_port_off = fbb.create_string(&route.service_port);
             let mut args = GatewayRouteArgs::default();
             args.path_prefix = Some(path_off);
             args.target_port = route.target_port;
+            args.service_name = Some(service_off);
+            args.service_port = Some(svc_port_off);
+            args.source = fb_route_source(route.source);
             route_offsets.push(GatewayRoute::create(&mut fbb, &args));
         }
         let routes_vec = fbb.create_vector(&route_offsets);
@@ -465,7 +500,8 @@ pub mod machine {
         let mut args = GatewayProviderRecordArgs::default();
         args.manifest_id = Some(manifest_off);
         args.peer_id = Some(peer_off);
-        args.ingress_host = Some(ingress_off);
+        args.host = Some(host_off);
+        args.owner_public_key_b64 = Some(owner_off);
         args.routes = Some(routes_vec);
         args.ttl_ms = ttl_ms;
         args.last_updated_ms = last_updated_ms;
@@ -488,17 +524,26 @@ pub mod machine {
             .peer_id()
             .ok_or_else(|| anyhow::anyhow!("gateway record missing peer_id"))?
             .to_string();
-        let ingress_host = record
-            .ingress_host()
-            .ok_or_else(|| anyhow::anyhow!("gateway record missing ingress_host"))?
+        let host = record
+            .host()
+            .ok_or_else(|| anyhow::anyhow!("gateway record missing host"))?
             .to_string();
+
+        let owner_public_key_b64 = record
+            .owner_public_key_b64()
+            .map(|value| value.to_string())
+            .filter(|value| !value.is_empty());
 
         let mut routes = Vec::new();
         if let Some(fb_routes) = record.routes() {
             for fb_route in fb_routes {
                 routes.push(GatewayRouteSpec {
+                    host: host.clone(),
                     path_prefix: fb_route.path_prefix().unwrap_or_default().to_string(),
                     target_port: fb_route.target_port(),
+                    service_name: fb_route.service_name().unwrap_or_default().to_string(),
+                    service_port: fb_route.service_port().unwrap_or_default().to_string(),
+                    source: gateway_route_kind_from_fb(fb_route.source()),
                 });
             }
         }
@@ -506,7 +551,8 @@ pub mod machine {
         Ok(GatewayProviderRecordOwned {
             manifest_id,
             peer_id,
-            ingress_host,
+            host,
+            owner_public_key_b64,
             routes,
             ttl_ms: record.ttl_ms(),
             last_updated_ms: record.last_updated_ms(),

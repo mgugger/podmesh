@@ -1,7 +1,5 @@
-//! Runtime engine implementations for different container technologies
+//! Runtime engine implementations for Podman
 
-pub mod docker;
 pub mod podman;
 
-pub use docker::DockerEngine;
 pub use podman::PodmanEngine;

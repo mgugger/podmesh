@@ -700,10 +700,23 @@ fn dispatch_proxy_request(
         oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
     >,
 ) -> Result<(), (ProxyPendingRequest, anyhow::Error)> {
-    if let Some(port) = select_route_port(record, &pending.request.path_and_query) {
+    let host = extract_host_header(&pending.request.headers);
+    if let Some(port) = select_route_port(record, &pending.request.path_and_query, host.as_deref())
+    {
         pending.request.target_port = port;
     } else if pending.request.target_port == 0 {
-        return Err((pending, anyhow!("no matching route for path")));
+        let host_msg = host
+            .as_deref()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let request_path = pending.request.path_and_query.clone();
+        return Err((
+            pending,
+            anyhow!(format!(
+                "no matching route for host {} path {}",
+                host_msg, request_path
+            )),
+        ));
     }
 
     let peer_id = match record.peer_id.parse::<PeerId>() {
@@ -719,22 +732,49 @@ fn dispatch_proxy_request(
     Ok(())
 }
 
-fn select_route_port(record: &GatewayProviderRecordOwned, path: &str) -> Option<u16> {
+fn select_route_port(
+    record: &GatewayProviderRecordOwned,
+    path: &str,
+    host: Option<&str>,
+) -> Option<u16> {
     let mut normalized = if path.is_empty() {
         "/".to_string()
     } else {
-        path.to_string()
+        path.split('?').next().unwrap_or(path).to_string()
     };
     if !normalized.starts_with('/') {
         normalized = format!("/{}", normalized);
     }
 
-    record
+    let normalized_host = host.map(|h| h.to_lowercase());
+    let mut candidates = record
         .routes
         .iter()
         .filter(|route| normalized.starts_with(&route.path_prefix))
+        .peekable();
+
+    if let Some(ref host_value) = normalized_host {
+        if candidates.peek().is_some() {
+            if let Some(route) = candidates
+                .clone()
+                .filter(|route| route.host.eq_ignore_ascii_case(host_value))
+                .max_by_key(|route| route.path_prefix.len())
+            {
+                return Some(route.target_port);
+            }
+        }
+    }
+
+    candidates
         .max_by_key(|route| route.path_prefix.len())
         .map(|route| route.target_port)
+}
+
+fn extract_host_header(headers: &[(String, String)]) -> Option<String> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value.split(':').next().unwrap_or(value).to_lowercase())
 }
 
 fn trace_kad(event: &kad::Event) {

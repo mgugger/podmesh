@@ -1,16 +1,16 @@
 use std::{fs, io::ErrorKind, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
+use base64::Engine;
 use clap::Parser;
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
-use protocol::{
-    gateway_metadata::{DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR, GatewaySidecarMetadata},
-    libp2p_constants::DEFAULT_INGRESS_MANIFEST_ID,
-    machine::GatewayRouteSpec,
+use protocol::gateway_metadata::{DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR, GatewaySidecarMetadata};
+use workplane_gateway::{
+    DEFAULT_GATEWAY_APP_PORT, GatewayConfig, manifest_routes::extract_gateway_routes, run_gateway,
+    split_csv,
 };
-use workplane_gateway::{DEFAULT_GATEWAY_APP_PORT, GatewayConfig, run_gateway, split_csv};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -69,18 +69,19 @@ impl TryFrom<Args> for GatewayConfig {
             format!("{ns}/{workload}")
         };
 
-        let metadata = load_metadata(&args.metadata_path)?;
+        let metadata = load_metadata(&args.metadata_path)?
+            .ok_or_else(|| anyhow::anyhow!("gateway metadata missing at {}", args.metadata_path))?;
 
-        let manifest_id = metadata
-            .as_ref()
-            .map(|m| m.manifest_id.clone())
-            .unwrap_or_else(|| DEFAULT_INGRESS_MANIFEST_ID.to_string());
+        let manifest_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&metadata.manifest_b64)
+            .context("failed to decode manifest payload from metadata")?;
+        let manifest_id = metadata.manifest_id.clone();
         let ingress_host = format!("{}.mesh.local", manifest_id);
 
-        let mut bootstrap_peers = metadata
-            .as_ref()
-            .map(|m| vec![m.bootstrap_peer.clone()])
-            .unwrap_or_default();
+        let extraction = extract_gateway_routes(&manifest_bytes, &manifest_id)
+            .with_context(|| format!("failed to extract routes for manifest {}", manifest_id))?;
+
+        let mut bootstrap_peers = vec![metadata.bootstrap_peer.clone()];
         bootstrap_peers.extend(split_csv(Some(args.bootstrap_peers)));
 
         Ok(Self {
@@ -95,10 +96,8 @@ impl TryFrom<Args> for GatewayConfig {
             manifest_id,
             ingress_host,
             app_port: DEFAULT_GATEWAY_APP_PORT,
-            routes: vec![GatewayRouteSpec {
-                path_prefix: "/".to_string(),
-                target_port: DEFAULT_GATEWAY_APP_PORT,
-            }],
+            routes: extraction.routes,
+            owner_public_key_b64: metadata.owner_public_key_b64.clone(),
         })
     }
 }
