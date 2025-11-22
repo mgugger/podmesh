@@ -19,6 +19,7 @@ const INGRESS_HOST_HEADER: &str = "demo-nginx.mesh.local";
 const EXPECTED_BODY_SUBSTRING: &str = "Welcome to Podmesh";
 const REQUIRED_MACHINE_PEERS: usize = 1;
 const EXPECTED_CONTAINERS: [&str; 2] = ["my-nginx", "sidecar"];
+const PODMESH_NETWORK: &str = "podmesh";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
@@ -85,8 +86,9 @@ struct PodmanKubeGuard {
 impl PodmanKubeGuard {
     async fn launch(manifest_path: &Path) -> Result<Self> {
         let manifest_arg = manifest_path.to_string_lossy().to_string();
+        ensure_podman_network(PODMESH_NETWORK).await?;
         let _ = run_podman_command(["kube", "down", &manifest_arg]).await;
-        run_podman_command(["kube", "play", &manifest_arg])
+        run_podman_command(["kube", "play", "--network", PODMESH_NETWORK, &manifest_arg])
             .await
             .context("failed to start rootless stack with podman kube play")?;
         log::info!(
@@ -325,6 +327,16 @@ async fn run_podman_command<const N: usize>(args: [&str; N]) -> Result<String> {
             args,
             String::from_utf8_lossy(&output.stderr)
         ))
+    }
+}
+
+async fn ensure_podman_network(network: &str) -> Result<()> {
+    match run_podman_command(["network", "exists", network]).await {
+        Ok(_) => Ok(()),
+        Err(_) => run_podman_command(["network", "create", network])
+            .await
+            .context(format!("failed to create podman network {network}"))
+            .map(|_| ()),
     }
 }
 
