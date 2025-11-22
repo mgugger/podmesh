@@ -1,7 +1,11 @@
-# **Beemesh: Global Mesh Computing**
+# **Podmesh**
 
-> This is a partial implementation of [Beemesh](https://github.com/beemesh/beemesh)
+A scheduler for pods built with libp2p. 
 
-> See [Beemesh](https://github.com/beemesh/beemesh) for more details.
+* machine is the podman scheduler
+* meshproxy is the ingress / egress node
+* sidecar is the sidecar in the pod that connects to the meshproxy
+
+* See deploy/README.md for usage
 
 **License**: Apache 2.0

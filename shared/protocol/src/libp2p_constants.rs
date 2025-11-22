@@ -3,19 +3,19 @@
 //! This module contains all protocol constants to eliminate duplication across crates.
 
 /// Ident topic used for workload-plane gossipsub exchanges.
-pub const WORKLOAD_CLUSTER_TOPIC: &str = "beemesh-workload";
+pub const WORKLOAD_CLUSTER_TOPIC: &str = "podmesh-workload";
 
 /// Ident topic used for machine-plane gossipsub exchanges.
-pub const MACHINE_CLUSTER_TOPIC: &str = "beemesh-machine";
+pub const MACHINE_CLUSTER_TOPIC: &str = "podmesh-machine";
 
 /// Record key prefix for manifest->gateway announcements on the workload DHT.
-pub const MANIFEST_RECORD_PREFIX: &str = "beemesh/manifest/";
+pub const MANIFEST_RECORD_PREFIX: &str = "podmesh/manifest/";
 
 /// Default manifest identifier used by the ingress e2e test.
 pub const DEFAULT_INGRESS_MANIFEST_ID: &str = "demo-app";
 
 /// Protocol ID for the ingress proxy libp2p request-response stream.
-pub const INGRESS_PROXY_PROTOCOL: &str = "/beemesh/ingress-proxy/1.0.0";
+pub const INGRESS_PROXY_PROTOCOL: &str = "/podmesh/ingress-proxy/1.0.0";
 
 // === GOSSIPSUB TOPICS ===
 
@@ -37,13 +37,13 @@ pub const TOPIC_PROPOSALS: &str = "scheduler-proposals";
 // === MESSAGE PREFIXES ===
 
 /// Prefix used for handshake messages exchanged on the gossip topic.
-pub const HANDSHAKE_PREFIX: &str = "beemesh-handshake";
+pub const HANDSHAKE_PREFIX: &str = "podmesh-handshake";
 
 /// Prefix used when querying peers for free capacity (gossipsub message topic payload prefix).
-pub const FREE_CAPACITY_PREFIX: &str = "beemesh-free-capacity";
+pub const FREE_CAPACITY_PREFIX: &str = "podmesh-free-capacity";
 
 /// Prefix used for replies to free-capacity queries.
-pub const FREE_CAPACITY_REPLY_PREFIX: &str = "beemesh-free-capacity-reply";
+pub const FREE_CAPACITY_REPLY_PREFIX: &str = "podmesh-free-capacity-reply";
 
 /// Prefix used for lease-related operations
 pub const LEASE_PREFIX: &str = "lease/";

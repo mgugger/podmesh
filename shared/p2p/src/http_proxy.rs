@@ -1,6 +1,6 @@
 use std::io;
 
-use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use futures::io::{AsyncRead, AsyncWrite};
 use libp2p::request_response;
 use serde::{Deserialize, Serialize};
 

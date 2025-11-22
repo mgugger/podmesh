@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "machineplane",
-    "workloadplane/workload",
-    "workloadplane/gateway",
-    "workloadplane/tests",
-    "beectl",
+    "machine",
+    "meshproxy",
+    "sidecar",
+    "tests",
+    "podctl",
     "shared/axum_support",
     "shared/crypto",
     "shared/protocol",
@@ -31,12 +31,12 @@ uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
 thiserror = "1.0"
 clap = { version = "4", features = ["derive"] }
-beectl = { path = "./beectl" }
+podctl = { path = "./podctl" }
 crypto = { path = "./shared/crypto" }
 protocol = { path = "./shared/protocol" }
 p2p = { path = "./shared/p2p" }
 axum-support = { path = "./shared/axum_support" }
-machine = { path = "./machineplane" }
-workplane = { path = "./workloadplane/workload" }
-workplane-gateway = { path = "./workloadplane/gateway" }
+machine = { path = "./machine" }
+meshproxy = { path = "./meshproxy" }
+sidecar = { path = "./sidecar" }
 flatbuffers = "25.2.10"

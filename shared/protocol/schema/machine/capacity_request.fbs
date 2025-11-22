@@ -1,4 +1,4 @@
-namespace beemesh.machine;
+namespace podmesh.machine;
 
 table CapacityRequest {
   request_id:string;

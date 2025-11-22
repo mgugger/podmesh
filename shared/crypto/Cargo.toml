@@ -2,7 +2,7 @@
 name = "crypto"
 version = "0.1.0"
 edition = "2024"
-description = "Crypto parts of Beemesh"
+description = "Crypto parts of podmesh"
 
 [dependencies]
 anyhow = { workspace = true }

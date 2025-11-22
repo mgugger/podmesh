@@ -1,6 +1,6 @@
-# Beemesh
+# Podmesh
 
-Beemesh is a decentralized, lock-free orchestration system that turns any device into an interchangeable compute resource through a decentralized scheduler. The workload plane is strictly focusing on scheduling and running workloads, it does not contain any service mesh like behavior.
+Podmesh is a decentralized, lock-free orchestration system that turns any device into an interchangeable compute resource through a decentralized scheduler. The workload plane is strictly focusing on scheduling and running workloads, it does not contain any service mesh like behavior.
 
 ## Principles
 
@@ -11,10 +11,11 @@ Beemesh is a decentralized, lock-free orchestration system that turns any device
 
 ## Code Layout
 The machineplane consists of the following crates:
-* cli: consists of the beectl cli similar to kubectl that allows to interact with beemesh
+* podctl: consists of the podctl cli similar to kubectl that allows to interact with podmesh
 * crypto: the common library that offers helper functions for the cli and machine
-* machine: containts the libp2p machine implementation offering scheduling and managing lifecycle of the workload, similar to kubelet
-* workplane: contains the workload plane implementation
+* machine: containts the libp2p machine implementation for scheduling and managing lifecycle of the workload, similar to kubelet
+* meshproxy: contains the workload plane mesh proxy implementation
+* sidecar: contains the workload plane gateway sidecar implementation
 * protocol: contains the flatbuffers that are used for messaging between the nodes in the machine plane
 
 ## Workflow

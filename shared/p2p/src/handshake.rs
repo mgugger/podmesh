@@ -10,7 +10,7 @@ use tokio::time::Instant;
 use crate::envelope::{SignEnvelopeConfig, sign_with_node_keys};
 use crate::message_verifier::verify_signed_message;
 
-pub const HANDSHAKE_PROTOCOL: &str = "/beemesh/handshake/1.0.0";
+pub const HANDSHAKE_PROTOCOL: &str = "/podmesh/handshake/1.0.0";
 
 /// Tracks handshake progress per peer.
 #[derive(Debug, Clone)]
@@ -42,7 +42,7 @@ impl Default for HandshakeDriveConfig {
         Self {
             retry_interval: Duration::from_secs(2),
             max_attempts: 3,
-            protocol_version: "beemesh/1.0",
+            protocol_version: "podmesh/1.0",
         }
     }
 }
@@ -141,7 +141,7 @@ fn build_signed_handshake_response(peer: &PeerId) -> Result<Vec<u8>> {
     let payload = machine::build_handshake(
         rand::random::<u32>(),
         timestamp,
-        "beemesh/1.0",
+        "podmesh/1.0",
         &peer.to_string(),
     );
     let cfg = SignEnvelopeConfig {

@@ -10,7 +10,7 @@ extern crate flatbuffers;
 use self::flatbuffers::{EndianScalar, Follow};
 
 #[allow(unused_imports, dead_code)]
-pub mod beemesh {
+pub mod podmesh {
 
   use core::mem;
   use core::cmp::Ordering;
@@ -331,5 +331,5 @@ pub fn finish_size_prefixed_capacity_reply_buffer<'a, 'b, A: flatbuffers::Alloca
   fbb.finish_size_prefixed(root, None);
 }
 }  // pub mod machine
-}  // pub mod beemesh
+}  // pub mod podmesh
 

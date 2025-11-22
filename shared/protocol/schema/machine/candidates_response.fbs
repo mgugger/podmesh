@@ -1,4 +1,4 @@
-namespace beemesh.machine;
+namespace podmesh.machine;
 
 // A candidate node with its public key for encrypted key share distribution
 table CandidateNode {

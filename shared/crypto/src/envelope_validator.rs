@@ -218,7 +218,6 @@ mod tests {
         );
 
         // Should return None for invalid input when signing is not required
-        // The actual behavior depends on BEEMESH_REQUIRE_SIGNED_MESSAGES
         if EnvelopeValidator::require_signed_messages() {
             assert!(result.is_none());
             assert!(!error_message.is_empty());

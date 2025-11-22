@@ -23,7 +23,7 @@ pub mod flatbuffer_envelope;
 pub mod keypair_manager;
 pub mod logging;
 
-pub const KEY_DIR: &str = ".beemesh";
+pub const KEY_DIR: &str = ".podmesh";
 pub const PUBKEY_FILE: &str = "pubkey.bin";
 pub const PRIVKEY_FILE: &str = "privkey.bin";
 pub const KEM_PUBFILE: &str = "kem_pub.bin";

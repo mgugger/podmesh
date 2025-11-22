@@ -1,4 +1,4 @@
-namespace beemesh.machine;
+namespace podmesh.machine;
 
 // CapacityReply schema (separate file so we can have per-file root_type)
 table CapacityReply {

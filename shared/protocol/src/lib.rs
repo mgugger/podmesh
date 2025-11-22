@@ -229,74 +229,74 @@ pub mod gateway_metadata;
 
 pub mod machine {
     // Avoid glob imports; re-export specific items below.
-    pub use crate::generated::generated_capacity_reply::beemesh::machine::{
+    pub use crate::generated::generated_capacity_reply::podmesh::machine::{
         CapacityReply, finish_capacity_reply_buffer, root_as_capacity_reply,
     };
-    pub use crate::generated::generated_capacity_request::beemesh::machine::{
+    pub use crate::generated::generated_capacity_request::podmesh::machine::{
         CapacityRequest, finish_capacity_request_buffer, root_as_capacity_request,
     };
-    pub use crate::generated::generated_health::beemesh::machine::{Health, root_as_health};
+    pub use crate::generated::generated_health::podmesh::machine::{Health, root_as_health};
     // Re-export Args to allow building nested FB objects in other modules
-    pub use crate::generated::generated_apply_request::beemesh::machine::{
+    pub use crate::generated::generated_apply_request::podmesh::machine::{
         ApplyRequest, root_as_apply_request,
     };
-    pub use crate::generated::generated_apply_response::beemesh::machine::{
+    pub use crate::generated::generated_apply_response::podmesh::machine::{
         ApplyResponse, root_as_apply_response,
     };
-    pub use crate::generated::generated_gateway_provider_record::beemesh::machine::{
+    pub use crate::generated::generated_gateway_provider_record::podmesh::machine::{
         GatewayProviderRecord, GatewayProviderRecordArgs, GatewayRoute, GatewayRouteArgs,
         root_as_gateway_provider_record,
     };
 
-    use crate::generated::generated_gateway_provider_record::beemesh::machine::GatewayRouteSource as FbGatewayRouteSource;
+    use crate::generated::generated_gateway_provider_record::podmesh::machine::GatewayRouteSource as FbGatewayRouteSource;
     use serde::{Deserialize, Serialize};
 
     // Delete request/response
-    pub use crate::generated::generated_delete_request::beemesh::machine::{
+    pub use crate::generated::generated_delete_request::podmesh::machine::{
         DeleteRequest, root_as_delete_request,
     };
-    pub use crate::generated::generated_delete_response::beemesh::machine::{
+    pub use crate::generated::generated_delete_response::podmesh::machine::{
         DeleteResponse, root_as_delete_response,
     };
 
-    pub use crate::generated::generated_candidates_response::beemesh::machine::root_as_candidates_response;
-    pub use crate::generated::generated_capacity_reply::beemesh::machine::CapacityReplyArgs;
-    pub use crate::generated::generated_capacity_request::beemesh::machine::CapacityRequestArgs;
-    pub use crate::generated::generated_envelope::beemesh::machine::{
+    pub use crate::generated::generated_candidates_response::podmesh::machine::root_as_candidates_response;
+    pub use crate::generated::generated_capacity_reply::podmesh::machine::CapacityReplyArgs;
+    pub use crate::generated::generated_capacity_request::podmesh::machine::CapacityRequestArgs;
+    pub use crate::generated::generated_envelope::podmesh::machine::{
         Envelope as FbEnvelope, root_as_envelope,
     };
-    pub use crate::generated::generated_handshake::beemesh::machine::{
+    pub use crate::generated::generated_handshake::podmesh::machine::{
         Handshake, root_as_handshake,
     };
-    pub use crate::generated::generated_nodes_response::beemesh::machine::root_as_nodes_response;
-    pub use crate::generated::generated_task_create_response::beemesh::machine::root_as_task_create_response;
+    pub use crate::generated::generated_nodes_response::podmesh::machine::root_as_nodes_response;
+    pub use crate::generated::generated_task_create_response::podmesh::machine::root_as_task_create_response;
     // Also export Args and helper finish function for builders/tests
-    pub use crate::generated::generated_envelope::beemesh::machine::{
+    pub use crate::generated::generated_envelope::podmesh::machine::{
         EnvelopeArgs, finish_envelope_buffer,
     };
 
     // Nodes response
-    pub use crate::generated::generated_nodes_response::beemesh::machine::{
+    pub use crate::generated::generated_nodes_response::podmesh::machine::{
         NodesResponse, NodesResponseArgs,
     };
 
     // Candidates response
-    pub use crate::generated::generated_candidates_response::beemesh::machine::{
+    pub use crate::generated::generated_candidates_response::podmesh::machine::{
         CandidateNode, CandidateNodeArgs, CandidatesResponse, CandidatesResponseArgs,
     };
 
     // Task create response
-    pub use crate::generated::generated_task_create_response::beemesh::machine::{
+    pub use crate::generated::generated_task_create_response::podmesh::machine::{
         TaskCreateResponse, TaskCreateResponseArgs,
     };
 
     // Task status response
-    pub use crate::generated::generated_task_status_response::beemesh::machine::{
+    pub use crate::generated::generated_task_status_response::podmesh::machine::{
         TaskStatusResponse, TaskStatusResponseArgs,
     };
 
     pub mod generated_applied_manifest {
-        pub use crate::generated::generated_applied_manifest::beemesh::machine::*;
+        pub use crate::generated::generated_applied_manifest::podmesh::machine::*;
     }
 
     pub use crate::machine::generated_applied_manifest::{
@@ -311,12 +311,12 @@ pub mod machine {
     pub fn build_health(ok: bool, status: &str) -> Vec<u8> {
         let mut fbb = FlatBufferBuilder::with_capacity(128);
         let status_off = fbb.create_string(status);
-        let mut args: crate::generated::generated_health::beemesh::machine::HealthArgs =
+        let mut args: crate::generated::generated_health::podmesh::machine::HealthArgs =
             Default::default();
         args.ok = ok;
         args.status = Some(status_off);
         let off =
-            crate::generated::generated_health::beemesh::machine::Health::create(&mut fbb, &args);
+            crate::generated::generated_health::podmesh::machine::Health::create(&mut fbb, &args);
         fbb.finish(off, None);
         fbb.finished_data().to_vec()
     }
@@ -328,13 +328,13 @@ pub mod machine {
         replicas: u32,
     ) -> Vec<u8> {
         let mut fbb = FlatBufferBuilder::with_capacity(128);
-        let mut args: crate::generated::generated_capacity_request::beemesh::machine::CapacityRequestArgs = Default::default();
+        let mut args: crate::generated::generated_capacity_request::podmesh::machine::CapacityRequestArgs = Default::default();
         args.cpu_milli = cpu_milli;
         args.memory_bytes = memory_bytes;
         args.storage_bytes = storage_bytes;
         args.replicas = replicas;
         let off =
-            crate::generated::generated_capacity_request::beemesh::machine::CapacityRequest::create(
+            crate::generated::generated_capacity_request::podmesh::machine::CapacityRequest::create(
                 &mut fbb, &args,
             );
         fbb.finish(off, None);
@@ -363,7 +363,7 @@ pub mod machine {
             caps_vec.push(fbb.create_string(c));
         }
         let caps_off = fbb.create_vector(&caps_vec);
-        let mut args: crate::generated::generated_capacity_reply::beemesh::machine::CapacityReplyArgs = Default::default();
+        let mut args: crate::generated::generated_capacity_reply::podmesh::machine::CapacityReplyArgs = Default::default();
         args.ok = ok;
         args.cpu_available_milli = cpu_available_milli;
         args.memory_available_bytes = memory_available_bytes;
@@ -376,7 +376,7 @@ pub mod machine {
         }
         args.capabilities = Some(caps_off);
         let off =
-            crate::generated::generated_capacity_reply::beemesh::machine::CapacityReply::create(
+            crate::generated::generated_capacity_reply::podmesh::machine::CapacityReply::create(
                 &mut fbb, &args,
             );
         fbb.finish(off, None);
@@ -395,13 +395,13 @@ pub mod machine {
         let manifest_off = fbb.create_string(manifest_json);
         let origin_off = fbb.create_string(origin_peer);
         let manifest_id_off = fbb.create_string(manifest_id);
-        let mut args: crate::generated::generated_apply_request::beemesh::machine::ApplyRequestArgs = Default::default();
+        let mut args: crate::generated::generated_apply_request::podmesh::machine::ApplyRequestArgs = Default::default();
         args.replicas = replicas;
         args.operation_id = Some(op_off);
         args.manifest_json = Some(manifest_off);
         args.origin_peer = Some(origin_off);
         args.manifest_id = Some(manifest_id_off);
-        let off = crate::generated::generated_apply_request::beemesh::machine::ApplyRequest::create(
+        let off = crate::generated::generated_apply_request::podmesh::machine::ApplyRequest::create(
             &mut fbb, &args,
         );
         fbb.finish(off, None);
@@ -412,12 +412,12 @@ pub mod machine {
         let mut fbb = FlatBufferBuilder::with_capacity(128);
         let op_off = fbb.create_string(operation_id);
         let msg_off = fbb.create_string(message);
-        let mut args: crate::generated::generated_apply_response::beemesh::machine::ApplyResponseArgs = Default::default();
+        let mut args: crate::generated::generated_apply_response::podmesh::machine::ApplyResponseArgs = Default::default();
         args.ok = ok;
         args.operation_id = Some(op_off);
         args.message = Some(msg_off);
         let off =
-            crate::generated::generated_apply_response::beemesh::machine::ApplyResponse::create(
+            crate::generated::generated_apply_response::podmesh::machine::ApplyResponse::create(
                 &mut fbb, &args,
             );
         fbb.finish(off, None);
@@ -571,14 +571,14 @@ pub mod machine {
         let operation_id_off = fbb.create_string(operation_id);
         let origin_peer_off = fbb.create_string(origin_peer);
 
-        let mut args: crate::generated::generated_delete_request::beemesh::machine::DeleteRequestArgs = Default::default();
+        let mut args: crate::generated::generated_delete_request::podmesh::machine::DeleteRequestArgs = Default::default();
         args.manifest_id = Some(manifest_id_off);
         args.operation_id = Some(operation_id_off);
         args.origin_peer = Some(origin_peer_off);
         args.force = force;
 
         let off =
-            crate::generated::generated_delete_request::beemesh::machine::DeleteRequest::create(
+            crate::generated::generated_delete_request::podmesh::machine::DeleteRequest::create(
                 &mut fbb, &args,
             );
         fbb.finish(off, None);
@@ -604,7 +604,7 @@ pub mod machine {
             .collect();
         let workloads_vec = fbb.create_vector(&workload_offsets);
 
-        let mut args: crate::generated::generated_delete_response::beemesh::machine::DeleteResponseArgs = Default::default();
+        let mut args: crate::generated::generated_delete_response::podmesh::machine::DeleteResponseArgs = Default::default();
         args.ok = ok;
         args.operation_id = Some(operation_id_off);
         args.message = Some(message_off);
@@ -612,7 +612,7 @@ pub mod machine {
         args.removed_workloads = Some(workloads_vec);
 
         let off =
-            crate::generated::generated_delete_response::beemesh::machine::DeleteResponse::create(
+            crate::generated::generated_delete_response::podmesh::machine::DeleteResponse::create(
                 &mut fbb, &args,
             );
         fbb.finish(off, None);
@@ -644,7 +644,7 @@ pub mod machine {
         let peer_id_off = fbb.create_string("");
 
         let mut args =
-            crate::generated::generated_envelope::beemesh::machine::EnvelopeArgs::default();
+            crate::generated::generated_envelope::podmesh::machine::EnvelopeArgs::default();
         args.payload = Some(payload_vec);
         args.payload_type = Some(payload_type_off);
         args.nonce = Some(nonce_off);
@@ -655,7 +655,7 @@ pub mod machine {
         args.kem_pubkey = Some(kem_pub_off);
         args.peer_id = Some(peer_id_off);
 
-        let env_off = crate::generated::generated_envelope::beemesh::machine::Envelope::create(
+        let env_off = crate::generated::generated_envelope::podmesh::machine::Envelope::create(
             &mut fbb, &args,
         );
         fbb.finish(env_off, None);
@@ -686,7 +686,7 @@ pub mod machine {
         let peer_id_off = fbb.create_string("");
 
         let mut args =
-            crate::generated::generated_envelope::beemesh::machine::EnvelopeArgs::default();
+            crate::generated::generated_envelope::podmesh::machine::EnvelopeArgs::default();
         args.payload = Some(payload_vec);
         args.payload_type = Some(payload_type_off);
         args.nonce = Some(nonce_off);
@@ -697,7 +697,7 @@ pub mod machine {
         args.kem_pubkey = Some(kem_pub_off);
         args.peer_id = Some(peer_id_off);
 
-        let env_off = crate::generated::generated_envelope::beemesh::machine::Envelope::create(
+        let env_off = crate::generated::generated_envelope::podmesh::machine::Envelope::create(
             &mut fbb, &args,
         );
         fbb.finish(env_off, None);
@@ -726,7 +726,7 @@ pub mod machine {
         let peer_id_off = fbb.create_string(peer_id);
 
         let mut args =
-            crate::generated::generated_envelope::beemesh::machine::EnvelopeArgs::default();
+            crate::generated::generated_envelope::podmesh::machine::EnvelopeArgs::default();
         args.payload = Some(payload_vec);
         args.payload_type = Some(payload_type_off);
         args.nonce = Some(nonce_off);
@@ -737,7 +737,7 @@ pub mod machine {
         args.kem_pubkey = Some(kem_pub_off);
         args.peer_id = Some(peer_id_off);
 
-        let env_off = crate::generated::generated_envelope::beemesh::machine::Envelope::create(
+        let env_off = crate::generated::generated_envelope::podmesh::machine::Envelope::create(
             &mut fbb, &args,
         );
         fbb.finish(env_off, None);
@@ -768,7 +768,7 @@ pub mod machine {
         let peer_id_off = fbb.create_string(peer_id);
 
         let mut args =
-            crate::generated::generated_envelope::beemesh::machine::EnvelopeArgs::default();
+            crate::generated::generated_envelope::podmesh::machine::EnvelopeArgs::default();
         args.payload = Some(payload_vec);
         args.payload_type = Some(payload_type_off);
         args.nonce = Some(nonce_off);
@@ -779,7 +779,7 @@ pub mod machine {
         args.kem_pubkey = Some(kem_pub_off);
         args.peer_id = Some(peer_id_off);
 
-        let env_off = crate::generated::generated_envelope::beemesh::machine::Envelope::create(
+        let env_off = crate::generated::generated_envelope::podmesh::machine::Envelope::create(
             &mut fbb, &args,
         );
         fbb.finish(env_off, None);
@@ -863,13 +863,13 @@ pub mod machine {
         let mut fbb = FlatBufferBuilder::with_capacity(128);
         let proto = fbb.create_string(protocol_version);
         let sig = fbb.create_string(signature);
-        let mut args: crate::generated::generated_handshake::beemesh::machine::HandshakeArgs =
+        let mut args: crate::generated::generated_handshake::podmesh::machine::HandshakeArgs =
             Default::default();
         args.nonce = nonce;
         args.timestamp = timestamp;
         args.protocol_version = Some(proto);
         args.signature = Some(sig);
-        let off = crate::generated::generated_handshake::beemesh::machine::Handshake::create(
+        let off = crate::generated::generated_handshake::podmesh::machine::Handshake::create(
             &mut fbb, &args,
         );
         fbb.finish(off, None);
@@ -1014,7 +1014,7 @@ pub mod machine {
         let manifest_id_off = fbb.create_string(manifest_id);
         let message_off = fbb.create_string("task created");
 
-        let task_response = crate::generated::generated_task_create_response::beemesh::machine::TaskCreateResponse::create(&mut fbb, &crate::generated::generated_task_create_response::beemesh::machine::TaskCreateResponseArgs {
+        let task_response = crate::generated::generated_task_create_response::podmesh::machine::TaskCreateResponse::create(&mut fbb, &crate::generated::generated_task_create_response::podmesh::machine::TaskCreateResponseArgs {
             ok,
             task_id: Some(task_id_off),
             manifest_ref: Some(manifest_id_off),

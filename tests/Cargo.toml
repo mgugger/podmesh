@@ -1,0 +1,25 @@
+[package]
+name = "podmesh-integration-tests"
+version = "0.1.0"
+edition = "2024"
+description = "Integration tests for podmesh"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+meshproxy = { workspace = true }
+sidecar = { workspace = true }
+protocol = { workspace = true }
+machine = { workspace = true }
+podctl = { workspace = true }
+axum = "0.8"
+axum-support = { workspace = true }
+reqwest = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+env_logger = { workspace = true }
+serial_test = "3.0"
+serde_json = { workspace = true }
+futures = { workspace = true }
+log = { workspace = true }

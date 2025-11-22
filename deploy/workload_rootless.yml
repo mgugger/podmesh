@@ -1,14 +1,14 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: beemesh-workload
+  name: podmesh-workload
   labels:
-    app: beemesh-workload
+    app: podmesh-workload
 spec:
   restartPolicy: Always
   containers:
     - name: bootstrap
-      image: beemesh/workload:latest
+      image: podmesh/workload:latest
       env:
       - name: RUST_LOG
         value: "debug"
@@ -29,7 +29,7 @@ spec:
           hostPort: 6000
           protocol: UDP
     - name: peer1-with-localhost
-      image: beemesh/workload:latest
+      image: podmesh/workload:latest
       env:
       - name: RUST_LOG
         value: "debug"
@@ -38,7 +38,7 @@ spec:
         - "/ip4/127.0.0.1/udp/7001/quic-v1"
         - "--disable-rest-api"
     - name: peer2-with-localhost
-      image: beemesh/workload:latest
+      image: podmesh/workload:latest
       env:
       - name: RUST_LOG
         value: "debug"

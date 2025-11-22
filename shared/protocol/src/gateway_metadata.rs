@@ -17,12 +17,12 @@ pub struct GatewaySidecarMetadata {
 pub const DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR: &str = "/dns4/workload-bootstrap/udp/4002/quic-v1";
 
 /// Default mount path inside the workload pod where gateway metadata is exposed.
-pub const DEFAULT_METADATA_MOUNT_PATH: &str = "/var/run/beemesh/gateway";
+pub const DEFAULT_METADATA_MOUNT_PATH: &str = "/var/run/podmesh/gateway";
 /// File name placed inside the metadata mount.
 pub const DEFAULT_METADATA_FILENAME: &str = "metadata.json";
 /// Fully-qualified default path for the metadata JSON file.
-pub const DEFAULT_METADATA_FILE: &str = "/var/run/beemesh/gateway/metadata.json";
+pub const DEFAULT_METADATA_FILE: &str = "/var/run/podmesh/gateway/metadata.json";
 /// Environment variable that conveys the metadata file path to the gateway process.
-pub const METADATA_PATH_ENV_VAR: &str = "BEEMESH_GATEWAY_METADATA_PATH";
+pub const METADATA_PATH_ENV_VAR: &str = "PODMESH_GATEWAY_METADATA_PATH";
 /// Environment variable that optionally overrides the bootstrap peer from metadata.
-pub const BOOTSTRAP_ENV_VAR: &str = "BEEMESH_GATEWAY_BOOTSTRAP_PEER";
+pub const BOOTSTRAP_ENV_VAR: &str = "PODMESH_GATEWAY_BOOTSTRAP_PEER";

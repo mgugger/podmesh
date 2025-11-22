@@ -1,14 +1,14 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: beemesh
+  name: podmesh
   labels:
-    app: beemesh
+    app: podmesh
 spec:
   restartPolicy: Always
   containers:
     - name: machine-bootstrap
-      image: beemesh/machine:latest
+      image: podmesh/machine:latest
       env:
       - name: RUST_LOG
         value: "info"
@@ -41,7 +41,7 @@ spec:
   restartPolicy: Always
   containers:
     - name: machine-1
-      image: beemesh/machine:latest
+      image: podmesh/machine:latest
       env:
       - name: RUST_LOG
         value: "info"
@@ -91,7 +91,7 @@ spec:
   restartPolicy: Always
   containers:
     - name: machine-2
-      image: beemesh/machine:latest
+      image: podmesh/machine:latest
       env:
       - name: RUST_LOG
         value: "info"
@@ -141,7 +141,7 @@ spec:
   restartPolicy: Always
   containers:
     - name: workload-bootstrap
-      image: beemesh/workload:latest
+      image: podmesh/workload:latest
       env:
         - name: libp2p_quic_port
           value: "4002"
@@ -180,7 +180,7 @@ spec:
   restartPolicy: Always
   containers:
     - name: workload-1
-      image: beemesh/workload:latest
+      image: podmesh/workload:latest
       env:
       - name: RUST_LOG
         value: "info"
@@ -199,7 +199,7 @@ spec:
   restartPolicy: Always
   containers:
     - name: workload-2
-      image: beemesh/workload:latest
+      image: podmesh/workload:latest
       env:
       - name: RUST_LOG
         value: "info"

@@ -1,4 +1,4 @@
-namespace beemesh.machine;
+namespace podmesh.machine;
 
 table ApplyRequest {
   replicas:uint32 = 1;

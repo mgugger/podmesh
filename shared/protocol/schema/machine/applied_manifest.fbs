@@ -1,4 +1,4 @@
-namespace beemesh.machine;
+namespace podmesh.machine;
 
 // Signature scheme used to sign the manifest record
 enum SignatureScheme:byte {

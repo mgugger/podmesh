@@ -1,14 +1,14 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: beemesh-machine
+  name: podmesh-machine
   labels:
-    app: beemesh-machine
+    app: podmesh-machine
 spec:
   restartPolicy: Always
   containers:
     - name: bootstrap
-      image: beemesh/machine:latest
+      image: podmesh/machine:latest
       env:
       - name: RUST_LOG
         value: "info"
@@ -31,7 +31,7 @@ spec:
           hostPort: 3000
           protocol: UDP
     - name: peer1-with-dns
-      image: beemesh/machine:latest
+      image: podmesh/machine:latest
       env:
       - name: RUST_LOG
         value: "info"
@@ -55,7 +55,7 @@ spec:
           mountPath: /var/lib/containers/storage
           readOnly: true
     - name: peer2-with-localhost
-      image: beemesh/machine:latest
+      image: podmesh/machine:latest
       env:
       - name: RUST_LOG
         value: "info"
