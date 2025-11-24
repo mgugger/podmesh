@@ -121,9 +121,7 @@ pub fn delete_message(
                         delete_resp.ok(),
                         delete_resp.operation_id(),
                         delete_resp.message(),
-                        delete_resp
-                            .removed_workloads()
-                            .map(|w| w.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                            delete_resp.removed_workloads().to_vec()
                     );
                 }
                 Err(e) => {

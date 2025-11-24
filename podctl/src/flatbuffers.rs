@@ -98,10 +98,7 @@ impl FlatbufferClient {
             .map_err(|e| anyhow::anyhow!("Failed to parse envelope: {}", e))?;
 
         // Extract the payload from the envelope
-        let payload_bytes = envelope
-            .payload()
-            .map(|v| v.iter().collect::<Vec<u8>>())
-            .unwrap_or_default();
+        let payload_bytes = envelope.payload_vec();
 
         // If the payload is encrypted (starts with 0x02), decrypt it
         if !payload_bytes.is_empty() && payload_bytes[0] == 0x02 {
@@ -418,17 +415,13 @@ impl FlatbufferClient {
                 if candidates_response.ok() {
                     let responders: Vec<String> = candidates_response
                         .candidates()
-                        .map(|v| {
-                            v.iter()
-                                .filter_map(|candidate| {
-                                    let peer_id = candidate.peer_id()?.to_string();
-                                    let public_key =
-                                        candidate.public_key().unwrap_or("").to_string();
-                                    Some(format!("{}:{}", peer_id, public_key))
-                                })
-                                .collect()
+                        .iter()
+                        .filter_map(|candidate| {
+                            let peer_id = candidate.peer_id()?;
+                            let public_key = candidate.public_key().unwrap_or("");
+                            Some(format!("{}:{}", peer_id, public_key))
                         })
-                        .unwrap_or_default();
+                        .collect();
                     log::debug!("get_candidates: found {} responders", responders.len());
                     Ok(responders)
                 } else {

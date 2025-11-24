@@ -7,7 +7,7 @@ use axum::{
 };
 use base64::Engine;
 use log::{debug, error, warn};
-use protocol::machine::{FbEnvelope, root_as_envelope};
+use protocol::machine::{Envelope as FbEnvelope, root_as_envelope};
 
 use std::sync::Arc;
 
@@ -120,8 +120,7 @@ impl EnvelopeHandler {
         let encrypted_payload = envelope
             .payload()
             .ok_or_else(|| anyhow!("No payload in envelope"))?
-            .iter()
-            .collect::<Vec<u8>>();
+            .to_vec();
 
         // Decrypt payload using our KEM private key
         let decrypted_payload =

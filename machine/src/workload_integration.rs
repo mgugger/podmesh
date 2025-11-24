@@ -313,7 +313,7 @@ pub async fn handle_apply_message_with_workload_manager(
 /// Process manifest deployment using the workload manager
 async fn process_manifest_deployment(
     swarm: &mut Swarm<MyBehaviour>,
-    apply_req: &machine::ApplyRequest<'_>,
+    apply_req: &machine::ApplyRequest,
     manifest_json: &str,
     owner_pubkey: &[u8],
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -750,9 +750,7 @@ async fn decrypt_manifest_content(
 
     if payload_type == "manifest" {
         // Extract encrypted payload from envelope and decrypt directly
-        if let Some(payload_vector) = envelope.payload() {
-            let payload_bytes = payload_vector.bytes();
-
+        if let Some(payload_bytes) = envelope.payload() {
             // Attempt to decrypt the manifest using KEM decryption
             match decrypt_manifest_from_envelope(manifest_id, payload_bytes).await {
                 Ok(decrypted_content) => {

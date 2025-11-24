@@ -113,7 +113,7 @@ impl FlatbufferEnvelopeBuilder {
             .map_err(|e| anyhow::anyhow!("Failed to parse envelope: {}", e))?;
 
         // Build signed envelope using protocol helper
-        let payload_bytes = envelope.payload().map(|v| v.bytes()).unwrap_or(&[]);
+        let payload_bytes = envelope.payload().unwrap_or(&[]);
 
         // Reconstruct canonical bytes using the same method as verification
         let canonical_bytes = protocol::machine::build_envelope_canonical(

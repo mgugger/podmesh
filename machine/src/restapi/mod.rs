@@ -192,7 +192,8 @@ pub async fn get_candidates(
         task_id,
         uuid::Uuid::new_v4()
     );
-    let capacity_fb = protocol::machine::build_capacity_request(
+    let capacity_fb = protocol::machine::build_capacity_request_with_id(
+        &request_id,
         500u32,
         512u64 * 1024 * 1024,
         10u64 * 1024 * 1024 * 1024,

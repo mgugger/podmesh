@@ -27,26 +27,19 @@ pub async fn handle_query_capacity_with_payload(
         .or_insert_with(Vec::new)
         .push(reply_tx);
 
-    // Parse the provided payload as a CapacityRequest FlatBuffer and rebuild it into a TopicMessage wrapper
+    // Parse the provided payload as a CapacityRequest postcard message and attach the request_id if needed
     match protocol::machine::root_as_capacity_request(&payload) {
         Ok(cap_req) => {
-            // Rebuild a CapacityRequest flatbuffer embedding the request_id.
-            let mut fbb = flatbuffers::FlatBufferBuilder::new();
-            let req_id_off = fbb.create_string(&request_id);
-            let cpu = cap_req.cpu_milli();
-            let mem = cap_req.memory_bytes();
-            let stor = cap_req.storage_bytes();
-            let reps = cap_req.replicas();
-            let cap_args = protocol::machine::CapacityRequestArgs {
-                request_id: Some(req_id_off),
-                cpu_milli: cpu,
-                memory_bytes: mem,
-                storage_bytes: stor,
-                replicas: reps,
+            let finished = match cap_req.request_id() {
+                Some(existing) if !existing.is_empty() => payload,
+                _ => protocol::machine::build_capacity_request_with_id(
+                    &request_id,
+                    cap_req.cpu_milli(),
+                    cap_req.memory_bytes(),
+                    cap_req.storage_bytes(),
+                    cap_req.replicas(),
+                ),
             };
-            let cap_off = protocol::machine::CapacityRequest::create(&mut fbb, &cap_args);
-            protocol::machine::finish_capacity_request_buffer(&mut fbb, cap_off);
-            let finished = fbb.finished_data().to_vec();
             // Broadcast signed scheduler requests to peers (centralized helper)
             match utils::broadcast_signed_request_to_peers(swarm, &finished, "capacity") {
                 Ok(sent) => {
