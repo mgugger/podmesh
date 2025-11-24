@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, anyhow, bail};
-use protocol::machine::{GatewayRouteKind, GatewayRouteSpec};
+use protocol::{
+    libp2p_constants::MESH_DOMAIN_SUFFIX,
+    machine::{GatewayRouteKind, GatewayRouteSpec},
+};
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 use tracing::warn;
-
-const SERVICE_DOMAIN_SUFFIX: &str = "mesh.local";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteExtraction {
@@ -348,7 +349,7 @@ fn find_service_port<'a>(
 }
 
 fn format_service_host(service: &str, manifest_id: &str) -> String {
-    format!("{}.{}.{}", service, manifest_id, SERVICE_DOMAIN_SUFFIX).to_lowercase()
+    format!("{}.{}.{}", service, manifest_id, MESH_DOMAIN_SUFFIX).to_lowercase()
 }
 
 fn normalize_path(path: &str) -> String {
@@ -390,11 +391,12 @@ mod tests {
                 .iter()
                 .any(|route| route.source == GatewayRouteKind::Ingress)
         );
+        let expected_host = format!("demo-nginx.{}", MESH_DOMAIN_SUFFIX);
         assert!(
             extraction
                 .routes
                 .iter()
-                .any(|route| route.host == "demo-nginx.mesh.local")
+                .any(|route| route.host == expected_host)
         );
     }
 }

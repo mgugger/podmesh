@@ -198,10 +198,7 @@ pub fn verify_flatbuffer_envelope_for_peer(
         .context("failed to base64-decode pubkey")?;
 
     // Reconstruct canonical bytes using the same method as signing
-    let payload_vec = fb_env
-        .payload()
-        .map(|b| b.to_vec())
-        .unwrap_or_default();
+    let payload_vec = fb_env.payload().map(|b| b.to_vec()).unwrap_or_default();
     let payload_type = fb_env.payload_type().unwrap_or("");
     let nonce = fb_env.nonce().unwrap_or("");
     let ts = fb_env.ts();
@@ -270,10 +267,7 @@ pub fn verify_flatbuffer_envelope_skip_nonce_check(
         .context("failed to base64-decode pubkey")?;
 
     // Reconstruct canonical bytes using the same method as signing
-    let payload_vec = fb_env
-        .payload()
-        .map(|b| b.to_vec())
-        .unwrap_or_default();
+    let payload_vec = fb_env.payload().map(|b| b.to_vec()).unwrap_or_default();
     let payload_type = fb_env.payload_type().unwrap_or("");
     let nonce = fb_env.nonce().unwrap_or("");
     let ts = fb_env.ts();

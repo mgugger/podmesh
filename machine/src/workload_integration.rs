@@ -15,13 +15,13 @@ use crate::resource_verifier::ResourceVerifier;
 use crate::runtime::{
     DeploymentConfig, GatewayInjectionConfig, RuntimeRegistry, create_default_registry,
 };
-use crate::yaml_utils::{parse_yaml_documents_from_slice, serialize_yaml_documents};
 use base64::Engine;
 use libp2p::Swarm;
 use libp2p::request_response;
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 use protocol::machine;
+use protocol::manifest_yaml::{parse_yaml_documents_from_slice, serialize_yaml_documents};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -1084,7 +1084,7 @@ pub async fn discover_manifest_providers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::yaml_utils::parse_yaml_documents_from_slice;
+    use protocol::manifest_yaml::parse_yaml_documents_from_slice;
 
     #[tokio::test]
     async fn test_runtime_registry_initialization() {

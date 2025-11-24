@@ -7,8 +7,9 @@
 use libp2p::kad::RecordKey;
 use libp2p::{PeerId, Swarm};
 use log::{debug, error, info, warn};
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 
@@ -150,7 +151,7 @@ impl ProviderManager {
 
         // Store locally
         {
-            let mut local_providers = self.local_providers.lock().unwrap();
+            let mut local_providers = self.local_providers.lock();
             local_providers.insert(manifest_id.to_string(), provider_info);
         }
 
@@ -171,7 +172,7 @@ impl ProviderManager {
             manifest_id
         );
 
-        let mut local_providers = self.local_providers.lock().unwrap();
+        let mut local_providers = self.local_providers.lock();
         if local_providers.remove(manifest_id).is_some() {
             debug!("Removed local provider for manifest: {}", manifest_id);
             Ok(())
@@ -194,7 +195,7 @@ impl ProviderManager {
 
         // Check if we have cached providers
         {
-            let remote_providers = self.remote_providers.lock().unwrap();
+            let remote_providers = self.remote_providers.lock();
             if let Some(providers) = remote_providers.get(manifest_id) {
                 // Filter out expired providers
                 let valid_providers: Vec<ProviderInfo> = providers
@@ -220,13 +221,13 @@ impl ProviderManager {
 
     /// Get all manifests this node is providing
     pub fn get_local_providers(&self) -> Vec<ProviderInfo> {
-        let local_providers = self.local_providers.lock().unwrap();
+        let local_providers = self.local_providers.lock();
         local_providers.values().cloned().collect()
     }
 
     /// Get providers for a specific manifest (including expired ones)
     pub fn get_providers_for_manifest(&self, manifest_id: &str) -> Vec<ProviderInfo> {
-        let remote_providers = self.remote_providers.lock().unwrap();
+        let remote_providers = self.remote_providers.lock();
         remote_providers
             .get(manifest_id)
             .cloned()
@@ -239,7 +240,7 @@ impl ProviderManager {
 
         let mut removed_count = 0;
         {
-            let mut remote_providers = self.remote_providers.lock().unwrap();
+            let mut remote_providers = self.remote_providers.lock();
             for (_manifest_id, providers) in remote_providers.iter_mut() {
                 let original_len = providers.len();
                 providers.retain(|p| !p.is_expired());
@@ -260,7 +261,7 @@ impl ProviderManager {
         debug!("Re-announcing local providers");
 
         let manifest_ids: Vec<String> = {
-            let local_providers = self.local_providers.lock().unwrap();
+            let local_providers = self.local_providers.lock();
             local_providers.keys().cloned().collect()
         };
 
@@ -297,7 +298,7 @@ impl ProviderManager {
                     // Clean up expired providers
                     let mut removed_count = 0;
                     {
-                        let mut providers = remote_providers_clone.lock().unwrap();
+                        let mut providers = remote_providers_clone.lock();
                         for providers_list in providers.values_mut() {
                             let original_len = providers_list.len();
                             providers_list.retain(|p| !p.is_expired());
@@ -365,7 +366,7 @@ impl ProviderManager {
 
         // Store the sender for this query
         {
-            let mut pending_queries = self.pending_queries.lock().unwrap();
+            let mut pending_queries = self.pending_queries.lock();
             pending_queries
                 .entry(manifest_id.to_string())
                 .or_insert_with(Vec::new)
@@ -391,7 +392,7 @@ impl ProviderManager {
 
                 // Cache the results
                 {
-                    let mut remote_providers = self.remote_providers.lock().unwrap();
+                    let mut remote_providers = self.remote_providers.lock();
                     remote_providers.insert(manifest_id.to_string(), providers.clone());
                 }
 
@@ -432,7 +433,7 @@ impl ProviderManager {
 
         // Add to remote providers
         {
-            let mut remote_providers = self.remote_providers.lock().unwrap();
+            let mut remote_providers = self.remote_providers.lock();
             let providers = remote_providers
                 .entry(manifest_id.to_string())
                 .or_insert_with(Vec::new);
@@ -459,7 +460,7 @@ impl ProviderManager {
 
         // Notify any pending queries
         {
-            let mut pending_queries = self.pending_queries.lock().unwrap();
+            let mut pending_queries = self.pending_queries.lock();
             if let Some(senders) = pending_queries.remove(manifest_id) {
                 let providers = self.get_providers_for_manifest(manifest_id);
                 for sender in senders {
@@ -471,14 +472,14 @@ impl ProviderManager {
 
     /// Get statistics about the provider manager
     pub fn get_stats(&self) -> ProviderStats {
-        let local_count = self.local_providers.lock().unwrap().len();
+        let local_count = self.local_providers.lock().len();
         let (remote_manifests, total_remote_providers) = {
-            let remote_providers = self.remote_providers.lock().unwrap();
+            let remote_providers = self.remote_providers.lock();
             let manifests = remote_providers.len();
             let total_providers = remote_providers.values().map(|v| v.len()).sum();
             (manifests, total_providers)
         };
-        let pending_queries = self.pending_queries.lock().unwrap().len();
+        let pending_queries = self.pending_queries.lock().len();
 
         ProviderStats {
             local_providers: local_count,
@@ -563,7 +564,7 @@ mod tests {
 
         // Add an expired provider
         {
-            let mut remote_providers = manager.remote_providers.lock().unwrap();
+            let mut remote_providers = manager.remote_providers.lock();
             let expired_provider = ProviderInfo {
                 peer_id: PeerId::random(),
                 manifest_id: "test".to_string(),

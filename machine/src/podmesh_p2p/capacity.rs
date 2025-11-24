@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use libp2p::{gossipsub, request_response};
 
 use crate::podmesh_p2p::reply::{self, CapacityReply, CapacityReplyParams};
-use crate::podmesh_p2p::request_response_codec::SchedulerCodec;
+use p2p::request_response::SchedulerCodec;
 
 /// Build a capacity reply, apply optional adjustments, and emit standard KEM warnings.
 pub fn compose_capacity_reply<'a, F>(

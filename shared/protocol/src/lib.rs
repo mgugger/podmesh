@@ -1,6 +1,7 @@
 pub mod gateway_metadata;
 pub mod libp2p_constants;
 pub mod machine;
+pub mod manifest_yaml;
 
 #[cfg(test)]
 mod tests {

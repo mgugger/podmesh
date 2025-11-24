@@ -18,8 +18,7 @@ use tracing::{debug, error, info};
 
 use crate::p2p::ProxyClient;
 use p2p::http_proxy::ProxyHttpRequest;
-
-const DEFAULT_DOMAIN_SUFFIX: &str = "mesh.local";
+use protocol::libp2p_constants::MESH_DOMAIN_SUFFIX;
 const MAX_PROXY_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct IngressServer {
@@ -100,13 +99,13 @@ fn parse_host(value: &HeaderValue) -> Option<String> {
     if host_part.is_empty() {
         return None;
     }
-    let suffix = format!(".{}", DEFAULT_DOMAIN_SUFFIX);
+    let suffix = format!(".{}", MESH_DOMAIN_SUFFIX);
     let stripped = if let Some(stripped) = host_part.strip_suffix(&suffix) {
         stripped
     } else {
         debug!(
             host = host_part,
-            expected_suffix = DEFAULT_DOMAIN_SUFFIX,
+            expected_suffix = MESH_DOMAIN_SUFFIX,
             "ingress host missing expected suffix"
         );
         host_part

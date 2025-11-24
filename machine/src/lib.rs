@@ -22,7 +22,6 @@ pub mod runtime;
 pub mod scheduler;
 pub mod workload_integration;
 pub mod workload_manager;
-mod yaml_utils;
 
 pub use scheduler::{
     NodeCandidate, NodeCapabilities, Scheduler, SchedulerConfig, SchedulerStats, SchedulingError,

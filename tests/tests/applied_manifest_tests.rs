@@ -1,4 +1,7 @@
-use protocol::machine::{build_applied_manifest, root_as_applied_manifest};
+use protocol::machine::{
+    AppliedManifest, KeyValue, OperationType, SignatureScheme, build_applied_manifest,
+    root_as_applied_manifest,
+};
 
 #[test]
 fn test_applied_manifest_owner_fields_roundtrip() {
@@ -9,22 +12,28 @@ fn test_applied_manifest_owner_fields_roundtrip() {
     let signature = vec![9u8, 8u8, 7u8];
     let manifest_json = "{\"k\":\"v\"}";
     let manifest_kind = "Test";
-    let labels: Vec<(String, String)> = vec![];
     let timestamp = 123456789u64;
 
-    let buf = build_applied_manifest(
-        id,
-        operation_id,
-        origin_peer,
-        &owner_pub,
-        &signature,
-        manifest_json,
-        manifest_kind,
-        labels,
+    let manifest = AppliedManifest {
+        id: id.into(),
+        operation_id: operation_id.into(),
+        origin_peer: origin_peer.into(),
+        owner_pubkey: owner_pub.clone(),
+        signature_scheme: SignatureScheme::Ed25519,
+        signature: signature.clone(),
+        manifest_json: manifest_json.into(),
+        manifest_kind: manifest_kind.into(),
+        labels: vec![KeyValue {
+            key: "env".into(),
+            value: "test".into(),
+        }],
         timestamp,
-        3600,
-        "chash",
-    );
+        operation: OperationType::Apply,
+        ttl_secs: 3600,
+        content_hash: "chash".into(),
+    };
+
+    let buf = build_applied_manifest(manifest);
 
     let parsed = root_as_applied_manifest(&buf).expect("parse");
     assert_eq!(parsed.id().unwrap(), id);

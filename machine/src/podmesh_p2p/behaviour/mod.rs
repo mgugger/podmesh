@@ -23,8 +23,7 @@ use p2p::CoreBehaviourAccess;
 
 pub use scheduler_message::scheduler_message;
 
-use crate::podmesh_p2p::request_response_codec::SchedulerCodec;
-use crate::podmesh_p2p::{ApplyCodec, DeleteCodec, HandshakeCodec};
+use p2p::request_response::{ApplyCodec, DeleteCodec, HandshakeCodec, SchedulerCodec};
 
 // Add DHT event handlers
 pub mod kademlia_event;

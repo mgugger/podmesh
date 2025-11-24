@@ -12,7 +12,7 @@ use p2p::{
     CoreBehaviourAccess, NodeConfig,
     handshake::{self, HandshakeDriveConfig, HandshakeState},
     http_proxy::{ProxyCodec, ProxyHttpRequest, ProxyHttpResponse},
-    request_response::ByteCodec,
+    request_response::HandshakeCodec,
 };
 use protocol::libp2p_constants::{
     INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX, WORKLOAD_CLUSTER_TOPIC,
@@ -23,8 +23,6 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
-
-type HandshakeCodec = ByteCodec;
 
 const PROXY_PROVIDER_KEY: &str = "podmesh-proxy-node";
 const DEFAULT_MANIFEST_RECORD_TTL_MS: u64 = 30_000;
@@ -404,34 +402,28 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
                     }
                     _ = handshake_interval.tick() => {
                         let local_peer = swarm.local_peer_id().clone();
-                        let mut pending_requests: Vec<(PeerId, Vec<u8>)> = Vec::new();
-                        let mut dropped_peers: Vec<PeerId> = Vec::new();
-                        if let Err(err) = handshake::drive_handshakes(
+                        match handshake::collect_handshake_actions(
                             &mut handshake_states,
                             &local_peer,
                             &HandshakeDriveConfig::default(),
-                            |peer, payload| {
-                                pending_requests.push((peer.clone(), payload));
-                                true
-                            },
-                            |peer| dropped_peers.push(peer.clone()),
                         ) {
-                            warn!(?err, "workload handshake drive failed");
-                        }
+                            Ok(actions) => {
+                                for (peer, payload) in actions.requests {
+                                    let request_id = swarm
+                                        .behaviour_mut()
+                                        .handshake_rr
+                                        .send_request(&peer, payload);
+                                    debug!(%peer, ?request_id, "workload handshake request sent");
+                                }
 
-                        for (peer, payload) in pending_requests {
-                            let request_id = swarm
-                                .behaviour_mut()
-                                .handshake_rr
-                                .send_request(&peer, payload);
-                            debug!(%peer, ?request_id, "workload handshake request sent");
-                        }
-
-                        for peer in dropped_peers {
-                            swarm
-                                .behaviour_mut()
-                                .gossipsub
-                                .remove_explicit_peer(&peer);
+                                for peer in actions.drops {
+                                    swarm
+                                        .behaviour_mut()
+                                        .gossipsub
+                                        .remove_explicit_peer(&peer);
+                                }
+                            }
+                            Err(err) => warn!(?err, "workload handshake drive failed"),
                         }
                     }
                     _ = interval.tick() => {

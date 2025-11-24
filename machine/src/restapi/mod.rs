@@ -14,9 +14,10 @@ use base64::Engine;
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 use protocol::libp2p_constants::{FREE_CAPACITY_PREFIX, FREE_CAPACITY_TIMEOUT_MS};
+use protocol::machine::parse_peer_with_pubkey;
 
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -66,31 +67,9 @@ pub struct RestState {
     pub envelope_handler: std::sync::Arc<EnvelopeHandler>,
 }
 
-// Global in-memory store of decrypted manifests for debugging / tests.
-// Keyed by manifest_id -> decrypted manifest JSON/value.
-static DECRYPTED_MANIFESTS: Lazy<tokio::sync::RwLock<HashMap<String, serde_json::Value>>> =
-    Lazy::new(|| tokio::sync::RwLock::new(HashMap::new()));
-
 // Global mapping of operation_id -> manifest_cid to ensure consistent manifest ID usage across REST API and apply processing
 static OPERATION_MANIFEST_MAPPING: Lazy<tokio::sync::RwLock<HashMap<String, String>>> =
     Lazy::new(|| tokio::sync::RwLock::new(HashMap::new()));
-
-/// Store a decrypted manifest (async). FOR DEBUG/TEST USE ONLY.
-/// This function should NOT be called during normal operation as the machine plane
-/// should be stateless and not persist manifest content. Only use for debugging endpoints.
-pub async fn store_decrypted_manifest(manifest_id: &str, value: serde_json::Value) {
-    let mut map = DECRYPTED_MANIFESTS.write().await;
-    map.insert(manifest_id.to_string(), value.clone());
-    log::warn!(
-        "store_decrypted_manifest: stored manifest_id='{}' value_preview='{}'",
-        manifest_id,
-        serde_json::to_string(&value)
-            .unwrap_or("(invalid)".to_string())
-            .chars()
-            .take(100)
-            .collect::<String>()
-    );
-}
 
 /// Store the mapping of operation_id -> manifest_cid for consistent manifest ID usage
 pub async fn store_operation_manifest_mapping(operation_id: &str, manifest_cid: &str) {
@@ -109,12 +88,6 @@ pub async fn get_manifest_cid_for_operation(operation_id: &str) -> Option<String
     map.get(operation_id).cloned()
 }
 
-/// Return all decrypted manifests as a JSON object.
-pub async fn get_decrypted_manifests_map() -> serde_json::Value {
-    let map = DECRYPTED_MANIFESTS.read().await;
-    serde_json::to_value(map.clone()).unwrap_or(serde_json::json!({}))
-}
-
 pub fn build_router(
     peer_rx: watch::Receiver<Vec<String>>,
     control_tx: mpsc::UnboundedSender<crate::podmesh_p2p::control::Libp2pControl>,
@@ -130,7 +103,6 @@ pub fn build_router(
         .route("/health", get(|| async { "ok" }))
         .route("/api/v1/kem_pubkey", get(get_kem_public_key))
         .route("/api/v1/signing_pubkey", get(get_signing_public_key))
-        .route("/debug/decrypted_manifests", get(debug_decrypted_manifests))
         .route("/debug/dht/active_announces", get(debug_active_announces))
         .route("/debug/dht/peers", get(debug_dht_peers))
         .route("/debug/peers", get(debug_peers))
@@ -209,6 +181,7 @@ pub async fn get_candidates(
     );
 
     let mut responders: Vec<String> = Vec::new();
+    let mut responder_set: HashSet<String> = HashSet::new();
     let start = std::time::Instant::now();
     let timeout = Duration::from_millis(FREE_CAPACITY_TIMEOUT_MS);
     log::info!(
@@ -224,7 +197,7 @@ pub async fn get_candidates(
                     "get_candidates: received response from peer: {}",
                     &peer[..16]
                 );
-                if !responders.contains(&peer) {
+                if responder_set.insert(peer.clone()) {
                     responders.push(peer);
                     // Get a few candidates to choose from
                     if responders.len() >= 5 {
@@ -258,26 +231,20 @@ pub async fn get_candidates(
     // Parse candidates with their public keys
     let mut candidates: Vec<(String, String)> = Vec::new();
     for peer_with_key in &responders {
-        if let Some(colon_pos) = peer_with_key.find(':') {
-            let peer_id_str = &peer_with_key[..colon_pos];
-            let pubkey_b64 = &peer_with_key[colon_pos + 1..];
-            if !pubkey_b64.is_empty() {
-                candidates.push((peer_id_str.to_string(), pubkey_b64.to_string()));
+        match parse_peer_with_pubkey(peer_with_key) {
+            Some((peer_id, pubkey_b64)) => {
                 log::info!(
                     "get_candidates: added candidate {} with public key",
-                    peer_id_str
+                    peer_id
                 );
-            } else {
+                candidates.push((peer_id, pubkey_b64));
+            }
+            None => {
                 log::warn!(
-                    "get_candidates: peer {} has no public key, skipping",
-                    peer_id_str
+                    "get_candidates: invalid candidate format '{}', skipping",
+                    peer_with_key
                 );
             }
-        } else {
-            log::warn!(
-                "get_candidates: no public key separator found for: {}, skipping",
-                peer_with_key
-            );
         }
     }
 
@@ -559,14 +526,6 @@ pub async fn create_task(
         // No KEM key in metadata, return unencrypted response
         create_response_with_fallback(&response_data).await
     }
-}
-
-// Debug: return the decrypted manifests collected by this node (for testing)
-async fn debug_decrypted_manifests(
-    State(_state): State<RestState>,
-) -> axum::Json<serde_json::Value> {
-    let data = get_decrypted_manifests_map().await;
-    axum::Json(serde_json::json!({"ok": true, "decrypted_manifests": data}))
 }
 
 // Debug: return the active announces (provider CIDs) tracked by the control module

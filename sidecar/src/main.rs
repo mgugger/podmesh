@@ -6,7 +6,10 @@ use clap::Parser;
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
-use protocol::gateway_metadata::{DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR, GatewaySidecarMetadata};
+use protocol::{
+    gateway_metadata::{DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR, GatewaySidecarMetadata},
+    libp2p_constants::MESH_DOMAIN_SUFFIX,
+};
 use sidecar::{
     DEFAULT_GATEWAY_APP_PORT, GatewayConfig, manifest_routes::extract_gateway_routes, run_gateway,
     split_csv,
@@ -82,7 +85,7 @@ impl TryFrom<Args> for GatewayConfig {
             .decode(&metadata.manifest_b64)
             .context("failed to decode manifest payload from metadata")?;
         let manifest_id = metadata.manifest_id.clone();
-        let ingress_host = format!("{}.mesh.local", manifest_id);
+        let ingress_host = format!("{}.{}", manifest_id, MESH_DOMAIN_SUFFIX);
 
         let extraction = extract_gateway_routes(&manifest_bytes, &manifest_id)
             .with_context(|| format!("failed to extract routes for manifest {}", manifest_id))?;

@@ -47,6 +47,13 @@ impl Default for HandshakeDriveConfig {
     }
 }
 
+/// Actions produced after driving pending handshakes.
+#[derive(Default)]
+pub struct HandshakeActions {
+    pub requests: Vec<(PeerId, Vec<u8>)>,
+    pub drops: Vec<PeerId>,
+}
+
 /// Ensure a peer has an entry in the handshake map and return mutable reference to its state.
 pub fn track_peer<'a>(
     states: &'a mut HashMap<PeerId, HandshakeState>,
@@ -224,4 +231,24 @@ where
     }
 
     Ok(())
+}
+
+/// Helper that wraps [`drive_handshakes`] and collects pending requests/drops.
+pub fn collect_handshake_actions(
+    handshake_states: &mut HashMap<PeerId, HandshakeState>,
+    local_peer: &PeerId,
+    cfg: &HandshakeDriveConfig,
+) -> Result<HandshakeActions> {
+    let mut actions = HandshakeActions::default();
+    drive_handshakes(
+        handshake_states,
+        local_peer,
+        cfg,
+        |peer, payload| {
+            actions.requests.push((peer.clone(), payload));
+            true
+        },
+        |peer| actions.drops.push(peer.clone()),
+    )?;
+    Ok(actions)
 }

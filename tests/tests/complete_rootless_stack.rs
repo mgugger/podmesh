@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use podctl::{apply_file, delete_file};
 use podmesh_integration_tests::support::init_tracing;
+use protocol::libp2p_constants::MESH_DOMAIN_SUFFIX;
 use reqwest::Client;
 use serde_json::Value;
 use serial_test::serial;
@@ -15,7 +16,6 @@ const MACHINE_API_URL: &str = "http://127.0.0.1:3000";
 const ROOTLESS_MANIFEST_PATH: &str = "deploy/complete_rootless.yml";
 const SAMPLE_MANIFEST_PATH: &str = "tests/sample_manifests/demo_deployment.yml";
 const MESH_PROXY_URL: &str = "http://127.0.0.1:8080/";
-const INGRESS_HOST_HEADER: &str = "demo-nginx.mesh.local";
 const EXPECTED_BODY_SUBSTRING: &str = "Welcome to Podmesh";
 const REQUIRED_MACHINE_PEERS: usize = 1;
 const EXPECTED_CONTAINERS: [&str; 2] = ["my-nginx", "sidecar"];
@@ -274,11 +274,12 @@ async fn wait_for_workload_teardown(manifest_id: &str, timeout: Duration) -> Res
 async fn wait_for_meshproxy_response(client: &Client, timeout: Duration) -> Result<String> {
     let deadline = Instant::now() + timeout;
     let mut last_err: Option<anyhow::Error> = None;
+    let ingress_host_header = format!("demo-nginx.{}", MESH_DOMAIN_SUFFIX);
 
     while Instant::now() < deadline {
         match client
             .get(MESH_PROXY_URL)
-            .header("host", INGRESS_HOST_HEADER)
+            .header("host", &ingress_host_header)
             .send()
             .await
         {

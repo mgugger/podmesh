@@ -8,9 +8,9 @@ use crate::runtime::{
     DeploymentConfig, PortMapping, RuntimeEngine, RuntimeError, RuntimeResult, WorkloadInfo,
     WorkloadStatus,
 };
-use crate::yaml_utils::parse_yaml_documents_from_str;
 use async_trait::async_trait;
 use log::{debug, info, warn};
+use protocol::manifest_yaml::parse_yaml_documents_from_str;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

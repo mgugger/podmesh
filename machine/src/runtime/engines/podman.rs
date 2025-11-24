@@ -7,12 +7,12 @@ use crate::runtime::{
     DeploymentConfig, PortMapping, RuntimeEngine, RuntimeError, RuntimeResult, WorkloadInfo,
     WorkloadStatus,
 };
-use crate::yaml_utils::{
-    parse_yaml_documents_from_slice, parse_yaml_documents_from_str, serialize_yaml_documents,
-};
 use async_trait::async_trait;
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
+use protocol::manifest_yaml::{
+    parse_yaml_documents_from_slice, parse_yaml_documents_from_str, serialize_yaml_documents,
+};
 use serde_yaml::Value;
 use std::collections::HashMap;
 use std::fs;

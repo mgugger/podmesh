@@ -25,6 +25,7 @@ protocol = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 uuid = { workspace = true }
+p2p = { workspace = true }
 
 [[bin]]
 name = "podctl"

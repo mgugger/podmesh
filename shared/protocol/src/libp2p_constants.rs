@@ -14,6 +14,9 @@ pub const MANIFEST_RECORD_PREFIX: &str = "podmesh/manifest/";
 /// Default manifest identifier used by the ingress e2e test.
 pub const DEFAULT_INGRESS_MANIFEST_ID: &str = "demo-app";
 
+/// Domain suffix appended to ingress hosts across the workload plane.
+pub const MESH_DOMAIN_SUFFIX: &str = "mesh.local";
+
 /// Protocol ID for the ingress proxy libp2p request-response stream.
 pub const INGRESS_PROXY_PROTOCOL: &str = "/podmesh/ingress-proxy/1.0.0";
 

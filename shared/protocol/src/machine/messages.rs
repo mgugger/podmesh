@@ -595,6 +595,17 @@ pub fn build_manifest_target(peer_id: &str, payload_json: &str) -> (String, Stri
     (peer_id.to_string(), payload_json.to_string())
 }
 
+/// Parse a `peer_id:pubkey` entry emitted by the machine when returning candidates.
+pub fn parse_peer_with_pubkey(entry: &str) -> Option<(String, String)> {
+    let (peer_id, pubkey_b64) = entry.split_once(':')?;
+    let peer = peer_id.trim();
+    let key = pubkey_b64.trim();
+    if peer.is_empty() || key.is_empty() {
+        return None;
+    }
+    Some((peer.to_string(), key.to_string()))
+}
+
 pub fn extract_manifest_name(manifest_data: &[u8]) -> Option<String> {
     let manifest_str = std::str::from_utf8(manifest_data).ok()?;
     for line in manifest_str.lines() {

@@ -62,9 +62,6 @@ pub fn is_scheduling_disabled_for(peer: &PeerId) -> bool {
         .unwrap_or(false)
 }
 
-mod request_response_codec;
-pub use request_response_codec::{ApplyCodec, DeleteCodec, HandshakeCodec};
-
 use crate::podmesh_p2p::{
     behaviour::{MyBehaviour, MyBehaviourEvent},
     control::Libp2pControl,
@@ -360,34 +357,28 @@ pub async fn start_libp2p_node(
             }
             _ = handshake_interval.tick() => {
                 let local_peer = swarm.local_peer_id().clone();
-                let mut pending_requests: Vec<(PeerId, Vec<u8>)> = Vec::new();
-                let mut dropped_peers: Vec<PeerId> = Vec::new();
-                if let Err(err) = handshake::drive_handshakes(
+                match handshake::collect_handshake_actions(
                     &mut handshake_states,
                     &local_peer,
                     &HandshakeDriveConfig::default(),
-                    |peer, payload| {
-                        pending_requests.push((peer.clone(), payload));
-                        true
-                    },
-                    |peer| dropped_peers.push(peer.clone()),
                 ) {
-                    warn!("handshake drive failed: {err:?}");
-                }
+                    Ok(actions) => {
+                        for (peer, payload) in actions.requests {
+                            let request_id = swarm
+                                .behaviour_mut()
+                                .handshake_rr
+                                .send_request(&peer, payload);
+                            debug!("libp2p: sent handshake request to peer={} request_id={:?}", peer, request_id);
+                        }
 
-                for (peer, payload) in pending_requests {
-                    let request_id = swarm
-                        .behaviour_mut()
-                        .handshake_rr
-                        .send_request(&peer, payload);
-                    debug!("libp2p: sent handshake request to peer={} request_id={:?}", peer, request_id);
-                }
-
-                for peer in dropped_peers {
-                    swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .remove_explicit_peer(&peer);
+                        for peer in actions.drops {
+                            swarm
+                                .behaviour_mut()
+                                .gossipsub
+                                .remove_explicit_peer(&peer);
+                        }
+                    }
+                    Err(err) => warn!("handshake drive failed: {err:?}"),
                 }
 
                 // Update peer list in channel after handshake changes

@@ -14,7 +14,7 @@ use libp2p::{
 use p2p::http_proxy::{ProxyCodec, ProxyHttpRequest, ProxyHttpResponse};
 use p2p::{
     handshake::{self, HandshakeDriveConfig, HandshakeState},
-    request_response::ByteCodec,
+    request_response::HandshakeCodec,
 };
 use protocol::libp2p_constants::{INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX};
 use protocol::machine::{GatewayRouteSpec, build_gateway_provider_record};
@@ -27,8 +27,6 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 pub mod manifest_routes;
-
-type HandshakeCodec = ByteCodec;
 
 pub const DEFAULT_GATEWAY_APP_PORT: u16 = 18080;
 const MANIFEST_RECORD_TTL_MS: u32 = 30_000;
@@ -155,7 +153,30 @@ pub async fn run_gateway_with_shutdown(
                 break;
             }
             _ = handshake_ticker.tick() => {
-                drive_handshakes(&mut swarm, &mut state);
+                let local_peer = swarm.local_peer_id().clone();
+                match handshake::collect_handshake_actions(
+                    &mut state.handshake_states,
+                    &local_peer,
+                    &HandshakeDriveConfig::default(),
+                ) {
+                    Ok(actions) => {
+                        for (peer, payload) in actions.requests {
+                            let request_id = swarm
+                                .behaviour_mut()
+                                .handshake_rr
+                                .send_request(&peer, payload);
+                            debug!(%peer, ?request_id, "gateway handshake request sent");
+                        }
+
+                        for peer in actions.drops {
+                            debug!(%peer, "gateway removing peer after failed handshake attempts");
+                            swarm.behaviour_mut().kademlia.remove_peer(&peer);
+                        }
+                    }
+                    Err(err) => {
+                        warn!(?err, "gateway handshake drive failed");
+                    }
+                }
             },
             _ = manifest_ticker.tick() => {
                 publish_manifest_record(&mut swarm, &cfg);
@@ -640,37 +661,6 @@ async fn execute_local_http_request(
         headers,
         body,
     })
-}
-
-fn drive_handshakes(swarm: &mut Swarm<GatewayBehaviour>, state: &mut GatewayState) {
-    let local_peer = swarm.local_peer_id().clone();
-    let mut pending: Vec<(PeerId, Vec<u8>)> = Vec::new();
-    let mut dropped: Vec<PeerId> = Vec::new();
-    if let Err(err) = handshake::drive_handshakes(
-        &mut state.handshake_states,
-        &local_peer,
-        &HandshakeDriveConfig::default(),
-        |peer, payload| {
-            pending.push((peer.clone(), payload));
-            true
-        },
-        |peer| dropped.push(peer.clone()),
-    ) {
-        warn!(?err, "gateway handshake drive failed");
-    }
-
-    for (peer, payload) in pending {
-        let request_id = swarm
-            .behaviour_mut()
-            .handshake_rr
-            .send_request(&peer, payload);
-        debug!(%peer, ?request_id, "gateway handshake request sent");
-    }
-
-    for peer in dropped {
-        debug!(%peer, "gateway removing peer after failed handshake attempts");
-        swarm.behaviour_mut().kademlia.remove_peer(&peer);
-    }
 }
 
 fn handle_kad_event(

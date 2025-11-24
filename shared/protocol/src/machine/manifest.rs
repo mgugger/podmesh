@@ -139,41 +139,16 @@ impl AppliedManifest {
     }
 }
 
-pub fn build_applied_manifest(
-    id: &str,
-    operation_id: &str,
-    origin_peer: &str,
-    owner_pubkey: &[u8],
-    signature: &[u8],
-    manifest_json: &str,
-    manifest_kind: &str,
-    labels: Vec<(String, String)>,
-    timestamp: u64,
-    ttl_secs: u32,
-    content_hash: &str,
-) -> Vec<u8> {
-    let label_entries = labels
-        .into_iter()
-        .map(|(key, value)| KeyValue { key, value })
-        .collect();
-
-    serialize(&AppliedManifest {
-        id: id.to_string(),
-        operation_id: operation_id.to_string(),
-        origin_peer: origin_peer.to_string(),
-        owner_pubkey: owner_pubkey.to_vec(),
-        signature_scheme: SignatureScheme::None,
-        signature: signature.to_vec(),
-        manifest_json: manifest_json.to_string(),
-        manifest_kind: manifest_kind.to_string(),
-        labels: label_entries,
-        timestamp,
-        operation: OperationType::Apply,
-        ttl_secs,
-        content_hash: content_hash.to_string(),
-    })
+pub fn build_applied_manifest(manifest: AppliedManifest) -> Vec<u8> {
+    serialize(&manifest)
 }
 
 pub fn root_as_applied_manifest(bytes: &[u8]) -> Result<AppliedManifest, postcard::Error> {
     deserialize(bytes)
+}
+
+impl AppliedManifest {
+    pub fn serialize_vec(self) -> Vec<u8> {
+        build_applied_manifest(self)
+    }
 }

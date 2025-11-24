@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["env"] }
-libp2p = { workspace = true }
+libp2p = { workspace = true, features = ["relay", "autonat", "identify"] }
 tokio = { workspace = true }
 p2p = { workspace = true }
 protocol = { workspace = true }

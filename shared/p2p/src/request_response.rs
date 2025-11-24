@@ -5,6 +5,13 @@ use libp2p::request_response;
 #[derive(Debug, Clone, Default)]
 pub struct ByteCodec;
 
+// Common podmesh protocols all share the same byte codec.
+pub type HandshakeCodec = ByteCodec;
+pub type ApplyCodec = ByteCodec;
+pub type DeleteCodec = ByteCodec;
+pub type SchedulerCodec = ByteCodec;
+pub type ManifestFetchCodec = ByteCodec;
+
 #[async_trait::async_trait]
 impl request_response::Codec for ByteCodec {
     type Protocol = &'static str;
