@@ -101,7 +101,7 @@ kind: Pod
 metadata:
   name: workload-bootstrap
   labels:
-    app: meshproxy
+    app: podmesh-proxy
 spec:
   restartPolicy: Always
   containers:

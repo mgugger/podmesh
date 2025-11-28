@@ -8,10 +8,10 @@ publish = false
 [dependencies]
 anyhow = { workspace = true }
 tokio = { workspace = true }
-meshproxy = { workspace = true }
-sidecar = { workspace = true }
+podmesh-proxy = { workspace = true }
+podmesh-sidecar = { workspace = true }
 protocol = { workspace = true }
-machine = { workspace = true }
+podmesh-scheduler = { workspace = true }
 podctl = { workspace = true }
 axum = "0.8"
 axum-support = { workspace = true }

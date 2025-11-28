@@ -15,7 +15,7 @@ use tokio::{process::Command as TokioCommand, time::sleep};
 const MACHINE_API_URL: &str = "http://127.0.0.1:3000";
 const ROOTLESS_MANIFEST_PATH: &str = "deploy/complete_rootless.yml";
 const SAMPLE_MANIFEST_PATH: &str = "tests/sample_manifests/demo_deployment.yml";
-const MESH_PROXY_URL: &str = "http://127.0.0.1:8080/";
+const PODMESH_PROXY_URL: &str = "http://127.0.0.1:8080/";
 const EXPECTED_BODY_SUBSTRING: &str = "Welcome to Podmesh";
 const REQUIRED_MACHINE_PEERS: usize = 1;
 const EXPECTED_CONTAINERS: [&str; 2] = ["my-nginx", "sidecar"];
@@ -53,7 +53,7 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
     workload_guard.set(manifest_id.clone());
 
     wait_for_workload_containers(&manifest_id, Duration::from_secs(180)).await?;
-    wait_for_meshproxy_response(&client, Duration::from_secs(120)).await?;
+    wait_for_podmesh_proxy_response(&client, Duration::from_secs(120)).await?;
 
     delete_file(sample_manifest.clone(), true, Some(MACHINE_API_URL))
         .await
@@ -271,14 +271,14 @@ async fn wait_for_workload_teardown(manifest_id: &str, timeout: Duration) -> Res
     ))
 }
 
-async fn wait_for_meshproxy_response(client: &Client, timeout: Duration) -> Result<String> {
+async fn wait_for_podmesh_proxy_response(client: &Client, timeout: Duration) -> Result<String> {
     let deadline = Instant::now() + timeout;
     let mut last_err: Option<anyhow::Error> = None;
     let ingress_host_header = format!("demo-nginx.{}", MESH_DOMAIN_SUFFIX);
 
     while Instant::now() < deadline {
         match client
-            .get(MESH_PROXY_URL)
+            .get(PODMESH_PROXY_URL)
             .header("host", &ingress_host_header)
             .send()
             .await
@@ -286,7 +286,7 @@ async fn wait_for_meshproxy_response(client: &Client, timeout: Duration) -> Resu
             Ok(response) if response.status().is_success() => match response.text().await {
                 Ok(body) => {
                     if body.contains(EXPECTED_BODY_SUBSTRING) {
-                        log::info!("meshproxy served expected content for ingress host");
+                        log::info!("podmesh-proxy served expected content for ingress host");
                         return Ok(body);
                     } else {
                         last_err = Some(anyhow!("unexpected ingress body: {body}"));
@@ -295,7 +295,7 @@ async fn wait_for_meshproxy_response(client: &Client, timeout: Duration) -> Resu
                 Err(err) => last_err = Some(err.into()),
             },
             Ok(response) => {
-                last_err = Some(anyhow!("meshproxy status {}", response.status()));
+                last_err = Some(anyhow!("podmesh-proxy status {}", response.status()));
             }
             Err(err) => last_err = Some(err.into()),
         }
@@ -303,7 +303,7 @@ async fn wait_for_meshproxy_response(client: &Client, timeout: Duration) -> Resu
         sleep(Duration::from_millis(500)).await;
     }
 
-    Err(last_err.unwrap_or_else(|| anyhow!("meshproxy never returned the expected page")))
+    Err(last_err.unwrap_or_else(|| anyhow!("podmesh-proxy never returned the expected page")))
 }
 
 async fn capture_podman_containers() -> Result<Vec<PodmanContainer>> {

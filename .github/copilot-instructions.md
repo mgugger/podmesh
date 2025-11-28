@@ -13,9 +13,9 @@ Podmesh is a decentralized, lock-free orchestration system that turns any device
 The machineplane consists of the following crates:
 * podctl: consists of the podctl cli similar to kubectl that allows to interact with podmesh
 * crypto: the common library that offers helper functions for the cli and machine
-* machine: containts the libp2p machine implementation for scheduling and managing lifecycle of the workload, similar to kubelet
-* meshproxy: contains the workload plane mesh proxy implementation
-* sidecar: contains the workload plane gateway sidecar implementation
+* podmesh-scheduler: contains the libp2p scheduler implementation for managing workload lifecycles (the former `machine` crate)
+* podmesh-proxy: contains the workload-plane mesh proxy implementation (previously `meshproxy`)
+* podmesh-sidecar: contains the workload-plane gateway sidecar implementation (previously `sidecar`)
 * protocol: contains the flatbuffers that are used for messaging between the nodes in the machine plane
 
 ## Workflow
