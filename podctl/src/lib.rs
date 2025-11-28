@@ -4,11 +4,10 @@ use log::debug;
 use log::error;
 use log::info;
 use protocol::machine::parse_peer_with_pubkey;
+use protocol::manifest_yaml::parse_manifest_to_json;
 use uuid::Uuid;
 
-use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use serde_yaml::{self, Value as YamlValue};
 use std::env;
 use std::path::PathBuf;
 
@@ -17,7 +16,6 @@ use flatbuffers::FlatbufferClient;
 
 mod flatbuffer_envelope;
 
-// Helper function to extract manifest name from JSON
 fn extract_manifest_name_from_json(manifest_json: &serde_json::Value) -> Option<String> {
     match manifest_json {
         serde_json::Value::Object(_) => manifest_json
@@ -30,29 +28,6 @@ fn extract_manifest_name_from_json(manifest_json: &serde_json::Value) -> Option<
             .filter_map(extract_manifest_name_from_json)
             .next(),
         _ => None,
-    }
-}
-
-fn parse_manifest_documents(contents: &str) -> anyhow::Result<JsonValue> {
-    let mut docs = Vec::new();
-
-    for document in serde_yaml::Deserializer::from_str(contents) {
-        let yaml_value = YamlValue::deserialize(document)?;
-        if yaml_value.is_null() {
-            continue;
-        }
-        let json_value = serde_json::to_value(yaml_value)?;
-        docs.push(json_value);
-    }
-
-    if docs.is_empty() {
-        anyhow::bail!("manifest file did not contain any YAML documents");
-    }
-
-    if docs.len() == 1 {
-        Ok(docs.into_iter().next().unwrap())
-    } else {
-        Ok(JsonValue::Array(docs))
     }
 }
 
@@ -106,7 +81,7 @@ pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> anyhow::Result
     );
 
     // Parse manifest to JSON if possible, else wrap raw
-    let manifest_json = parse_manifest_documents(&contents)
+    let manifest_json = parse_manifest_to_json(&contents)
         .unwrap_or_else(|_| serde_json::json!({"raw": contents}));
     debug!("apply_file: manifest parsed successfully");
 
@@ -186,10 +161,7 @@ pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> anyhow::Result
     debug!("Selected nodes with pubkeys: {:?}", selected_nodes);
 
     // Create encrypted tasks for each node sequentially with same manifest_id
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let ts = p2p::timestamp_millis();
 
     let original_manifest_str = contents.clone();
     let mut succeeded_nodes = Vec::new();
@@ -343,7 +315,7 @@ pub async fn delete_file(
     );
 
     // Parse manifest to JSON if possible
-    let manifest_json = parse_manifest_documents(&contents)
+    let manifest_json = parse_manifest_to_json(&contents)
         .unwrap_or_else(|_| serde_json::json!({"raw": contents}));
     debug!("delete_file: manifest parsed successfully");
 
@@ -451,7 +423,7 @@ metadata:
     name: second
 "#;
 
-        let value = parse_manifest_documents(manifest).expect("parse yaml");
+        let value = parse_manifest_to_json(manifest).expect("parse yaml");
         let name = extract_manifest_name_from_json(&value);
         assert_eq!(name.as_deref(), Some("first"));
     }
@@ -467,7 +439,7 @@ metadata:
     name: actual
 "#;
 
-        let value = parse_manifest_documents(manifest).expect("parse yaml");
+        let value = parse_manifest_to_json(manifest).expect("parse yaml");
         let name = extract_manifest_name_from_json(&value);
         assert_eq!(name.as_deref(), Some("actual"));
     }

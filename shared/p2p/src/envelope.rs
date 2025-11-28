@@ -1,7 +1,9 @@
 use anyhow::Context;
 use base64::Engine;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use uuid::Uuid;
+
+use crate::util::timestamp_millis;
 
 /// Signed envelope bytes alongside the generated nonce/timestamp.
 pub struct SignedEnvelope {
@@ -84,12 +86,7 @@ fn sign_internal(
         .map(|value| value.to_string())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    let timestamp = timestamp.unwrap_or_else(|| {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0u64)
-    });
+    let timestamp = timestamp.unwrap_or_else(timestamp_millis);
 
     let canonical = if let Some(peer) = peer_id {
         protocol::machine::build_envelope_canonical_with_peer(
@@ -148,8 +145,67 @@ fn sign_internal(
     })
 }
 
-/// Accept a signature string potentially prefixed (e.g. "ml-dsa-65:<b64>") and return decoded bytes.
-/// Keeps prefix-handling logic centralized.
+pub fn create_signed_envelope(
+    payload: &[u8],
+    payload_type: &str,
+    private_key: &[u8],
+    public_key_b64: &str,
+    peer_id: Option<&str>,
+    kem_pub_b64: Option<&str>,
+) -> anyhow::Result<Vec<u8>> {
+    let public_key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(public_key_b64)
+        .context("failed to decode public key")?;
+
+    let config = SignEnvelopeConfig {
+        peer_id,
+        kem_pub_b64,
+        ..Default::default()
+    };
+
+    let envelope = sign_with_existing_keypair(
+        payload,
+        payload_type,
+        config,
+        &public_key_bytes,
+        private_key,
+    )?;
+
+    Ok(envelope.bytes)
+}
+
+pub fn create_encrypted_signed_envelope(
+    payload: &[u8],
+    payload_type: &str,
+    recipient_kem_pubkey: &[u8],
+    private_key: &[u8],
+    public_key_b64: &str,
+    peer_id: Option<&str>,
+    sender_kem_pub_b64: Option<&str>,
+) -> anyhow::Result<Vec<u8>> {
+    let encrypted_payload = crypto::encrypt_payload_for_recipient(recipient_kem_pubkey, payload)?;
+
+    let public_key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(public_key_b64)
+        .context("failed to decode public key")?;
+
+    let config = SignEnvelopeConfig {
+        peer_id,
+        kem_pub_b64: sender_kem_pub_b64,
+        ..Default::default()
+    };
+
+    let envelope = sign_with_existing_keypair(
+        &encrypted_payload,
+        payload_type,
+        config,
+        &public_key_bytes,
+        private_key,
+    )?;
+
+    Ok(envelope.bytes)
+}
+
 pub fn normalize_and_decode_signature(sig_opt: Option<&str>) -> anyhow::Result<Vec<u8>> {
     crypto::flatbuffer_envelope::normalize_and_decode_signature(sig_opt)
 }
@@ -266,23 +322,34 @@ pub fn verify_flatbuffer_envelope_skip_nonce_check(
         .decode(pub_str)
         .context("failed to base64-decode pubkey")?;
 
-    // Reconstruct canonical bytes using the same method as signing
     let payload_vec = fb_env.payload().map(|b| b.to_vec()).unwrap_or_default();
     let payload_type = fb_env.payload_type().unwrap_or("");
     let nonce = fb_env.nonce().unwrap_or("");
     let ts = fb_env.ts();
     let alg = fb_env.alg().unwrap_or("");
+    let peer_id_opt = fb_env.peer_id();
+    let kem_pubkey_opt = fb_env.kem_pubkey();
 
-    let canonical = protocol::machine::build_envelope_canonical(
-        &payload_vec,
-        payload_type,
-        nonce,
-        ts,
-        alg,
-        None,
-    );
-
-    // Skip nonce replay check intentionally
+    let canonical = if peer_id_opt.is_some() {
+        protocol::machine::build_envelope_canonical_with_peer(
+            &payload_vec,
+            payload_type,
+            nonce,
+            ts,
+            alg,
+            peer_id_opt.unwrap_or(""),
+            kem_pubkey_opt,
+        )
+    } else {
+        protocol::machine::build_envelope_canonical(
+            &payload_vec,
+            payload_type,
+            nonce,
+            ts,
+            alg,
+            kem_pubkey_opt,
+        )
+    };
 
     crypto::verify_envelope(&pub_bytes, &canonical, &sig_bytes)
         .context("flatbuffer signature verification failed")?;
@@ -299,6 +366,7 @@ pub fn verify_flatbuffer_envelope_skip_nonce_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::timestamp_millis;
     use crypto::{ensure_keypair_ephemeral, ensure_pqc_init, sign_envelope};
 
     #[test]
@@ -308,13 +376,7 @@ mod tests {
 
         let payload = b"test payload data";
         let payload_type = "test";
-        let nonce = format!(
-            "test-nonce-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
+        let nonce = format!("test-nonce-{}", timestamp_millis());
         let timestamp = 1234567890u64;
         let alg = "ml-dsa-65";
 

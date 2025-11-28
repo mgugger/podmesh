@@ -1,6 +1,5 @@
 use anyhow::Result;
 use base64::Engine;
-use rand;
 use serde_json::Value as JsonValue;
 
 /// Convert JSON requests into flatbuffer payloads for direct communication with the machine
@@ -109,7 +108,6 @@ impl FlatbufferClient {
         }
     }
 
-    /// Send an unencrypted flatbuffer request (for already-signed envelopes)
     #[allow(dead_code)]
     async fn send_unencrypted_request(
         &self,
@@ -117,55 +115,15 @@ impl FlatbufferClient {
         payload: &[u8],
         payload_type: &str,
     ) -> Result<Vec<u8>> {
-        // Create unencrypted envelope with peer_id and public key
-        use crypto::sign_envelope;
-        use protocol::machine::{
-            build_envelope_canonical_with_peer, build_envelope_signed_with_peer,
-        };
-
-        // Generate nonce and timestamp
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        std::time::SystemTime::now().hash(&mut hasher);
-        let nonce = format!("{:x}", hasher.finish());
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        // Build canonical envelope for signing (with peer_id).
         let kem_pub_b64 = base64::engine::general_purpose::STANDARD.encode(&self.kem_public_key);
-        let canonical = build_envelope_canonical_with_peer(
+        let envelope = p2p::envelope::create_signed_envelope(
             payload,
             payload_type,
-            &nonce,
-            ts,
-            "ml-dsa-65",
-            "cli-client",
-            Some(kem_pub_b64.as_str()),
-        );
-
-        // Sign the envelope
-        // Decode public key from base64 for signing
-        let public_key_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&self.public_key)
-            .map_err(|e| anyhow::anyhow!("Failed to decode public key: {}", e))?;
-        let (sig_b64, pub_b64) = sign_envelope(&self.private_key, &public_key_bytes, &canonical)?;
-
-        // Create signed envelope
-        let envelope = build_envelope_signed_with_peer(
-            payload,
-            payload_type,
-            &nonce,
-            ts,
-            "ml-dsa-65",
-            "ml-dsa-65",
-            &sig_b64,
-            &pub_b64,
-            "cli-client",
-            Some(kem_pub_b64.as_str()),
-        );
+            &self.private_key,
+            &self.public_key,
+            Some("cli-client"),
+            Some(&kem_pub_b64),
+        )?;
 
         let resp = self
             .client
@@ -185,7 +143,7 @@ impl FlatbufferClient {
         }
 
         let response_bytes = resp.bytes().await?.to_vec();
-        println!(
+        log::debug!(
             "send_unencrypted_request: response_bytes.len()={}",
             response_bytes.len()
         );
@@ -193,78 +151,32 @@ impl FlatbufferClient {
         Ok(response_bytes)
     }
 
-    /// Send an encrypted flatbuffer request
     pub async fn send_encrypted_request(
         &self,
         url: &str,
         payload: &[u8],
         payload_type: &str,
     ) -> Result<Vec<u8>> {
+        let kem_pub_b64 = base64::engine::general_purpose::STANDARD.encode(&self.kem_public_key);
         let envelope = if let Some(machine_pubkey) = &self.machine_public_key {
-            // Create encrypted envelope with peer_id. Include our KEM public key (base64)
-            let kem_pub_b64 =
-                base64::engine::general_purpose::STANDARD.encode(&self.kem_public_key);
-            protocol::machine::build_encrypted_envelope_with_peer(
+            p2p::envelope::create_encrypted_signed_envelope(
                 payload,
                 payload_type,
                 machine_pubkey,
                 &self.private_key,
                 &self.public_key,
-                "cli-client",
-                Some(kem_pub_b64.as_str()),
+                Some("cli-client"),
+                Some(&kem_pub_b64),
             )?
         } else {
-            // Create unencrypted envelope with peer_id and public key
-            use crypto::sign_envelope;
-            use protocol::machine::{
-                build_envelope_canonical_with_peer, build_envelope_signed_with_peer,
-            };
-
-            // Generate unique random nonce and timestamp
-            let nonce_bytes: [u8; 16] = rand::random();
-            let nonce = base64::engine::general_purpose::STANDARD.encode(&nonce_bytes);
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            // Build canonical envelope for signing (with peer_id).
-            // Include the CLI's advertised KEM public key (base64) in the canonical
-            // bytes so the header-provided KEM key is integrity-protected by the
-            // envelope signature.
-            let kem_pub_b64 =
-                base64::engine::general_purpose::STANDARD.encode(&self.kem_public_key);
-            let canonical = build_envelope_canonical_with_peer(
+            p2p::envelope::create_signed_envelope(
                 payload,
                 payload_type,
-                &nonce,
-                ts,
-                "ml-dsa-65",
-                "cli-client",
-                Some(kem_pub_b64.as_str()),
-            );
-
-            // Decode sender public key from base64 for signing
-            let sender_pubkey_bytes = base64::engine::general_purpose::STANDARD
-                .decode(&self.public_key)
-                .map_err(|e| anyhow::anyhow!("Failed to decode sender public key: {}", e))?;
-
-            // Sign the canonical envelope
-            let signature = sign_envelope(&self.private_key, &sender_pubkey_bytes, &canonical)?;
-
-            // Build the final signed envelope with unencrypted payload (with peer_id)
-            build_envelope_signed_with_peer(
-                payload,
-                payload_type,
-                &nonce,
-                ts,
-                "ml-dsa-65",
-                "ml-dsa-65",
-                &signature.0,
-                &signature.1,
-                "cli-client",
-                Some(kem_pub_b64.as_str()),
-            )
+                &self.private_key,
+                &self.public_key,
+                Some("cli-client"),
+                Some(&kem_pub_b64),
+            )?
         };
 
         let resp = self
@@ -296,11 +208,7 @@ impl FlatbufferClient {
 
         // Try to decrypt if it looks like an encrypted envelope
         if response_bytes.len() > 100 && self.machine_public_key.is_some() {
-            println!(
-                "send_encrypted_request: response length={}, machine_pubkey available, attempting envelope parsing",
-                response_bytes.len()
-            );
-            log::info!(
+            log::debug!(
                 "send_encrypted_request: response length={}, machine_pubkey available, attempting envelope parsing",
                 response_bytes.len()
             );
@@ -308,17 +216,10 @@ impl FlatbufferClient {
             // Try to parse as envelope first
             match protocol::machine::root_as_envelope(&response_bytes) {
                 Ok(envelope) => {
-                    println!(
+                    log::debug!(
                         "send_encrypted_request: Detected envelope response, attempting decryption"
                     );
-                    log::info!(
-                        "send_encrypted_request: Detected envelope response, attempting decryption"
-                    );
-                    println!(
-                        "send_encrypted_request: envelope payload length: {:?}",
-                        envelope.payload().map(|p| p.len())
-                    );
-                    log::info!(
+                    log::debug!(
                         "send_encrypted_request: envelope payload length: {:?}",
                         envelope.payload().map(|p| p.len())
                     );
@@ -346,11 +247,7 @@ impl FlatbufferClient {
                     }
                 }
                 Err(e) => {
-                    println!(
-                        "send_encrypted_request: Not an envelope ({}), server likely sent unencrypted FlatBuffer response",
-                        e
-                    );
-                    log::info!(
+                    log::debug!(
                         "send_encrypted_request: Not an envelope ({}), server likely sent unencrypted FlatBuffer response",
                         e
                     );
@@ -359,12 +256,7 @@ impl FlatbufferClient {
                 }
             }
         } else {
-            println!(
-                "send_encrypted_request: response_bytes.len()={}, machine_public_key.is_some()={}, skipping decryption",
-                response_bytes.len(),
-                self.machine_public_key.is_some()
-            );
-            log::info!(
+            log::debug!(
                 "send_encrypted_request: response_bytes.len()={}, machine_public_key.is_some()={}, skipping decryption",
                 response_bytes.len(),
                 self.machine_public_key.is_some()
@@ -388,7 +280,6 @@ impl FlatbufferClient {
             requested
         );
         log::debug!("get_candidates: requesting URL: {}", url);
-        println!("CLI: get_candidates requesting URL: {}", url);
 
         // Send empty payload for GET-like request
         log::debug!("get_candidates: sending request...");
@@ -463,71 +354,27 @@ impl FlatbufferClient {
         }
     }
 
-    /// Send a DELETE request with optional body
     pub async fn send_delete_request(&self, url: &str, body: &[u8]) -> Result<Vec<u8>> {
-        // Wrap the delete request in a signed envelope
+        let kem_pub_b64 = base64::engine::general_purpose::STANDARD.encode(&self.kem_public_key);
         let envelope = if let Some(machine_pubkey) = &self.machine_public_key {
-            // Create encrypted envelope with peer_id
-            let kem_pub_b64 =
-                base64::engine::general_purpose::STANDARD.encode(&self.kem_public_key);
-            protocol::machine::build_encrypted_envelope_with_peer(
+            p2p::envelope::create_encrypted_signed_envelope(
                 body,
                 "delete_request",
                 machine_pubkey,
                 &self.private_key,
                 &self.public_key,
-                "cli-client",
-                Some(kem_pub_b64.as_str()),
+                Some("cli-client"),
+                Some(&kem_pub_b64),
             )?
         } else {
-            // Create unencrypted envelope with peer_id and public key
-            use crypto::sign_envelope;
-            use protocol::machine::{
-                build_envelope_canonical_with_peer, build_envelope_signed_with_peer,
-            };
-
-            // Generate unique random nonce and timestamp
-            let nonce_bytes: [u8; 16] = rand::random();
-            let nonce = base64::engine::general_purpose::STANDARD.encode(&nonce_bytes);
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            // Build canonical envelope for signing (with peer_id)
-            let kem_pub_b64 =
-                base64::engine::general_purpose::STANDARD.encode(&self.kem_public_key);
-            let canonical = build_envelope_canonical_with_peer(
+            p2p::envelope::create_signed_envelope(
                 body,
                 "delete_request",
-                &nonce,
-                ts,
-                "ml-dsa-65",
-                "cli-client",
-                Some(kem_pub_b64.as_str()),
-            );
-
-            // Decode sender public key from base64 for signing
-            let sender_pubkey_bytes = base64::engine::general_purpose::STANDARD
-                .decode(&self.public_key)
-                .map_err(|e| anyhow::anyhow!("Failed to decode sender public key: {}", e))?;
-
-            // Sign the canonical envelope
-            let signature = sign_envelope(&self.private_key, &sender_pubkey_bytes, &canonical)?;
-
-            // Build the final signed envelope with unencrypted payload (with peer_id)
-            build_envelope_signed_with_peer(
-                body,
-                "delete_request",
-                &nonce,
-                ts,
-                "ml-dsa-65",
-                "ml-dsa-65",
-                &signature.0,
-                &signature.1,
-                "cli-client",
-                Some(kem_pub_b64.as_str()),
-            )
+                &self.private_key,
+                &self.public_key,
+                Some("cli-client"),
+                Some(&kem_pub_b64),
+            )?
         };
 
         let resp = self
@@ -573,7 +420,7 @@ impl FlatbufferClient {
                     }
                 }
                 Err(_) => {
-                    log::error!(
+                    log::debug!(
                         "send_delete_request: Not an envelope, server sent unencrypted response"
                     );
                     // Server sent unencrypted response directly, return as-is

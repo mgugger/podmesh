@@ -2,17 +2,17 @@ pub mod envelope;
 pub mod handshake;
 pub mod http_proxy;
 pub mod message_verifier;
+pub mod multiaddr;
 pub mod request_response;
 pub mod security;
+pub mod util;
+
+pub use multiaddr::{build_quic_multiaddr, parse_bootstrap_peer};
+pub use util::{split_csv, timestamp_millis, timestamp_secs};
 
 use anyhow::Result;
-use libp2p::{
-    Swarm, gossipsub, kad,
-    multiaddr::{Multiaddr, Protocol},
-    swarm::NetworkBehaviour,
-};
+use libp2p::{Swarm, gossipsub, kad, swarm::NetworkBehaviour};
 use log::debug;
-use std::net::IpAddr;
 use tokio::sync::watch;
 
 /// Behaviour accessor for shared libp2p helpers.
@@ -76,29 +76,8 @@ where
         .gossipsub_mut()
         .add_explicit_peer(&local_peer);
 
-    let listen_addr: Multiaddr = match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ipv4)) => {
-            let mut addr = Multiaddr::empty();
-            addr.push(Protocol::Ip4(ipv4));
-            addr.push(Protocol::Udp(quic_port));
-            addr.push(Protocol::QuicV1);
-            addr
-        }
-        Ok(IpAddr::V6(ipv6)) => {
-            let mut addr = Multiaddr::empty();
-            addr.push(Protocol::Ip6(ipv6));
-            addr.push(Protocol::Udp(quic_port));
-            addr.push(Protocol::QuicV1);
-            addr
-        }
-        Err(_) => {
-            debug!(
-                "libp2p host '{}' is not an IP literal; falling back to IPv4 multiaddr string",
-                host
-            );
-            format!("/ip4/{}/udp/{}/quic-v1", host, quic_port).parse()?
-        }
-    };
+    let listen_addr = build_quic_multiaddr(&host, quic_port)
+        .ok_or_else(|| anyhow::anyhow!("failed to build listen address for {}:{}", host, quic_port))?;
 
     swarm.listen_on(listen_addr)?;
 

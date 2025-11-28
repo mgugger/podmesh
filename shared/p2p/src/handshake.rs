@@ -9,6 +9,7 @@ use tokio::time::Instant;
 
 use crate::envelope::{SignEnvelopeConfig, sign_with_node_keys};
 use crate::message_verifier::verify_signed_message;
+use crate::util::timestamp_millis;
 
 pub const HANDSHAKE_PROTOCOL: &str = "/podmesh/handshake/1.0.0";
 
@@ -143,7 +144,7 @@ fn handle_response(
 }
 
 fn build_signed_handshake_response(peer: &PeerId) -> Result<Vec<u8>> {
-    let timestamp = current_timestamp();
+    let timestamp = timestamp_millis();
     let nonce = format!("handshake_resp_{}", rand::thread_rng().r#gen::<u32>());
     let payload = machine::build_handshake(
         rand::random::<u32>(),
@@ -163,7 +164,7 @@ fn build_signed_handshake_request(
     local_peer: &PeerId,
     cfg: &HandshakeDriveConfig,
 ) -> Result<Vec<u8>> {
-    let timestamp = current_timestamp();
+    let timestamp = timestamp_millis();
     let nonce = rand::thread_rng().r#gen::<u32>();
     let payload = machine::build_handshake(
         nonce,
@@ -178,13 +179,6 @@ fn build_signed_handshake_request(
         ..Default::default()
     };
     Ok(sign_with_node_keys(&payload, "handshake", sign_cfg)?.bytes)
-}
-
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 /// Drive outbound handshake attempts for every unconfirmed peer.

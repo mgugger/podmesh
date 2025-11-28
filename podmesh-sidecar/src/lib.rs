@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures::{StreamExt, future};
@@ -11,6 +10,7 @@ use libp2p::{
     request_response,
     swarm::{NetworkBehaviour, SwarmEvent},
 };
+use p2p::{build_quic_multiaddr, parse_bootstrap_peer, timestamp_millis};
 use p2p::http_proxy::{ProxyCodec, ProxyHttpRequest, ProxyHttpResponse};
 use p2p::{
     handshake::{self, HandshakeDriveConfig, HandshakeState},
@@ -203,73 +203,12 @@ impl GatewayConfig {
     }
 
     pub fn listen_addr(&self) -> Option<Multiaddr> {
-        match self.libp2p_host.parse::<IpAddr>() {
-            Ok(IpAddr::V4(ipv4)) => {
-                let mut addr = Multiaddr::empty();
-                addr.push(Protocol::Ip4(ipv4));
-                addr.push(Protocol::Udp(self.libp2p_port));
-                addr.push(Protocol::QuicV1);
-                Some(addr)
-            }
-            Ok(IpAddr::V6(ipv6)) => {
-                let mut addr = Multiaddr::empty();
-                addr.push(Protocol::Ip6(ipv6));
-                addr.push(Protocol::Udp(self.libp2p_port));
-                addr.push(Protocol::QuicV1);
-                Some(addr)
-            }
-            Err(_) => format!("/ip4/{}/udp/{}/quic-v1", self.libp2p_host, self.libp2p_port)
-                .parse()
-                .ok(),
-        }
+        build_quic_multiaddr(&self.libp2p_host, self.libp2p_port)
     }
 
     pub fn bootstrap_peer_multiaddr(&self) -> Option<Multiaddr> {
         let raw = self.bootstrap_peer_ip.as_deref()?;
-
-        if let Ok(ma) = raw.parse::<Multiaddr>() {
-            return Some(ma);
-        }
-
-        let (host, port_opt) = match raw.rsplit_once(':') {
-            Some((host, port_str)) => match port_str.parse::<u16>() {
-                Ok(port) => (host, Some(port)),
-                Err(err) => {
-                    warn!(input = %raw, error = %err, "invalid bootstrap port");
-                    return None;
-                }
-            },
-            None => (raw, None),
-        };
-
-        let port = match port_opt.or_else(|| (self.libp2p_port != 0).then_some(self.libp2p_port)) {
-            Some(port) => port,
-            None => {
-                warn!(input = %raw, "bootstrap address missing port and no libp2p_port provided");
-                return None;
-            }
-        };
-
-        match host.parse::<IpAddr>() {
-            Ok(IpAddr::V4(ipv4)) => {
-                let mut addr = Multiaddr::empty();
-                addr.push(Protocol::Ip4(ipv4));
-                addr.push(Protocol::Udp(port));
-                addr.push(Protocol::QuicV1);
-                Some(addr)
-            }
-            Ok(IpAddr::V6(ipv6)) => {
-                let mut addr = Multiaddr::empty();
-                addr.push(Protocol::Ip6(ipv6));
-                addr.push(Protocol::Udp(port));
-                addr.push(Protocol::QuicV1);
-                Some(addr)
-            }
-            Err(err) => {
-                warn!(input = %raw, error = %err, "invalid bootstrap ip");
-                None
-            }
-        }
+        parse_bootstrap_peer(raw, self.libp2p_port)
     }
 }
 
@@ -383,10 +322,7 @@ fn announce_provider(swarm: &mut Swarm<GatewayBehaviour>, cfg: &GatewayConfig) {
 }
 
 fn publish_manifest_record(swarm: &mut Swarm<GatewayBehaviour>, cfg: &GatewayConfig) {
-    let timestamp_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|dur| dur.as_millis() as u64)
-        .unwrap_or_default();
+    let timestamp_ms = timestamp_millis();
     let payload = build_gateway_provider_record(
         &cfg.manifest_id,
         &swarm.local_peer_id().to_string(),
@@ -770,12 +706,6 @@ fn split_peer_multiaddr(addr: &Multiaddr) -> Option<(PeerId, Multiaddr)> {
     }
 }
 
-pub fn split_csv(input: Option<String>) -> Vec<String> {
-    input
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
+// Re-export split_csv from shared p2p crate
+pub use p2p::split_csv;
 

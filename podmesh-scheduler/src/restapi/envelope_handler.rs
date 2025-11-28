@@ -156,66 +156,34 @@ impl EnvelopeHandler {
             kem_pubkey.len()
         );
 
-        // Try parsing provided pubkey bytes as an ml_kem_512 public key
-        let _ml_kem_pubkey = match saorsa_pqc::api::kem::MlKemPublicKey::from_bytes(
+        saorsa_pqc::api::kem::MlKemPublicKey::from_bytes(
             saorsa_pqc::api::kem::MlKemVariant::MlKem512,
             kem_pubkey,
-        ) {
-            Ok(pubkey) => pubkey,
-            Err(e) => {
-                return Err(anyhow!(
-                    "Failed to parse KEM public key for peer {}: {}",
-                    recipient_peer_id,
-                    e
-                ));
-            }
-        };
+        )
+        .map_err(|e| {
+            anyhow!(
+                "Failed to parse KEM public key for peer {}: {}",
+                recipient_peer_id,
+                e
+            )
+        })?;
 
-        // Encrypt payload using the provided KEM public key
-        let encrypted_blob = crypto::encrypt_payload_for_recipient(kem_pubkey, payload)?;
-
-        // Build envelope with encrypted payload
-        let nonce = uuid::Uuid::new_v4().to_string();
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        // Create canonical bytes for signing
-        let canonical_bytes = protocol::machine::build_envelope_canonical(
-            &encrypted_blob,
-            payload_type,
-            &nonce,
-            ts,
-            "ml-dsa-65",
-            None,
-        );
-
-        // Sign the canonical bytes
         let signing_key = self.signing_private_key.as_ref().ok_or_else(|| {
             anyhow!(
                 "No signing private key available for peer: {}",
                 recipient_peer_id
             )
         })?;
-        let public_key_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&self.public_key)
-            .map_err(|e| anyhow!("Failed to decode public key: {}", e))?;
-        let (sig_b64, pub_b64) =
-            crypto::sign_envelope(signing_key, &public_key_bytes, &canonical_bytes)?;
 
-        // Build the final signed envelope
-        Ok(protocol::machine::build_envelope_signed(
-            &encrypted_blob,
+        p2p::envelope::create_encrypted_signed_envelope(
+            payload,
             payload_type,
-            &nonce,
-            ts,
-            "ml-dsa-65",
-            "ml-dsa-65",
-            &sig_b64,
-            &pub_b64,
+            kem_pubkey,
+            signing_key,
+            &self.public_key,
             None,
-        ))
+            None,
+        )
     }
 
     /// Extract peer ID from request headers or envelope
