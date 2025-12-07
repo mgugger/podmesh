@@ -14,7 +14,7 @@ use axum::{
 use axum_support::{parse_socket_addr, spawn_tcp_listener};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info};
+use tracing::{error, info, warn};
 
 use crate::p2p::ProxyClient;
 use p2p::http_proxy::ProxyHttpRequest;
@@ -68,8 +68,13 @@ async fn ingress_entry(
         .get(axum::http::header::HOST)
         .and_then(parse_host);
 
-    let Some(app_id) = host else {
+    let Some(host) = host else {
         return status_response(StatusCode::BAD_REQUEST, "missing host header");
+    };
+
+    let Some(app_id) = manifest_id_from_host(&host) else {
+        warn!(host = %host, "unable to derive manifest id from host" );
+        return status_response(StatusCode::BAD_REQUEST, "invalid host header");
     };
 
     let method = request.method().to_string();
@@ -78,16 +83,16 @@ async fn ingress_entry(
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| request.uri().path().to_string());
-    info!(app_id = %app_id, method = %method, path = %path, "ingress proxy forwarding request via gateway");
+    info!(host = %host, manifest = %app_id, method = %method, path = %path, "ingress proxy forwarding request via gateway");
 
     match state.gateway.forward(&app_id, request).await {
         Ok(response) => {
             let status = response.status().as_u16();
-            info!(app_id = %app_id, method = %method, path = %path, status, "ingress proxy received response from gateway");
+            info!(host = %host, manifest = %app_id, method = %method, path = %path, status, "ingress proxy received response from gateway");
             response
         }
         Err(err) => {
-            error!(app_id = %app_id, error = %err, "gateway forward failed");
+            error!(host = %host, manifest = %app_id, error = %err, "gateway forward failed");
             status_response(StatusCode::BAD_GATEWAY, "gateway forwarding failed")
         }
     }
@@ -99,24 +104,23 @@ fn parse_host(value: &HeaderValue) -> Option<String> {
     if host_part.is_empty() {
         return None;
     }
-    let suffix = format!(".{}", MESH_DOMAIN_SUFFIX);
-    let stripped = if let Some(stripped) = host_part.strip_suffix(&suffix) {
-        stripped
-    } else {
-        debug!(
-            host = host_part,
-            expected_suffix = MESH_DOMAIN_SUFFIX,
-            "ingress host missing expected suffix"
-        );
-        host_part
-    };
+    Some(host_part.trim_end_matches('.').to_lowercase())
+}
 
-    stripped
-        .trim_matches('.')
-        .rsplit('.')
-        .next()
-        .filter(|segment| !segment.is_empty())
-        .map(|segment| segment.to_string())
+fn manifest_id_from_host(host: &str) -> Option<String> {
+    if host.is_empty() {
+        return None;
+    }
+    let suffix = format!(".{}", MESH_DOMAIN_SUFFIX);
+    if let Some(stripped) = host.strip_suffix(&suffix) {
+        return stripped
+            .trim_matches('.')
+            .rsplit('.')
+            .next()
+            .filter(|segment| !segment.is_empty())
+            .map(|segment| segment.to_string());
+    }
+    Some(host.to_string())
 }
 
 fn status_response(code: StatusCode, body: &str) -> Response<Body> {
@@ -234,4 +238,3 @@ impl GatewayForwarder for ProxyGatewayForwarder {
             .map_err(|err| GatewayError::ForwardFailed(format!("build response failed: {err}")))
     }
 }
-

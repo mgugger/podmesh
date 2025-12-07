@@ -81,8 +81,8 @@ pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> anyhow::Result
     );
 
     // Parse manifest to JSON if possible, else wrap raw
-    let manifest_json = parse_manifest_to_json(&contents)
-        .unwrap_or_else(|_| serde_json::json!({"raw": contents}));
+    let manifest_json =
+        parse_manifest_to_json(&contents).unwrap_or_else(|_| serde_json::json!({"raw": contents}));
     debug!("apply_file: manifest parsed successfully");
 
     // Extract replicas count from manifest (check spec.replicas or top-level replicas, default to 1)
@@ -315,8 +315,8 @@ pub async fn delete_file(
     );
 
     // Parse manifest to JSON if possible
-    let manifest_json = parse_manifest_to_json(&contents)
-        .unwrap_or_else(|_| serde_json::json!({"raw": contents}));
+    let manifest_json =
+        parse_manifest_to_json(&contents).unwrap_or_else(|_| serde_json::json!({"raw": contents}));
     debug!("delete_file: manifest parsed successfully");
 
     // Ensure CLI keypair - always use persistent keypairs for consistency

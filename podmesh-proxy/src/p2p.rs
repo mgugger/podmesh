@@ -1,4 +1,4 @@
-use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -10,14 +10,16 @@ use libp2p::{
 };
 use p2p::{
     CoreBehaviourAccess, NodeConfig,
+    gateway_manifest::verify_gateway_manifest_envelope,
     handshake::{self, HandshakeDriveConfig, HandshakeState},
     http_proxy::{ProxyCodec, ProxyHttpRequest, ProxyHttpResponse},
-    request_response::HandshakeCodec,
+    request_response::{HandshakeCodec, ManifestFetchCodec},
 };
 use protocol::libp2p_constants::{
-    INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX, WORKLOAD_CLUSTER_TOPIC,
+    GATEWAY_MANIFEST_PROTOCOL, INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX,
+    WORKLOAD_CLUSTER_TOPIC,
 };
-use protocol::machine::{GatewayProviderRecordOwned, decode_gateway_provider_record};
+use protocol::machine::{GatewayProviderRecordOwned, build_gateway_manifest_request};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -26,6 +28,7 @@ use crate::config::Config;
 
 const PROXY_PROVIDER_KEY: &str = "podmesh-proxy-node";
 const DEFAULT_MANIFEST_RECORD_TTL_MS: u64 = 30_000;
+const MAX_MANIFEST_FETCH_PEERS: usize = 4;
 
 enum P2pCommand {
     ProxyHttp {
@@ -47,6 +50,9 @@ struct GatewayCacheEntry {
 struct ManifestQueryState {
     waiters: Vec<ProxyPendingRequest>,
     query_id: kad::QueryId,
+    pending_requests: HashSet<request_response::OutboundRequestId>,
+    requested_peers: HashSet<PeerId>,
+    providers_finished: bool,
 }
 
 fn announce_proxy_provider(
@@ -82,6 +88,7 @@ pub struct WorkloadBehaviour {
     pub autonat: autonat::Behaviour,
     pub identify: identify::Behaviour,
     pub proxy_rr: request_response::Behaviour<ProxyCodec>,
+    pub manifest_rr: request_response::Behaviour<ManifestFetchCodec>,
 }
 
 impl CoreBehaviourAccess for WorkloadBehaviour {
@@ -195,6 +202,13 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
             )),
             request_response::Config::default(),
         );
+        let manifest_rr = request_response::Behaviour::new(
+            std::iter::once((
+                GATEWAY_MANIFEST_PROTOCOL,
+                request_response::ProtocolSupport::Full,
+            )),
+            request_response::Config::default(),
+        );
 
         let store = kad::store::MemoryStore::new(key.public().to_peer_id());
         let mut kademlia_config = kad::Config::default();
@@ -221,6 +235,7 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
             autonat,
             identify,
             proxy_rr,
+            manifest_rr,
         }
     })?;
 
@@ -279,6 +294,8 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
         let mut gateway_cache: HashMap<String, GatewayCacheEntry> = HashMap::new();
         let mut manifest_queries: HashMap<String, ManifestQueryState> = HashMap::new();
         let mut query_manifest: HashMap<kad::QueryId, String> = HashMap::new();
+        let mut manifest_request_map: HashMap<request_response::OutboundRequestId, String> =
+            HashMap::new();
         let mut pending_proxy_requests: HashMap<
             request_response::OutboundRequestId,
             oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
@@ -322,10 +339,9 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
                                 handle_manifest_queries(
                                     &mut swarm,
                                     event,
-                                    &mut gateway_cache,
                                     &mut manifest_queries,
                                     &mut query_manifest,
-                                    &mut pending_proxy_requests,
+                                    &mut manifest_request_map,
                                 );
                             }
                             SwarmEvent::Behaviour(WorkloadBehaviourEvent::HandshakeRr(request_response::Event::Message { message, peer, connection_id: _ })) => {
@@ -350,6 +366,17 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
                             }
                             SwarmEvent::Behaviour(WorkloadBehaviourEvent::ProxyRr(event)) => {
                                 handle_proxy_rr_event(event, &mut pending_proxy_requests);
+                            }
+                            SwarmEvent::Behaviour(WorkloadBehaviourEvent::ManifestRr(event)) => {
+                                handle_manifest_rr_event(
+                                    &mut swarm,
+                                    event,
+                                    &mut manifest_queries,
+                                    &mut manifest_request_map,
+                                    &mut query_manifest,
+                                    &mut gateway_cache,
+                                    &mut pending_proxy_requests,
+                                );
                             }
                             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                                 warn!("connection established with {}", peer_id);
@@ -523,15 +550,19 @@ fn process_proxy_command(
     }
 
     let key = format!("{}{}", MANIFEST_RECORD_PREFIX, manifest_id);
+    info!(manifest = %manifest_id, key = %key, "workload proxy querying manifest providers");
     let query_id = swarm
         .behaviour_mut()
         .kademlia
-        .get_record(kad::RecordKey::new(&key));
+        .get_providers(kad::RecordKey::new(&key));
     manifest_queries.insert(
         manifest_id.clone(),
         ManifestQueryState {
             waiters: vec![pending],
             query_id,
+            pending_requests: HashSet::new(),
+            requested_peers: HashSet::new(),
+            providers_finished: false,
         },
     );
     query_manifest.insert(query_id, manifest_id);
@@ -540,42 +571,57 @@ fn process_proxy_command(
 fn handle_manifest_queries(
     swarm: &mut Swarm<WorkloadBehaviour>,
     event: kad::Event,
-    gateway_cache: &mut HashMap<String, GatewayCacheEntry>,
     manifest_queries: &mut HashMap<String, ManifestQueryState>,
     query_manifest: &mut HashMap<kad::QueryId, String>,
-    pending_proxy_requests: &mut HashMap<
-        request_response::OutboundRequestId,
-        oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
-    >,
+    manifest_request_map: &mut HashMap<request_response::OutboundRequestId, String>,
 ) {
     if let kad::Event::OutboundQueryProgressed { id, result, .. } = event {
         if let Some(manifest_id) = query_manifest.get(&id).cloned() {
             match result {
-                kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(peer_record))) => {
-                    complete_manifest_query_success(
-                        swarm,
-                        manifest_id,
-                        peer_record.record.value,
-                        gateway_cache,
-                        manifest_queries,
-                        query_manifest,
-                        pending_proxy_requests,
-                    );
+                kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders {
+                    providers,
+                    ..
+                })) => {
+                    if let Some(state) = manifest_queries.get_mut(&manifest_id) {
+                        for peer in providers {
+                            if state.requested_peers.len() >= MAX_MANIFEST_FETCH_PEERS {
+                                break;
+                            }
+                            if state.requested_peers.insert(peer.clone()) {
+                                let request = build_gateway_manifest_request(&manifest_id);
+                                let request_id = swarm
+                                    .behaviour_mut()
+                                    .manifest_rr
+                                    .send_request(&peer, request);
+                                state.pending_requests.insert(request_id);
+                                manifest_request_map.insert(request_id, manifest_id.clone());
+                            }
+                        }
+                    }
                 }
-                kad::QueryResult::GetRecord(Ok(
-                    kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. },
+                kad::QueryResult::GetProviders(Ok(
+                    kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. },
                 )) => {
-                    complete_manifest_query_error(
-                        manifest_id,
-                        "manifest record not found".to_string(),
-                        manifest_queries,
-                        query_manifest,
-                    );
+                    if let Some(state) = manifest_queries.get_mut(&manifest_id) {
+                        state.providers_finished = true;
+                        if state.pending_requests.is_empty() && state.waiters.is_empty() {
+                            // No waiters to notify.
+                            query_manifest.remove(&state.query_id);
+                            manifest_queries.remove(&manifest_id);
+                        } else if state.pending_requests.is_empty() {
+                            fail_manifest_query(
+                                manifest_id.clone(),
+                                "manifest providers unavailable".to_string(),
+                                manifest_queries,
+                                query_manifest,
+                            );
+                        }
+                    }
                 }
-                kad::QueryResult::GetRecord(Err(err)) => {
-                    complete_manifest_query_error(
-                        manifest_id,
-                        format!("kad get_record failed: {err}"),
+                kad::QueryResult::GetProviders(Err(err)) => {
+                    fail_manifest_query(
+                        manifest_id.clone(),
+                        format!("kad get_providers failed: {err}"),
                         manifest_queries,
                         query_manifest,
                     );
@@ -585,12 +631,139 @@ fn handle_manifest_queries(
         }
     }
 }
+fn handle_manifest_rr_event(
+    swarm: &mut Swarm<WorkloadBehaviour>,
+    event: request_response::Event<Vec<u8>, Vec<u8>>,
+    manifest_queries: &mut HashMap<String, ManifestQueryState>,
+    manifest_request_map: &mut HashMap<request_response::OutboundRequestId, String>,
+    query_manifest: &mut HashMap<kad::QueryId, String>,
+    gateway_cache: &mut HashMap<String, GatewayCacheEntry>,
+    pending_proxy_requests: &mut HashMap<
+        request_response::OutboundRequestId,
+        oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
+    >,
+) {
+    match event {
+        request_response::Event::Message { message, .. } => match message {
+            request_response::Message::Response {
+                request_id,
+                response,
+                ..
+            } => {
+                if let Some(manifest_id) = manifest_request_map.remove(&request_id) {
+                    process_manifest_response(
+                        swarm,
+                        request_id,
+                        manifest_id,
+                        response,
+                        manifest_queries,
+                        query_manifest,
+                        gateway_cache,
+                        pending_proxy_requests,
+                    );
+                } else {
+                    warn!(
+                        ?request_id,
+                        "received manifest response for unknown request"
+                    );
+                }
+            }
+            request_response::Message::Request { .. } => {
+                warn!("unexpected inbound manifest fetch request");
+            }
+        },
+        request_response::Event::OutboundFailure {
+            request_id, error, ..
+        } => {
+            if let Some(manifest_id) = manifest_request_map.remove(&request_id) {
+                handle_manifest_request_failure(
+                    manifest_id,
+                    request_id,
+                    error,
+                    manifest_queries,
+                    query_manifest,
+                );
+            }
+        }
+        request_response::Event::InboundFailure { peer, error, .. } => {
+            warn!(%peer, ?error, "manifest response inbound failure");
+        }
+        request_response::Event::ResponseSent { .. } => {}
+    }
+}
 
-fn complete_manifest_query_success(
+fn process_manifest_response(
+    swarm: &mut Swarm<WorkloadBehaviour>,
+    request_id: request_response::OutboundRequestId,
+    manifest_id: String,
+    response: Vec<u8>,
+    manifest_queries: &mut HashMap<String, ManifestQueryState>,
+    query_manifest: &mut HashMap<kad::QueryId, String>,
+    gateway_cache: &mut HashMap<String, GatewayCacheEntry>,
+    pending_proxy_requests: &mut HashMap<
+        request_response::OutboundRequestId,
+        oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
+    >,
+) {
+    if let Some(state) = manifest_queries.get_mut(&manifest_id) {
+        state.pending_requests.remove(&request_id);
+    }
+
+    match verify_gateway_manifest_envelope(&response) {
+        Ok(verified) => {
+            store_gateway_record(&manifest_id, &verified.record, gateway_cache);
+            satisfy_manifest_waiters(
+                swarm,
+                manifest_id,
+                verified.record,
+                manifest_queries,
+                query_manifest,
+                pending_proxy_requests,
+            );
+        }
+        Err(err) => {
+            warn!(manifest = %manifest_id, error = %err, "failed to verify manifest envelope");
+            maybe_fail_manifest_due_to_exhaustion(
+                manifest_id,
+                manifest_queries,
+                query_manifest,
+                "manifest verification failed",
+            );
+        }
+    }
+}
+
+fn store_gateway_record(
+    manifest_id: &str,
+    record: &GatewayProviderRecordOwned,
+    gateway_cache: &mut HashMap<String, GatewayCacheEntry>,
+) {
+    let should_replace = gateway_cache
+        .get(manifest_id)
+        .map(|entry| record.last_updated_ms >= entry.record.last_updated_ms)
+        .unwrap_or(true);
+    if !should_replace {
+        return;
+    }
+    let ttl_ms = if record.ttl_ms == 0 {
+        DEFAULT_MANIFEST_RECORD_TTL_MS
+    } else {
+        record.ttl_ms as u64
+    };
+    let expires_at = Instant::now() + Duration::from_millis(ttl_ms);
+    gateway_cache.insert(
+        manifest_id.to_string(),
+        GatewayCacheEntry {
+            record: record.clone(),
+            expires_at,
+        },
+    );
+}
+
+fn satisfy_manifest_waiters(
     swarm: &mut Swarm<WorkloadBehaviour>,
     manifest_id: String,
-    data: Vec<u8>,
-    gateway_cache: &mut HashMap<String, GatewayCacheEntry>,
+    record: GatewayProviderRecordOwned,
     manifest_queries: &mut HashMap<String, ManifestQueryState>,
     query_manifest: &mut HashMap<kad::QueryId, String>,
     pending_proxy_requests: &mut HashMap<
@@ -600,42 +773,56 @@ fn complete_manifest_query_success(
 ) {
     if let Some(state) = manifest_queries.remove(&manifest_id) {
         query_manifest.remove(&state.query_id);
-        match decode_gateway_provider_record(&data) {
-            Ok(record) => {
-                let ttl_ms = if record.ttl_ms == 0 {
-                    DEFAULT_MANIFEST_RECORD_TTL_MS
-                } else {
-                    record.ttl_ms as u64
-                };
-                let expires_at = Instant::now() + Duration::from_millis(ttl_ms);
-                gateway_cache.insert(
-                    manifest_id.clone(),
-                    GatewayCacheEntry {
-                        record: record.clone(),
-                        expires_at,
-                    },
-                );
-                for pending in state.waiters {
-                    if let Err((pending, err)) =
-                        dispatch_proxy_request(swarm, pending, &record, pending_proxy_requests)
-                    {
-                        let _ = pending.respond_to.send(Err(err));
-                    }
-                }
-            }
-            Err(err) => {
-                complete_manifest_query_error(
-                    manifest_id,
-                    format!("failed to decode manifest record: {err}"),
-                    manifest_queries,
-                    query_manifest,
-                );
+        for pending in state.waiters {
+            if let Err((pending, err)) =
+                dispatch_proxy_request(swarm, pending, &record, pending_proxy_requests)
+            {
+                let _ = pending.respond_to.send(Err(err));
             }
         }
     }
 }
 
-fn complete_manifest_query_error(
+fn handle_manifest_request_failure(
+    manifest_id: String,
+    request_id: request_response::OutboundRequestId,
+    error: request_response::OutboundFailure,
+    manifest_queries: &mut HashMap<String, ManifestQueryState>,
+    query_manifest: &mut HashMap<kad::QueryId, String>,
+) {
+    if let Some(state) = manifest_queries.get_mut(&manifest_id) {
+        state.pending_requests.remove(&request_id);
+    }
+    warn!(manifest = %manifest_id, ?error, "manifest fetch request failed");
+    maybe_fail_manifest_due_to_exhaustion(
+        manifest_id,
+        manifest_queries,
+        query_manifest,
+        "manifest fetch failed",
+    );
+}
+
+fn maybe_fail_manifest_due_to_exhaustion(
+    manifest_id: String,
+    manifest_queries: &mut HashMap<String, ManifestQueryState>,
+    query_manifest: &mut HashMap<kad::QueryId, String>,
+    reason: &str,
+) {
+    let should_fail = manifest_queries
+        .get(&manifest_id)
+        .map(|state| state.providers_finished && state.pending_requests.is_empty())
+        .unwrap_or(false);
+    if should_fail {
+        fail_manifest_query(
+            manifest_id,
+            reason.to_string(),
+            manifest_queries,
+            query_manifest,
+        );
+    }
+}
+
+fn fail_manifest_query(
     manifest_id: String,
     message: String,
     manifest_queries: &mut HashMap<String, ManifestQueryState>,
@@ -643,12 +830,12 @@ fn complete_manifest_query_error(
 ) {
     if let Some(state) = manifest_queries.remove(&manifest_id) {
         query_manifest.remove(&state.query_id);
+        warn!(manifest = %manifest_id, reason = %message, "manifest query failed");
         for pending in state.waiters {
             let _ = pending.respond_to.send(Err(anyhow!(message.clone())));
         }
     }
 }
-
 fn handle_proxy_rr_event(
     event: request_response::Event<ProxyHttpRequest, ProxyHttpResponse>,
     pending_proxy_requests: &mut HashMap<
@@ -831,4 +1018,3 @@ fn extract_peer_id(mut addr: Multiaddr) -> Option<(PeerId, Multiaddr)> {
         _ => None,
     }
 }
-

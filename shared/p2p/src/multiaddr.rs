@@ -43,7 +43,10 @@ pub fn parse_bootstrap_peer(raw: &str, default_port: u16) -> Option<Multiaddr> {
     };
 
     if port == 0 && default_port == 0 {
-        log::warn!("bootstrap address '{}' missing port and no default provided", raw);
+        log::warn!(
+            "bootstrap address '{}' missing port and no default provided",
+            raw
+        );
         return None;
     }
 

@@ -65,6 +65,11 @@ pub struct GatewayProviderRecordOwned {
     pub version: u16,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayManifestRequest {
+    pub manifest_id: String,
+}
+
 pub fn build_gateway_provider_record(
     manifest_id: &str,
     peer_id: &str,
@@ -146,4 +151,16 @@ pub fn decode_gateway_provider_record(data: &[u8]) -> anyhow::Result<GatewayProv
         last_updated_ms,
         version,
     })
+}
+
+pub fn build_gateway_manifest_request(manifest_id: &str) -> Vec<u8> {
+    serialize(&GatewayManifestRequest {
+        manifest_id: manifest_id.to_string(),
+    })
+}
+
+pub fn root_as_gateway_manifest_request(
+    bytes: &[u8],
+) -> Result<GatewayManifestRequest, postcard::Error> {
+    deserialize(bytes)
 }

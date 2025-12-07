@@ -19,6 +19,8 @@ pub const MESH_DOMAIN_SUFFIX: &str = "mesh.local";
 
 /// Protocol ID for the ingress proxy libp2p request-response stream.
 pub const INGRESS_PROXY_PROTOCOL: &str = "/podmesh/ingress-proxy/1.0.0";
+/// Protocol ID for gateway manifest fetch RPCs between proxies and sidecars.
+pub const GATEWAY_MANIFEST_PROTOCOL: &str = "/podmesh/gateway-manifest/1.0.0";
 
 // === GOSSIPSUB TOPICS ===
 

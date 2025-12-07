@@ -14,7 +14,7 @@ pub struct GatewaySidecarMetadata {
 }
 
 /// Default workload-plane bootstrap peer multiaddr used by gateways.
-pub const DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR: &str = "/dns4/workload-bootstrap/udp/4002/quic-v1";
+pub const DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR: &str = "/dns4/proxy/udp/4002/quic-v1";
 
 /// Default mount path inside the workload pod where gateway metadata is exposed.
 pub const DEFAULT_METADATA_MOUNT_PATH: &str = "/var/run/podmesh/gateway";

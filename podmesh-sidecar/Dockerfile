@@ -22,8 +22,8 @@ RUN strip /app/target/x86_64-unknown-linux-musl/release/podmesh-sidecar
 FROM scratch
 
 # Provide a minimal BusyBox for basic tooling (optional)
-COPY --from=busybox:musl /bin/busybox /bin/busybox
-RUN ["/bin/busybox", "ln", "-s", "/bin/busybox", "/bin/sh"]
+#COPY --from=busybox:musl /bin/busybox /bin/busybox
+#RUN ["/bin/busybox", "ln", "-s", "/bin/busybox", "/bin/sh"]
 
 # Basic /etc data needed by glibc-compatible binaries
 COPY --from=alpine:latest /etc/passwd /etc/passwd
@@ -32,7 +32,7 @@ COPY --from=alpine:latest /etc/hosts /etc/hosts
 COPY --from=alpine:latest /etc/nsswitch.conf /etc/nsswitch.conf
 COPY --from=alpine:latest /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
-# Gateway binary
+# Sidecar binary
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/podmesh-sidecar /usr/local/bin/podmesh-sidecar
 
 ENV PATH=/usr/local/bin:/bin

@@ -5,12 +5,12 @@ use anyhow::{Result, anyhow};
 use axum::{Router, routing::get};
 use axum_support::spawn_tcp_listener;
 use podmesh_proxy::{Config, Workload};
-use protocol::machine::{GatewayRouteKind, GatewayRouteSpec};
-use reqwest::Client;
 use podmesh_sidecar::{
     DEFAULT_GATEWAY_APP_PORT, GatewayConfig, GatewayEvent, manifest_routes::extract_gateway_routes,
     run_gateway_with_shutdown,
 };
+use protocol::machine::{GatewayRouteKind, GatewayRouteSpec};
+use reqwest::Client;
 use tokio::{
     net::TcpListener,
     sync::{mpsc, oneshot, watch},

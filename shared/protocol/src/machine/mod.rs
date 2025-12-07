@@ -12,8 +12,9 @@ pub use envelope::{
 };
 
 pub use gateway::{
-    GatewayProviderRecordOwned, GatewayRouteKind, GatewayRouteSpec, build_gateway_provider_record,
-    decode_gateway_provider_record, root_as_gateway_provider_record,
+    GatewayManifestRequest, GatewayProviderRecordOwned, GatewayRouteKind, GatewayRouteSpec,
+    build_gateway_manifest_request, build_gateway_provider_record, decode_gateway_provider_record,
+    root_as_gateway_manifest_request, root_as_gateway_provider_record,
 };
 
 pub use manifest::{

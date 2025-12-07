@@ -14,7 +14,7 @@ use tokio::{process::Command as TokioCommand, time::sleep};
 
 const MACHINE_API_URL: &str = "http://127.0.0.1:3000";
 const ROOTLESS_MANIFEST_PATH: &str = "deploy/complete_rootless.yml";
-const SAMPLE_MANIFEST_PATH: &str = "tests/sample_manifests/demo_deployment.yml";
+const SAMPLE_MANIFEST_PATH: &str = "tests/sample_manifests/demo_deployment_without_sidecar.yml";
 const PODMESH_PROXY_URL: &str = "http://127.0.0.1:8080/";
 const EXPECTED_BODY_SUBSTRING: &str = "Welcome to Podmesh";
 const REQUIRED_MACHINE_PEERS: usize = 1;

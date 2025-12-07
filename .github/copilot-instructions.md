@@ -5,18 +5,18 @@ Podmesh is a decentralized, lock-free orchestration system that turns any device
 ## Principles
 
 * The solution prioritizes decentralization through libp2p and zero-trust by encrypting and signing all communication and encrypting with the receivers kem public key through functions in the crypto crate.
-* The machine plane listen should check for node failure and restart crashed containers and reschedule workloads on failed nodes, but does not handle any workload communication as this is handled by the machine plane (strict segregation and zero trust, the workload plane does not trust the machine plane).
+* The scheduler listen should check for node failure and restart crashed containers and reschedule workloads on failed nodes, but does not handle any workload communication as this is handled by the scheduler plane (strict segregation and zero trust, the workload plane does not trust the scheduler plane).
 * always use log::info! or error! or warn!, never println!
 * No backward compatibility guarantees / implementations required for changes
 
 ## Code Layout
-The machineplane consists of the following crates:
+The scheduler consists of the following crates:
 * podctl: consists of the podctl cli similar to kubectl that allows to interact with podmesh
-* crypto: the common library that offers helper functions for the cli and machine
-* podmesh-scheduler: contains the libp2p scheduler implementation for managing workload lifecycles (the former `machine` crate)
-* podmesh-proxy: contains the workload-plane mesh proxy implementation (previously `meshproxy`)
-* podmesh-sidecar: contains the workload-plane gateway sidecar implementation (previously `sidecar`)
-* protocol: contains the flatbuffers that are used for messaging between the nodes in the machine plane
+* crypto: the common library that offers helper functions for the cli and scheduler
+* podmesh-scheduler: contains the libp2p scheduler implementation for managing pod lifecycles
+* podmesh-proxy: contains the proxy implementation
+* podmesh-sidecar: contains the gateway sidecar implementation
+* protocol: contains the flatbuffers that are used for messaging between the nodes in the scheduler
 
 ## Workflow
 1. Fetch any URL's provided by the user using the fetch tool. Recursively follow links to gather all relevant context.

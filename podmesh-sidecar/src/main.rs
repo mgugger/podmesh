@@ -3,16 +3,17 @@ use std::{fs, io::ErrorKind, path::Path, time::Duration};
 use anyhow::{Context, Result};
 use base64::Engine;
 use clap::Parser;
-use tracing::error;
+use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;
 
-use protocol::{
-    gateway_metadata::{DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR, GatewaySidecarMetadata},
-    libp2p_constants::MESH_DOMAIN_SUFFIX,
-};
 use podmesh_sidecar::{
     DEFAULT_GATEWAY_APP_PORT, GatewayConfig, manifest_routes::extract_gateway_routes, run_gateway,
     split_csv,
+};
+use protocol::{
+    gateway_metadata::{DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR, GatewaySidecarMetadata},
+    libp2p_constants::MESH_DOMAIN_SUFFIX,
+    machine::{GatewayRouteKind, GatewayRouteSpec},
 };
 
 #[derive(Parser, Debug)]
@@ -84,11 +85,26 @@ impl TryFrom<Args> for GatewayConfig {
         let manifest_bytes = base64::engine::general_purpose::STANDARD
             .decode(&metadata.manifest_b64)
             .context("failed to decode manifest payload from metadata")?;
-        let manifest_id = metadata.manifest_id.clone();
-        let ingress_host = format!("{}.{}", manifest_id, MESH_DOMAIN_SUFFIX);
 
-        let extraction = extract_gateway_routes(&manifest_bytes, &manifest_id)
-            .with_context(|| format!("failed to extract routes for manifest {}", manifest_id))?;
+        let extraction = extract_gateway_routes(&manifest_bytes, &metadata.manifest_id)
+            .with_context(|| {
+                format!(
+                    "failed to extract routes for manifest {}",
+                    metadata.manifest_id
+                )
+            })?;
+
+        let mut routes = extraction.routes;
+        let (manifest_id, ingress_host, derived_from_ingress) =
+            derive_manifest_identity(&routes, &metadata.manifest_id);
+        if !derived_from_ingress {
+            warn!(
+                metadata_manifest = %metadata.manifest_id,
+                manifest = %manifest_id,
+                "no ingress host detected; using fallback manifest id"
+            );
+        }
+        update_service_route_hosts(&mut routes, &manifest_id);
 
         let mut bootstrap_peers = vec![metadata.bootstrap_peer.clone()];
         bootstrap_peers.extend(split_csv(Some(args.bootstrap_peers)));
@@ -105,7 +121,7 @@ impl TryFrom<Args> for GatewayConfig {
             manifest_id,
             ingress_host,
             app_port: DEFAULT_GATEWAY_APP_PORT,
-            routes: extraction.routes,
+            routes,
             owner_public_key_b64: metadata.owner_public_key_b64.clone(),
         })
     }
@@ -168,3 +184,69 @@ fn init_tracing() {
         .try_init();
 }
 
+fn derive_manifest_identity(
+    routes: &[GatewayRouteSpec],
+    metadata_manifest_id: &str,
+) -> (String, String, bool) {
+    if let Some((manifest_id, host)) = routes
+        .iter()
+        .filter(|route| matches!(route.source, GatewayRouteKind::Ingress))
+        .filter_map(|route| manifest_id_from_host(&route.host).map(|id| (id, route.host.clone())))
+        .next()
+    {
+        return (manifest_id, host, true);
+    }
+
+    let manifest_id = sanitize_manifest_id(metadata_manifest_id);
+    let ingress_host = format!("{}.{}", manifest_id, MESH_DOMAIN_SUFFIX);
+    (manifest_id, ingress_host, false)
+}
+
+fn manifest_id_from_host(host: &str) -> Option<String> {
+    let suffix = format!(".{}", MESH_DOMAIN_SUFFIX);
+    let normalized = host.trim().trim_end_matches('.').to_lowercase();
+    if let Some(without_suffix) = normalized.strip_suffix(&suffix) {
+        let trimmed = without_suffix.trim_matches('.');
+        return trimmed
+            .rsplit('.')
+            .next()
+            .map(|segment| segment.to_string())
+            .filter(|segment| !segment.is_empty());
+    }
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn sanitize_manifest_id(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+
+    for ch in value.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() || lower == '-' {
+            slug.push(lower);
+            last_dash = lower == '-';
+        } else if !last_dash && !slug.is_empty() {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+
+    let trimmed = slug.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "workload".to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn update_service_route_hosts(routes: &mut [GatewayRouteSpec], manifest_id: &str) {
+    for route in routes.iter_mut() {
+        if matches!(route.source, GatewayRouteKind::Service) {
+            route.host = format!(
+                "{}.{}.{}",
+                route.service_name, manifest_id, MESH_DOMAIN_SUFFIX
+            )
+            .to_lowercase();
+        }
+    }
+}

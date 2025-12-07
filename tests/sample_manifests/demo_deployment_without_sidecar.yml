@@ -34,15 +34,6 @@ spec:
             - name: custom-html
               mountPath: /usr/share/nginx/html/index.html
               subPath: index.html
-        - name: sidecar
-          image: podmesh/sidecar:latest
-          env:
-            - name: PODMESH_NAMESPACE
-              value: test-namespace
-            - name: PODMESH_WORKLOAD
-              value: nginx
-            - name: MANIFEST_ID
-              value: test-namespace/nginx
       volumes:
         - name: custom-html
           configMap:

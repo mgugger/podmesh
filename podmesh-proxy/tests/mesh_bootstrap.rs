@@ -287,4 +287,3 @@ fn allocate_tcp_port() -> u16 {
         .expect("tcp local addr")
         .port()
 }
-

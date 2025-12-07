@@ -10,14 +10,21 @@ use libp2p::{
     request_response,
     swarm::{NetworkBehaviour, SwarmEvent},
 };
-use p2p::{build_quic_multiaddr, parse_bootstrap_peer, timestamp_millis};
 use p2p::http_proxy::{ProxyCodec, ProxyHttpRequest, ProxyHttpResponse};
 use p2p::{
-    handshake::{self, HandshakeDriveConfig, HandshakeState},
-    request_response::HandshakeCodec,
+    build_quic_multiaddr, gateway_manifest::sign_gateway_manifest_record, parse_bootstrap_peer,
+    timestamp_millis,
 };
-use protocol::libp2p_constants::{INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX};
-use protocol::machine::{GatewayRouteSpec, build_gateway_provider_record};
+use p2p::{
+    handshake::{self, HandshakeDriveConfig, HandshakeState},
+    request_response::{HandshakeCodec, ManifestFetchCodec},
+};
+use protocol::libp2p_constants::{
+    GATEWAY_MANIFEST_PROTOCOL, INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX,
+};
+use protocol::machine::{
+    GatewayRouteSpec, build_gateway_provider_record, root_as_gateway_manifest_request,
+};
 use reqwest::{
     Client, Method,
     header::{HeaderName, HeaderValue},
@@ -29,7 +36,7 @@ use tracing::{debug, info, warn};
 pub mod manifest_routes;
 
 pub const DEFAULT_GATEWAY_APP_PORT: u16 = 18080;
-const MANIFEST_RECORD_TTL_MS: u32 = 30_000;
+const MANIFEST_RECORD_TTL_MS: u32 = 300_000;
 const MANIFEST_RECORD_VERSION: u16 = 1;
 
 #[derive(Clone, Debug)]
@@ -130,7 +137,7 @@ pub async fn run_gateway_with_shutdown(
     handshake_ticker.tick().await;
     let mut manifest_ticker = tokio::time::interval(cfg.announce_interval);
     manifest_ticker.tick().await;
-    publish_manifest_record(&mut swarm, &cfg);
+    // Don't publish manifest immediately - wait for bootstrap to complete
     loop {
         tokio::select! {
             event = swarm.select_next_some() => {
@@ -144,7 +151,7 @@ pub async fn run_gateway_with_shutdown(
                     future::pending::<()>().await;
                 }
             } => {
-                if cfg.announce_providers {
+                if cfg.announce_providers && state.kad_bootstrap_complete {
                     announce_provider(&mut swarm, &cfg);
                 }
             },
@@ -179,7 +186,9 @@ pub async fn run_gateway_with_shutdown(
                 }
             },
             _ = manifest_ticker.tick() => {
-                publish_manifest_record(&mut swarm, &cfg);
+                if state.kad_bootstrap_complete {
+                    publish_manifest_record(&mut swarm, &cfg);
+                }
             },
             Some(pending) = proxy_resp_rx.recv() => {
                 if let Err(err) = swarm.behaviour_mut().proxy_rr.send_response(pending.channel, pending.response) {
@@ -217,12 +226,14 @@ struct GatewayBehaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     handshake_rr: request_response::Behaviour<HandshakeCodec>,
     proxy_rr: request_response::Behaviour<ProxyCodec>,
+    manifest_rr: request_response::Behaviour<ManifestFetchCodec>,
 }
 
 struct GatewayState {
     known_providers: HashSet<String>,
     handshake_states: HashMap<PeerId, HandshakeState>,
     kad_bootstrapped: bool,
+    kad_bootstrap_complete: bool,
     http_client: Client,
 }
 
@@ -232,6 +243,7 @@ impl GatewayState {
             known_providers: HashSet::new(),
             handshake_states: HashMap::new(),
             kad_bootstrapped: false,
+            kad_bootstrap_complete: false,
             http_client,
         }
     }
@@ -264,10 +276,18 @@ fn build_swarm(_cfg: &GatewayConfig) -> Result<Swarm<GatewayBehaviour>> {
                 )),
                 request_response::Config::default(),
             );
+            let manifest_rr = request_response::Behaviour::new(
+                std::iter::once((
+                    GATEWAY_MANIFEST_PROTOCOL,
+                    request_response::ProtocolSupport::Full,
+                )),
+                request_response::Config::default(),
+            );
             let mut behaviour = GatewayBehaviour {
                 kademlia: kad::Behaviour::new(peer_id, store),
                 handshake_rr,
                 proxy_rr,
+                manifest_rr,
             };
             behaviour.kademlia.set_mode(Some(kad::Mode::Client));
             behaviour
@@ -323,19 +343,17 @@ fn announce_provider(swarm: &mut Swarm<GatewayBehaviour>, cfg: &GatewayConfig) {
 
 fn publish_manifest_record(swarm: &mut Swarm<GatewayBehaviour>, cfg: &GatewayConfig) {
     let timestamp_ms = timestamp_millis();
-    let payload = build_gateway_provider_record(
-        &cfg.manifest_id,
-        &swarm.local_peer_id().to_string(),
-        &cfg.ingress_host,
-        cfg.owner_public_key_b64.as_deref(),
-        &cfg.routes,
-        MANIFEST_RECORD_TTL_MS,
-        timestamp_ms,
-        MANIFEST_RECORD_VERSION,
+    let payload = build_manifest_record_payload(swarm.local_peer_id(), cfg, timestamp_ms);
+    let record_key = cfg.manifest_record_key();
+    info!(
+        manifest = %cfg.manifest_id,
+        ingress_host = %cfg.ingress_host,
+        ?record_key,
+        "gateway publishing ingress manifest to dht"
     );
 
     let record = Record {
-        key: cfg.manifest_record_key(),
+        key: record_key.clone(),
         value: payload,
         publisher: Some(*swarm.local_peer_id()),
         expires: Some(Instant::now() + Duration::from_millis(MANIFEST_RECORD_TTL_MS as u64)),
@@ -353,6 +371,32 @@ fn publish_manifest_record(swarm: &mut Swarm<GatewayBehaviour>, cfg: &GatewayCon
             warn!(manifest = %cfg.manifest_id, error = %err, "gateway failed to publish manifest record")
         }
     }
+
+    match swarm.behaviour_mut().kademlia.start_providing(record_key) {
+        Ok(query_id) => {
+            debug!(?query_id, manifest = %cfg.manifest_id, "gateway announced manifest provider")
+        }
+        Err(err) => {
+            warn!(manifest = %cfg.manifest_id, error = %err, "gateway manifest provider announce failed")
+        }
+    }
+}
+
+fn build_manifest_record_payload(
+    peer_id: &PeerId,
+    cfg: &GatewayConfig,
+    timestamp_ms: u64,
+) -> Vec<u8> {
+    build_gateway_provider_record(
+        &cfg.manifest_id,
+        &peer_id.to_string(),
+        &cfg.ingress_host,
+        cfg.owner_public_key_b64.as_deref(),
+        &cfg.routes,
+        MANIFEST_RECORD_TTL_MS,
+        timestamp_ms,
+        MANIFEST_RECORD_VERSION,
+    )
 }
 
 fn handle_swarm_event(
@@ -406,13 +450,16 @@ fn handle_swarm_event(
             }
         }
         SwarmEvent::Behaviour(GatewayBehaviourEvent::Kademlia(event)) => {
-            handle_kad_event(event, cfg, state, event_tx);
+            handle_kad_event(swarm, event, cfg, state, event_tx);
         }
         SwarmEvent::Behaviour(GatewayBehaviourEvent::HandshakeRr(event)) => {
             handle_handshake_event(swarm, event, state);
         }
         SwarmEvent::Behaviour(GatewayBehaviourEvent::ProxyRr(event)) => {
             handle_proxy_event(cfg, state, event, proxy_resp_tx);
+        }
+        SwarmEvent::Behaviour(GatewayBehaviourEvent::ManifestRr(event)) => {
+            handle_manifest_fetch_event(swarm, cfg, event);
         }
         _ => {}
     }
@@ -505,6 +552,68 @@ fn handle_proxy_event(
             debug!(%peer, "gateway proxy response sent");
         }
     }
+}
+
+fn handle_manifest_fetch_event(
+    swarm: &mut Swarm<GatewayBehaviour>,
+    cfg: &GatewayConfig,
+    event: request_response::Event<Vec<u8>, Vec<u8>>,
+) {
+    match event {
+        request_response::Event::Message { peer, message, .. } => match message {
+            request_response::Message::Request {
+                request, channel, ..
+            } => {
+                let response =
+                    match build_manifest_response_bytes(swarm.local_peer_id(), cfg, &request) {
+                        Ok(bytes) => bytes,
+                        Err(err) => {
+                            warn!(%peer, error = %err, "gateway failed to build manifest response");
+                            Vec::new()
+                        }
+                    };
+                if let Err(err) = swarm
+                    .behaviour_mut()
+                    .manifest_rr
+                    .send_response(channel, response)
+                {
+                    warn!(%peer, error = ?err, "gateway failed to send manifest response");
+                }
+            }
+            request_response::Message::Response { .. } => {
+                debug!(%peer, "gateway received unexpected manifest response");
+            }
+        },
+        request_response::Event::OutboundFailure { peer, error, .. } => {
+            warn!(%peer, ?error, "gateway manifest outbound failure");
+        }
+        request_response::Event::InboundFailure { peer, error, .. } => {
+            warn!(%peer, ?error, "gateway manifest inbound failure");
+        }
+        request_response::Event::ResponseSent { peer, .. } => {
+            debug!(%peer, "gateway manifest response sent");
+        }
+    }
+}
+
+fn build_manifest_response_bytes(
+    peer_id: &PeerId,
+    cfg: &GatewayConfig,
+    request_bytes: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let request =
+        root_as_gateway_manifest_request(request_bytes).context("parse manifest fetch request")?;
+    if request.manifest_id != cfg.manifest_id {
+        anyhow::bail!(
+            "received manifest request for {} but serving {}",
+            request.manifest_id,
+            cfg.manifest_id
+        );
+    }
+
+    let timestamp_ms = timestamp_millis();
+    let payload = build_manifest_record_payload(peer_id, cfg, timestamp_ms);
+    sign_gateway_manifest_record(&payload)
 }
 
 fn spawn_local_http_request(
@@ -600,6 +709,7 @@ async fn execute_local_http_request(
 }
 
 fn handle_kad_event(
+    swarm: &mut Swarm<GatewayBehaviour>,
     event: kad::Event,
     cfg: &GatewayConfig,
     state: &mut GatewayState,
@@ -624,6 +734,19 @@ fn handle_kad_event(
             },
             kad::QueryResult::GetProviders(Err(err)) => {
                 warn!(provider = %cfg.provider_label, error = %err, "gateway provider lookup failed");
+            }
+            kad::QueryResult::Bootstrap(Ok(_)) => {
+                if !state.kad_bootstrap_complete {
+                    state.kad_bootstrap_complete = true;
+                    info!("gateway kademlia bootstrap completed, publishing manifest");
+                    publish_manifest_record(swarm, cfg);
+                    if cfg.announce_providers {
+                        announce_provider(swarm, cfg);
+                    }
+                }
+            }
+            kad::QueryResult::Bootstrap(Err(err)) => {
+                warn!(error = %err, "gateway kademlia bootstrap failed");
             }
             _ => {}
         },
@@ -708,4 +831,3 @@ fn split_peer_multiaddr(addr: &Multiaddr) -> Option<(PeerId, Multiaddr)> {
 
 // Re-export split_csv from shared p2p crate
 pub use p2p::split_csv;
-

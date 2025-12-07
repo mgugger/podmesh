@@ -99,4 +99,3 @@ impl Workload {
         self.ingress.as_ref().map(|server| server.listen_addr())
     }
 }
-

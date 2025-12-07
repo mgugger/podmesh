@@ -1,4 +1,5 @@
 pub mod envelope;
+pub mod gateway_manifest;
 pub mod handshake;
 pub mod http_proxy;
 pub mod message_verifier;
@@ -76,8 +77,9 @@ where
         .gossipsub_mut()
         .add_explicit_peer(&local_peer);
 
-    let listen_addr = build_quic_multiaddr(&host, quic_port)
-        .ok_or_else(|| anyhow::anyhow!("failed to build listen address for {}:{}", host, quic_port))?;
+    let listen_addr = build_quic_multiaddr(&host, quic_port).ok_or_else(|| {
+        anyhow::anyhow!("failed to build listen address for {}:{}", host, quic_port)
+    })?;
 
     swarm.listen_on(listen_addr)?;
 

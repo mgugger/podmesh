@@ -6,4 +6,3 @@ pub mod workload;
 
 pub use config::Config;
 pub use workload::Workload;
-

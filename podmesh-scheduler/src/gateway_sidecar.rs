@@ -19,7 +19,7 @@ pub const GATEWAY_BOOTSTRAP_ENV: &str = BOOTSTRAP_ENV_VAR;
 /// Environment variable configuring the gateway's log verbosity.
 pub const GATEWAY_LOG_ENV: &str = "RUST_LOG";
 /// Default log level used for injected gateway sidecars.
-pub const GATEWAY_LOG_LEVEL: &str = "info";
+pub const GATEWAY_LOG_LEVEL: &str = "debug";
 
 /// Settings that control global gateway sidecar behavior.
 #[derive(Debug, Clone)]

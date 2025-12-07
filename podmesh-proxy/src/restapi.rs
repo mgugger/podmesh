@@ -68,4 +68,3 @@ async fn healthz(State(state): State<RestState>) -> Json<HealthResponse> {
         peer_count: peers.len(),
     })
 }
-

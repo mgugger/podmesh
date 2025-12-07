@@ -1,14 +1,14 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: machine
+  name: scheduler
   labels:
-    app: machine
+    app: scheduler
 spec:
   restartPolicy: Always
   containers:
-    - name: machine-bootstrap
-      image: podmesh/machine:latest
+    - name: scheduler-bootstrap
+      image: podmesh/scheduler:latest
       env:
       - name: RUST_LOG
         value: "info"
@@ -30,8 +30,8 @@ spec:
         - containerPort: 3000
           hostPort: 3000
           protocol: UDP
-    - name: machine-1
-      image: podmesh/machine:latest
+    - name: scheduler-1
+      image: podmesh/scheduler:latest
       env:
       - name: RUST_LOG
         value: "info"
@@ -39,7 +39,7 @@ spec:
         - "--disable-rest-api"
         - "--disable-machine-api"
         - "--bootstrap-peer"
-        - "/dns4/machine/udp/4001/quic-v1"
+        - "/dns4/scheduler/udp/4001/quic-v1"
         - "--podman-socket"
         - "/run/podman/podman.sock"
       volumeMounts:
@@ -54,8 +54,8 @@ spec:
         - name: host-containers-storage
           mountPath: /var/lib/containers/storage
           readOnly: true
-    - name: machine-2
-      image: podmesh/machine:latest
+    - name: scheduler-2
+      image: podmesh/scheduler:latest
       env:
       - name: RUST_LOG
         value: "info"
@@ -63,7 +63,7 @@ spec:
         - "--disable-rest-api"
         - "--disable-machine-api"
         - "--bootstrap-peer"
-        - "/dns4/machine/udp/4001/quic-v1"
+        - "/dns4/scheduler/udp/4001/quic-v1"
         - "--podman-socket"
         - "/run/podman/podman.sock"
       volumeMounts:
@@ -99,21 +99,23 @@ spec:
 apiVersion: v1
 kind: Pod
 metadata:
-  name: workload-bootstrap
+  name: proxy
   labels:
-    app: podmesh-proxy
+    app: podmesh
 spec:
   restartPolicy: Always
   containers:
-    - name: workload-bootstrap
-      image: podmesh/workload:latest
+    - name: proxy-bootstrap
+      image: podmesh/proxy:latest
+      args:
+        - "--enable-ingress"
       env:
         - name: libp2p_quic_port
           value: "4002"
         - name: rest_port
           value: "3001"
         - name: RUST_LOG
-          value: "info"
+          value: "debug"
       ports:
         - containerPort: 4002
           hostPort: 4002
@@ -133,21 +135,21 @@ spec:
         - containerPort: 8080
           hostPort: 8080
           protocol: TCP
-    - name: workload-1
-      image: podmesh/workload:latest
+    - name: proxy-1
+      image: podmesh/proxy:latest
       env:
       - name: RUST_LOG
         value: "info"
       args:
         - "--bootstrap-peer"
-        - "/dns4/workload-bootstrap/udp/4002/quic-v1"
+        - "/dns4/proxy/udp/4002/quic-v1"
         - "--disable-rest-api"
-    - name: workload-2
-      image: podmesh/workload:latest
+    - name: proxy-2
+      image: podmesh/proxy:latest
       env:
       - name: RUST_LOG
         value: "info"
       args:
         - "--bootstrap-peer"
-        - "/dns4/workload-bootstrap/udp/4002/quic-v1"
+        - "/dns4/proxy/udp/4002/quic-v1"
         - "--disable-rest-api"

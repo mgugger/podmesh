@@ -99,4 +99,3 @@ fn init_tracing() {
         .with_target(false)
         .try_init();
 }
-
