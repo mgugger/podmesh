@@ -46,7 +46,37 @@ pub fn delete_message(
             };
 
             let envelope_pubkey = verified.pubkey.clone();
-            let effective_request = verified.payload;
+            let encrypted_payload = verified.payload;
+
+            // Decrypt the payload using node's KEM private key (for end-to-end encryption from CLI)
+            let effective_request = match crypto::ensure_kem_keypair_on_disk() {
+                Ok((_, kem_private_key)) => {
+                    match crypto::decrypt_payload_from_recipient_blob(&encrypted_payload, &kem_private_key) {
+                        Ok(decrypted) => {
+                            log::debug!("Successfully decrypted delete request payload ({} bytes)", decrypted.len());
+                            decrypted
+                        }
+                        Err(e) => {
+                            error!("Failed to decrypt delete request from peer={}: {}", peer, e);
+                            let error_response = delete_error_response("failed to decrypt request");
+                            let _ = swarm
+                                .behaviour_mut()
+                                .delete_rr
+                                .send_response(channel, error_response);
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to load KEM private key: {}", e);
+                    let error_response = delete_error_response("kem key not available");
+                    let _ = swarm
+                        .behaviour_mut()
+                        .delete_rr
+                        .send_response(channel, error_response);
+                    return;
+                }
+            };
 
             // Parse the FlatBuffer delete request
             match machine::root_as_delete_request(&effective_request) {
@@ -133,7 +163,7 @@ pub fn delete_message(
 }
 
 /// Process a delete request by verifying ownership and removing workloads
-async fn process_delete_request(
+pub(crate) async fn process_delete_request(
     manifest_id: &str,
     force: bool,
     envelope_pubkey: &[u8],

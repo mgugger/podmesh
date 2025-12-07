@@ -1,5 +1,6 @@
 use anyhow::Result;
 use base64::Engine;
+use log::debug;
 use serde_json::Value as JsonValue;
 
 /// Convert JSON requests into flatbuffer payloads for direct communication with the machine
@@ -149,6 +150,102 @@ impl FlatbufferClient {
         );
 
         Ok(response_bytes)
+    }
+
+    /// Send encrypted request to a specific node (end-to-end encryption with target node)
+    pub async fn send_encrypted_request_to_node(
+        &self,
+        url: &str,
+        payload: &[u8],
+        payload_type: &str,
+        target_node_kem_pubkey: &[u8],
+    ) -> Result<Vec<u8>> {
+        let kem_pub_b64 = base64::engine::general_purpose::STANDARD.encode(&self.kem_public_key);
+        // Encrypt for the target node, not the bootstrap/machine
+        let envelope = p2p::envelope::create_encrypted_signed_envelope(
+            payload,
+            payload_type,
+            target_node_kem_pubkey,
+            &self.private_key,
+            &self.public_key,
+            Some("cli-client"),
+            Some(&kem_pub_b64),
+        )?;
+
+        let resp = self
+            .client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .header("x-peer-id", "cli-client")
+            .body(envelope)
+            .send()
+            .await?;
+
+        let status = resp.status();
+
+        if status.as_u16() == 405 {
+            let body_text = resp.text().await?;
+            return Ok(body_text.into_bytes());
+        }
+
+        if !status.is_success() {
+            let body_text = resp.text().await?;
+            anyhow::bail!("Request failed: {} {}", status, body_text);
+        }
+
+        let response_bytes = resp.bytes().await?;
+
+        // Response might be encrypted with our KEM key, try to decrypt
+        if response_bytes.len() > 100 {
+            debug!(
+                "send_encrypted_request_to_node: response length={}, attempting envelope parsing",
+                response_bytes.len()
+            );
+
+            if let Ok(envelope) = protocol::machine::root_as_envelope(&response_bytes) {
+                if let Some(payload) = envelope.payload() {
+                    debug!(
+                        "send_encrypted_request_to_node: Detected envelope response, attempting decryption"
+                    );
+                    debug!(
+                        "send_encrypted_request_to_node: envelope payload length: {:?}",
+                        payload.len()
+                    );
+
+                    match crypto::decrypt_payload_from_recipient_blob(payload, &self.kem_private_key) {
+                        Ok(decrypted) => {
+                            debug!(
+                                "send_encrypted_request_to_node: Decryption successful, decrypted length: {}",
+                                decrypted.len()
+                            );
+                            debug!(
+                                "send_encrypted_request_to_node: first 50 bytes of decrypted: {:?}",
+                                &decrypted[..decrypted.len().min(50)]
+                            );
+                            return Ok(decrypted);
+                        }
+                        Err(e) => {
+                            debug!(
+                                "send_encrypted_request_to_node: Decryption failed: {:?}, returning raw bytes",
+                                e
+                            );
+                        }
+                    }
+                } else {
+                    debug!(
+                        "send_encrypted_request_to_node: Not an envelope ({}), server likely sent unencrypted FlatBuffer response",
+                        response_bytes.len()
+                    );
+                }
+            }
+        } else {
+            debug!(
+                "send_encrypted_request_to_node: response_bytes.len()={}, skipping decryption",
+                response_bytes.len()
+            );
+        }
+
+        Ok(response_bytes.to_vec())
     }
 
     pub async fn send_encrypted_request(

@@ -17,6 +17,8 @@ pub struct EnvelopeMetadata {
     pub signing_pubkey: Vec<u8>,
     pub kem_pubkey: Vec<u8>,
     pub peer_id: Option<String>,
+    /// Original signed envelope bytes (for forwarding to other nodes)
+    pub original_envelope: Vec<u8>,
 }
 
 /// Encrypted envelope handler for REST API communication
@@ -200,6 +202,91 @@ impl EnvelopeHandler {
     }
 }
 
+/// Middleware for passthrough routing - extracts envelope metadata but doesn't decrypt
+/// Used for end-to-end encrypted messages that the bootstrap node should just route
+pub async fn envelope_passthrough_middleware(
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let headers = request.headers().clone();
+    let content_type = headers
+        .get("content-type")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+
+    // Only process flatbuffer envelopes
+    if content_type == "application/octet-stream" {
+        // Extract body bytes and parts
+        let (mut parts, body) = request.into_parts();
+        let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+            Ok(bytes) => bytes,
+            Err(_) => return Err(StatusCode::BAD_REQUEST),
+        };
+
+        // Try to parse as envelope
+        match root_as_envelope(&body_bytes) {
+            Ok(envelope) => {
+                debug!("Passthrough: Processing envelope from peer: {:?}", envelope.peer_id());
+
+                // Extract and store envelope metadata (but don't decrypt)
+                let signing_pubkey = envelope
+                    .pubkey()
+                    .and_then(|pk| base64::engine::general_purpose::STANDARD.decode(pk).ok())
+                    .unwrap_or_default();
+                let kem_pubkey = envelope
+                    .kem_pubkey()
+                    .and_then(|pk| base64::engine::general_purpose::STANDARD.decode(pk).ok())
+                    .unwrap_or_default();
+                let peer_id = envelope.peer_id().map(|s| s.to_string());
+
+                let metadata = EnvelopeMetadata {
+                    signing_pubkey,
+                    kem_pubkey,
+                    peer_id,
+                    original_envelope: body_bytes.to_vec(),
+                };
+                parts.extensions.insert(metadata);
+                debug!("Passthrough: Stored envelope metadata, forwarding without decryption");
+
+                // Pass through without decrypting - keep original encrypted body
+                let new_body = axum::body::Body::from(body_bytes);
+                let new_request = Request::from_parts(parts, new_body);
+                let response = next.run(new_request).await;
+                return Ok(response);
+            }
+            Err(_) => {
+                // Not an envelope, pass through as-is
+                let metadata = EnvelopeMetadata {
+                    signing_pubkey: Vec::new(),
+                    kem_pubkey: Vec::new(),
+                    peer_id: None,
+                    original_envelope: Vec::new(),
+                };
+                parts.extensions.insert(metadata);
+
+                let new_body = axum::body::Body::from(body_bytes);
+                let new_request = Request::from_parts(parts, new_body);
+                let response = next.run(new_request).await;
+                return Ok(response);
+            }
+        }
+    }
+
+    // For non-flatbuffer requests, add empty metadata and pass through
+    let (mut parts, body) = request.into_parts();
+    let metadata = EnvelopeMetadata {
+        signing_pubkey: Vec::new(),
+        kem_pubkey: Vec::new(),
+        peer_id: None,
+        original_envelope: Vec::new(),
+    };
+    parts.extensions.insert(metadata);
+
+    let new_request = Request::from_parts(parts, body);
+    let response = next.run(new_request).await;
+    Ok(response)
+}
+
 /// Middleware to handle encrypted envelope requests
 pub async fn envelope_middleware(
     State(envelope_handler): State<Arc<EnvelopeHandler>>,
@@ -241,6 +328,7 @@ pub async fn envelope_middleware(
                     signing_pubkey,
                     kem_pubkey,
                     peer_id,
+                    original_envelope: body_bytes.to_vec(),
                 };
                 parts.extensions.insert(metadata);
                 debug!("Stored envelope metadata in request extensions");
@@ -272,6 +360,7 @@ pub async fn envelope_middleware(
                     signing_pubkey: Vec::new(),
                     kem_pubkey: Vec::new(),
                     peer_id: None,
+                    original_envelope: Vec::new(),
                 };
                 parts.extensions.insert(metadata);
                 debug!("Added empty envelope metadata for non-envelope request");
@@ -290,6 +379,7 @@ pub async fn envelope_middleware(
         signing_pubkey: Vec::new(),
         kem_pubkey: Vec::new(),
         peer_id: None,
+        original_envelope: Vec::new(),
     };
     parts.extensions.insert(metadata);
     debug!("Added empty envelope metadata for non-flatbuffer request");

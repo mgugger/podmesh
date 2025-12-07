@@ -55,6 +55,9 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
     wait_for_workload_containers(&manifest_id, Duration::from_secs(180)).await?;
     wait_for_podmesh_proxy_response(&client, Duration::from_secs(120)).await?;
 
+    // Give the DHT time to propagate provider records before attempting delete
+    sleep(Duration::from_secs(10)).await;
+
     delete_file(sample_manifest.clone(), true, Some(MACHINE_API_URL))
         .await
         .context("podctl delete failed")?;

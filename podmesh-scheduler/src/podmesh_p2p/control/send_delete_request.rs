@@ -1,5 +1,5 @@
 use libp2p::{PeerId, Swarm};
-use log::info;
+use log::{info, warn};
 use tokio::sync::mpsc;
 
 use crate::podmesh_p2p::behaviour::MyBehaviour;
@@ -16,7 +16,36 @@ pub async fn handle_send_delete_request(
         peer_id
     );
 
-    // Send the delete request via request-response protocol
+    // Handle self-delete locally to avoid dialing ourselves through RequestResponse
+    if peer_id == *swarm.local_peer_id() {
+        info!(
+            "handle_send_delete_request: processing self-delete request for peer {}",
+            peer_id
+        );
+
+        match crate::workload_integration::process_enhanced_self_delete_request(&delete_request)
+            .await
+        {
+            Ok(_) => {
+                let _ = reply_tx.send(Ok("Delete request handled locally".to_string()));
+            }
+            Err(e) => {
+                warn!(
+                    "handle_send_delete_request: self-delete processing failed for peer {}: {}",
+                    peer_id, e
+                );
+                let _ = reply_tx.send(Err(format!(
+                    "Self-delete processing failed: {}",
+                    e
+                )));
+            }
+        }
+
+        return;
+    }
+
+    // The delete request should already be signed by the CLI when coming through the REST API
+    // Just forward it as-is to preserve the original signature for verification on the worker node
     let request_id = swarm
         .behaviour_mut()
         .delete_rr

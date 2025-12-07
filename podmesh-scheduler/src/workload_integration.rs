@@ -42,6 +42,10 @@ static RESOURCE_VERIFIER: Lazy<Arc<ResourceVerifier>> =
 static MANIFEST_OWNER_MAP: Lazy<RwLock<HashMap<String, Vec<u8>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
+/// Global task store for tracking deployed workloads and their assigned peers
+static TASK_STORE: Lazy<Arc<RwLock<Option<Arc<RwLock<HashMap<String, crate::restapi::TaskRecord>>>>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(None)));
+
 /// Initialize the runtime registry and provider manager
 pub async fn initialize_workload_manager(
     force_mock_runtime: bool,
@@ -125,6 +129,13 @@ pub async fn get_manifest_owner(manifest_id: &str) -> Option<Vec<u8>> {
     map.get(manifest_id).cloned()
 }
 
+/// Set the global task store reference from the REST API state
+pub async fn set_task_store(task_store: Arc<RwLock<HashMap<String, crate::restapi::TaskRecord>>>) {
+    let mut global_task_store = TASK_STORE.write().await;
+    *global_task_store = Some(task_store);
+    debug!("Global task store reference set");
+}
+
 /// Remove the owner mapping for a manifest.
 pub async fn remove_manifest_owner(manifest_id: &str) -> Option<Vec<u8>> {
     let mut map = MANIFEST_OWNER_MAP.write().await;
@@ -161,7 +172,7 @@ pub async fn handle_apply_message_with_workload_manager(
             info!("Received apply request from peer={}", peer);
 
             // Verify request as a FlatBuffer Envelope
-            let (effective_request, owner_pubkey) =
+            let (encrypted_payload, owner_pubkey) =
                 match crate::podmesh_p2p::security::verify_envelope_and_check_nonce_for_peer(
                     &request,
                     &peer.to_string(),
@@ -188,6 +199,44 @@ pub async fn handle_apply_message_with_workload_manager(
                         (request.clone(), Vec::new())
                     }
                 };
+
+            // Decrypt the payload using node's KEM private key (for end-to-end encryption from CLI)
+            let effective_request = match crypto::ensure_kem_keypair_on_disk() {
+                Ok((_, kem_private_key)) => {
+                    match crypto::decrypt_payload_from_recipient_blob(&encrypted_payload, &kem_private_key) {
+                        Ok(decrypted) => {
+                            debug!("Successfully decrypted apply request payload ({} bytes)", decrypted.len());
+                            decrypted
+                        }
+                        Err(e) => {
+                            error!("Failed to decrypt apply request from peer={}: {}", peer, e);
+                            let error_response = machine::build_apply_response(
+                                false,
+                                "unknown",
+                                "failed to decrypt request",
+                            );
+                            let _ = swarm
+                                .behaviour_mut()
+                                .apply_rr
+                                .send_response(channel, error_response);
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to load KEM private key: {}", e);
+                    let error_response = machine::build_apply_response(
+                        false,
+                        "unknown",
+                        "kem key not available",
+                    );
+                    let _ = swarm
+                        .behaviour_mut()
+                        .apply_rr
+                        .send_response(channel, error_response);
+                    return;
+                }
+            };
 
             // Parse the FlatBuffer apply request
             match machine::root_as_apply_request(&effective_request) {
@@ -451,6 +500,41 @@ async fn process_manifest_deployment(
                 "Announced as provider for manifest_id: {} using engine '{}'",
                 manifest_id, engine_name
             );
+        }
+    }
+
+    // Update task store with ourselves as the assigned peer
+    // This enables fast provider discovery without waiting for DHT propagation
+    {
+        let local_peer_id = swarm.local_peer_id().to_string();
+        if let Some(task_store) = TASK_STORE.read().await.as_ref() {
+            let mut store = task_store.write().await;
+            if let Some(record) = store.get_mut(&manifest_id) {
+                let assigned_peers = record.assigned_peers.get_or_insert_with(Vec::new);
+                if !assigned_peers.contains(&local_peer_id) {
+                    assigned_peers.push(local_peer_id.clone());
+                    info!(
+                        "Updated task store: added {} as assigned peer for manifest_id: {}",
+                        local_peer_id, manifest_id
+                    );
+                }
+            } else {
+                // Create a task record if it doesn't exist
+                debug!(
+                    "Creating new task record for manifest_id: {} with assigned peer {}",
+                    manifest_id, local_peer_id
+                );
+                let record = crate::restapi::TaskRecord {
+                    manifest_bytes: Vec::new(),
+                    created_at: std::time::SystemTime::now(),
+                    manifests_distributed: HashMap::new(),
+                    assigned_peers: Some(vec![local_peer_id.clone()]),
+                    manifest_cid: Some(manifest_id.clone()),
+                    last_operation_id: None,
+                    owner_pubkey: owner_pubkey.to_vec(),
+                };
+                store.insert(manifest_id.clone(), record);
+            }
         }
     }
 
@@ -852,7 +936,54 @@ pub async fn process_enhanced_self_apply_request(manifest: &[u8], swarm: &mut Sw
         manifest.len()
     );
 
-    match machine::root_as_apply_request(manifest) {
+    // Check if this is a signed envelope (from CLI) or raw apply request (from tests)
+    let (apply_request_bytes, owner_pubkey) = if let Ok(envelope) = machine::root_as_envelope(manifest) {
+        // It's a signed envelope - need to decrypt and extract payload
+        // Note: For self-apply, envelope was already verified by REST API middleware,
+        // so we skip re-verification to avoid nonce replay detection
+        debug!("Self-apply: received signed envelope, extracting and decrypting");
+        
+        // Extract owner pubkey from envelope
+        let owner_pubkey = envelope
+            .pubkey()
+            .and_then(|pk| base64::engine::general_purpose::STANDARD.decode(pk).ok())
+            .unwrap_or_default();
+        
+        // Extract encrypted payload
+        let encrypted_payload = envelope
+            .payload()
+            .map(|p| p.to_vec())
+            .unwrap_or_default();
+        
+        // Decrypt using node's KEM private key
+        let kem_private_key = match crypto::ensure_kem_keypair_on_disk() {
+            Ok((_, priv_key)) => priv_key,
+            Err(e) => {
+                error!("Self-apply: failed to load KEM private key: {}", e);
+                return;
+            }
+        };
+        
+        let decrypted_payload = match crypto::decrypt_payload_from_recipient_blob(&encrypted_payload, &kem_private_key) {
+            Ok(payload) => payload,
+            Err(e) => {
+                error!("Self-apply: failed to decrypt envelope payload: {}", e);
+                return;
+            }
+        };
+        
+        debug!("Self-apply: successfully decrypted envelope payload ({} bytes)", decrypted_payload.len());
+        (decrypted_payload, owner_pubkey)
+    } else {
+        // It's a raw apply request - use default signing keypair as owner
+        debug!("Self-apply: received raw apply request (test mode)");
+        let owner_pubkey = crypto::keypair_manager::KeypairManager::get_default_signing_keypair()
+            .map(|(pub_bytes, _)| pub_bytes)
+            .unwrap_or_default();
+        (manifest.to_vec(), owner_pubkey)
+    };
+
+    match machine::root_as_apply_request(&apply_request_bytes) {
         Ok(apply_req) => {
             debug!(
                 "Enhanced self-apply request - operation_id={:?} replicas={}",
@@ -861,11 +992,6 @@ pub async fn process_enhanced_self_apply_request(manifest: &[u8], swarm: &mut Sw
             );
 
             if let Some(manifest_json) = apply_req.manifest_json() {
-                let owner_pubkey =
-                    crypto::keypair_manager::KeypairManager::get_default_signing_keypair()
-                        .map(|(pub_bytes, _)| pub_bytes)
-                        .unwrap_or_default();
-
                 match process_manifest_deployment(swarm, &apply_req, manifest_json, &owner_pubkey)
                     .await
                 {
@@ -886,6 +1012,76 @@ pub async fn process_enhanced_self_apply_request(manifest: &[u8], swarm: &mut Sw
         Err(e) => {
             error!("Failed to parse self-apply request: {}", e);
         }
+    }
+}
+
+/// Process an encrypted delete request envelope locally (self-delete path)
+pub async fn process_enhanced_self_delete_request(envelope_bytes: &[u8]) -> Result<(), String> {
+    use crate::podmesh_p2p::envelope::verify_flatbuffer_envelope_for_peer;
+
+    let envelope = protocol::machine::root_as_envelope(envelope_bytes)
+        .map_err(|e| format!("Failed to parse delete envelope: {}", e))?;
+
+    let peer_id = envelope.peer_id().unwrap_or("cli-client");
+
+    // Verify signature before processing
+    let nonce_window = std::time::Duration::from_secs(300);
+    verify_flatbuffer_envelope_for_peer(envelope_bytes, nonce_window, peer_id)
+        .map_err(|e| format!("Envelope verification failed: {}", e))?;
+
+    let owner_pubkey = envelope
+        .pubkey()
+        .and_then(|pk| base64::engine::general_purpose::STANDARD.decode(pk).ok())
+        .ok_or_else(|| "Delete envelope missing owner pubkey".to_string())?;
+
+    let encrypted_payload = envelope
+        .payload()
+        .ok_or_else(|| "Delete envelope missing payload".to_string())?
+        .to_vec();
+
+    let kem_private_key = crypto::ensure_kem_keypair_on_disk()
+        .map_err(|e| format!("Failed to load KEM keypair: {}", e))?
+        .1;
+
+    let decrypted_payload = crypto::decrypt_payload_from_recipient_blob(
+        &encrypted_payload,
+        &kem_private_key,
+    )
+    .map_err(|e| format!("Failed to decrypt delete payload: {}", e))?;
+
+    let delete_req = protocol::machine::root_as_delete_request(&decrypted_payload)
+        .map_err(|e| format!("Failed to parse delete request: {}", e))?;
+
+    let manifest_id = delete_req
+        .manifest_id()
+        .ok_or_else(|| "Delete request missing manifest_id".to_string())?
+        .to_string();
+    let operation_id = delete_req
+        .operation_id()
+        .unwrap_or("unknown-operation")
+        .to_string();
+    let force = delete_req.force();
+
+    let (success, message, removed_workloads) =
+        crate::podmesh_p2p::behaviour::delete_message::process_delete_request(
+            &manifest_id,
+            force,
+            &owner_pubkey,
+            peer_id,
+        )
+        .await;
+
+    if success {
+        info!(
+            "Self-delete succeeded for manifest_id={} operation_id={} removed_workloads={:?}",
+            manifest_id, operation_id, removed_workloads
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "Delete request failed for manifest_id {}: {}",
+            manifest_id, message
+        ))
     }
 }
 

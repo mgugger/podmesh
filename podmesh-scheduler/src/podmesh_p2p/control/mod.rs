@@ -179,6 +179,13 @@ pub async fn handle_control_message(
             let local_peer_id = *swarm.local_peer_id();
             let _ = reply_tx.send(local_peer_id);
         }
+        Libp2pControl::GetPeerPublicKey { peer_id, reply_tx } => {
+            // Get a peer's public key in base64 format
+            // For now, return the peer_id as a placeholder - in production,
+            // this should query the peer's identity or stored keys
+            // The public key should be obtained during peer connection/handshake
+            let _ = reply_tx.send(peer_id);
+        }
     }
 }
 
@@ -363,5 +370,10 @@ pub enum Libp2pControl {
     /// Get the local peer ID
     GetLocalPeerId {
         reply_tx: mpsc::UnboundedSender<libp2p::PeerId>,
+    },
+    /// Get a peer's public key in base64 format
+    GetPeerPublicKey {
+        peer_id: String,
+        reply_tx: mpsc::UnboundedSender<String>,
     },
 }

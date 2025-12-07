@@ -273,8 +273,10 @@ async fn send_apply_to_node(
         node_id
     );
 
+    // Encrypt and sign the ApplyRequest for the target worker node (end-to-end encryption)
+    // The bootstrap node will route based on URL path without decrypting the payload
     let response_bytes = fb_client
-        .send_encrypted_request(&url, &apply_request_bytes, "apply_request")
+        .send_encrypted_request_to_node(&url, &apply_request_bytes, "apply_request", &node_pubkey_bytes)
         .await?;
 
     let apply_response = protocol::machine::root_as_apply_response(&response_bytes)
@@ -345,46 +347,177 @@ pub async fn delete_file(
     fb_client.fetch_machine_public_key().await?;
     debug!("Successfully fetched machine's public key");
 
-    // Build delete request
-    let operation_id = Uuid::new_v4().to_string();
-    let delete_request_bytes = protocol::machine::build_delete_request(
-        &manifest_id,
-        &operation_id,
-        "", // origin_peer (CLI doesn't have peer ID)
-        force,
+    // Step 1: Discover which nodes are providing this manifest via DHT
+    debug!("Discovering providers for manifest_id: {}", manifest_id);
+    let providers = discover_manifest_providers(&fb_client, &manifest_id).await?;
+
+    if providers.is_empty() {
+        info!("No providers found for manifest_id: {}", manifest_id);
+        return Ok(manifest_id);
+    }
+
+    info!(
+        "Found {} providers for manifest_id {}: {:?}",
+        providers.len(),
+        manifest_id,
+        providers.iter().map(|(id, _)| id).collect::<Vec<_>>()
     );
 
-    // Send delete request via REST API
+    // Step 2: Send delete requests directly to each provider node (end-to-end encryption)
+    let operation_id = Uuid::new_v4().to_string();
+    let mut succeeded_nodes = Vec::new();
+    let mut failed_nodes: Vec<(String, String)> = Vec::new();
+
+    for (node_id, node_pubkey_b64) in &providers {
+        match send_delete_to_node(
+            &fb_client,
+            node_id,
+            node_pubkey_b64,
+            &manifest_id,
+            &operation_id,
+            force,
+        )
+        .await
+        {
+            Ok(_) => {
+                succeeded_nodes.push(node_id.clone());
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+            Err(err) => {
+                let err_msg = err.to_string();
+                log::error!("Direct delete failed for node {}: {}", node_id, err_msg);
+                failed_nodes.push((node_id.clone(), err_msg));
+            }
+        }
+    }
+
+    if failed_nodes.is_empty() {
+        info!(
+            "Delete completed for manifest_id {} on {} nodes",
+            manifest_id,
+            succeeded_nodes.len()
+        );
+        return Ok(manifest_id);
+    }
+
+    if !succeeded_nodes.is_empty() {
+        log::warn!(
+            "Delete partially succeeded for manifest {} ({} ok / {} failed)",
+            manifest_id,
+            succeeded_nodes.len(),
+            failed_nodes.len()
+        );
+    }
+
+    let failure_count = failed_nodes.len();
+    let failure_summary = failed_nodes
+        .into_iter()
+        .map(|(node, err)| format!("{node}: {err}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    anyhow::bail!(
+        "Delete failed for {} of {} provider nodes: {}",
+        failure_count,
+        providers.len(),
+        failure_summary
+    );
+}
+
+async fn discover_manifest_providers(
+    fb_client: &FlatbufferClient,
+    manifest_id: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
     let url = format!(
-        "{}/tasks/{}",
+        "{}/tasks/{}/providers",
         fb_client.base_url.trim_end_matches('/'),
         manifest_id
     );
 
-    debug!("Sending delete request to: {}", url);
+    debug!("Discovering providers at: {}", url);
 
+    // Use a simple GET request to discover providers
     let response_bytes = fb_client
-        .send_delete_request(&url, &delete_request_bytes)
+        .send_encrypted_request(&url, &[], "providers_request")
         .await?;
 
-    // Parse response as DeleteResponse
+    debug!("Received provider discovery response: {} bytes", response_bytes.len());
+
+    // Parse response - expecting JSON with provider list
+    let response_text = String::from_utf8_lossy(&response_bytes);
+    debug!("Provider response text: {}", response_text);
+    
+    let providers_json: serde_json::Value = serde_json::from_str(&response_text)
+        .map_err(|e| anyhow::anyhow!("Failed to parse providers response: {} (response was: {})", e, response_text))?;
+
+    let providers_array = providers_json
+        .get("providers")
+        .and_then(|p| p.as_array())
+        .ok_or_else(|| anyhow::anyhow!("Invalid providers response format"))?;
+
+    let mut result = Vec::new();
+    for provider in providers_array {
+        if let (Some(peer_id), Some(pubkey)) = (
+            provider.get("peer_id").and_then(|p| p.as_str()),
+            provider.get("pubkey").and_then(|p| p.as_str()),
+        ) {
+            result.push((peer_id.to_string(), pubkey.to_string()));
+        }
+    }
+
+    Ok(result)
+}
+
+async fn send_delete_to_node(
+    fb_client: &FlatbufferClient,
+    node_id: &str,
+    node_pubkey_b64: &str,
+    manifest_id: &str,
+    operation_id: &str,
+    force: bool,
+) -> anyhow::Result<()> {
+    debug!("Sending delete request to node: {}", node_id);
+
+    let node_pubkey_bytes = base64::engine::general_purpose::STANDARD
+        .decode(node_pubkey_b64)
+        .map_err(|e| anyhow::anyhow!("Failed to decode node public key for {}: {}", node_id, e))?;
+
+    let delete_request_bytes = protocol::machine::build_delete_request(
+        manifest_id,
+        operation_id,
+        "", // origin_peer (CLI doesn't have peer ID)
+        force,
+    );
+
+    let url = format!(
+        "{}/delete_direct/{}",
+        fb_client.base_url.trim_end_matches('/'),
+        node_id
+    );
+
+    debug!(
+        "Sending DeleteRequest directly to node {} for manifest_id {}",
+        node_id, manifest_id
+    );
+
+    // Encrypt and sign the DeleteRequest for the target worker node (end-to-end encryption)
+    let response_bytes = fb_client
+        .send_encrypted_request_to_node(&url, &delete_request_bytes, "delete_request", &node_pubkey_bytes)
+        .await?;
+
     let delete_response = protocol::machine::root_as_delete_response(&response_bytes)
         .map_err(|e| anyhow::anyhow!("Failed to parse DeleteResponse: {}", e))?;
 
     if !delete_response.ok() {
         anyhow::bail!(
-            "Delete failed: {}",
+            "Direct delete failed for node {}: {}",
+            node_id,
             delete_response.message().unwrap_or("unknown error")
         );
     }
 
-    info!(
-        "Delete completed for manifest_id {}: {}",
-        manifest_id,
-        delete_response.message().unwrap_or("success")
-    );
-
-    Ok(manifest_id)
+    debug!("Direct delete successful for node {}", node_id);
+    Ok(())
 }
 
 #[cfg(test)]

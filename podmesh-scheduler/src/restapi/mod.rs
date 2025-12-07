@@ -93,10 +93,20 @@ pub fn build_router(
     control_tx: mpsc::UnboundedSender<crate::podmesh_p2p::control::Libp2pControl>,
     envelope_handler: std::sync::Arc<EnvelopeHandler>,
 ) -> Router {
+    let task_store = Arc::new(RwLock::new(HashMap::new()));
+    
+    // Set the global task store reference for workload integration
+    tokio::spawn({
+        let task_store_clone = Arc::clone(&task_store);
+        async move {
+            crate::workload_integration::set_task_store(task_store_clone).await;
+        }
+    });
+    
     let state = RestState {
         peer_rx,
         control_tx,
-        task_store: Arc::new(RwLock::new(HashMap::new())),
+        task_store,
         envelope_handler,
     };
     Router::new()
@@ -117,7 +127,7 @@ pub fn build_router(
         .route("/tasks/{task_id}", get(get_task_status))
         .route("/tasks/{task_id}", delete(delete_task))
         .route("/tasks/{task_id}/candidates", post(get_candidates))
-        .route("/apply_direct/{peer_id}", post(apply_direct))
+        .route("/tasks/{task_id}/providers", post(get_task_providers))
         .route("/nodes", get(get_nodes))
         .route("/runtime/engines", get(runtime_engines))
         .route("/runtime/workloads", get(list_runtime_workloads))
@@ -134,6 +144,9 @@ pub fn build_router(
             state.envelope_handler.clone(),
             envelope_handler::envelope_middleware,
         ))
+        // Passthrough routes for end-to-end encryption (no decryption by bootstrap)
+        .route("/apply_direct/{peer_id}", post(apply_direct).layer(middleware::from_fn(envelope_handler::envelope_passthrough_middleware)))
+        .route("/delete_direct/{peer_id}", post(delete_direct).layer(middleware::from_fn(envelope_handler::envelope_passthrough_middleware)))
         // state
         .with_state(state)
 }
@@ -330,6 +343,111 @@ async fn create_response_for_candidates(
     } else {
         // No KEM key in metadata, return unencrypted response
         create_response_with_fallback(response_data).await
+    }
+}
+
+/// Discover providers for a task/manifest via DHT
+pub async fn get_task_providers(
+    Path(task_id): Path<String>,
+    State(state): State<RestState>,
+    Extension(envelope_metadata): Extension<crate::restapi::envelope_handler::EnvelopeMetadata>,
+) -> Result<axum::response::Response<axum::body::Body>, axum::http::StatusCode> {
+    info!("get_task_providers: discovering providers for task_id={}", task_id);
+    debug!("get_task_providers: envelope_metadata peer_id={:?}, has_kem_pubkey={}", envelope_metadata.peer_id, !envelope_metadata.kem_pubkey.is_empty());
+
+    let providers = match find_manifest_providers(&task_id, &state).await {
+        Ok(providers) => {
+            info!("find_manifest_providers returned {} providers", providers.len());
+            providers
+        }
+        Err(e) => {
+            error!("Failed to discover providers for task_id {}: {}", task_id, e);
+            let error_json = serde_json::json!({
+                "providers": []
+            });
+            let response_data = error_json.to_string().into_bytes();
+            warn!("Returning error response with 0 providers ({} bytes)", response_data.len());
+            return create_response_for_providers(&state, &response_data, &envelope_metadata).await;
+        }
+    };
+
+    if providers.is_empty() {
+        info!("No providers found for task_id={}", task_id);
+        let empty_json = serde_json::json!({
+            "providers": []
+        });
+        let response_data = empty_json.to_string().into_bytes();
+        return create_response_for_providers(&state, &response_data, &envelope_metadata).await;
+    }
+
+    // For each provider, get their signing public key (stored during peer connection)
+    // For now, use a placeholder - in production, public keys should be cached from peer metadata
+    let mut providers_with_keys = Vec::new();
+    
+    // Get local peer ID to check if we're the provider
+    let (local_peer_tx, mut local_peer_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _ = state.control_tx.send(
+        crate::podmesh_p2p::control::Libp2pControl::GetLocalPeerId {
+            reply_tx: local_peer_tx,
+        },
+    );
+    
+    let local_peer_id = match tokio::time::timeout(Duration::from_secs(1), local_peer_rx.recv()).await {
+        Ok(Some(peer_id)) => Some(peer_id.to_string()),
+        _ => None,
+    };
+
+    for provider_peer_id in providers {
+        // If this is the local peer, get our own KEM public key for encryption
+        let pubkey_b64 = if Some(&provider_peer_id) == local_peer_id.as_ref() {
+            match crypto::ensure_kem_keypair_on_disk() {
+                Ok((pub_bytes, _)) => base64::engine::general_purpose::STANDARD.encode(&pub_bytes),
+                Err(e) => {
+                    warn!("Failed to get local KEM public key: {}", e);
+                    String::new()
+                }
+            }
+        } else {
+            // For remote peers, use placeholder (peer_id) until we have their real key via gossip/libp2p
+            provider_peer_id.clone()
+        };
+
+        providers_with_keys.push(serde_json::json!({
+            "peer_id": provider_peer_id,
+            "pubkey": pubkey_b64
+        }));
+    }
+
+    let response_json = serde_json::json!({
+        "providers": providers_with_keys
+    });
+
+    let response_data = response_json.to_string().into_bytes();
+    info!("get_task_providers: returning {} providers ({} bytes)", providers_with_keys.len(), response_data.len());
+    debug!("get_task_providers: response JSON: {}", response_json);
+    create_response_for_providers(&state, &response_data, &envelope_metadata).await
+}
+
+async fn create_response_for_providers(
+    state: &RestState,
+    response_data: &[u8],
+    envelope_metadata: &crate::restapi::envelope_handler::EnvelopeMetadata,
+) -> Result<axum::response::Response<axum::body::Body>, axum::http::StatusCode> {
+    if !envelope_metadata.kem_pubkey.is_empty() {
+        create_encrypted_response_with_key(
+            &state.envelope_handler,
+            response_data,
+            "providers_response",
+            envelope_metadata.peer_id.as_deref(),
+            &envelope_metadata.kem_pubkey,
+        )
+        .await
+    } else {
+        // No KEM key in metadata, return unencrypted response
+        Ok(axum::response::Response::builder()
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(response_data.to_vec()))
+            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?)
     }
 }
 
@@ -875,9 +993,14 @@ pub async fn delete_task(
         providers
     );
 
-    // Step 2: Create delete request
-    let delete_request =
-        protocol::machine::build_delete_request(&task_id, &operation_id, &origin_peer, force);
+    // Step 2: Use the original signed envelope from the CLI for forwarding
+    // This preserves the CLI's signature for verification on worker nodes
+    let delete_request_to_forward = if !envelope_metadata.original_envelope.is_empty() {
+        envelope_metadata.original_envelope.clone()
+    } else {
+        // Fallback: build a new delete request if no envelope (shouldn't happen with CLI requests)
+        protocol::machine::build_delete_request(&task_id, &operation_id, &origin_peer, force)
+    };
 
     // Step 3: Send delete requests to all providers
     let mut successful_deletes = Vec::new();
@@ -966,7 +1089,7 @@ pub async fn delete_task(
             }
         } else {
             // Send delete request to remote peer
-            match send_delete_request_to_peer(&state, &provider_peer_id_str, &delete_request).await
+            match send_delete_request_to_peer(&state, &provider_peer_id_str, &delete_request_to_forward).await
             {
                 Ok(result) => {
                     info!(
@@ -1053,9 +1176,29 @@ async fn handle_local_delete(manifest_id: &str, _force: bool) -> Result<Vec<Stri
     }
 }
 
-/// Find providers for a task using DHT discovery
+/// Find providers for a task using cached assignment info and DHT discovery
 async fn find_manifest_providers(task_id: &str, state: &RestState) -> Result<Vec<String>, String> {
     info!("find_manifest_providers: searching for task_id={}", task_id);
+
+    // First, check if we have assigned_peers in the task record (this is faster and more reliable)
+    {
+        let store = state.task_store.read().await;
+        if let Some(record) = store.get(task_id) {
+            if let Some(ref assigned_peers) = record.assigned_peers {
+                if !assigned_peers.is_empty() {
+                    info!(
+                        "find_manifest_providers: found {} assigned peers from task record for task_id={}",
+                        assigned_peers.len(),
+                        task_id
+                    );
+                    return Ok(assigned_peers.clone());
+                }
+            }
+        }
+    }
+
+    // Fallback to DHT discovery if no assigned peers found
+    info!("find_manifest_providers: no assigned peers found, falling back to DHT discovery");
 
     // Use the libp2p control system to find providers for this manifest
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1075,7 +1218,7 @@ async fn find_manifest_providers(task_id: &str, state: &RestState) -> Result<Vec
     match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
         Ok(Some(providers)) => {
             info!(
-                "find_manifest_providers: found {} providers for task_id={}",
+                "find_manifest_providers: found {} providers from DHT for task_id={}",
                 providers.len(),
                 task_id
             );
@@ -1160,13 +1303,19 @@ pub async fn apply_direct(
     Path(peer_id): Path<String>,
     State(state): State<RestState>,
     _headers: HeaderMap,
-    Extension(_envelope_metadata): Extension<crate::restapi::envelope_handler::EnvelopeMetadata>,
+    Extension(envelope_metadata): Extension<crate::restapi::envelope_handler::EnvelopeMetadata>,
     body: Bytes,
 ) -> Result<axum::response::Response<axum::body::Body>, axum::http::StatusCode> {
     debug!("apply_direct: forwarding ApplyRequest to peer {}", peer_id);
 
-    // The envelope middleware has already decrypted the payload for us
-    let apply_request_bytes = body.to_vec();
+    // Use the original signed envelope from the CLI (preserved by middleware)
+    // This maintains the CLI's signature for verification on the worker node
+    let apply_request_bytes = if !envelope_metadata.original_envelope.is_empty() {
+        envelope_metadata.original_envelope.clone()
+    } else {
+        // Fallback to decrypted payload if no envelope (shouldn't happen)
+        body.to_vec()
+    };
 
     // Parse the peer string into a PeerId
     let target_peer_id: libp2p::PeerId = match peer_id.parse() {
@@ -1229,6 +1378,98 @@ pub async fn apply_direct(
     };
 
     // Return response (simplified - no encryption needed for this case)
+    create_response_with_fallback(&result).await
+}
+
+/// Forward a DeleteRequest directly to a specific peer via libp2p (passthrough with end-to-end encryption)
+pub async fn delete_direct(
+    Path(peer_id): Path<String>,
+    State(state): State<RestState>,
+    _headers: HeaderMap,
+    Extension(envelope_metadata): Extension<crate::restapi::envelope_handler::EnvelopeMetadata>,
+    body: Bytes,
+) -> Result<axum::response::Response<axum::body::Body>, axum::http::StatusCode> {
+    debug!("delete_direct: forwarding DeleteRequest to peer {}", peer_id);
+
+    // Use the original signed envelope from the CLI (preserved by passthrough middleware)
+    let delete_request_bytes = if !envelope_metadata.original_envelope.is_empty() {
+        envelope_metadata.original_envelope.clone()
+    } else {
+        // Fallback to body if no envelope (shouldn't happen)
+        body.to_vec()
+    };
+
+    // Parse the peer string into a PeerId
+    let target_peer_id: libp2p::PeerId = match peer_id.parse() {
+        Ok(id) => id,
+        Err(e) => {
+            log::warn!("delete_direct: invalid peer ID '{}': {}", peer_id, e);
+            let error_response = protocol::machine::build_delete_response(
+                false,
+                "unknown",
+                &format!("Invalid peer ID: {}", e),
+                "unknown",
+                &[],
+            );
+            return create_response_with_fallback(&error_response).await;
+        }
+    };
+
+    // Forward the DeleteRequest directly to the peer via libp2p
+    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Result<String, String>>();
+    if let Err(e) = state.control_tx.send(
+        crate::podmesh_p2p::control::Libp2pControl::SendDeleteRequest {
+            peer_id: target_peer_id,
+            delete_request: delete_request_bytes,
+            reply_tx,
+        },
+    ) {
+        log::error!("delete_direct: failed to send to libp2p control: {}", e);
+        let error_response = protocol::machine::build_delete_response(
+            false,
+            "unknown",
+            "Failed to forward request to libp2p",
+            "unknown",
+            &[],
+        );
+        return create_response_with_fallback(&error_response).await;
+    }
+
+    // Wait for response with timeout
+    let result = match tokio::time::timeout(Duration::from_secs(30), reply_rx.recv()).await {
+        Ok(Some(Ok(_msg))) => {
+            debug!("delete_direct: success for peer {}", peer_id);
+            protocol::machine::build_delete_response(
+                true,
+                "forwarded",
+                "Request forwarded successfully",
+                "unknown",
+                &[],
+            )
+        }
+        Ok(Some(Err(e))) => {
+            log::warn!("delete_direct: error for peer {}: {}", peer_id, e);
+            protocol::machine::build_delete_response(
+                false,
+                "forwarded",
+                &format!("Forward failed: {}", e),
+                "unknown",
+                &[],
+            )
+        }
+        _ => {
+            log::warn!("delete_direct: timeout for peer {}", peer_id);
+            protocol::machine::build_delete_response(
+                false,
+                "forwarded",
+                "Timeout waiting for peer response",
+                "unknown",
+                &[],
+            )
+        }
+    };
+
+    // Return response
     create_response_with_fallback(&result).await
 }
 

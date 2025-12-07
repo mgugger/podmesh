@@ -116,7 +116,8 @@ pub fn setup_libp2p_node(
                 "/podmesh/apply/1.0.0",
                 request_response::ProtocolSupport::Full,
             )),
-            request_response::Config::default(),
+            request_response::Config::default()
+                .with_request_timeout(std::time::Duration::from_secs(60)),
         );
 
         let handshake_rr = request_response::Behaviour::new(
@@ -145,15 +146,19 @@ pub fn setup_libp2p_node(
 
         let store = kad::store::MemoryStore::new(key.public().to_peer_id());
         let mut kademlia_config = kad::Config::default();
-        kademlia_config.set_replication_factor(std::num::NonZeroUsize::new(1).unwrap());
+        // Use replication factor of 3 to ensure provider records reach all nodes in small networks
+        kademlia_config.set_replication_factor(std::num::NonZeroUsize::new(3).unwrap());
         kademlia_config.set_max_packet_size(1024 * 1024);
         kademlia_config.set_parallelism(std::num::NonZeroUsize::new(3).unwrap());
         kademlia_config.set_query_timeout(std::time::Duration::from_secs(15));
         kademlia_config.set_provider_record_ttl(Some(std::time::Duration::from_secs(30)));
         kademlia_config.set_provider_publication_interval(Some(std::time::Duration::from_secs(5)));
 
-        let kademlia =
+        let mut kademlia =
             kad::Behaviour::with_config(key.public().to_peer_id(), store, kademlia_config);
+        
+        // Set Kademlia to server mode so nodes can store and serve provider records from other peers
+        kademlia.set_mode(Some(kad::Mode::Server));
 
         let relay = relay::Behaviour::new(key.public().to_peer_id(), Default::default());
         let autonat = autonat::Behaviour::new(key.public().to_peer_id(), Default::default());

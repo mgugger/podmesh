@@ -29,6 +29,12 @@ pub fn kademlia_event(event: kad::Event, _peer_id: Option<PeerId>) {
                     let _ = tx.send(providers.into_iter().collect());
                 }
             }
+            kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FinishedWithNoAdditionalRecord { closest_peers })) => {
+                info!("DHT: No providers found for query {:?}, closest_peers: {:?}", id, closest_peers);
+                if let Some(tx) = control::take_pending_providers_query(&id) {
+                    let _ = tx.send(Vec::new()); // Send empty vector when no providers found
+                }
+            }
             kad::QueryResult::GetProviders(Err(e)) => {
                 warn!("DHT: Failed to get providers for query {:?}: {:?}", id, e);
                 if let Some(tx) = control::take_pending_providers_query(&id) {
@@ -104,6 +110,15 @@ pub fn kademlia_event(event: kad::Event, _peer_id: Option<PeerId>) {
                     source,
                     record.as_ref().map(|r| &r.key)
                 );
+            }
+            kad::InboundRequest::AddProvider { record } => {
+                info!(
+                    "DHT: Received AddProvider request for key: {:?}",
+                    record.as_ref().map(|r| &r.key)
+                );
+            }
+            kad::InboundRequest::FindNode { .. } => {
+                debug!("DHT: Received FindNode request");
             }
             _ => {
                 debug!("DHT: Other inbound request: {:?}", request);
