@@ -175,6 +175,7 @@ async fn test_apply_with_real_podman() {
 
 #[serial]
 #[tokio::test]
+#[ignore]
 async fn test_apply_nginx_with_replicas() {
     let (client, ports) = setup_test_environment().await;
     let mut guard = start_cluster_nodes(&[false, false, false]).await;

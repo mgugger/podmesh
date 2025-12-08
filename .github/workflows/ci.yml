@@ -55,3 +55,8 @@ jobs:
         env:
           PODMAN_HOST: ${{ env.PODMAN_HOST }}
         run: cargo test --workspace --locked --features podman-tests
+
+      - name: Cargo test (ignored tests)
+        env:
+          PODMAN_HOST: ${{ env.PODMAN_HOST }}
+        run: cargo test -- --ignored
