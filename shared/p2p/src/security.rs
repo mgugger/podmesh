@@ -4,15 +4,8 @@ use thiserror::Error;
 
 use crate::envelope;
 
-/// Verified envelope metadata captured during signature validation.
-#[derive(Debug)]
-pub struct VerifiedEnvelope {
-    pub payload: Vec<u8>,
-    pub pubkey: Vec<u8>,
-    pub signature: Vec<u8>,
-    pub timestamp_ms: u64,
-    pub payload_type: String,
-}
+// Re-export VerifiedEnvelope from the envelope module for backward compatibility
+pub use crate::envelope::VerifiedEnvelope;
 
 /// Signature enforcement failure when signed messages are required.
 #[derive(Debug, Error)]
@@ -27,19 +20,19 @@ pub fn require_signed_messages() -> bool {
 }
 
 /// Verify a FlatBuffer envelope and check nonce for replay protection.
-/// Returns the parsed envelope parts on successful verification.
+/// Returns the verified envelope on successful verification.
 pub fn verify_envelope_and_check_nonce(
     envelope_bytes: &[u8],
-) -> anyhow::Result<crate::envelope::VerifiedEnvelopeParts> {
+) -> anyhow::Result<VerifiedEnvelope> {
     verify_envelope_and_check_nonce_for_peer(envelope_bytes, "global")
 }
 
 /// Verify a FlatBuffer envelope and check nonce for replay protection for a specific peer.
-/// Returns the parsed envelope parts on successful verification.
+/// Returns the verified envelope on successful verification.
 pub fn verify_envelope_and_check_nonce_for_peer(
     envelope_bytes: &[u8],
     peer_id: &str,
-) -> anyhow::Result<crate::envelope::VerifiedEnvelopeParts> {
+) -> anyhow::Result<VerifiedEnvelope> {
     envelope::verify_flatbuffer_envelope_for_peer(
         envelope_bytes,
         std::time::Duration::from_secs(300),
@@ -54,12 +47,5 @@ pub fn verify_signed_payload_for_peer(
     peer: &PeerId,
 ) -> Result<VerifiedEnvelope, EnvelopeRejection> {
     verify_envelope_and_check_nonce_for_peer(message_bytes, &peer.to_string())
-        .map(|parts| VerifiedEnvelope {
-            payload: parts.payload,
-            pubkey: parts.pubkey,
-            signature: parts.signature,
-            timestamp_ms: parts.timestamp_ms,
-            payload_type: parts.payload_type,
-        })
         .map_err(EnvelopeRejection::SignatureRequired)
 }

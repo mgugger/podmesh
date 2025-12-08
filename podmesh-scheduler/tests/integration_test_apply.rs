@@ -179,11 +179,15 @@ async fn test_apply_nginx_with_replicas() {
     let (client, ports) = setup_test_environment().await;
     let mut guard = start_cluster_nodes(&[false, false, false]).await;
 
+    // Wait longer for mesh formation and stabilization, especially for replica tests
     sleep(Duration::from_secs(3)).await;
-    let mesh_formed = wait_for_mesh_formation(&client, &ports, Duration::from_secs(15)).await;
+    let mesh_formed = wait_for_mesh_formation(&client, &ports, Duration::from_secs(20)).await;
     if !mesh_formed {
         log::warn!("Mesh formation incomplete, but proceeding with test");
     }
+    
+    // Additional stabilization time for request-response protocol to be ready
+    sleep(Duration::from_secs(2)).await;
 
     let manifest_path = manifest_path("nginx_with_replicas.yml");
     let original_content = tokio::fs::read_to_string(manifest_path.clone())

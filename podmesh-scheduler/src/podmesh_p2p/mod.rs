@@ -102,7 +102,8 @@ pub fn setup_libp2p_node(
                 "/podmesh/handshake/1.0.0",
                 request_response::ProtocolSupport::Full,
             )),
-            request_response::Config::default(),
+            request_response::Config::default()
+                .with_request_timeout(std::time::Duration::from_secs(5)),
         );
 
         let scheduler_rr = request_response::Behaviour::new(
@@ -110,7 +111,8 @@ pub fn setup_libp2p_node(
                 "/podmesh/scheduler-tasks/1.0.0",
                 request_response::ProtocolSupport::Full,
             )),
-            request_response::Config::default(),
+            request_response::Config::default()
+                .with_request_timeout(std::time::Duration::from_secs(5)),
         );
 
         let delete_rr = request_response::Behaviour::new(
@@ -118,7 +120,8 @@ pub fn setup_libp2p_node(
                 "/podmesh/delete/1.0.0",
                 request_response::ProtocolSupport::Full,
             )),
-            request_response::Config::default(),
+            request_response::Config::default()
+                .with_request_timeout(std::time::Duration::from_secs(5)),
         );
 
         let store = kad::store::MemoryStore::new(key.public().to_peer_id());

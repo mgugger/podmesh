@@ -106,20 +106,28 @@ pub async fn wait_for_mesh_formation(
     let start = Instant::now();
     loop {
         let mut total_peers = 0usize;
+        let mut nodes_with_peers = 0usize;
+        
         for &port in ports {
             let base = format!("http://127.0.0.1:{}", port);
             if let Ok(resp) = client.get(format!("{}/debug/peers", base)).send().await {
                 if let Ok(json) = resp.json::<serde_json::Value>().await {
                     if let Some(peers_array) = json.get("peers").and_then(|v| v.as_array()) {
-                        total_peers += peers_array.len();
+                        let peer_count = peers_array.len();
+                        total_peers += peer_count;
+                        if peer_count > 0 {
+                            nodes_with_peers += 1;
+                        }
                     }
                 }
             }
         }
 
-        if total_peers >= 2 {
+        // Require all nodes to have at least one peer connection
+        if nodes_with_peers >= ports.len() {
             log::info!(
-                "Mesh formation successful: {} total peer connections",
+                "Mesh formation successful: {} nodes with peers, {} total peer connections",
+                nodes_with_peers,
                 total_peers
             );
             return true;
@@ -127,8 +135,10 @@ pub async fn wait_for_mesh_formation(
 
         if start.elapsed() > timeout {
             log::warn!(
-                "Mesh formation timed out after {:?}, only {} peer connections",
+                "Mesh formation timed out after {:?}, only {}/{} nodes with peers, {} total connections",
                 timeout,
+                nodes_with_peers,
+                ports.len(),
                 total_peers
             );
             return false;
