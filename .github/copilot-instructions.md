@@ -80,7 +80,7 @@ The project consists of the following crates:
 
 ## Message Security
 
-**All inter-node communication MUST be encrypted and signed.** The system uses post-quantum cryptographic primitives for future-proof security.
+**All inter-node communication MUST be encrypted and signed.** The system uses proven cryptographic primitives.
 
 ### Envelope Structure
 
@@ -88,15 +88,15 @@ Every message is wrapped in an `Envelope` (see `shared/protocol/src/machine.rs`)
 
 ```rust
 Envelope {
-    payload: Vec<u8>,      // Encrypted payload (AES-256-GCM)
+    payload: Vec<u8>,      // Encrypted payload (XChaCha20-Poly1305)
     payload_type: String,  // "manifest", "handshake", "capacity", etc.
     nonce: String,         // Unique nonce for replay protection
     ts: u64,               // Unix timestamp in milliseconds
-    alg: String,           // Signature algorithm ("ml-dsa-65")
+    alg: String,           // Signature algorithm ("ed25519")
     sig: String,           // Base64-encoded signature
     pubkey: String,        // Sender's signing public key (base64)
     peer_id: String,       // Sender's libp2p peer ID
-    kem_pubkey: String,    // Sender's KEM public key for encrypted responses
+    kem_pubkey: String,    // Sender's X25519 public key for encrypted responses
 }
 ```
 
@@ -104,18 +104,9 @@ Envelope {
 
 | Purpose | Algorithm | Implementation |
 |---------|-----------|----------------|
-| Digital Signatures | ML-DSA-65 (post-quantum) | `saorsa_pqc` crate |
-| Key Encapsulation | ML-KEM-512 (post-quantum) | `saorsa_pqc` crate |
-| Symmetric Encryption | AES-256-GCM | `aes-gcm` crate |
-
-### Encryption Flow
-
-1. **Sender** encapsulates to recipient's ML-KEM-512 public key → derives shared secret
-2. **Sender** encrypts payload with AES-256-GCM using the shared secret
-3. **Sender** signs the envelope with ML-DSA-65 private key
-4. **Recipient** decapsulates ciphertext → recovers shared secret
-5. **Recipient** decrypts AES-256-GCM payload
-6. **Recipient** verifies ML-DSA-65 signature against sender's public key
+| Digital Signatures | Ed25519 | `ed25519_dalek` crate |
+| Key Exchange | X25519 | `x25519_dalek` crate |
+| Symmetric Encryption | XChaCha20-Poly1305 | `chacha20poly1305` crate |
 
 ### Security Requirements
 

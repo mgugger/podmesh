@@ -1,16 +1,15 @@
-use crypto::{ensure_keypair_ephemeral, ensure_pqc_init, sign_envelope};
+use crypto::{ensure_keypair_ephemeral, sign_envelope};
 use protocol::machine::build_envelope_signed;
 
 #[test]
 fn envelope_helper_roundtrip() {
-    ensure_pqc_init().expect("init");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("keypair");
 
     let payload = b"hello-postcard".to_vec();
     let payload_type = "test";
     let nonce = "n-123";
     let ts = 42u64;
-    let alg = "ml-dsa-65";
+    let alg = "ed25519";
 
     // Build canonical bytes and sign using crypto helper
     let canonical =
@@ -24,7 +23,7 @@ fn envelope_helper_roundtrip() {
         nonce,
         ts,
         alg,
-        "ml-dsa-65",
+        "ed25519",
         &sig_b64,
         &pub_b64,
         None,
@@ -39,6 +38,6 @@ fn envelope_helper_roundtrip() {
     // signature/pub decode to non-empty bytes
     assert!(!sig_bytes.is_empty());
     assert!(!pub_bytes.is_empty());
-    assert!(sig_field.contains("ml-dsa-65"));
+    assert!(sig_field.contains("ed25519"));
     assert_eq!(pub_field, pub_b64);
 }

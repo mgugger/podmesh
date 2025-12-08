@@ -187,7 +187,8 @@ async fn test_apply_nginx_with_replicas() {
     }
     
     // Additional stabilization time for request-response protocol to be ready
-    sleep(Duration::from_secs(2)).await;
+    // This is especially important in CI environments where resources may be constrained
+    sleep(Duration::from_secs(3)).await;
 
     let manifest_path = manifest_path("nginx_with_replicas.yml");
     let original_content = tokio::fs::read_to_string(manifest_path.clone())

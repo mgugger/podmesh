@@ -5,9 +5,11 @@
 
 use crate::logging::CryptoLogger;
 use anyhow::Result;
+use ed25519_dalek::SigningKey;
 use log::{info, warn};
 use once_cell::sync::OnceCell;
 use std::sync::Mutex;
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 /// Keypair operation error types
 #[derive(Debug, thiserror::Error)]
@@ -20,8 +22,6 @@ pub enum KeypairError {
     StorageFailed(String),
     #[error("Invalid keypair format: {0}")]
     InvalidFormat(String),
-    #[error("PQC initialization failed: {0}")]
-    PqcInitFailed(String),
 }
 
 /// Keypair operation result type
@@ -150,17 +150,13 @@ impl KeypairManager {
             return Ok(keypair.clone());
         }
 
-        // Generate new ephemeral KEM keypair
-        crate::ensure_pqc_init().map_err(|e| KeypairError::PqcInitFailed(e.to_string()))?;
+        // Generate new ephemeral X25519 keypair
+        let mut rng = rand::rngs::OsRng;
+        let secret = StaticSecret::random_from_rng(&mut rng);
+        let public = X25519PublicKey::from(&secret);
 
-        use saorsa_pqc::api::kem::ml_kem_512;
-        let kem = ml_kem_512();
-        let (pubk, privk) = kem.generate_keypair().map_err(|e| {
-            KeypairError::GenerationFailed(format!("KEM keypair generation: {:?}", e))
-        })?;
-
-        let pub_bytes = pubk.to_bytes();
-        let priv_bytes = privk.to_bytes();
+        let pub_bytes = public.as_bytes().to_vec();
+        let priv_bytes = secret.as_bytes().to_vec();
 
         CryptoLogger::log_crypto_operation(
             "generate_ephemeral_kem_keypair",
@@ -179,18 +175,14 @@ impl KeypairManager {
 
     /// Generate fresh keypair without caching
     pub fn generate_fresh_keypair(keypair_type: KeypairType) -> KeypairResult<(Vec<u8>, Vec<u8>)> {
-        crate::ensure_pqc_init().map_err(|e| KeypairError::PqcInitFailed(e.to_string()))?;
-
         match keypair_type {
             KeypairType::Signing => {
-                use saorsa_pqc::api::sig::ml_dsa_65;
-                let dsa = ml_dsa_65();
-                let (pubk, privk) = dsa.generate_keypair().map_err(|e| {
-                    KeypairError::GenerationFailed(format!("signing keypair: {:?}", e))
-                })?;
+                let mut rng = rand::rngs::OsRng;
+                let signing_key = SigningKey::generate(&mut rng);
+                let verifying_key = signing_key.verifying_key();
 
-                let pub_bytes = pubk.to_bytes();
-                let priv_bytes = privk.to_bytes();
+                let pub_bytes = verifying_key.to_bytes().to_vec();
+                let priv_bytes = signing_key.to_bytes().to_vec();
 
                 CryptoLogger::log_crypto_operation(
                     "generate_fresh_signing_keypair",
@@ -200,14 +192,12 @@ impl KeypairManager {
                 Ok((pub_bytes, priv_bytes))
             }
             KeypairType::Kem => {
-                use saorsa_pqc::api::kem::ml_kem_512;
-                let kem = ml_kem_512();
-                let (pubk, privk) = kem
-                    .generate_keypair()
-                    .map_err(|e| KeypairError::GenerationFailed(format!("KEM keypair: {:?}", e)))?;
+                let mut rng = rand::rngs::OsRng;
+                let secret = StaticSecret::random_from_rng(&mut rng);
+                let public = X25519PublicKey::from(&secret);
 
-                let pub_bytes = pubk.to_bytes();
-                let priv_bytes = privk.to_bytes();
+                let pub_bytes = public.as_bytes().to_vec();
+                let priv_bytes = secret.as_bytes().to_vec();
 
                 CryptoLogger::log_crypto_operation(
                     "generate_fresh_kem_keypair",
@@ -352,10 +342,6 @@ impl KeypairManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::OnceLock;
-
-    // Mutex for PQC tests to avoid races
-    static PQC_TEST_MUTEX: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
 
     #[test]
     fn test_keypair_type_display() {
@@ -383,9 +369,6 @@ mod tests {
 
         let error = KeypairError::InvalidFormat("format error".to_string());
         assert!(error.to_string().contains("format error"));
-
-        let error = KeypairError::PqcInitFailed("pqc error".to_string());
-        assert!(error.to_string().contains("pqc error"));
     }
 
     #[test]
@@ -410,11 +393,6 @@ mod tests {
 
     #[test]
     fn test_ephemeral_keypair_generation() {
-        let _guard = PQC_TEST_MUTEX
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
         // Clear caches first
         KeypairManager::clear_ephemeral_caches();
 
@@ -434,11 +412,6 @@ mod tests {
 
     #[test]
     fn test_fresh_keypair_generation() {
-        let _guard = PQC_TEST_MUTEX
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
         // Generate fresh signing keypairs (should be different each time)
         let result1 = KeypairManager::generate_fresh_keypair(KeypairType::Signing);
         let result2 = KeypairManager::generate_fresh_keypair(KeypairType::Signing);
@@ -456,11 +429,6 @@ mod tests {
 
     #[test]
     fn test_keypair_info() {
-        let _guard = PQC_TEST_MUTEX
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
         let info = KeypairManager::get_keypair_info(KeypairType::Signing, StorageMode::Ephemeral);
 
         if info.is_ok() {

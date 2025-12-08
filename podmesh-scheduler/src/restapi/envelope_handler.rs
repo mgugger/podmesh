@@ -477,7 +477,7 @@ pub fn get_peer_id_from_request(headers: &HeaderMap) -> Option<String> {
 #[cfg(test)]
 mod tests {
 
-    use crypto::{ensure_keypair_ephemeral, ensure_pqc_init};
+    use crypto::ensure_keypair_ephemeral;
 
     struct KeypairConfigGuard(crypto::KeypairConfig);
 
@@ -501,8 +501,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_envelope_roundtrip() {
-        ensure_pqc_init().expect("PQC init failed");
-
         // Set ephemeral KEM mode for this test
         let _config_guard = KeypairConfigGuard::kem_ephemeral();
 
@@ -535,7 +533,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let alg = "ml-dsa-65";
+        let alg = "ed25519";
 
         // Build canonical envelope for signing
         let canonical = protocol::machine::build_envelope_canonical(
@@ -558,7 +556,7 @@ mod tests {
             &nonce,
             timestamp,
             alg,
-            "ml-dsa-65",
+            "ed25519",
             &sig_b64,
             &pub_b64,
             None,

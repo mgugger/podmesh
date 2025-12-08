@@ -21,14 +21,14 @@ mod tests {
     #[test]
     fn canonical_and_signed_envelope_share_payload() {
         let payload = b"demo";
-        let canonical = build_envelope_canonical(payload, "demo", "nonce", 1, "ml-dsa-65", None);
+        let canonical = build_envelope_canonical(payload, "demo", "nonce", 1, "ed25519", None);
         let signed = build_envelope_signed(
             payload,
             "demo",
             "nonce",
             1,
-            "ml-dsa-65",
-            "ml-dsa-65",
+            "ed25519",
+            "ed25519",
             "c2ln",
             "cHVi",
             None,

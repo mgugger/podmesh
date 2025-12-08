@@ -555,7 +555,7 @@ pub async fn create_task(
 
     // Create envelope for the encrypted payload - no longer need to parse as EncryptedManifest
     let manifest_bytes_to_store =
-        if !payload_bytes_for_parsing.is_empty() && payload_bytes_for_parsing[0] == 0x02 {
+        if !payload_bytes_for_parsing.is_empty() && payload_bytes_for_parsing[0] == 0x03 {
             log::info!("create_task: detected encrypted manifest payload (recipient-blob format)");
 
             // Create a proper envelope containing the encrypted payload for decryption
@@ -572,7 +572,7 @@ pub async fn create_task(
                 "manifest",
                 &nonce_str,
                 ts,
-                "ml-kem-512",
+                "x25519",
                 None,
             )
         } else {

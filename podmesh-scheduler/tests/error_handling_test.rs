@@ -1,11 +1,10 @@
-use crypto::{b64_encode, ensure_keypair_ephemeral, ensure_pqc_init, sign_envelope};
+use crypto::{b64_encode, ensure_keypair_ephemeral, sign_envelope};
 use podmesh_scheduler::podmesh_p2p::envelope::verify_envelope;
 use protocol::machine::{build_envelope_canonical, build_envelope_signed};
 use std::time::Duration;
 
 #[test]
 fn test_signature_verification_error_messages() {
-    ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
     let (pubb2, _privb2) = ensure_keypair_ephemeral().expect("Failed to generate second keypair");
 
@@ -15,7 +14,7 @@ fn test_signature_verification_error_messages() {
         "test",
         "error-test-nonce",
         1234567890,
-        "ml-dsa-65",
+        "ed25519",
         None,
     );
 
@@ -28,8 +27,8 @@ fn test_signature_verification_error_messages() {
             "test",
             "invalid-sig-nonce",
             1234567890,
-            "ml-dsa-65",
-            "ml-dsa-65",
+            "ed25519",
+            "ed25519",
             invalid_sig,
             &pub_b64,
             None,
@@ -55,8 +54,8 @@ fn test_signature_verification_error_messages() {
             "test",
             "invalid-length-nonce",
             1234567890,
-            "ml-dsa-65",
-            "ml-dsa-65",
+            "ed25519",
+            "ed25519",
             &invalid_sig,
             &pub_b64,
             None,
@@ -83,8 +82,8 @@ fn test_signature_verification_error_messages() {
             "test",
             "wrong-key-nonce",
             1234567890,
-            "ml-dsa-65",
-            "ml-dsa-65",
+            "ed25519",
+            "ed25519",
             &sig_b64,
             &wrong_pub_b64,
             None,
@@ -110,7 +109,7 @@ fn test_signature_verification_error_messages() {
             "test",
             "tamper-nonce",
             1234567890,
-            "ml-dsa-65",
+            "ed25519",
             None,
         );
 
@@ -122,8 +121,8 @@ fn test_signature_verification_error_messages() {
             "test",
             "tamper-nonce",
             1234567890,
-            "ml-dsa-65",
-            "ml-dsa-65",
+            "ed25519",
+            "ed25519",
             &sig_b64,
             &pub_b64,
             None,
@@ -151,8 +150,8 @@ fn test_signature_verification_error_messages() {
             "test",
             "invalid-pub-nonce",
             1234567890,
-            "ml-dsa-65",
-            "ml-dsa-65",
+            "ed25519",
+            "ed25519",
             &sig_b64,
             &invalid_pub,
             None,
@@ -175,7 +174,6 @@ fn test_signature_verification_error_messages() {
 
 #[test]
 fn test_envelope_parsing_robustness() {
-    ensure_pqc_init().expect("PQC initialization failed");
 
     {
         let truncated_data = b"truncated";
@@ -229,8 +227,8 @@ fn test_envelope_parsing_robustness() {
             "test",
             "empty-sig-nonce",
             1234567890,
-            "ml-dsa-65",
-            "ml-dsa-65",
+            "ed25519",
+            "ed25519",
             "",
             "",
             None,
@@ -258,8 +256,8 @@ fn test_envelope_parsing_robustness() {
             "test",
             "malformed-b64-nonce",
             1234567890,
-            "ml-dsa-65",
-            "ml-dsa-65",
+            "ed25519",
+            "ed25519",
             "malformed-base64-!!!",
             "also-malformed-base64-@@@",
             None,
@@ -282,7 +280,6 @@ fn test_envelope_parsing_robustness() {
 
 #[test]
 fn test_nonce_validation_errors() {
-    ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 
     let payload = b"nonce validation test";
@@ -293,7 +290,7 @@ fn test_nonce_validation_errors() {
             "test",
             "duplicate-nonce-123",
             1234567890,
-            "ml-dsa-65",
+            "ed25519",
             None,
         );
 
@@ -305,8 +302,8 @@ fn test_nonce_validation_errors() {
             "test",
             "duplicate-nonce-123",
             1234567890,
-            "ml-dsa-65",
-            "ml-dsa-65",
+            "ed25519",
+            "ed25519",
             &sig_b64,
             &pub_b64,
             None,
@@ -331,7 +328,7 @@ fn test_nonce_validation_errors() {
 
     {
         let canonical_empty_nonce =
-            build_envelope_canonical(payload, "test", "", 1234567890, "ml-dsa-65", None);
+            build_envelope_canonical(payload, "test", "", 1234567890, "ed25519", None);
 
         let (sig_b64, pub_b64) = sign_envelope(&privb, &pubb, &canonical_empty_nonce)
             .expect("Failed to sign envelope with empty nonce");
@@ -341,8 +338,8 @@ fn test_nonce_validation_errors() {
             "test",
             "",
             1234567890,
-            "ml-dsa-65",
-            "ml-dsa-65",
+            "ed25519",
+            "ed25519",
             &sig_b64,
             &pub_b64,
             None,
@@ -359,7 +356,6 @@ fn test_nonce_validation_errors() {
 
 #[test]
 fn test_algorithm_mismatch_errors() {
-    ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 
     let payload = b"algorithm test payload";
@@ -382,7 +378,7 @@ fn test_algorithm_mismatch_errors() {
         "alg-test-nonce",
         1234567890,
         "different-algorithm",
-        "ml-dsa-65",
+        "ed25519",
         &sig_b64,
         &pub_b64,
         None,
@@ -398,14 +394,13 @@ fn test_algorithm_mismatch_errors() {
 
 #[test]
 fn test_timestamp_edge_cases() {
-    ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 
     let payload = b"timestamp test payload";
 
     {
         let canonical_zero_ts =
-            build_envelope_canonical(payload, "test", "zero-ts-nonce", 0, "ml-dsa-65", None);
+            build_envelope_canonical(payload, "test", "zero-ts-nonce", 0, "ed25519", None);
 
         let (sig_b64, pub_b64) = sign_envelope(&privb, &pubb, &canonical_zero_ts)
             .expect("Failed to sign envelope with zero timestamp");
@@ -415,8 +410,8 @@ fn test_timestamp_edge_cases() {
             "test",
             "zero-ts-nonce",
             0,
-            "ml-dsa-65",
-            "ml-dsa-65",
+            "ed25519",
+            "ed25519",
             &sig_b64,
             &pub_b64,
             None,
@@ -437,7 +432,7 @@ fn test_timestamp_edge_cases() {
             "test",
             "max-ts-nonce",
             max_timestamp,
-            "ml-dsa-65",
+            "ed25519",
             None,
         );
 
@@ -449,8 +444,8 @@ fn test_timestamp_edge_cases() {
             "test",
             "max-ts-nonce",
             max_timestamp,
-            "ml-dsa-65",
-            "ml-dsa-65",
+            "ed25519",
+            "ed25519",
             &sig_b64,
             &pub_b64,
             None,
@@ -470,7 +465,6 @@ fn test_concurrent_nonce_validation() {
     use std::sync::Arc;
     use std::thread;
 
-    ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 
     let payload = b"concurrent nonce test";
@@ -492,7 +486,7 @@ fn test_concurrent_nonce_validation() {
                 "test",
                 &nonce,
                 1234567890 + i as u64,
-                "ml-dsa-65",
+                "ed25519",
                 None,
             );
 
@@ -504,8 +498,8 @@ fn test_concurrent_nonce_validation() {
                 "test",
                 &nonce,
                 1234567890 + i as u64,
-                "ml-dsa-65",
-                "ml-dsa-65",
+                "ed25519",
+                "ed25519",
                 &sig_b64,
                 &pub_b64,
                 None,

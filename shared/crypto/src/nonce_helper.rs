@@ -9,7 +9,7 @@ fn nonce_store() -> &'static Mutex<HashMap<String, HashMap<String, Instant>>> {
     NONCE_STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Accept a signature string potentially prefixed (e.g. "ml-dsa-65:<b64>") and return decoded bytes.
+/// Accept a signature string potentially prefixed (e.g. "ed25519:<b64>") and return decoded bytes.
 /// Keeps prefix-handling logic centralized.
 pub fn normalize_and_decode_signature(sig_opt: Option<&str>) -> anyhow::Result<Vec<u8>> {
     let sig_str = sig_opt.unwrap_or("");
@@ -77,7 +77,7 @@ mod tests {
     #[test]
     fn test_signature_prefix_handling() {
         // Test with prefix
-        let sig_with_prefix = "ml-dsa-65:dGVzdA=="; // "test" in base64
+        let sig_with_prefix = "ed25519:dGVzdA=="; // "test" in base64
         let decoded = normalize_and_decode_signature(Some(sig_with_prefix)).unwrap();
         assert_eq!(decoded, b"test");
 

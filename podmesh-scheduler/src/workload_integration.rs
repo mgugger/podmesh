@@ -903,9 +903,9 @@ async fn decrypt_manifest_from_envelope(
     );
 
     // Validate recipient-blob version byte
-    if payload_bytes.is_empty() || payload_bytes[0] != 0x02 {
+    if payload_bytes.is_empty() || payload_bytes[0] != 0x03 {
         return Err(
-            "unsupported payload format: expected recipient-blob (version byte 0x02)".into(),
+            "unsupported payload format: expected recipient-blob (version byte 0x03)".into(),
         );
     }
 

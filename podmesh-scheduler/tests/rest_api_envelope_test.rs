@@ -1,4 +1,4 @@
-use crypto::{b64_decode, b64_encode, ensure_keypair_ephemeral, ensure_pqc_init, sign_envelope};
+use crypto::{b64_decode, b64_encode, ensure_keypair_ephemeral, sign_envelope};
 use protocol::machine::{build_envelope_canonical, build_envelope_signed};
 use std::time::Duration;
 
@@ -9,7 +9,6 @@ fn test_envelope_payload_extraction() {
 
 #[test]
 fn test_apply_request_envelope() {
-    ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 
     let apply_request = protocol::machine::build_apply_request(
@@ -32,7 +31,7 @@ fn test_apply_request_envelope() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    let alg = "ml-dsa-65";
+    let alg = "ed25519";
 
     let canonical_bytes =
         build_envelope_canonical(&apply_request, payload_type, &nonce, timestamp, alg, None);
@@ -46,7 +45,7 @@ fn test_apply_request_envelope() {
         &nonce,
         timestamp,
         alg,
-        "ml-dsa-65",
+        "ed25519",
         &sig_b64,
         &pub_b64,
         None,
@@ -79,14 +78,13 @@ fn test_apply_request_envelope() {
 
 #[test]
 fn test_envelope_base64_encoding_for_transport() {
-    ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 
     let payload = b"test transport payload";
     let payload_type = "transport_test";
     let nonce = "transport-nonce";
     let timestamp = 1234567890u64;
-    let alg = "ml-dsa-65";
+    let alg = "ed25519";
 
     let canonical_bytes =
         build_envelope_canonical(payload, payload_type, nonce, timestamp, alg, None);
@@ -99,7 +97,7 @@ fn test_envelope_base64_encoding_for_transport() {
         nonce,
         timestamp,
         alg,
-        "ml-dsa-65",
+        "ed25519",
         &sig_b64,
         &pub_b64,
         None,

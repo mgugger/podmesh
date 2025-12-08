@@ -1,4 +1,4 @@
-use crypto::{b64_encode, ensure_keypair_ephemeral, ensure_pqc_init, sign_envelope};
+use crypto::{b64_encode, ensure_keypair_ephemeral, sign_envelope};
 use podmesh_scheduler::podmesh_p2p::envelope::verify_envelope;
 use protocol::machine::{build_envelope_canonical, build_envelope_signed};
 use std::time::Duration;
@@ -6,7 +6,6 @@ use std::time::Duration;
 #[test]
 fn test_envelope_roundtrip() {
     // Test that postcard envelopes signed with canonical bytes verify correctly
-    ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 
     let payload = b"test payload data";
@@ -19,7 +18,7 @@ fn test_envelope_roundtrip() {
             .as_nanos()
     );
     let timestamp = 1234567890u64;
-    let alg = "ml-dsa-65";
+    let alg = "ed25519";
 
     let canonical_bytes =
         build_envelope_canonical(payload, payload_type, &nonce, timestamp, alg, None);
@@ -33,7 +32,7 @@ fn test_envelope_roundtrip() {
         &nonce,
         timestamp,
         alg,
-        "ml-dsa-65",
+        "ed25519",
         &sig_b64,
         &pub_b64,
         None,
@@ -53,14 +52,13 @@ fn test_envelope_roundtrip() {
 
 #[test]
 fn test_envelope_invalid_signature() {
-    ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, _privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 
     let payload = b"test payload data";
     let payload_type = "test";
     let nonce = "invalid-sig-test";
     let timestamp = 1234567890u64;
-    let alg = "ml-dsa-65";
+    let alg = "ed25519";
 
     let invalid_envelope = build_envelope_signed(
         payload,
@@ -68,7 +66,7 @@ fn test_envelope_invalid_signature() {
         nonce,
         timestamp,
         alg,
-        "ml-dsa-65",
+        "ed25519",
         "aW52YWxpZC1zaWduYXR1cmU=",
         &b64_encode(&pubb),
         None,
@@ -83,7 +81,6 @@ fn test_envelope_invalid_signature() {
 
 #[test]
 fn test_envelope_replay_protection() {
-    ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 
     let payload = b"replay test payload";
@@ -96,7 +93,7 @@ fn test_envelope_replay_protection() {
             .as_nanos()
     );
     let timestamp = 1234567890u64;
-    let alg = "ml-dsa-65";
+    let alg = "ed25519";
 
     let canonical_bytes =
         build_envelope_canonical(payload, payload_type, &nonce, timestamp, alg, None);
@@ -109,7 +106,7 @@ fn test_envelope_replay_protection() {
         &nonce,
         timestamp,
         alg,
-        "ml-dsa-65",
+        "ed25519",
         &sig_b64,
         &pub_b64,
         None,
@@ -131,14 +128,13 @@ fn test_envelope_replay_protection() {
 
 #[test]
 fn test_envelope_signature_prefix_handling() {
-    ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 
     let payload = b"prefix test payload";
     let payload_type = "test";
     let nonce = "prefix-test-nonce";
     let timestamp = 1234567890u64;
-    let alg = "ml-dsa-65";
+    let alg = "ed25519";
 
     let canonical_bytes =
         build_envelope_canonical(payload, payload_type, nonce, timestamp, alg, None);
@@ -151,7 +147,7 @@ fn test_envelope_signature_prefix_handling() {
         nonce,
         timestamp,
         alg,
-        "ml-dsa-65",
+        "ed25519",
         &sig_b64,
         &pub_b64,
         None,
@@ -168,7 +164,7 @@ fn test_envelope_signature_prefix_handling() {
         protocol::machine::root_as_envelope(&envelope_with_prefix).expect("should parse envelope");
     let sig_field = env.sig().unwrap_or("");
     assert!(
-        sig_field.contains("ml-dsa-65:"),
+        sig_field.contains("ed25519:"),
         "Signature field should contain prefix: {}",
         sig_field
     );
@@ -176,14 +172,13 @@ fn test_envelope_signature_prefix_handling() {
 
 #[test]
 fn test_envelope_empty_payload() {
-    ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 
     let payload = b"";
     let payload_type = "empty";
     let nonce = "empty-payload-test";
     let timestamp = 1234567890u64;
-    let alg = "ml-dsa-65";
+    let alg = "ed25519";
 
     let canonical_bytes =
         build_envelope_canonical(payload, payload_type, nonce, timestamp, alg, None);
@@ -196,7 +191,7 @@ fn test_envelope_empty_payload() {
         nonce,
         timestamp,
         alg,
-        "ml-dsa-65",
+        "ed25519",
         &sig_b64,
         &pub_b64,
         None,
@@ -215,14 +210,13 @@ fn test_envelope_empty_payload() {
 
 #[test]
 fn test_envelope_large_payload() {
-    ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 
     let large_payload = vec![0x42u8; 1024 * 1024];
     let payload_type = "large";
     let nonce = "large-payload-test";
     let timestamp = 1234567890u64;
-    let alg = "ml-dsa-65";
+    let alg = "ed25519";
 
     let canonical_bytes =
         build_envelope_canonical(&large_payload, payload_type, nonce, timestamp, alg, None);
@@ -235,7 +229,7 @@ fn test_envelope_large_payload() {
         nonce,
         timestamp,
         alg,
-        "ml-dsa-65",
+        "ed25519",
         &sig_b64,
         &pub_b64,
         None,

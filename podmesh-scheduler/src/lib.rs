@@ -172,9 +172,6 @@ pub async fn start_machine(cli: Cli) -> anyhow::Result<Vec<tokio::task::JoinHand
         log::info!("scheduling disabled via CLI flag; skipping container runtime configuration");
     }
 
-    // initialize PQC once at process startup; fail early if it doesn't initialize
-    crypto::ensure_pqc_init().map_err(|e| anyhow::anyhow!("pqc initialization failed: {}", e))?;
-
     let _keypair = if cli.ephemeral {
         let kp = crypto::ensure_keypair_ephemeral().ok();
         podmesh_p2p::set_node_keypair(kp.clone());

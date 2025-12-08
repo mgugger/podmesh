@@ -1,9 +1,8 @@
-use crypto::{b64_decode, ensure_keypair_ephemeral, ensure_pqc_init, sign_envelope, verify_envelope};
+use crypto::{b64_decode, ensure_keypair_ephemeral, sign_envelope, verify_envelope};
 use protocol::machine::{build_envelope_canonical, build_envelope_signed, root_as_envelope};
 
 #[test]
 fn postcard_envelope_sign_and_verify() -> anyhow::Result<()> {
-    ensure_pqc_init()?;
     let (pub_bytes, priv_bytes) = ensure_keypair_ephemeral()?;
     let payload_bytes = b"hello inner payload";
 
@@ -12,7 +11,7 @@ fn postcard_envelope_sign_and_verify() -> anyhow::Result<()> {
         "test.payload.v1",
         "nonce-abc-123",
         123_456_789,
-        "ml-dsa-65",
+        "ed25519",
         None,
     );
 
@@ -23,8 +22,8 @@ fn postcard_envelope_sign_and_verify() -> anyhow::Result<()> {
         "test.payload.v1",
         "nonce-abc-123",
         123_456_789,
-        "ml-dsa-65",
-        "ml-dsa-65",
+        "ed25519",
+        "ed25519",
         &sig_b64,
         &pub_b64,
         None,
@@ -46,7 +45,7 @@ fn postcard_envelope_sign_and_verify() -> anyhow::Result<()> {
     let parsed = root_as_envelope(&signed_bytes)?;
     assert_eq!(parsed.payload(), Some(&payload_bytes[..]));
     assert_eq!(parsed.payload_type(), Some("test.payload.v1"));
-    let expected_sig = format!("ml-dsa-65:{sig_b64}");
+    let expected_sig = format!("ed25519:{sig_b64}");
     assert_eq!(parsed.sig(), Some(expected_sig.as_str()));
     assert_eq!(parsed.pubkey(), Some(pub_b64.as_str()));
 

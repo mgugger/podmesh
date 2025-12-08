@@ -21,7 +21,6 @@ pub struct ApiClient {
 impl ApiClient {
     pub fn new(base_url: String) -> Result<Self> {
         // Use persistent keypairs from disk to match machine expectations
-        crypto::ensure_pqc_init()?;
         let (public_key_bytes, private_key) = crypto::ensure_keypair_on_disk()?;
         let public_key = crypto::b64_encode(&public_key_bytes);
 
@@ -97,8 +96,8 @@ impl ApiClient {
         // Extract the payload from the envelope
         let payload_bytes = envelope.payload_vec();
 
-        // If the payload is encrypted (starts with 0x02), decrypt it
-        if !payload_bytes.is_empty() && payload_bytes[0] == 0x02 {
+        // If the payload is encrypted (starts with 0x03 for XChaCha20-Poly1305), decrypt it
+        if !payload_bytes.is_empty() && payload_bytes[0] == 0x03 {
             crypto::decrypt_payload_from_recipient_blob(&payload_bytes, &self.kem_private_key)
         } else {
             // Payload is not encrypted, return as-is

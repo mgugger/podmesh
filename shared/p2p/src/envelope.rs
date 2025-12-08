@@ -28,8 +28,8 @@ impl<'a> Default for SignEnvelopeConfig<'a> {
             timestamp: None,
             peer_id: None,
             kem_pub_b64: None,
-            algorithm: "ml-dsa-65",
-            signature_prefix: "ml-dsa-65",
+            algorithm: "ed25519",
+            signature_prefix: "ed25519",
         }
     }
 }
@@ -365,18 +365,17 @@ pub type VerifiedEnvelopeParts = VerifiedEnvelope;
 mod tests {
     use super::*;
     use crate::util::timestamp_millis;
-    use crypto::{ensure_keypair_ephemeral, ensure_pqc_init, sign_envelope};
+    use crypto::{ensure_keypair_ephemeral, sign_envelope};
 
     #[test]
     fn test_build_and_verify_envelope_roundtrip() {
-        ensure_pqc_init().unwrap();
         let (pubb, privb) = ensure_keypair_ephemeral().expect("keypair");
 
         let payload = b"test payload data";
         let payload_type = "test";
         let nonce = format!("test-nonce-{}", timestamp_millis());
         let timestamp = 1234567890u64;
-        let alg = "ml-dsa-65";
+        let alg = "ed25519";
 
         // Create and sign postcard envelope
         let canonical = protocol::machine::build_envelope_canonical(
@@ -396,7 +395,7 @@ mod tests {
             &nonce,
             timestamp,
             alg,
-            "ml-dsa-65",
+            "ed25519",
             &sig_b64,
             &pub_b64,
             None,
@@ -427,7 +426,7 @@ mod tests {
     #[test]
     fn test_signature_prefix_handling() {
         // Test with prefix
-        let sig_with_prefix = "ml-dsa-65:dGVzdA=="; // "test" in base64
+        let sig_with_prefix = "ed25519:dGVzdA=="; // "test" in base64
         let decoded = normalize_and_decode_signature(Some(sig_with_prefix)).unwrap();
         assert_eq!(decoded, b"test");
 

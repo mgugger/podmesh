@@ -56,7 +56,9 @@ pub const LEASE_PREFIX: &str = "lease/";
 // === TIMEOUTS AND TIMING ===
 
 /// Timeout, in milliseconds, to wait for free-capacity responses from peers.
-pub const FREE_CAPACITY_TIMEOUT_MS: u64 = 500;
+/// This timeout should be long enough to handle slower network conditions (e.g., CI environments)
+/// while still providing reasonable responsiveness for production use.
+pub const FREE_CAPACITY_TIMEOUT_MS: u64 = 2000;
 
 /// Timeout, in seconds, to wait for request-response RPCs (ApplyRequest/ApplyResponse)
 pub const REQUEST_RESPONSE_TIMEOUT_SECS: u64 = 3;

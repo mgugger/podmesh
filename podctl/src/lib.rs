@@ -242,7 +242,7 @@ async fn send_apply_to_node(
         "manifest",
         "",
         timestamp_ms,
-        "ml-kem-512",
+        "x25519",
         "",
         None,
     );
