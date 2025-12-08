@@ -137,17 +137,16 @@ pub fn ensure_keypair_on_disk() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
 
     match config.signing_mode {
         KeypairMode::Ephemeral => {
-            if let Some(k) = EPHEMERAL_SIGNING.get() {
-                return Ok((k.0.clone(), k.1.clone()));
-            }
-            ensure_pqc_init()?;
-            let dsa = ml_dsa_65();
-            let (pubk, privk) = dsa.generate_keypair()?;
-            let pubb = pubk.to_bytes();
-            let privb = privk.to_bytes();
-            log::warn!("ensure_keypair_on_disk: using ephemeral signing keypair (no disk writes)");
-            let _ = EPHEMERAL_SIGNING.set((pubb.clone(), privb.clone()));
-            Ok((pubb, privb))
+            let keypair = EPHEMERAL_SIGNING.get_or_try_init(|| {
+                ensure_pqc_init()?;
+                let dsa = ml_dsa_65();
+                let (pubk, privk) = dsa.generate_keypair()?;
+                let pubb = pubk.to_bytes();
+                let privb = privk.to_bytes();
+                log::warn!("ensure_keypair_on_disk: using ephemeral signing keypair (no disk writes)");
+                Ok::<_, anyhow::Error>((pubb, privb))
+            })?;
+            Ok((keypair.0.clone(), keypair.1.clone()))
         }
         KeypairMode::Persistent => {
             let key_dir = resolve_key_dir(config.key_directory.as_deref())?;
@@ -186,17 +185,16 @@ pub fn ensure_kem_keypair_on_disk() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
 
     match config.kem_mode {
         KeypairMode::Ephemeral => {
-            if let Some(k) = EPHEMERAL_KEM.get() {
-                return Ok((k.0.clone(), k.1.clone()));
-            }
-            ensure_pqc_init()?;
-            let kem = ml_kem_512();
-            let (pubk, privk) = kem.generate_keypair()?;
-            let pubb = pubk.to_bytes();
-            let privb = privk.to_bytes();
-            log::warn!("ensure_kem_keypair_on_disk: using ephemeral KEM keypair (no disk writes)");
-            let _ = EPHEMERAL_KEM.set((pubb.clone(), privb.clone()));
-            Ok((pubb, privb))
+            let keypair = EPHEMERAL_KEM.get_or_try_init(|| {
+                ensure_pqc_init()?;
+                let kem = ml_kem_512();
+                let (pubk, privk) = kem.generate_keypair()?;
+                let pubb = pubk.to_bytes();
+                let privb = privk.to_bytes();
+                log::warn!("ensure_kem_keypair_on_disk: using ephemeral KEM keypair (no disk writes)");
+                Ok::<_, anyhow::Error>((pubb, privb))
+            })?;
+            Ok((keypair.0.clone(), keypair.1.clone()))
         }
         KeypairMode::Persistent => {
             let key_dir = resolve_key_dir(config.key_directory.as_deref())?;

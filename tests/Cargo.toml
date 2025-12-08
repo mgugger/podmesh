@@ -13,6 +13,7 @@ podmesh-sidecar = { workspace = true }
 protocol = { workspace = true }
 podmesh-scheduler = { workspace = true }
 podctl = { workspace = true }
+crypto = { workspace = true }
 axum = "0.8"
 axum-support = { workspace = true }
 reqwest = { workspace = true }

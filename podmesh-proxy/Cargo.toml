@@ -21,4 +21,6 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }
+crypto = { workspace = true }
+serial_test = "3.0"
 

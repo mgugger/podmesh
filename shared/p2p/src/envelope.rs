@@ -289,7 +289,7 @@ pub fn verify_flatbuffer_envelope_for_peer(
     }
 
     crypto::verify_envelope(&pub_bytes, &canonical, &sig_bytes)
-        .context("flatbuffer signature verification failed")?;
+        .context("signature verification failed")?;
 
     Ok(VerifiedEnvelope {
         payload: payload_vec,
@@ -347,7 +347,7 @@ pub fn verify_flatbuffer_envelope_skip_nonce_check(
     };
 
     crypto::verify_envelope(&pub_bytes, &canonical, &sig_bytes)
-        .context("flatbuffer signature verification failed")?;
+        .context("signature verification failed")?;
 
     Ok(VerifiedEnvelope {
         payload: payload_vec,

@@ -11,13 +11,14 @@ use podmesh_sidecar::{
 };
 use protocol::machine::{SidecarRouteKind, SidecarRouteSpec};
 use reqwest::Client;
+use serial_test::serial;
 use tokio::{
     net::TcpListener,
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
 
-use podmesh_integration_tests::support::{allocate_tcp_port, allocate_udp_port, init_tracing};
+use podmesh_integration_tests::support::{allocate_tcp_port, allocate_udp_port, init_ephemeral_keys, init_tracing};
 
 const PROXY_PROVIDER_LABEL: &str = "podmesh-proxy-node";
 const DEMO_MANIFEST_ID: &str = "demo-nginx";
@@ -43,8 +44,10 @@ fn build_workload_config(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn sidecar_discovers_workload_provider() -> Result<()> {
     init_tracing();
+    init_ephemeral_keys();
     let mut workloads = Vec::new();
 
     let test_result: Result<()> = async {
@@ -142,8 +145,10 @@ async fn sidecar_discovers_workload_provider() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn ingress_proxies_requests_via_sidecar() -> Result<()> {
     init_tracing();
+    init_ephemeral_keys();
     let mut handle = start_workload(Vec::new(), true, true)?;
     let mut sidecar_shutdown: Option<oneshot::Sender<()>> = None;
     let mut sidecar_task: Option<JoinHandle<()>> = None;

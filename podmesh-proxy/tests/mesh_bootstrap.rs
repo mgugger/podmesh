@@ -5,14 +5,28 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use podmesh_proxy::{Config, Workload};
 use serde::Deserialize;
+use serial_test::serial;
 use tokio::sync::watch::Receiver;
 use tokio::time::{Instant, sleep};
 
 static INIT_TRACING: Once = Once::new();
+static INIT_EPHEMERAL_KEYS: Once = Once::new();
+
+fn init_ephemeral_keys() {
+    INIT_EPHEMERAL_KEYS.call_once(|| {
+        crypto::set_keypair_config(crypto::KeypairConfig {
+            signing_mode: crypto::KeypairMode::Ephemeral,
+            kem_mode: crypto::KeypairMode::Ephemeral,
+            key_directory: None,
+        });
+    });
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
 async fn workload_mesh_bootstraps_three_nodes() -> Result<()> {
     init_tracing();
+    init_ephemeral_keys();
 
     let mut nodes = Vec::new();
     let test_result: Result<()> = async {
@@ -63,8 +77,10 @@ async fn workload_mesh_bootstraps_three_nodes() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn workload_mesh_single_node_reports_zero_peers() -> Result<()> {
     init_tracing();
+    init_ephemeral_keys();
 
     let mut node = start_node(
         allocate_udp_port(),
