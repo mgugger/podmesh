@@ -195,7 +195,7 @@ impl WorkloadManager {
             .read()
             .get(workload_id)
             .cloned()
-            .ok_or_else(|| WorkloadManagerError::WorkloadNotFound(workload_id.to_string()))
+            .ok_or_else(|| WorkloadManagerError::WorkloadNotFound(workload_id.into()))
     }
 
     fn remove_deployment_entry(&self, workload_id: &str) -> Option<DeploymentStatus> {

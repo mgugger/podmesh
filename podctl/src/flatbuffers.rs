@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::Engine;
 use log::debug;
 use serde_json::Value as JsonValue;
@@ -52,7 +52,7 @@ impl FlatbufferClient {
             .get(&url)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to machine at {}: {}", url, e))?;
+            .with_context(|| format!("Failed to connect to machine at {}", url))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -70,24 +70,23 @@ impl FlatbufferClient {
         let pubkey_b64 = resp
             .text()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to get response text: {}", e))?;
+            .context("Failed to get response text")?;
 
-        // Check for error response
         if pubkey_b64.starts_with("ERROR:") {
             anyhow::bail!("Machine returned error: {}", pubkey_b64);
         }
 
         log::debug!("Received pubkey response: {}", pubkey_b64);
 
-        let pubkey_bytes = base64::engine::general_purpose::STANDARD
+        let kem_pubkey_bytes = base64::engine::general_purpose::STANDARD
             .decode(&pubkey_b64)
-            .map_err(|e| anyhow::anyhow!("Failed to decode public key: {}", e))?;
+            .context("Failed to decode public key")?;
 
         log::info!(
             "Successfully fetched machine KEM public key ({} bytes)",
-            pubkey_bytes.len()
+            kem_pubkey_bytes.len()
         );
-        self.machine_public_key = Some(pubkey_bytes);
+        self.machine_public_key = Some(kem_pubkey_bytes);
         Ok(())
     }
 

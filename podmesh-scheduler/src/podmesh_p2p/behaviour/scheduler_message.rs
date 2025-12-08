@@ -33,7 +33,7 @@ pub fn scheduler_message(
                     request_part
                 );
                 // KEM pubkey caching has been removed - keys are now extracted directly from envelopes
-                let peer_pubkey = cap_reply.kem_pubkey().unwrap_or("").to_string();
+                let peer_pubkey = cap_reply.kem_pubkey().unwrap_or("");
                 let peer_with_key = format!("{}:{}", peer.to_string(), peer_pubkey);
                 utils::notify_capacity_observers(pending_queries, &request_part, move || {
                     peer_with_key.clone()
@@ -162,7 +162,7 @@ fn parse_capacity_request(
     );
 
     Some(CapacityRequestContext {
-        request_id: orig_request_id.to_string(),
+        request_id: orig_request_id.into(),
         manifest_id,
         resource_request,
     })
@@ -188,7 +188,7 @@ fn run_capacity_check(
         );
         crate::resource_verifier::CapacityCheckResult {
             has_capacity: false,
-            rejection_reason: Some("Internal error".to_string()),
+            rejection_reason: Some("Internal error".into()),
             available_cpu_milli: 0,
             available_memory_bytes: 0,
             available_storage_bytes: 0,
@@ -288,6 +288,6 @@ fn log_capacity_failure(
         check_result
             .rejection_reason
             .clone()
-            .unwrap_or_else(|| "Unknown reason".to_string())
+            .unwrap_or_else(|| "Unknown reason".into())
     );
 }

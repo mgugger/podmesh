@@ -23,3 +23,7 @@ serial_test = "3.0"
 serde_json = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
+
+[features]
+default = []
+podman-tests = []

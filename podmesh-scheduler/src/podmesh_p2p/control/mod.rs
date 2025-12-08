@@ -130,7 +130,7 @@ pub async fn handle_control_message(
                 };
                 let mut map = ACTIVE_ANNOUNCES.lock().unwrap();
                 map.insert(
-                    cid.clone(),
+                    cid,
                     AnnounceEntry {
                         ttl_ms: ttl_ms,
                         next_due: next,
@@ -202,7 +202,7 @@ pub fn announce_provider_direct(
     // Check if we have sufficient DHT connectivity before announcing
     let connected_peers: Vec<_> = swarm.connected_peers().cloned().collect();
     if connected_peers.is_empty() {
-        return Err("No connected peers for DHT announcement".to_string());
+        return Err("No connected peers for DHT announcement".into());
     }
 
     match swarm.behaviour_mut().kademlia.start_providing(record_key) {

@@ -22,7 +22,7 @@ pub fn spawn_tcp_server(
                 let addr = listener
                     .local_addr()
                     .map(|a| a.to_string())
-                    .unwrap_or_else(|_| "unknown".to_string());
+                    .unwrap_or_else(|_| "unknown".into());
                 info!(
                     target: "axum_support",
                     "axum tcp server listening (label={}, addr={})",
@@ -60,7 +60,7 @@ pub fn spawn_tcp_listener(
     let addr = listener
         .local_addr()
         .map(|a| a.to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
+        .unwrap_or_else(|_| "unknown".into());
 
     tokio::spawn(async move {
         info!(

@@ -27,7 +27,7 @@ pub async fn handle_send_delete_request(
             .await
         {
             Ok(_) => {
-                let _ = reply_tx.send(Ok("Delete request handled locally".to_string()));
+                let _ = reply_tx.send(Ok("Delete request handled locally".into()));
             }
             Err(e) => {
                 warn!(
@@ -59,5 +59,5 @@ pub async fn handle_send_delete_request(
     // For now, send immediate success response
     // In a complete implementation, we would track the request_id and wait for the actual response
     // from the peer, but that requires more complex request tracking infrastructure
-    let _ = reply_tx.send(Ok("Delete request sent".to_string()));
+    let _ = reply_tx.send(Ok("Delete request sent".into()));
 }

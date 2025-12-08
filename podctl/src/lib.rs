@@ -6,15 +6,22 @@ use log::info;
 use protocol::machine::parse_peer_with_pubkey;
 use protocol::manifest_yaml::parse_manifest_to_json;
 use uuid::Uuid;
+use std::env;
 
 use serde_json::Value as JsonValue;
-use std::env;
 use std::path::PathBuf;
 
 mod flatbuffers;
 use flatbuffers::FlatbufferClient;
 
 mod flatbuffer_envelope;
+
+fn resolve_api_base(override_url: Option<&str>) -> String {
+    override_url
+        .map(str::to_string)
+        .or_else(|| env::var("PODMESH_API").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:3000".to_string())
+}
 
 fn extract_manifest_name_from_json(manifest_json: &serde_json::Value) -> Option<String> {
     match manifest_json {
@@ -108,14 +115,10 @@ pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> anyhow::Result
         &pk_bytes[..8]
     );
 
-    let base = api_base
-        .map(|s| s.to_string())
-        .or_else(|| env::var("PODMESH_API").ok())
-        .unwrap_or_else(|| "http://127.0.0.1:3000".to_string());
+    let base = resolve_api_base(api_base);
     debug!("Creating FlatbufferClient with base URL: {}", base);
     let mut fb_client = FlatbufferClient::new(base)?;
 
-    // Fetch machine's public key for encrypted communication
     debug!("Fetching machine's public key...");
     fb_client.fetch_machine_public_key().await?;
     debug!("Successfully fetched machine's public key");
@@ -160,10 +163,8 @@ pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> anyhow::Result
     );
     debug!("Selected nodes with pubkeys: {:?}", selected_nodes);
 
-    // Create encrypted tasks for each node sequentially with same manifest_id
     let ts = p2p::timestamp_millis();
-
-    let original_manifest_str = contents.clone();
+    let original_manifest_str = contents;
     let mut succeeded_nodes = Vec::new();
     let mut failed_nodes: Vec<(String, String)> = Vec::new();
 
@@ -185,7 +186,7 @@ pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> anyhow::Result
             Err(err) => {
                 let err_msg = err.to_string();
                 log::error!("Direct apply failed for node {}: {}", node_id, err_msg);
-                failed_nodes.push((node_id.clone(), err_msg));
+                failed_nodes.push((node_id.to_string(), err_msg));
             }
         }
     }
@@ -461,7 +462,7 @@ async fn discover_manifest_providers(
             provider.get("peer_id").and_then(|p| p.as_str()),
             provider.get("pubkey").and_then(|p| p.as_str()),
         ) {
-            result.push((peer_id.to_string(), pubkey.to_string()));
+            result.push((peer_id.into(), pubkey.into()));
         }
     }
 
@@ -526,7 +527,7 @@ mod tests {
 
     #[test]
     fn test_parse_selected_nodes_success() {
-        let peers = vec!["peer1:dGVzdDE=".to_string(), "peer2:dGVzdDI=".to_string()];
+        let peers = vec!["peer1:dGVzdDE=".into(), "peer2:dGVzdDI=".into()];
 
         let parsed = parse_selected_nodes(&peers).expect("parse should succeed");
         assert_eq!(parsed.len(), 2);
@@ -537,7 +538,7 @@ mod tests {
 
     #[test]
     fn test_parse_selected_nodes_invalid_format() {
-        let peers = vec!["invalid".to_string()];
+        let peers = vec!["invalid".into()];
         let result = parse_selected_nodes(&peers);
         assert!(result.is_err());
     }

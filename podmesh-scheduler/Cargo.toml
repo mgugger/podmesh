@@ -33,3 +33,7 @@ parking_lot = { workspace = true }
 podctl = { workspace = true }
 reqwest = { workspace = true }
 serial_test = "3.0"
+
+[features]
+default = []
+podman-tests = []

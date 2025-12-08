@@ -78,7 +78,7 @@ impl DhtManager {
                 reply_tx,
             } => {
                 // For now, send an error as this requires more complex indexing
-                let _ = reply_tx.send(Err("Peer queries not implemented yet".to_string()));
+                let _ = reply_tx.send(Err("Peer queries not implemented yet".into()));
             }
         }
     }
@@ -98,7 +98,7 @@ impl DhtManager {
             }
         };
 
-        let manifest_bytes = manifest.clone().serialize_vec();
+        let manifest_bytes = manifest.serialize_vec();
 
         let record_key = Self::manifest_key(&manifest_id);
         let record = kad::Record {
@@ -223,7 +223,7 @@ pub fn create_applied_manifest_for_deployment(
         format!("{:x}", hasher.finish())
     };
 
-    let kind_label_value = manifest_kind.clone();
+    let kind_label_value = manifest_kind;
 
     let manifest = AppliedManifest {
         id,

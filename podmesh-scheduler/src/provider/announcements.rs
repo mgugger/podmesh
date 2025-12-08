@@ -362,7 +362,7 @@ impl AnnouncementManager {
 
         // Add node capabilities
         if !node_capabilities.is_empty() {
-            metadata.insert("capabilities".to_string(), node_capabilities.join(","));
+            metadata.insert("capabilities".into(), node_capabilities.join(","));
         }
 
         // Add resource information
@@ -379,7 +379,7 @@ impl AnnouncementManager {
 
         // Add announcement timestamp
         metadata.insert(
-            "announced_at".to_string(),
+            "announced_at".into(),
             SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

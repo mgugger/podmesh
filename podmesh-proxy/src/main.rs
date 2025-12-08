@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::signal;
 use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
 
 use podmesh_proxy::{Config, Workload};
 
@@ -52,7 +51,7 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
-    init_tracing();
+    tracing_support::init_tracing();
 
     let Args {
         bootstrap_peer,
@@ -91,11 +90,4 @@ async fn run() -> Result<()> {
     info!("shutting down workplane bootstrap node");
     workload.close().await;
     Ok(())
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_target(false)
-        .try_init();
 }

@@ -13,6 +13,7 @@ libp2p = { workspace = true }
 tokio = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing_support = { path = "../shared/tracing_support" }
 p2p = { workspace = true }
 protocol = { workspace = true }
 reqwest = { workspace = true }

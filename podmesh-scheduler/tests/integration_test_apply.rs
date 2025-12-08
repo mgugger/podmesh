@@ -1,5 +1,3 @@
-use env_logger::Env;
-use podmesh_scheduler::gateway_sidecar::GATEWAY_SIDECAR_CONTAINER_NAME;
 use serial_test::serial;
 use std::time::Duration;
 use std::{env, path::PathBuf};
@@ -10,6 +8,12 @@ use common::apply_common::{
     check_workload_deployment, get_peer_ids, setup_test_environment, start_cluster_nodes,
     wait_for_mesh_formation,
 };
+
+#[cfg(feature = "podman-tests")]
+use env_logger::Env;
+#[cfg(feature = "podman-tests")]
+use podmesh_scheduler::gateway_sidecar::GATEWAY_SIDECAR_CONTAINER_NAME;
+#[cfg(feature = "podman-tests")]
 use common::test_utils::{NodeGuard, make_test_cli, setup_cleanup_hook, start_nodes};
 
 fn manifest_path(file: &str) -> PathBuf {
@@ -72,6 +76,7 @@ async fn test_apply_functionality() {
 
 #[serial]
 #[tokio::test]
+#[cfg(feature = "podman-tests")]
 async fn test_apply_with_real_podman() {
     if !is_podman_available().await {
         log::warn!("Skipping Podman integration test - Podman not available");
@@ -234,6 +239,7 @@ async fn test_apply_nginx_with_replicas() {
     guard.cleanup().await;
 }
 
+#[cfg(feature = "podman-tests")]
 async fn setup_test_environment_for_podman() -> (reqwest::Client, Vec<u16>) {
     setup_cleanup_hook();
     let _ = env_logger::Builder::from_env(Env::default().default_filter_or("warn")).try_init();
@@ -241,6 +247,7 @@ async fn setup_test_environment_for_podman() -> (reqwest::Client, Vec<u16>) {
     (reqwest::Client::new(), vec![3000u16, 3100u16, 3200u16])
 }
 
+#[cfg(feature = "podman-tests")]
 async fn start_test_nodes_for_podman() -> NodeGuard {
     let mut cli1 = make_test_cli(3000, false, true, None, vec![], 4001, false);
     cli1.mock_only_runtime = false;
@@ -276,6 +283,7 @@ async fn start_test_nodes_for_podman() -> NodeGuard {
     start_nodes(vec![cli1, cli2, cli3], Duration::from_secs(1)).await
 }
 
+#[cfg(feature = "podman-tests")]
 async fn is_podman_available() -> bool {
     match tokio::process::Command::new("podman")
         .args(["--version"])
@@ -289,6 +297,7 @@ async fn is_podman_available() -> bool {
     }
 }
 
+#[cfg(feature = "podman-tests")]
 #[derive(Debug, Default)]
 struct PodmanDeploymentStatus {
     pod_name: Option<String>,
@@ -298,12 +307,14 @@ struct PodmanDeploymentStatus {
     sidecar_state: Option<String>,
 }
 
+#[cfg(feature = "podman-tests")]
 impl PodmanDeploymentStatus {
     fn new() -> Self {
         Self::default()
     }
 }
 
+#[cfg(feature = "podman-tests")]
 async fn verify_podman_deployment(task_id: &str) -> PodmanDeploymentStatus {
     let mut status = PodmanDeploymentStatus::new();
     let expected_prefix = format!("podmesh-{}", task_id);
@@ -409,6 +420,7 @@ async fn verify_podman_deployment(task_id: &str) -> PodmanDeploymentStatus {
     status
 }
 
+#[cfg(feature = "podman-tests")]
 async fn cleanup_podman_resources(task_id: &str) {
     log::info!("Cleaning up Podman resources for task: {}", task_id);
 

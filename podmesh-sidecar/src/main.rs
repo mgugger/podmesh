@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use clap::Parser;
 use tracing::{error, warn};
-use tracing_subscriber::EnvFilter;
 
 use podmesh_sidecar::{
     DEFAULT_GATEWAY_APP_PORT, GatewayConfig, manifest_routes::extract_gateway_routes, run_gateway,
@@ -136,7 +135,7 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
-    init_tracing();
+    tracing_support::init_tracing();
     let args = Args::parse();
     let cfg = GatewayConfig::try_from(args)?;
     run_gateway(cfg).await
@@ -177,13 +176,6 @@ fn load_metadata(path: &str) -> Result<Option<GatewaySidecarMetadata>> {
     }
 }
 
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_target(false)
-        .try_init();
-}
-
 fn derive_manifest_identity(
     routes: &[GatewayRouteSpec],
     metadata_manifest_id: &str,
@@ -210,7 +202,7 @@ fn manifest_id_from_host(host: &str) -> Option<String> {
         return trimmed
             .rsplit('.')
             .next()
-            .map(|segment| segment.to_string())
+            .map(String::from)
             .filter(|segment| !segment.is_empty());
     }
     (!normalized.is_empty()).then_some(normalized)
@@ -231,11 +223,11 @@ fn sanitize_manifest_id(value: &str) -> String {
         }
     }
 
-    let trimmed = slug.trim_matches('-').to_string();
+    let trimmed = slug.trim_matches('-');
     if trimmed.is_empty() {
-        "workload".to_string()
+        "workload".into()
     } else {
-        trimmed
+        trimmed.to_string()
     }
 }
 

@@ -10,6 +10,7 @@ members = [
     "shared/crypto",
     "shared/protocol",
     "shared/p2p",
+    "shared/tracing_support",
 ]
 
 [workspace.dependencies]

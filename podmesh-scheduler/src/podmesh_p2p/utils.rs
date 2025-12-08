@@ -116,14 +116,14 @@ pub fn extract_manifest_id_from_request_id(request_id: &str) -> Option<String> {
     let mut colon_parts = request_id.split(':');
     if let (Some(prefix), Some(manifest)) = (colon_parts.next(), colon_parts.next()) {
         if prefix == FREE_CAPACITY_PREFIX && !manifest.is_empty() {
-            return Some(manifest.to_string());
+            return Some(manifest.into());
         }
     }
 
     if request_id.starts_with(FREE_CAPACITY_PREFIX) {
         let parts: Vec<&str> = request_id.split('-').collect();
         if parts.len() >= 2 && !parts[1].is_empty() {
-            return Some(parts[1].to_string());
+            return Some(parts[1].into());
         }
     }
 

@@ -1,3 +1,5 @@
+#![cfg(feature = "podman-tests")]
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
@@ -20,6 +22,12 @@ const EXPECTED_BODY_SUBSTRING: &str = "Welcome to Podmesh";
 const REQUIRED_MACHINE_PEERS: usize = 1;
 const EXPECTED_CONTAINERS: [&str; 2] = ["my-nginx", "sidecar"];
 const PODMESH_NETWORK: &str = "podmesh";
+const ROOTLESS_PODMAN_SOCKET: &str = "/run/user/1000/podman/podman.sock";
+const REQUIRED_IMAGES: [&str; 3] = [
+    "localhost/podmesh/scheduler:latest",
+    "localhost/podmesh/proxy:latest",
+    "localhost/podmesh/sidecar:latest",
+];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
@@ -28,6 +36,21 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
 
     if !is_podman_available().await {
         log::warn!("skipping rootless end-to-end test because podman is unavailable");
+        return Ok(());
+    }
+
+    if let Err(err) = ensure_rootless_podman_socket() {
+        log::warn!(
+            "skipping rootless end-to-end test because rootless podman socket {} is unavailable: {err:?}. start it with `systemctl --user start podman.socket`",
+            ROOTLESS_PODMAN_SOCKET
+        );
+        return Ok(());
+    }
+
+    if let Err(err) = verify_required_images().await {
+        log::warn!(
+            "skipping rootless end-to-end test because required container images are not available: {err:?}"
+        );
         return Ok(());
     }
 
@@ -79,6 +102,78 @@ async fn is_podman_available() -> bool {
     {
         Ok(status) => status.success(),
         Err(_) => false,
+    }
+}
+
+fn ensure_rootless_podman_socket() -> Result<()> {
+    let socket_path = Path::new(ROOTLESS_PODMAN_SOCKET);
+    match std::fs::metadata(socket_path) {
+        Ok(metadata) => {
+            if is_unix_socket(&metadata) {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "{} exists but is not detected as a unix socket",
+                    socket_path.display()
+                ))
+            }
+        }
+        Err(err) => Err(anyhow!(
+            "{} unavailable: {err}",
+            socket_path.display()
+        )),
+    }
+}
+
+fn is_unix_socket(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        metadata.file_type().is_socket()
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        true
+    }
+}
+
+async fn verify_required_images() -> Result<()> {
+    let output = run_podman_command(["images", "--format", "json"]).await?;
+    let images: Value = serde_json::from_str(&output).context("invalid podman images json")?;
+    
+    let available_images: HashSet<String> = images
+        .as_array()
+        .ok_or_else(|| anyhow!("podman images output was not an array"))?
+        .iter()
+        .filter_map(|img| {
+            let names = img.get("Names").and_then(|n| n.as_array())?;
+            Some(
+                names
+                    .iter()
+                    .filter_map(|name| name.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flatten()
+        .collect();
+
+    let mut missing = Vec::new();
+    for required in REQUIRED_IMAGES {
+        if !available_images.contains(required) {
+            missing.push(required);
+        }
+    }
+
+    if missing.is_empty() {
+        log::info!("verified all required container images are available locally");
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "missing required container images: {:?}. build them with ./deploy/build_containers.sh",
+            missing
+        ))
     }
 }
 
