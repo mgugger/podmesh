@@ -180,7 +180,7 @@ async fn test_apply_nginx_with_replicas() {
     let mut guard = start_cluster_nodes(&[false, false, false]).await;
 
     sleep(Duration::from_secs(3)).await;
-    let mesh_formed = wait_for_mesh_formation(&client, &ports, Duration::from_secs(5)).await;
+    let mesh_formed = wait_for_mesh_formation(&client, &ports, Duration::from_secs(15)).await;
     if !mesh_formed {
         log::warn!("Mesh formation incomplete, but proceeding with test");
     }

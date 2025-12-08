@@ -49,7 +49,7 @@ jobs:
           echo "PODMAN_HOST=unix:///run/user/1000/podman/podman.sock" >> $GITHUB_ENV
 
       - name: Build Containers
-        run: ./deployment/build_containers.sh
+        run: ./deploy/build_containers.sh
 
       - name: Cargo test (with podman)
         env:
