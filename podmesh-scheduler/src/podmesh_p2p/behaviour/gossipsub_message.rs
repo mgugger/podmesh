@@ -181,9 +181,11 @@ pub fn gossipsub_message(
             "libp2p: received capreply for id={} from peer={}",
             request_part, peer_id
         );
-        // KEM pubkey caching has been removed - keys are now extracted directly from envelopes
+        // Extract KEM pubkey from capacity reply and include it in the notification
+        let peer_pubkey = cap_reply.kem_pubkey().unwrap_or("");
+        let peer_with_key = format!("{}:{}", peer_id.to_string(), peer_pubkey);
         utils::notify_capacity_observers(pending_queries, &request_part, move || {
-            peer_id.to_string()
+            peer_with_key.clone()
         });
         return;
     }

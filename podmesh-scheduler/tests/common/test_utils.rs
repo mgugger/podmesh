@@ -11,6 +11,18 @@ use tokio::time::sleep;
 
 static CLEANUP_HOOK_INIT: Once = Once::new();
 
+/// Clean up potentially corrupted key files from ~/.podmesh before tests
+#[allow(dead_code)]
+pub fn cleanup_key_files() {
+    if let Some(home) = dirs::home_dir() {
+        let podmesh_dir = home.join(".podmesh");
+        if podmesh_dir.exists() {
+            eprintln!("Cleaning up key files from {:?}", podmesh_dir);
+            let _ = std::fs::remove_dir_all(&podmesh_dir);
+        }
+    }
+}
+
 /// Set env var for tests while containing the unsafe block required by Rust 2024.
 #[allow(dead_code)]
 pub fn set_env_var(key: &str, value: &str) {
@@ -247,6 +259,15 @@ pub fn global_cleanup() {
         }
         if !output.stderr.is_empty() {
             eprintln!("pkill stderr: {}", String::from_utf8_lossy(&output.stderr));
+        }
+    }
+
+    // Clean up potentially corrupted key files from ~/.podmesh
+    if let Some(home) = dirs::home_dir() {
+        let podmesh_dir = home.join(".podmesh");
+        if podmesh_dir.exists() {
+            eprintln!("Cleaning up key files from {:?}", podmesh_dir);
+            let _ = std::fs::remove_dir_all(&podmesh_dir);
         }
     }
 

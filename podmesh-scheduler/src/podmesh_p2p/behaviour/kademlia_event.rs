@@ -1,4 +1,5 @@
 use crate::podmesh_p2p::control;
+use crate::provider::announcements::ProviderAnnouncement;
 use libp2p::{PeerId, kad};
 use log::{debug, info, warn};
 
@@ -19,6 +20,23 @@ pub fn kademlia_event(event: kad::Event, _peer_id: Option<PeerId>) {
                     "DHT: Retrieved record with key: {:?} from query: {:?}",
                     record.key, id
                 );
+                // Check if this is a pending provider record query
+                if let Some(tx) = control::take_pending_provider_record_query(&id) {
+                    // Try to parse the record as a ProviderAnnouncement
+                    match ProviderAnnouncement::from_bytes(&record.value) {
+                        Ok(announcement) => {
+                            info!(
+                                "DHT: Parsed provider announcement for manifest: {}, peer: {}",
+                                announcement.manifest_id, announcement.peer_id
+                            );
+                            let _ = tx.send(Some(announcement.metadata));
+                        }
+                        Err(e) => {
+                            warn!("DHT: Failed to parse provider announcement: {}", e);
+                            let _ = tx.send(None);
+                        }
+                    }
+                }
             }
             kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders {
                 key: _key,
@@ -43,6 +61,10 @@ pub fn kademlia_event(event: kad::Event, _peer_id: Option<PeerId>) {
             }
             kad::QueryResult::GetRecord(Err(e)) => {
                 warn!("DHT: Failed to get record for query {:?}: {:?}", id, e);
+                // Send None if this was a pending provider record query
+                if let Some(tx) = control::take_pending_provider_record_query(&id) {
+                    let _ = tx.send(None);
+                }
             }
             kad::QueryResult::PutRecord(Ok(kad::PutRecordOk { key })) => {
                 info!("DHT: Successfully stored record with key: {:?}", key);

@@ -186,6 +186,24 @@ pub async fn handle_control_message(
             // The public key should be obtained during peer connection/handshake
             let _ = reply_tx.send(peer_id);
         }
+        Libp2pControl::GetProviderRecord {
+            manifest_id,
+            reply_tx,
+        } => {
+            // Get the provider announcement record from DHT
+            let record_key = RecordKey::new(&format!("provider:{}", manifest_id));
+            info!(
+                "DHT: attempting get_record for provider:{}",
+                manifest_id
+            );
+            let query_id = swarm.behaviour_mut().kademlia.get_record(record_key);
+            // Register pending sender so the kademlia_event handler can reply when results arrive
+            insert_pending_provider_record_query(query_id, reply_tx);
+            info!(
+                "DHT: initiated get_record for provider announcement (query_id={:?})",
+                manifest_id
+            );
+        }
     }
 }
 
@@ -238,6 +256,11 @@ static PENDING_PROVIDERS_QUERIES: Lazy<
     Mutex<std::collections::HashMap<String, mpsc::UnboundedSender<Vec<libp2p::PeerId>>>>,
 > = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// Pending provider record queries: QueryId string -> reply sender (Option<HashMap<String, String>>)
+static PENDING_PROVIDER_RECORD_QUERIES: Lazy<
+    Mutex<std::collections::HashMap<String, mpsc::UnboundedSender<Option<HashMap<String, String>>>>>,
+> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+
 /// Insert a pending providers query sender for the given QueryId
 pub fn insert_pending_providers_query(
     id: QueryId,
@@ -254,6 +277,25 @@ pub fn take_pending_providers_query(
 ) -> Option<mpsc::UnboundedSender<Vec<libp2p::PeerId>>> {
     let key = format!("{:?}", id);
     let mut map = PENDING_PROVIDERS_QUERIES.lock().unwrap();
+    map.remove(&key)
+}
+
+/// Insert a pending provider record query sender for the given QueryId
+pub fn insert_pending_provider_record_query(
+    id: QueryId,
+    sender: mpsc::UnboundedSender<Option<HashMap<String, String>>>,
+) {
+    let key = format!("{:?}", id);
+    let mut map = PENDING_PROVIDER_RECORD_QUERIES.lock().unwrap();
+    map.insert(key, sender);
+}
+
+/// Take and remove a pending provider record query sender by QueryId
+pub fn take_pending_provider_record_query(
+    id: &QueryId,
+) -> Option<mpsc::UnboundedSender<Option<HashMap<String, String>>>> {
+    let key = format!("{:?}", id);
+    let mut map = PENDING_PROVIDER_RECORD_QUERIES.lock().unwrap();
     map.remove(&key)
 }
 
@@ -375,5 +417,10 @@ pub enum Libp2pControl {
     GetPeerPublicKey {
         peer_id: String,
         reply_tx: mpsc::UnboundedSender<String>,
+    },
+    /// Get the provider announcement record from DHT (includes metadata with KEM key)
+    GetProviderRecord {
+        manifest_id: String,
+        reply_tx: mpsc::UnboundedSender<Option<HashMap<String, String>>>,
     },
 }

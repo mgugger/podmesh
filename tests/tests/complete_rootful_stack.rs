@@ -15,14 +15,14 @@ use serial_test::serial;
 use tokio::{process::Command as TokioCommand, time::sleep};
 
 const MACHINE_API_URL: &str = "http://127.0.0.1:3000";
-const ROOTLESS_MANIFEST_PATH: &str = "deploy/podmesh_rootless.yml";
+const ROOTLESS_MANIFEST_PATH: &str = "deploy/podmesh_rootful.yml";
 const SAMPLE_MANIFEST_PATH: &str = "tests/sample_manifests/demo_deployment_without_sidecar.yml";
 const PODMESH_PROXY_URL: &str = "http://127.0.0.1:8080/";
 const EXPECTED_BODY_SUBSTRING: &str = "Welcome to Podmesh";
 const REQUIRED_MACHINE_PEERS: usize = 1;
 const EXPECTED_CONTAINERS: [&str; 2] = ["my-nginx", "sidecar"];
 const PODMESH_NETWORK: &str = "podmesh";
-const ROOTLESS_PODMAN_SOCKET: &str = "/run/user/1000/podman/podman.sock";
+const ROOTLESS_PODMAN_SOCKET: &str = "/run/podman/podman.sock";
 const REQUIRED_IMAGES: [&str; 3] = [
     "localhost/podmesh/scheduler:latest",
     "localhost/podmesh/proxy:latest",

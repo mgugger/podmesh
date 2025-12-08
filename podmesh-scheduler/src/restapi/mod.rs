@@ -377,8 +377,10 @@ pub async fn get_task_providers(
         return create_response_for_providers(&state, &response_data, &envelope_metadata).await;
     }
 
-    // For each provider, get their signing public key (stored during peer connection)
-    // For now, use a placeholder - in production, public keys should be cached from peer metadata
+    // Fetch the provider record from DHT to get metadata (including KEM public key)
+    let provider_metadata = fetch_provider_record_metadata(&task_id, &state).await;
+    
+    // For each provider, get their KEM public key from the announcement metadata
     let mut providers_with_keys = Vec::new();
     
     // Get local peer ID to check if we're the provider
@@ -405,8 +407,15 @@ pub async fn get_task_providers(
                 }
             }
         } else {
-            // For remote peers, use placeholder (peer_id) until we have their real key via gossip/libp2p
-            provider_peer_id.clone()
+            // Try to get the KEM public key from the provider announcement metadata
+            provider_metadata
+                .as_ref()
+                .and_then(|m| m.get("kem_pubkey"))
+                .cloned()
+                .unwrap_or_else(|| {
+                    warn!("No KEM public key found in provider metadata for peer {}", provider_peer_id);
+                    String::new()
+                })
         };
 
         providers_with_keys.push(serde_json::json!({
@@ -1237,6 +1246,58 @@ async fn find_manifest_providers(task_id: &str, state: &RestState) -> Result<Vec
                 task_id
             );
             Ok(vec![])
+        }
+    }
+}
+
+/// Fetch provider record metadata from DHT (includes KEM public key)
+async fn fetch_provider_record_metadata(
+    task_id: &str,
+    state: &RestState,
+) -> Option<std::collections::HashMap<String, String>> {
+    info!("fetch_provider_record_metadata: fetching for task_id={}", task_id);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let control_msg = crate::podmesh_p2p::control::Libp2pControl::GetProviderRecord {
+        manifest_id: task_id.to_string(),
+        reply_tx: tx,
+    };
+
+    if let Err(e) = state.control_tx.send(control_msg) {
+        warn!("fetch_provider_record_metadata: failed to send request: {}", e);
+        return None;
+    }
+
+    // Wait for response with timeout
+    match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+        Ok(Some(metadata)) => {
+            if metadata.is_some() {
+                info!(
+                    "fetch_provider_record_metadata: found metadata for task_id={}",
+                    task_id
+                );
+            } else {
+                debug!(
+                    "fetch_provider_record_metadata: no metadata found for task_id={}",
+                    task_id
+                );
+            }
+            metadata
+        }
+        Ok(None) => {
+            warn!(
+                "fetch_provider_record_metadata: channel closed for task_id={}",
+                task_id
+            );
+            None
+        }
+        Err(_) => {
+            warn!(
+                "fetch_provider_record_metadata: timeout waiting for metadata for task_id={}",
+                task_id
+            );
+            None
         }
     }
 }

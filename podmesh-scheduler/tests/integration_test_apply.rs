@@ -14,7 +14,7 @@ use env_logger::Env;
 #[cfg(feature = "podman-tests")]
 use podmesh_scheduler::sidecar::SIDECAR_CONTAINER_NAME;
 #[cfg(feature = "podman-tests")]
-use common::test_utils::{NodeGuard, make_test_cli, setup_cleanup_hook, start_nodes};
+use common::test_utils::{cleanup_key_files, NodeGuard, make_test_cli, setup_cleanup_hook, start_nodes};
 
 fn manifest_path(file: &str) -> PathBuf {
     PathBuf::from(format!(
@@ -248,6 +248,7 @@ async fn test_apply_nginx_with_replicas() {
 #[cfg(feature = "podman-tests")]
 async fn setup_test_environment_for_podman() -> (reqwest::Client, Vec<u16>) {
     setup_cleanup_hook();
+    cleanup_key_files(); // Clean up potentially corrupted key files before test
     let _ = env_logger::Builder::from_env(Env::default().default_filter_or("warn")).try_init();
 
     (reqwest::Client::new(), vec![3000u16, 3100u16, 3200u16])
@@ -257,9 +258,9 @@ async fn setup_test_environment_for_podman() -> (reqwest::Client, Vec<u16>) {
 async fn start_test_nodes_for_podman() -> NodeGuard {
     let mut cli1 = make_test_cli(3000, false, true, None, vec![], 4001, false);
     cli1.mock_only_runtime = false;
-    cli1.signing_ephemeral = false;
-    cli1.kem_ephemeral = false;
-    cli1.ephemeral_keys = false;
+    cli1.signing_ephemeral = true;
+    cli1.kem_ephemeral = true;
+    cli1.ephemeral_keys = true;
 
     let mut cli2 = make_test_cli(
         3100,
@@ -271,9 +272,9 @@ async fn start_test_nodes_for_podman() -> NodeGuard {
         false,
     );
     cli2.mock_only_runtime = false;
-    cli2.signing_ephemeral = false;
-    cli2.kem_ephemeral = false;
-    cli2.ephemeral_keys = false;
+    cli2.signing_ephemeral = true;
+    cli2.kem_ephemeral = true;
+    cli2.ephemeral_keys = true;
 
     let bootstrap_peers = vec![
         "/ip4/127.0.0.1/udp/4001/quic-v1".to_string(),
@@ -282,9 +283,9 @@ async fn start_test_nodes_for_podman() -> NodeGuard {
 
     let mut cli3 = make_test_cli(3200, false, true, None, bootstrap_peers, 0, false);
     cli3.mock_only_runtime = false;
-    cli3.signing_ephemeral = false;
-    cli3.kem_ephemeral = false;
-    cli3.ephemeral_keys = false;
+    cli3.signing_ephemeral = true;
+    cli3.kem_ephemeral = true;
+    cli3.ephemeral_keys = true;
 
     start_nodes(vec![cli1, cli2, cli3], Duration::from_secs(1)).await
 }

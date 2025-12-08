@@ -489,6 +489,11 @@ async fn process_manifest_deployment(
         metadata.insert("workload_id".to_string(), workload_info.id.clone());
         metadata.insert("node_type".to_string(), "podmesh-machine".to_string());
 
+        // Include our KEM public key in the announcement so other nodes can encrypt messages to us
+        if let Ok((kem_pub_bytes, _)) = crypto::ensure_kem_keypair_on_disk() {
+            metadata.insert("kem_pubkey".to_string(), crypto::b64_encode(&kem_pub_bytes));
+        }
+
         if let Err(e) = provider_manager.announce_provider(swarm, &manifest_id, metadata) {
             warn!(
                 "Failed to announce as provider for manifest {}: {}",
