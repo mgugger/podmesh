@@ -20,7 +20,6 @@ async-trait = "0.1"
 crypto = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
-saorsa-pqc = { workspace = true }
 dirs = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }

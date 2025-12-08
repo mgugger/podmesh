@@ -2,7 +2,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 fn serialize<T: Serialize>(value: &T) -> Vec<u8> {
-    postcard::to_allocvec(value).expect("gateway serialization should succeed")
+    postcard::to_allocvec(value).expect("sidecar serialization should succeed")
 }
 
 fn deserialize<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, postcard::Error> {
@@ -11,83 +11,83 @@ fn deserialize<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, postcard
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[repr(u8)]
-pub enum GatewayRouteKind {
+pub enum SidecarRouteKind {
     Service = 0,
     Ingress = 1,
 }
 
-impl Default for GatewayRouteKind {
+impl Default for SidecarRouteKind {
     fn default() -> Self {
-        GatewayRouteKind::Service
+        SidecarRouteKind::Service
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct GatewayRouteWire {
+struct SidecarRouteWire {
     path_prefix: String,
     target_port: u16,
     service_name: String,
     service_port: String,
-    source: GatewayRouteKind,
+    source: SidecarRouteKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GatewayProviderRecordWire {
+pub struct SidecarProviderRecordWire {
     manifest_id: String,
     peer_id: String,
     host: String,
     owner_public_key_b64: String,
-    routes: Vec<GatewayRouteWire>,
+    routes: Vec<SidecarRouteWire>,
     ttl_ms: u32,
     last_updated_ms: u64,
     version: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GatewayRouteSpec {
+pub struct SidecarRouteSpec {
     pub host: String,
     pub path_prefix: String,
     pub target_port: u16,
     pub service_name: String,
     pub service_port: String,
-    pub source: GatewayRouteKind,
+    pub source: SidecarRouteKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GatewayProviderRecordOwned {
+pub struct SidecarProviderRecordOwned {
     pub manifest_id: String,
     pub peer_id: String,
     pub host: String,
     pub owner_public_key_b64: Option<String>,
-    pub routes: Vec<GatewayRouteSpec>,
+    pub routes: Vec<SidecarRouteSpec>,
     pub ttl_ms: u32,
     pub last_updated_ms: u64,
     pub version: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GatewayManifestRequest {
+pub struct SidecarManifestRequest {
     pub manifest_id: String,
 }
 
-pub fn build_gateway_provider_record(
+pub fn build_sidecar_provider_record(
     manifest_id: &str,
     peer_id: &str,
     host: &str,
     owner_public_key_b64: Option<&str>,
-    routes: &[GatewayRouteSpec],
+    routes: &[SidecarRouteSpec],
     ttl_ms: u32,
     last_updated_ms: u64,
     version: u16,
 ) -> Vec<u8> {
-    let wire = GatewayProviderRecordWire {
+    let wire = SidecarProviderRecordWire {
         manifest_id: manifest_id.to_string(),
         peer_id: peer_id.to_string(),
         host: host.to_string(),
         owner_public_key_b64: owner_public_key_b64.unwrap_or_default().to_string(),
         routes: routes
             .iter()
-            .map(|route| GatewayRouteWire {
+            .map(|route| SidecarRouteWire {
                 path_prefix: route.path_prefix.clone(),
                 target_port: route.target_port,
                 service_name: route.service_name.clone(),
@@ -102,17 +102,17 @@ pub fn build_gateway_provider_record(
     serialize(&wire)
 }
 
-pub fn root_as_gateway_provider_record(
+pub fn root_as_sidecar_provider_record(
     bytes: &[u8],
-) -> Result<GatewayProviderRecordWire, postcard::Error> {
+) -> Result<SidecarProviderRecordWire, postcard::Error> {
     deserialize(bytes)
 }
 
-pub fn decode_gateway_provider_record(data: &[u8]) -> anyhow::Result<GatewayProviderRecordOwned> {
+pub fn decode_sidecar_provider_record(data: &[u8]) -> anyhow::Result<SidecarProviderRecordOwned> {
     let record =
-        root_as_gateway_provider_record(data).context("failed to parse gateway provider record")?;
+        root_as_sidecar_provider_record(data).context("failed to parse sidecar provider record")?;
 
-    let GatewayProviderRecordWire {
+    let SidecarProviderRecordWire {
         manifest_id,
         peer_id,
         host,
@@ -131,7 +131,7 @@ pub fn decode_gateway_provider_record(data: &[u8]) -> anyhow::Result<GatewayProv
 
     let routes = routes
         .into_iter()
-        .map(|route| GatewayRouteSpec {
+        .map(|route| SidecarRouteSpec {
             host: host.clone(),
             path_prefix: route.path_prefix,
             target_port: route.target_port,
@@ -141,7 +141,7 @@ pub fn decode_gateway_provider_record(data: &[u8]) -> anyhow::Result<GatewayProv
         })
         .collect();
 
-    Ok(GatewayProviderRecordOwned {
+    Ok(SidecarProviderRecordOwned {
         manifest_id,
         peer_id,
         host,
@@ -153,14 +153,14 @@ pub fn decode_gateway_provider_record(data: &[u8]) -> anyhow::Result<GatewayProv
     })
 }
 
-pub fn build_gateway_manifest_request(manifest_id: &str) -> Vec<u8> {
-    serialize(&GatewayManifestRequest {
+pub fn build_sidecar_manifest_request(manifest_id: &str) -> Vec<u8> {
+    serialize(&SidecarManifestRequest {
         manifest_id: manifest_id.to_string(),
     })
 }
 
-pub fn root_as_gateway_manifest_request(
+pub fn root_as_sidecar_manifest_request(
     bytes: &[u8],
-) -> Result<GatewayManifestRequest, postcard::Error> {
+) -> Result<SidecarManifestRequest, postcard::Error> {
     deserialize(bytes)
 }

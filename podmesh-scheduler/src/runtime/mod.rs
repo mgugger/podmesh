@@ -103,14 +103,14 @@ pub struct DeploymentConfig {
     pub env: HashMap<String, String>,
     /// Additional runtime-specific options
     pub runtime_options: HashMap<String, String>,
-    /// Optional gateway sidecar injection data
-    pub gateway: Option<GatewayInjectionConfig>,
+    /// Optional sidecar injection data
+    pub sidecar: Option<SidecarInjectionConfig>,
 }
 
-/// Metadata required to inject and configure the workload gateway sidecar
+/// Metadata required to inject and configure the workload sidecar
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GatewayInjectionConfig {
-    /// Container image reference to run for the gateway sidecar
+pub struct SidecarInjectionConfig {
+    /// Container image reference to run for the sidecar
     pub image: String,
     /// Bootstrap peer multiaddr for the workload DHT
     pub bootstrap_peer: String,
@@ -144,7 +144,7 @@ impl Default for DeploymentConfig {
             },
             env: HashMap::new(),
             runtime_options: HashMap::new(),
-            gateway: None,
+            sidecar: None,
         }
     }
 }

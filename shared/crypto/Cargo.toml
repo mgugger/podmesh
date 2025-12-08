@@ -15,5 +15,4 @@ saorsa-pqc = { workspace = true }
 log = { workspace = true }
 zeroize = "1.5"
 once_cell = { workspace = true }
-libp2p = { workspace = true, features = ["macros"] }
 thiserror = { workspace = true }

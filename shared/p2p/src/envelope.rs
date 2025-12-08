@@ -1,5 +1,4 @@
 use anyhow::Context;
-use base64::Engine;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -153,8 +152,7 @@ pub fn create_signed_envelope(
     peer_id: Option<&str>,
     kem_pub_b64: Option<&str>,
 ) -> anyhow::Result<Vec<u8>> {
-    let public_key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(public_key_b64)
+    let public_key_bytes = crypto::b64_decode(public_key_b64)
         .context("failed to decode public key")?;
 
     let config = SignEnvelopeConfig {
@@ -185,8 +183,7 @@ pub fn create_encrypted_signed_envelope(
 ) -> anyhow::Result<Vec<u8>> {
     let encrypted_payload = crypto::encrypt_payload_for_recipient(recipient_kem_pubkey, payload)?;
 
-    let public_key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(public_key_b64)
+    let public_key_bytes = crypto::b64_decode(public_key_b64)
         .context("failed to decode public key")?;
 
     let config = SignEnvelopeConfig {
@@ -249,8 +246,7 @@ pub fn verify_flatbuffer_envelope_for_peer(
     let pub_str = fb_env.pubkey().unwrap_or("");
 
     let sig_bytes = normalize_and_decode_signature(Some(sig_str))?;
-    let pub_bytes = base64::engine::general_purpose::STANDARD
-        .decode(pub_str)
+    let pub_bytes = crypto::b64_decode(pub_str)
         .context("failed to base64-decode pubkey")?;
 
     // Reconstruct canonical bytes using the same method as signing
@@ -318,8 +314,7 @@ pub fn verify_flatbuffer_envelope_skip_nonce_check(
     let pub_str = fb_env.pubkey().unwrap_or("");
 
     let sig_bytes = normalize_and_decode_signature(Some(sig_str))?;
-    let pub_bytes = base64::engine::general_purpose::STANDARD
-        .decode(pub_str)
+    let pub_bytes = crypto::b64_decode(pub_str)
         .context("failed to base64-decode pubkey")?;
 
     let payload_vec = fb_env.payload().map(|b| b.to_vec()).unwrap_or_default();

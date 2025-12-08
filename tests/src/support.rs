@@ -1,16 +1,12 @@
 use std::net::{TcpListener, UdpSocket};
 use std::sync::Once;
 
-static INIT_TRACING: Once = Once::new();
+static INIT_LOGGING: Once = Once::new();
 
 pub fn init_tracing() {
-    INIT_TRACING.call_once(|| {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "warn,workplane=info".into()),
-            )
-            .with_target(false)
+    INIT_LOGGING.call_once(|| {
+        let _ = env_logger::builder()
+            .is_test(true)
             .try_init();
     });
 }

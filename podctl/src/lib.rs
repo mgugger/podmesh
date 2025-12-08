@@ -1,4 +1,3 @@
-use base64::Engine;
 use crypto::{encrypt_payload_for_recipient, ensure_keypair_on_disk};
 use log::debug;
 use log::error;
@@ -11,10 +10,8 @@ use std::env;
 use serde_json::Value as JsonValue;
 use std::path::PathBuf;
 
-mod flatbuffers;
-use flatbuffers::FlatbufferClient;
-
-mod flatbuffer_envelope;
+mod postcard_client;
+use postcard_client::FlatbufferClient;
 
 fn resolve_api_base(override_url: Option<&str>) -> String {
     override_url
@@ -234,8 +231,7 @@ async fn send_apply_to_node(
 ) -> anyhow::Result<()> {
     debug!("Creating encrypted task for node: {}", node_id);
 
-    let node_pubkey_bytes = base64::engine::general_purpose::STANDARD
-        .decode(node_pubkey_b64)
+    let node_pubkey_bytes = crypto::b64_decode(node_pubkey_b64)
         .map_err(|e| anyhow::anyhow!("Failed to decode node public key for {}: {}", node_id, e))?;
 
     let encrypted_blob =
@@ -257,8 +253,7 @@ async fn send_apply_to_node(
     );
 
     let operation_id = Uuid::new_v4().to_string();
-    let manifest_json_b64 =
-        base64::engine::general_purpose::STANDARD.encode(&encrypted_manifest_bytes);
+    let manifest_json_b64 = crypto::b64_encode(&encrypted_manifest_bytes);
 
     let apply_request_bytes = protocol::machine::build_apply_request(
         1,
@@ -479,8 +474,7 @@ async fn send_delete_to_node(
 ) -> anyhow::Result<()> {
     debug!("Sending delete request to node: {}", node_id);
 
-    let node_pubkey_bytes = base64::engine::general_purpose::STANDARD
-        .decode(node_pubkey_b64)
+    let node_pubkey_bytes = crypto::b64_decode(node_pubkey_b64)
         .map_err(|e| anyhow::anyhow!("Failed to decode node public key for {}: {}", node_id, e))?;
 
     let delete_request_bytes = protocol::machine::build_delete_request(

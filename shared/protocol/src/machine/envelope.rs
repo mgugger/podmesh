@@ -1,5 +1,4 @@
 use anyhow::Context;
-use base64::Engine;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::util::opt_str;
@@ -201,12 +200,8 @@ pub fn fb_envelope_extract_sig_pub(envelope_bytes: &[u8]) -> Option<(Vec<u8>, Ve
         .splitn(2, ':')
         .nth(if sig_field.contains(':') { 1 } else { 0 })
         .unwrap_or(sig_field);
-    let sig_bytes = base64::engine::general_purpose::STANDARD
-        .decode(sig_b64)
-        .ok()?;
-    let pub_bytes = base64::engine::general_purpose::STANDARD
-        .decode(envelope.pubkey()?)
-        .ok()?;
+    let sig_bytes = crypto::b64_decode(sig_b64).ok()?;
+    let pub_bytes = crypto::b64_decode(envelope.pubkey()?).ok()?;
     Some((sig_bytes, pub_bytes))
 }
 
@@ -233,11 +228,9 @@ pub fn fb_envelope_extract_sig_pub_legacy(
         .nth(if sig_field.contains(':') { 1 } else { 0 })
         .unwrap_or(&sig_field)
         .to_string();
-    let sig_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&sig_b64)
+    let sig_bytes = crypto::b64_decode(&sig_b64)
         .context("failed to base64-decode signature")?;
-    let pub_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&pubkey_field)
+    let pub_bytes = crypto::b64_decode(&pubkey_field)
         .context("failed to base64-decode pubkey")?;
 
     Ok((canonical, sig_bytes, pub_bytes, sig_field, pubkey_field))
@@ -263,8 +256,7 @@ pub fn build_encrypted_envelope(
         None,
     );
 
-    let sender_pubkey_bytes = base64::engine::general_purpose::STANDARD
-        .decode(sender_pubkey)
+    let sender_pubkey_bytes = crypto::b64_decode(sender_pubkey)
         .context("failed to decode sender public key")?;
     let (sig_b64, pub_b64) =
         crypto::sign_envelope(sender_privkey, &sender_pubkey_bytes, &canonical)?;
@@ -305,8 +297,7 @@ pub fn build_encrypted_envelope_with_peer(
         sender_kem_pub_b64,
     );
 
-    let sender_pubkey_bytes = base64::engine::general_purpose::STANDARD
-        .decode(sender_pubkey)
+    let sender_pubkey_bytes = crypto::b64_decode(sender_pubkey)
         .context("failed to decode sender public key")?;
     let (sig_b64, pub_b64) =
         crypto::sign_envelope(sender_privkey, &sender_pubkey_bytes, &canonical)?;

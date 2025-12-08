@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use anyhow::Result;
 use tokio::{sync::watch, task::JoinHandle};
-use tracing::info;
+use log::info;
 
 use crate::{config::Config, ingress, p2p, restapi};
 
@@ -38,9 +38,8 @@ impl Workload {
         let peer_id = node.peer_id().to_string();
         let rest_handle = if self.cfg.disable_rest_api {
             info!(
-                host = %self.cfg.rest_host,
-                port = self.cfg.rest_port,
-                "workload rest api disabled"
+                "workload rest api disabled host={} port={}",
+                self.cfg.rest_host, self.cfg.rest_port
             );
             None
         } else {
@@ -59,7 +58,7 @@ impl Workload {
             let ingress_server = ingress::IngressServer::spawn(
                 self.cfg.rest_host.clone(),
                 DEFAULT_INGRESS_PORT,
-                ingress::proxy_gateway_client(proxy_client),
+                ingress::proxy_sidecar_client(proxy_client),
             )?;
             self.ingress = Some(ingress_server);
         } else {

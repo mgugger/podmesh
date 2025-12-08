@@ -8,12 +8,12 @@ authors = ["Podmesh"]
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["env"] }
+crypto = { workspace = true }
 futures = { workspace = true }
 libp2p = { workspace = true }
 tokio = { workspace = true }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing_support = { path = "../shared/tracing_support" }
+log = { workspace = true }
+env_logger = { workspace = true }
 p2p = { workspace = true }
 protocol = { workspace = true }
 reqwest = { workspace = true }

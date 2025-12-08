@@ -14,7 +14,6 @@ RUN rustup target add x86_64-unknown-linux-musl
 COPY . .
 
 RUN cargo build --release --locked -p podmesh-sidecar --target x86_64-unknown-linux-musl
-RUN strip /app/target/x86_64-unknown-linux-musl/release/podmesh-sidecar
 
 # =====================
 # 2. Minimal runtime image

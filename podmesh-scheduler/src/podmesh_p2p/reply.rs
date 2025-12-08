@@ -1,5 +1,4 @@
 use crate::podmesh_p2p::envelope::{SignEnvelopeConfig, SignedEnvelope, sign_with_node_keys};
-use base64::Engine;
 use log::warn;
 
 /// Input parameters for building a capacity reply.
@@ -47,7 +46,7 @@ pub fn baseline_capacity_params<'a>(
 pub fn build_capacity_reply(params: CapacityReplyParams<'_>) -> CapacityReply {
     let kem_pub_b64 = crypto::ensure_kem_keypair_on_disk()
         .ok()
-        .map(|(pubb, _)| base64::engine::general_purpose::STANDARD.encode(&pubb));
+        .map(|(pubb, _)| crypto::b64_encode(&pubb));
 
     let payload = protocol::machine::build_capacity_reply(
         params.ok,

@@ -1,7 +1,7 @@
 mod envelope;
-mod gateway;
 mod manifest;
 mod messages;
+mod sidecar;
 mod util;
 
 pub use envelope::{
@@ -11,10 +11,10 @@ pub use envelope::{
     fb_envelope_extract_sig_pub_legacy, root_as_envelope,
 };
 
-pub use gateway::{
-    GatewayManifestRequest, GatewayProviderRecordOwned, GatewayRouteKind, GatewayRouteSpec,
-    build_gateway_manifest_request, build_gateway_provider_record, decode_gateway_provider_record,
-    root_as_gateway_manifest_request, root_as_gateway_provider_record,
+pub use sidecar::{
+    SidecarManifestRequest, SidecarProviderRecordOwned, SidecarRouteKind, SidecarRouteSpec,
+    build_sidecar_manifest_request, build_sidecar_provider_record, decode_sidecar_provider_record,
+    root_as_sidecar_manifest_request, root_as_sidecar_provider_record,
 };
 
 pub use manifest::{

@@ -24,7 +24,7 @@ pub fn handle_failure<E: std::fmt::Debug>(
     peer: libp2p::PeerId,
     error: E,
 ) {
-    ProtocolLogger::log_failure(protocol, &format!("{}", direction), peer, error);
+    ProtocolLogger::log_failure(protocol, &format!("{}", direction), &peer.to_string(), error);
 }
 
 /// Specialized handler for apply protocol inbound failures

@@ -1,5 +1,4 @@
-use base64::Engine;
-use crypto::{ensure_keypair_ephemeral, ensure_pqc_init, sign_envelope};
+use crypto::{b64_decode, b64_encode, ensure_keypair_ephemeral, ensure_pqc_init, sign_envelope};
 use protocol::machine::{build_envelope_canonical, build_envelope_signed};
 use std::time::Duration;
 
@@ -106,11 +105,10 @@ fn test_envelope_base64_encoding_for_transport() {
         None,
     );
 
-    let encoded_envelope = base64::engine::general_purpose::STANDARD.encode(&envelope);
+    let encoded_envelope = b64_encode(&envelope);
     assert!(!encoded_envelope.is_empty());
 
-    let decoded_envelope = base64::engine::general_purpose::STANDARD
-        .decode(&encoded_envelope)
+    let decoded_envelope = b64_decode(&encoded_envelope)
         .expect("Should decode base64 envelope");
 
     let verification_result = podmesh_scheduler::podmesh_p2p::envelope::verify_flatbuffer_envelope(

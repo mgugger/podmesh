@@ -12,7 +12,7 @@ use common::apply_common::{
 #[cfg(feature = "podman-tests")]
 use env_logger::Env;
 #[cfg(feature = "podman-tests")]
-use podmesh_scheduler::gateway_sidecar::GATEWAY_SIDECAR_CONTAINER_NAME;
+use podmesh_scheduler::sidecar::SIDECAR_CONTAINER_NAME;
 #[cfg(feature = "podman-tests")]
 use common::test_utils::{NodeGuard, make_test_cli, setup_cleanup_hook, start_nodes};
 
@@ -108,8 +108,8 @@ async fn test_apply_with_real_podman() {
     );
     assert!(
         nginx_status.sidecar_running,
-        "Gateway sidecar '{}' for task {} not running (state={:?})",
-        GATEWAY_SIDECAR_CONTAINER_NAME, task_id, nginx_status.sidecar_state
+        "Sidecar '{}' for task {} not running (state={:?})",
+        SIDECAR_CONTAINER_NAME, task_id, nginx_status.sidecar_state
     );
 
     let _delete_result = podctl::delete_file(nginx_manifest_path, true, None).await;
@@ -150,8 +150,8 @@ async fn test_apply_with_real_podman() {
     );
     assert!(
         demo_status.sidecar_running,
-        "Gateway sidecar '{}' for task {} not running (state={:?})",
-        GATEWAY_SIDECAR_CONTAINER_NAME, demo_task_id, demo_status.sidecar_state
+        "Sidecar '{}' for task {} not running (state={:?})",
+        SIDECAR_CONTAINER_NAME, demo_task_id, demo_status.sidecar_state
     );
 
     let _delete_demo = podctl::delete_file(demo_manifest_path, true, None).await;
@@ -378,7 +378,7 @@ async fn verify_podman_deployment(task_id: &str) -> PodmanDeploymentStatus {
                                         status.workload_found = true;
                                         if name_str
                                             .to_ascii_lowercase()
-                                            .contains(GATEWAY_SIDECAR_CONTAINER_NAME)
+                                            .contains(SIDECAR_CONTAINER_NAME)
                                         {
                                             status.sidecar_found = true;
                                             status.sidecar_state = container_state.clone();
@@ -391,7 +391,7 @@ async fn verify_podman_deployment(task_id: &str) -> PodmanDeploymentStatus {
                                                 status.sidecar_running = true;
                                             }
                                             log::info!(
-                                                "Found gateway sidecar container '{}' for task {} (state={:?})",
+                                                "Found sidecar container '{}' for task {} (state={:?})",
                                                 name_str,
                                                 task_id,
                                                 status.sidecar_state

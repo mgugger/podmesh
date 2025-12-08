@@ -14,7 +14,7 @@ use axum::{
 use axum_support::{parse_socket_addr, spawn_tcp_listener};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use log::{error, info, warn};
 
 use crate::p2p::ProxyClient;
 use p2p::http_proxy::ProxyHttpRequest;
@@ -27,17 +27,17 @@ pub struct IngressServer {
 }
 
 impl IngressServer {
-    pub fn spawn(host: String, port: u16, gateway: GatewayClient) -> Result<Self> {
+    pub fn spawn(host: String, port: u16, sidecar: SidecarClient) -> Result<Self> {
         let addr = parse_socket_addr(&host, port)?;
         let std_listener = StdTcpListener::bind(addr)?;
         std_listener.set_nonblocking(true)?;
         let listener = TcpListener::from_std(std_listener)?;
 
-        let state = IngressState { gateway };
+        let state = IngressState { sidecar };
         let app = Router::new().fallback(any(ingress_entry)).with_state(state);
         let join = spawn_tcp_listener(listener, app, "workload-ingress");
 
-        info!(addr = %addr, "ingress server listening");
+        info!("ingress server listening addr={}", addr);
         Ok(Self {
             join,
             listen_addr: addr,
@@ -56,7 +56,7 @@ impl IngressServer {
 
 #[derive(Clone)]
 pub struct IngressState {
-    gateway: GatewayClient,
+    sidecar: SidecarClient,
 }
 
 async fn ingress_entry(
@@ -73,7 +73,7 @@ async fn ingress_entry(
     };
 
     let Some(app_id) = manifest_id_from_host(&host) else {
-        warn!(host = %host, "unable to derive manifest id from host" );
+        warn!("unable to derive manifest id from host host={}", host);
         return status_response(StatusCode::BAD_REQUEST, "invalid host header");
     };
 
@@ -83,17 +83,17 @@ async fn ingress_entry(
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| request.uri().path().to_string());
-    info!(host = %host, manifest = %app_id, method = %method, path = %path, "ingress proxy forwarding request via gateway");
+    info!("ingress proxy forwarding request via sidecar host={} manifest={} method={} path={}", host, app_id, method, path);
 
-    match state.gateway.forward(&app_id, request).await {
+    match state.sidecar.forward(&app_id, request).await {
         Ok(response) => {
             let status = response.status().as_u16();
-            info!(host = %host, manifest = %app_id, method = %method, path = %path, status, "ingress proxy received response from gateway");
+            info!("ingress proxy received response from sidecar host={} manifest={} method={} path={} status={}", host, app_id, method, path, status);
             response
         }
         Err(err) => {
-            error!(host = %host, manifest = %app_id, error = %err, "gateway forward failed");
-            status_response(StatusCode::BAD_GATEWAY, "gateway forwarding failed")
+            error!("sidecar forward failed host={} manifest={} error={}", host, app_id, err);
+            status_response(StatusCode::BAD_GATEWAY, "sidecar forwarding failed")
         }
     }
 }
@@ -130,40 +130,40 @@ fn status_response(code: StatusCode, body: &str) -> Response<Body> {
         .unwrap_or_else(|_| Response::new(Body::from("invalid response")))
 }
 
-pub type GatewayClient = Arc<dyn GatewayForwarder + Send + Sync>;
+pub type SidecarClient = Arc<dyn SidecarForwarder + Send + Sync>;
 
-pub fn proxy_gateway_client(proxy_client: ProxyClient) -> GatewayClient {
-    Arc::new(ProxyGatewayForwarder::new(proxy_client))
+pub fn proxy_sidecar_client(proxy_client: ProxyClient) -> SidecarClient {
+    Arc::new(ProxySidecarForwarder::new(proxy_client))
 }
 
 #[async_trait]
-pub trait GatewayForwarder {
+pub trait SidecarForwarder {
     async fn forward(
         &self,
         app_id: &str,
         request: Request<Body>,
-    ) -> Result<Response<Body>, GatewayError>;
+    ) -> Result<Response<Body>, SidecarError>;
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum GatewayError {
-    #[error("no gateway registered for app {0}")]
-    MissingGateway(String),
+pub enum SidecarError {
+    #[error("no sidecar registered for app {0}")]
+    MissingSidecar(String),
     #[error("forwarding failed: {0}")]
     ForwardFailed(String),
 }
 
 #[derive(Clone, Default)]
-pub struct NoopGatewayForwarder;
+pub struct NoopSidecarForwarder;
 
 #[async_trait]
-impl GatewayForwarder for NoopGatewayForwarder {
+impl SidecarForwarder for NoopSidecarForwarder {
     async fn forward(
         &self,
         app_id: &str,
         _request: Request<Body>,
-    ) -> Result<Response<Body>, GatewayError> {
-        let body = format!("gateway forwarding not implemented (app={})", app_id);
+    ) -> Result<Response<Body>, SidecarError> {
+        let body = format!("sidecar forwarding not implemented (app={})", app_id);
         Ok(Response::builder()
             .status(StatusCode::NOT_IMPLEMENTED)
             .body(Body::from(body))
@@ -171,32 +171,32 @@ impl GatewayForwarder for NoopGatewayForwarder {
     }
 }
 
-pub fn noop_gateway_client() -> GatewayClient {
-    Arc::new(NoopGatewayForwarder::default())
+pub fn noop_sidecar_client() -> SidecarClient {
+    Arc::new(NoopSidecarForwarder::default())
 }
 
 #[derive(Clone)]
-struct ProxyGatewayForwarder {
+struct ProxySidecarForwarder {
     proxy: ProxyClient,
 }
 
-impl ProxyGatewayForwarder {
+impl ProxySidecarForwarder {
     fn new(proxy: ProxyClient) -> Self {
         Self { proxy }
     }
 }
 
 #[async_trait]
-impl GatewayForwarder for ProxyGatewayForwarder {
+impl SidecarForwarder for ProxySidecarForwarder {
     async fn forward(
         &self,
         app_id: &str,
         request: Request<Body>,
-    ) -> Result<Response<Body>, GatewayError> {
+    ) -> Result<Response<Body>, SidecarError> {
         let (parts, body) = request.into_parts();
         let body_bytes = to_bytes(body, MAX_PROXY_BODY_BYTES)
             .await
-            .map_err(|err| GatewayError::ForwardFailed(format!("read body failed: {err}")))?;
+            .map_err(|err| SidecarError::ForwardFailed(format!("read body failed: {err}")))?;
         let path_and_query = parts
             .uri
             .path_and_query()
@@ -222,7 +222,7 @@ impl GatewayForwarder for ProxyGatewayForwarder {
             .proxy
             .forward(proxy_request)
             .await
-            .map_err(|err| GatewayError::ForwardFailed(err.to_string()))?;
+            .map_err(|err| SidecarError::ForwardFailed(err.to_string()))?;
         let status =
             StatusCode::from_u16(proxy_response.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
         let mut builder = Response::builder().status(status);
@@ -235,6 +235,6 @@ impl GatewayForwarder for ProxyGatewayForwarder {
         }
         builder
             .body(Body::from(proxy_response.body))
-            .map_err(|err| GatewayError::ForwardFailed(format!("build response failed: {err}")))
+            .map_err(|err| SidecarError::ForwardFailed(format!("build response failed: {err}")))
     }
 }

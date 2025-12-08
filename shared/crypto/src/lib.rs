@@ -29,6 +29,20 @@ pub const PRIVKEY_FILE: &str = "privkey.bin";
 pub const KEM_PUBFILE: &str = "kem_pub.bin";
 pub const KEM_PRIVFILE: &str = "kem_priv.bin";
 
+/// Encode bytes to base64 string using STANDARD encoding.
+#[inline]
+pub fn b64_encode(data: &[u8]) -> String {
+    general_purpose::STANDARD.encode(data)
+}
+
+/// Decode base64 string to bytes using STANDARD encoding.
+#[inline]
+pub fn b64_decode(data: &str) -> anyhow::Result<Vec<u8>> {
+    general_purpose::STANDARD
+        .decode(data)
+        .map_err(|e| anyhow::anyhow!("base64 decode error: {}", e))
+}
+
 /// Storage mode for key material
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeypairMode {
@@ -212,6 +226,14 @@ pub fn ensure_kem_keypair_on_disk() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
             Ok((pubb, privb))
         }
     }
+}
+
+/// Validate a KEM public key by attempting to parse it. Returns Ok(()) if valid.
+pub fn validate_kem_pubkey(pub_bytes: &[u8]) -> anyhow::Result<()> {
+    ensure_pqc_init()?;
+    MlKemPublicKey::from_bytes(MlKemVariant::MlKem512, pub_bytes)
+        .map_err(|e| anyhow::anyhow!("Invalid KEM public key: {:?}", e))?;
+    Ok(())
 }
 
 /// Encapsulate to a recipient KEM public key bytes. Returns (ciphertext_bytes, shared_secret_bytes).

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::signal;
-use tracing::{error, info};
+use log::{error, info};
 
 use podmesh_proxy::{Config, Workload};
 
@@ -45,13 +45,13 @@ struct Args {
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
-        error!(error = %err, "workplane failed");
+        error!("workplane failed: {}", err);
         std::process::exit(1);
     }
 }
 
 async fn run() -> Result<()> {
-    tracing_support::init_tracing();
+    env_logger::init();
 
     let Args {
         bootstrap_peer,
@@ -80,7 +80,7 @@ async fn run() -> Result<()> {
     workload.start()?;
 
     if let Some(peer_id) = workload.peer_id() {
-        info!(%peer_id, "workplane bootstrap node started");
+        info!("workplane bootstrap node started peer_id={}", peer_id);
     } else {
         info!("workplane bootstrap node started");
     }

@@ -5,7 +5,6 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use base64::Engine;
 use log::{debug, error, warn};
 use protocol::machine::{Envelope as FbEnvelope, root_as_envelope};
 
@@ -46,8 +45,7 @@ impl EnvelopeHandler {
                 // No in-memory pair available; try on-disk as a fallback
                 match crypto::ensure_keypair_on_disk() {
                     Ok((pub_bytes, priv_bytes)) => {
-                        let on_disk_b64 =
-                            base64::engine::general_purpose::STANDARD.encode(&pub_bytes);
+                        let on_disk_b64 = crypto::b64_encode(&pub_bytes);
                         if on_disk_b64 == public_key {
                             Some(priv_bytes)
                         } else {
@@ -70,7 +68,7 @@ impl EnvelopeHandler {
             // NODE_KEYPAIR not initialized, fall back to on-disk keypair
             match crypto::ensure_keypair_on_disk() {
                 Ok((pub_bytes, priv_bytes)) => {
-                    let on_disk_b64 = base64::engine::general_purpose::STANDARD.encode(&pub_bytes);
+                    let on_disk_b64 = crypto::b64_encode(&pub_bytes);
                     if on_disk_b64 == public_key {
                         Some(priv_bytes)
                     } else {
@@ -158,11 +156,7 @@ impl EnvelopeHandler {
             kem_pubkey.len()
         );
 
-        saorsa_pqc::api::kem::MlKemPublicKey::from_bytes(
-            saorsa_pqc::api::kem::MlKemVariant::MlKem512,
-            kem_pubkey,
-        )
-        .map_err(|e| {
+        crypto::validate_kem_pubkey(kem_pubkey).map_err(|e| {
             anyhow!(
                 "Failed to parse KEM public key for peer {}: {}",
                 recipient_peer_id,
@@ -231,11 +225,11 @@ pub async fn envelope_passthrough_middleware(
                 // Extract and store envelope metadata (but don't decrypt)
                 let signing_pubkey = envelope
                     .pubkey()
-                    .and_then(|pk| base64::engine::general_purpose::STANDARD.decode(pk).ok())
+                    .and_then(|pk| crypto::b64_decode(pk).ok())
                     .unwrap_or_default();
                 let kem_pubkey = envelope
                     .kem_pubkey()
-                    .and_then(|pk| base64::engine::general_purpose::STANDARD.decode(pk).ok())
+                    .and_then(|pk| crypto::b64_decode(pk).ok())
                     .unwrap_or_default();
                 let peer_id = envelope.peer_id().map(|s| s.to_string());
 
@@ -316,11 +310,11 @@ pub async fn envelope_middleware(
                 // Extract and store envelope metadata securely in request extensions
                 let signing_pubkey = envelope
                     .pubkey()
-                    .and_then(|pk| base64::engine::general_purpose::STANDARD.decode(pk).ok())
+                    .and_then(|pk| crypto::b64_decode(pk).ok())
                     .unwrap_or_default();
                 let kem_pubkey = envelope
                     .kem_pubkey()
-                    .and_then(|pk| base64::engine::general_purpose::STANDARD.decode(pk).ok())
+                    .and_then(|pk| crypto::b64_decode(pk).ok())
                     .unwrap_or_default();
                 let peer_id = envelope.peer_id().map(|s| s.to_string());
 

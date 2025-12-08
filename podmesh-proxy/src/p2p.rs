@@ -1,5 +1,4 @@
-use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
-use std::hash::{Hash, Hasher};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -10,19 +9,19 @@ use libp2p::{
 };
 use p2p::{
     CoreBehaviourAccess, NodeConfig,
-    gateway_manifest::verify_gateway_manifest_envelope,
+    sidecar_manifest::verify_sidecar_manifest_envelope,
     handshake::{self, HandshakeDriveConfig, HandshakeState},
     http_proxy::{ProxyCodec, ProxyHttpRequest, ProxyHttpResponse},
     request_response::{HandshakeCodec, ManifestFetchCodec},
 };
 use protocol::libp2p_constants::{
-    GATEWAY_MANIFEST_PROTOCOL, INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX,
+    SIDECAR_MANIFEST_PROTOCOL, INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX,
     WORKLOAD_CLUSTER_TOPIC,
 };
-use protocol::machine::{GatewayProviderRecordOwned, build_gateway_manifest_request};
+use protocol::machine::{SidecarProviderRecordOwned, build_sidecar_manifest_request};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use log::{debug, error, info, warn};
 
 use crate::config::Config;
 
@@ -42,8 +41,8 @@ struct ProxyPendingRequest {
     respond_to: oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
 }
 
-struct GatewayCacheEntry {
-    record: GatewayProviderRecordOwned,
+struct SidecarCacheEntry {
+    record: SidecarProviderRecordOwned,
     expires_at: Instant,
 }
 
@@ -63,17 +62,17 @@ fn announce_proxy_provider(
     match swarm.behaviour_mut().kademlia.start_providing(record_key) {
         Ok(query_id) => {
             info!(
-                peer = %swarm.local_peer_id(),
-                ?query_id,
-                "workload proxy provider announcement scheduled"
+                "workload proxy provider announcement scheduled peer={} query_id={:?}",
+                swarm.local_peer_id(),
+                query_id
             );
             let _ = proxy_announced_tx.send(true);
         }
         Err(err) => {
             warn!(
-                peer = %swarm.local_peer_id(),
-                error = %err,
-                "failed to announce workload proxy provider"
+                "failed to announce workload proxy provider peer={} error={}",
+                swarm.local_peer_id(),
+                err
             );
         }
     }
@@ -166,27 +165,8 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
         WORKLOAD_CLUSTER_TOPIC,
     );
     let (mut swarm, _topic, peer_rx, peer_tx) = p2p::setup_swarm(node_cfg, |key| {
-        let message_id_fn = |message: &gossipsub::Message| {
-            let mut s = DefaultHasher::new();
-            message.data.hash(&mut s);
-            gossipsub::MessageId::from(s.finish().to_string())
-        };
-        let gossipsub_config = gossipsub::ConfigBuilder::default()
-            .heartbeat_interval(Duration::from_secs(10))
-            .validation_mode(gossipsub::ValidationMode::Strict)
-            .mesh_n_low(1)
-            .mesh_n(3)
-            .mesh_n_high(6)
-            .mesh_outbound_min(1)
-            .message_id_fn(message_id_fn)
-            .allow_self_origin(true)
-            .build()
-            .expect("valid workload gossipsub config");
-        let gossipsub = gossipsub::Behaviour::new(
-            gossipsub::MessageAuthenticity::Signed(key.clone()),
-            gossipsub_config,
-        )
-        .expect("create workload gossipsub behaviour");
+        let gossipsub = p2p::create_gossipsub_behaviour(key)
+            .expect("create workload gossipsub behaviour");
 
         let handshake_rr = request_response::Behaviour::new(
             std::iter::once((
@@ -204,20 +184,14 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
         );
         let manifest_rr = request_response::Behaviour::new(
             std::iter::once((
-                GATEWAY_MANIFEST_PROTOCOL,
+                SIDECAR_MANIFEST_PROTOCOL,
                 request_response::ProtocolSupport::Full,
             )),
             request_response::Config::default(),
         );
 
         let store = kad::store::MemoryStore::new(key.public().to_peer_id());
-        let mut kademlia_config = kad::Config::default();
-        kademlia_config.set_replication_factor(std::num::NonZeroUsize::new(3).unwrap());
-        kademlia_config.set_max_packet_size(1024 * 1024);
-        kademlia_config.set_parallelism(std::num::NonZeroUsize::new(3).unwrap());
-        kademlia_config.set_query_timeout(Duration::from_secs(15));
-        kademlia_config.set_provider_record_ttl(Some(Duration::from_secs(30)));
-        kademlia_config.set_provider_publication_interval(Some(Duration::from_secs(5)));
+        let kademlia_config = p2p::default_kademlia_config();
         let mut kademlia =
             kad::Behaviour::with_config(key.public().to_peer_id(), store, kademlia_config);
         kademlia.set_mode(Some(kad::Mode::Server));
@@ -247,9 +221,9 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
         .map(|p| p.to_string())
         .collect();
     warn!(
-        peer = %swarm.local_peer_id(),
-        ?kad_protocols,
-        "workload kad protocols configured"
+        "workload kad protocols configured peer={} kad_protocols={:?}",
+        swarm.local_peer_id(),
+        kad_protocols
     );
 
     let (proxy_announced_tx, proxy_provider_announced_rx) = watch::channel(false);
@@ -258,7 +232,7 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
     if enable_proxy_provider {
         announce_proxy_provider(&mut swarm, &proxy_announced_tx);
     } else {
-        warn!(peer = %swarm.local_peer_id(), "proxy provider announcement disabled");
+        warn!("proxy provider announcement disabled peer={}", swarm.local_peer_id());
     }
 
     let handshake_states: HashMap<PeerId, HandshakeState> = HashMap::new();
@@ -291,7 +265,7 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
         let proxy_announced_tx = runtime_proxy_announced_tx;
         let enable_proxy_provider = enable_proxy_provider;
         let single_node_mode = single_node_mode;
-        let mut gateway_cache: HashMap<String, GatewayCacheEntry> = HashMap::new();
+        let mut sidecar_cache: HashMap<String, SidecarCacheEntry> = HashMap::new();
         let mut manifest_queries: HashMap<String, ManifestQueryState> = HashMap::new();
         let mut query_manifest: HashMap<kad::QueryId, String> = HashMap::new();
         let mut manifest_request_map: HashMap<request_response::OutboundRequestId, String> =
@@ -355,14 +329,14 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
                                 );
                             }
                             SwarmEvent::Behaviour(WorkloadBehaviourEvent::HandshakeRr(request_response::Event::OutboundFailure { peer, error, .. })) => {
-                                warn!(%peer, ?error, "workload handshake outbound failure");
+                                warn!("workload handshake outbound failure peer={} error={:?}", peer, error);
                                 if matches!(error, request_response::OutboundFailure::UnsupportedProtocols) {
                                     handshake::track_peer(&mut handshake_states, &peer).confirmed = true;
-                                    warn!(%peer, "handshake disabled for peer due to unsupported protocol");
+                                    warn!("handshake disabled for peer due to unsupported protocol peer={}", peer);
                                 }
                             }
                             SwarmEvent::Behaviour(WorkloadBehaviourEvent::HandshakeRr(request_response::Event::InboundFailure { peer, error, .. })) => {
-                                warn!(%peer, ?error, "workload handshake inbound failure");
+                                warn!("workload handshake inbound failure peer={} error={:?}", peer, error);
                             }
                             SwarmEvent::Behaviour(WorkloadBehaviourEvent::ProxyRr(event)) => {
                                 handle_proxy_rr_event(event, &mut pending_proxy_requests);
@@ -374,7 +348,7 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
                                     &mut manifest_queries,
                                     &mut manifest_request_map,
                                     &mut query_manifest,
-                                    &mut gateway_cache,
+                                    &mut sidecar_cache,
                                     &mut pending_proxy_requests,
                                 );
                             }
@@ -392,9 +366,9 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
 
                                 let connected_count = swarm.connected_peers().count();
                                 if connected_count >= 2 && !kad_bootstrapped {
-                                    warn!(count = connected_count, "workload bootstrapping kademlia");
+                                    warn!("workload bootstrapping kademlia count={}", connected_count);
                                     if let Err(err) = swarm.behaviour_mut().kademlia.bootstrap() {
-                                        error!(?err, "workload kademlia bootstrap failed");
+                                        error!("workload kademlia bootstrap failed err={:?}", err);
                                     } else {
                                         kad_bootstrapped = true;
                                         warn!("workload kademlia bootstrap started");
@@ -421,7 +395,7 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
                         handle_command(
                             &mut swarm,
                             cmd,
-                            &mut gateway_cache,
+                            &mut sidecar_cache,
                             &mut manifest_queries,
                             &mut query_manifest,
                             &mut pending_proxy_requests,
@@ -440,7 +414,7 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
                                         .behaviour_mut()
                                         .handshake_rr
                                         .send_request(&peer, payload);
-                                    debug!(%peer, ?request_id, "workload handshake request sent");
+                                    debug!("workload handshake request sent peer={} request_id={:?}", peer, request_id);
                                 }
 
                                 for peer in actions.drops {
@@ -450,7 +424,7 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
                                         .remove_explicit_peer(&peer);
                                 }
                             }
-                            Err(err) => warn!(?err, "workload handshake drive failed"),
+                            Err(err) => warn!("workload handshake drive failed err={:?}", err),
                         }
                     }
                     _ = interval.tick() => {
@@ -488,7 +462,7 @@ fn publish_peer_snapshot(
 fn handle_command(
     swarm: &mut Swarm<WorkloadBehaviour>,
     cmd: P2pCommand,
-    gateway_cache: &mut HashMap<String, GatewayCacheEntry>,
+    sidecar_cache: &mut HashMap<String, SidecarCacheEntry>,
     manifest_queries: &mut HashMap<String, ManifestQueryState>,
     query_manifest: &mut HashMap<kad::QueryId, String>,
     pending_proxy_requests: &mut HashMap<
@@ -508,7 +482,7 @@ fn handle_command(
             process_proxy_command(
                 swarm,
                 pending,
-                gateway_cache,
+                sidecar_cache,
                 manifest_queries,
                 query_manifest,
                 pending_proxy_requests,
@@ -520,7 +494,7 @@ fn handle_command(
 fn process_proxy_command(
     swarm: &mut Swarm<WorkloadBehaviour>,
     pending: ProxyPendingRequest,
-    gateway_cache: &mut HashMap<String, GatewayCacheEntry>,
+    sidecar_cache: &mut HashMap<String, SidecarCacheEntry>,
     manifest_queries: &mut HashMap<String, ManifestQueryState>,
     query_manifest: &mut HashMap<kad::QueryId, String>,
     pending_proxy_requests: &mut HashMap<
@@ -530,7 +504,7 @@ fn process_proxy_command(
 ) {
     let manifest_id = pending.request.manifest_id.clone();
     let now = Instant::now();
-    if let Some(entry) = gateway_cache.get(&manifest_id) {
+    if let Some(entry) = sidecar_cache.get(&manifest_id) {
         if entry.expires_at > now {
             match dispatch_proxy_request(swarm, pending, &entry.record, pending_proxy_requests) {
                 Ok(()) => return,
@@ -540,7 +514,7 @@ fn process_proxy_command(
                 }
             }
         } else {
-            gateway_cache.remove(&manifest_id);
+            sidecar_cache.remove(&manifest_id);
         }
     }
 
@@ -550,7 +524,7 @@ fn process_proxy_command(
     }
 
     let key = format!("{}{}", MANIFEST_RECORD_PREFIX, manifest_id);
-    info!(manifest = %manifest_id, key = %key, "workload proxy querying manifest providers");
+    info!("workload proxy querying manifest providers manifest={} key={}", manifest_id, key);
     let query_id = swarm
         .behaviour_mut()
         .kademlia
@@ -588,7 +562,7 @@ fn handle_manifest_queries(
                                 break;
                             }
                             if state.requested_peers.insert(peer.clone()) {
-                                let request = build_gateway_manifest_request(&manifest_id);
+                                let request = build_sidecar_manifest_request(&manifest_id);
                                 let request_id = swarm
                                     .behaviour_mut()
                                     .manifest_rr
@@ -637,7 +611,7 @@ fn handle_manifest_rr_event(
     manifest_queries: &mut HashMap<String, ManifestQueryState>,
     manifest_request_map: &mut HashMap<request_response::OutboundRequestId, String>,
     query_manifest: &mut HashMap<kad::QueryId, String>,
-    gateway_cache: &mut HashMap<String, GatewayCacheEntry>,
+    sidecar_cache: &mut HashMap<String, SidecarCacheEntry>,
     pending_proxy_requests: &mut HashMap<
         request_response::OutboundRequestId,
         oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
@@ -658,13 +632,13 @@ fn handle_manifest_rr_event(
                         response,
                         manifest_queries,
                         query_manifest,
-                        gateway_cache,
+                        sidecar_cache,
                         pending_proxy_requests,
                     );
                 } else {
                     warn!(
-                        ?request_id,
-                        "received manifest response for unknown request"
+                        "received manifest response for unknown request request_id={:?}",
+                        request_id
                     );
                 }
             }
@@ -686,7 +660,7 @@ fn handle_manifest_rr_event(
             }
         }
         request_response::Event::InboundFailure { peer, error, .. } => {
-            warn!(%peer, ?error, "manifest response inbound failure");
+            warn!("manifest response inbound failure peer={} error={:?}", peer, error);
         }
         request_response::Event::ResponseSent { .. } => {}
     }
@@ -699,7 +673,7 @@ fn process_manifest_response(
     response: Vec<u8>,
     manifest_queries: &mut HashMap<String, ManifestQueryState>,
     query_manifest: &mut HashMap<kad::QueryId, String>,
-    gateway_cache: &mut HashMap<String, GatewayCacheEntry>,
+    sidecar_cache: &mut HashMap<String, SidecarCacheEntry>,
     pending_proxy_requests: &mut HashMap<
         request_response::OutboundRequestId,
         oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
@@ -709,9 +683,9 @@ fn process_manifest_response(
         state.pending_requests.remove(&request_id);
     }
 
-    match verify_gateway_manifest_envelope(&response) {
+    match verify_sidecar_manifest_envelope(&response) {
         Ok(verified) => {
-            store_gateway_record(&manifest_id, &verified.record, gateway_cache);
+            store_sidecar_record(&manifest_id, &verified.record, sidecar_cache);
             satisfy_manifest_waiters(
                 swarm,
                 manifest_id,
@@ -722,7 +696,7 @@ fn process_manifest_response(
             );
         }
         Err(err) => {
-            warn!(manifest = %manifest_id, error = %err, "failed to verify manifest envelope");
+            warn!("failed to verify manifest envelope manifest={} error={}", manifest_id, err);
             maybe_fail_manifest_due_to_exhaustion(
                 manifest_id,
                 manifest_queries,
@@ -733,12 +707,12 @@ fn process_manifest_response(
     }
 }
 
-fn store_gateway_record(
+fn store_sidecar_record(
     manifest_id: &str,
-    record: &GatewayProviderRecordOwned,
-    gateway_cache: &mut HashMap<String, GatewayCacheEntry>,
+    record: &SidecarProviderRecordOwned,
+    sidecar_cache: &mut HashMap<String, SidecarCacheEntry>,
 ) {
-    let should_replace = gateway_cache
+    let should_replace = sidecar_cache
         .get(manifest_id)
         .map(|entry| record.last_updated_ms >= entry.record.last_updated_ms)
         .unwrap_or(true);
@@ -751,9 +725,9 @@ fn store_gateway_record(
         record.ttl_ms as u64
     };
     let expires_at = Instant::now() + Duration::from_millis(ttl_ms);
-    gateway_cache.insert(
+    sidecar_cache.insert(
         manifest_id.to_string(),
-        GatewayCacheEntry {
+        SidecarCacheEntry {
             record: record.clone(),
             expires_at,
         },
@@ -763,7 +737,7 @@ fn store_gateway_record(
 fn satisfy_manifest_waiters(
     swarm: &mut Swarm<WorkloadBehaviour>,
     manifest_id: String,
-    record: GatewayProviderRecordOwned,
+    record: SidecarProviderRecordOwned,
     manifest_queries: &mut HashMap<String, ManifestQueryState>,
     query_manifest: &mut HashMap<kad::QueryId, String>,
     pending_proxy_requests: &mut HashMap<
@@ -793,7 +767,7 @@ fn handle_manifest_request_failure(
     if let Some(state) = manifest_queries.get_mut(&manifest_id) {
         state.pending_requests.remove(&request_id);
     }
-    warn!(manifest = %manifest_id, ?error, "manifest fetch request failed");
+    warn!("manifest fetch request failed manifest={} error={:?}", manifest_id, error);
     maybe_fail_manifest_due_to_exhaustion(
         manifest_id,
         manifest_queries,
@@ -830,7 +804,7 @@ fn fail_manifest_query(
 ) {
     if let Some(state) = manifest_queries.remove(&manifest_id) {
         query_manifest.remove(&state.query_id);
-        warn!(manifest = %manifest_id, reason = %message, "manifest query failed");
+        warn!("manifest query failed manifest={} reason={}", manifest_id, message);
         for pending in state.waiters {
             let _ = pending.respond_to.send(Err(anyhow!(message.clone())));
         }
@@ -873,7 +847,7 @@ fn handle_proxy_rr_event(
 fn dispatch_proxy_request(
     swarm: &mut Swarm<WorkloadBehaviour>,
     mut pending: ProxyPendingRequest,
-    record: &GatewayProviderRecordOwned,
+    record: &SidecarProviderRecordOwned,
     pending_proxy_requests: &mut HashMap<
         request_response::OutboundRequestId,
         oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
@@ -912,7 +886,7 @@ fn dispatch_proxy_request(
 }
 
 fn select_route_port(
-    record: &GatewayProviderRecordOwned,
+    record: &SidecarProviderRecordOwned,
     path: &str,
     host: Option<&str>,
 ) -> Option<u16> {
@@ -970,8 +944,9 @@ fn trace_kad(event: &kad::Event) {
                 num_provider_peers,
             } => {
                 warn!(
+                    "kad inbound get_provider request num_closer_peers={} num_provider_peers={}",
                     num_closer_peers,
-                    num_provider_peers, "kad inbound get_provider request"
+                    num_provider_peers
                 );
             }
             _ => {}
@@ -988,26 +963,26 @@ fn register_initial_peer(swarm: &mut Swarm<WorkloadBehaviour>, addr: &Multiaddr,
             behaviour.gossipsub.add_explicit_peer(&peer_id);
         }
         warn!(
-            %peer_id,
-            bootstrap_protocol = %base_addr,
-            address = %raw,
-            "registered bootstrap peer as initial peer"
+            "registered bootstrap peer as initial peer peer_id={} bootstrap_protocol={} address={}",
+            peer_id,
+            base_addr,
+            raw
         );
     }
 }
 
 fn log_peer_bootstrap_state(peer_protocols: &HashMap<PeerId, String>, kad_started: bool) {
     if peer_protocols.is_empty() {
-        warn!(kad_started, "no connected peers to report");
+        warn!("no connected peers to report kad_started={}", kad_started);
         return;
     }
 
     for (peer, protocol) in peer_protocols {
         warn!(
-            peer = %peer,
-            bootstrap_protocol = %protocol,
-            kad_started,
-            "workload peer bootstrap state"
+            "workload peer bootstrap state peer={} bootstrap_protocol={} kad_started={}",
+            peer,
+            protocol,
+            kad_started
         );
     }
 }

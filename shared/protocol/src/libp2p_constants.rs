@@ -8,7 +8,7 @@ pub const WORKLOAD_CLUSTER_TOPIC: &str = "podmesh-workload";
 /// Ident topic used for machine-plane gossipsub exchanges.
 pub const MACHINE_CLUSTER_TOPIC: &str = "podmesh-machine";
 
-/// Record key prefix for manifest->gateway announcements on the workload DHT.
+/// Record key prefix for manifest->sidecar announcements on the workload DHT.
 pub const MANIFEST_RECORD_PREFIX: &str = "podmesh/manifest/";
 
 /// Default manifest identifier used by the ingress e2e test.
@@ -19,8 +19,8 @@ pub const MESH_DOMAIN_SUFFIX: &str = "mesh.local";
 
 /// Protocol ID for the ingress proxy libp2p request-response stream.
 pub const INGRESS_PROXY_PROTOCOL: &str = "/podmesh/ingress-proxy/1.0.0";
-/// Protocol ID for gateway manifest fetch RPCs between proxies and sidecars.
-pub const GATEWAY_MANIFEST_PROTOCOL: &str = "/podmesh/gateway-manifest/1.0.0";
+/// Protocol ID for sidecar manifest fetch RPCs between proxies and sidecars.
+pub const SIDECAR_MANIFEST_PROTOCOL: &str = "/podmesh/sidecar-manifest/1.0.0";
 
 // === GOSSIPSUB TOPICS ===
 
@@ -111,3 +111,40 @@ pub const DEFAULT_MEMORY_REQUEST_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Default storage request in bytes if not specified in manifest (1 GB)
 pub const DEFAULT_STORAGE_REQUEST_BYTES: u64 = 1024 * 1024 * 1024;
+
+// === KADEMLIA CONFIGURATION CONSTANTS ===
+
+/// Kademlia replication factor for provider records
+pub const KADEMLIA_REPLICATION_FACTOR: usize = 3;
+
+/// Maximum packet size for Kademlia messages (1 MB)
+pub const KADEMLIA_MAX_PACKET_SIZE: usize = 1024 * 1024;
+
+/// Parallelism factor for Kademlia queries
+pub const KADEMLIA_PARALLELISM: usize = 3;
+
+/// Query timeout for Kademlia operations in seconds
+pub const KADEMLIA_QUERY_TIMEOUT_SECS: u64 = 15;
+
+/// Provider record TTL in seconds
+pub const KADEMLIA_PROVIDER_TTL_SECS: u64 = 30;
+
+/// Provider publication interval in seconds
+pub const KADEMLIA_PROVIDER_PUBLICATION_INTERVAL_SECS: u64 = 5;
+
+// === GOSSIPSUB CONFIGURATION CONSTANTS ===
+
+/// Heartbeat interval for gossipsub in seconds
+pub const GOSSIPSUB_HEARTBEAT_INTERVAL_SECS: u64 = 10;
+
+/// Minimum mesh size for gossipsub
+pub const GOSSIPSUB_MESH_N_LOW: usize = 1;
+
+/// Target mesh size for gossipsub
+pub const GOSSIPSUB_MESH_N: usize = 3;
+
+/// Maximum mesh size for gossipsub
+pub const GOSSIPSUB_MESH_N_HIGH: usize = 6;
+
+/// Minimum outbound mesh size for gossipsub
+pub const GOSSIPSUB_MESH_OUTBOUND_MIN: usize = 1;

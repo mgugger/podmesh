@@ -3,15 +3,14 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, anyhow, bail};
 use protocol::{
     libp2p_constants::MESH_DOMAIN_SUFFIX,
-    machine::{GatewayRouteKind, GatewayRouteSpec},
+    machine::{SidecarRouteKind, SidecarRouteSpec},
 };
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
-use tracing::warn;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteExtraction {
-    pub routes: Vec<GatewayRouteSpec>,
+    pub routes: Vec<SidecarRouteSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +46,7 @@ enum ServicePortSelector {
     Number(u16),
 }
 
-pub fn extract_gateway_routes(manifest: &[u8], manifest_id: &str) -> Result<RouteExtraction> {
+pub fn extract_sidecar_routes(manifest: &[u8], manifest_id: &str) -> Result<RouteExtraction> {
     let mut services: HashMap<String, ServiceInfo> = HashMap::new();
     let mut ingress_paths: Vec<IngressPath> = Vec::new();
     let mut container_ports: HashMap<String, u16> = HashMap::new();
@@ -75,13 +74,13 @@ pub fn extract_gateway_routes(manifest: &[u8], manifest_id: &str) -> Result<Rout
         let host = format_service_host(&svc.name, manifest_id);
         for port in &svc.ports {
             let target_port = resolve_service_target(port, &container_ports)?;
-            routes.push(GatewayRouteSpec {
+            routes.push(SidecarRouteSpec {
                 host: host.clone(),
                 path_prefix: "/".to_string(),
                 target_port,
                 service_name: svc.name.clone(),
                 service_port: port.name.clone().unwrap_or_else(|| port.port.to_string()),
-                source: GatewayRouteKind::Service,
+                source: SidecarRouteKind::Service,
             });
         }
     }
@@ -103,7 +102,7 @@ pub fn extract_gateway_routes(manifest: &[u8], manifest_id: &str) -> Result<Rout
             )
         })?;
         let target_port = resolve_service_target(svc_port, &container_ports)?;
-        routes.push(GatewayRouteSpec {
+        routes.push(SidecarRouteSpec {
             host: ingress.host.clone(),
             path_prefix: ingress.path.clone(),
             target_port,
@@ -112,14 +111,14 @@ pub fn extract_gateway_routes(manifest: &[u8], manifest_id: &str) -> Result<Rout
                 .name
                 .clone()
                 .unwrap_or_else(|| svc_port.port.to_string()),
-            source: GatewayRouteKind::Ingress,
+            source: SidecarRouteKind::Ingress,
         });
     }
 
     if routes.is_empty() {
-        warn!(
-            manifest = manifest_id,
-            "manifest does not define services or ingress routes; starting gateway without routes"
+        log::warn!(
+            "manifest does not define services or ingress routes; starting sidecar without routes manifest={}",
+            manifest_id
         );
     }
 
@@ -378,18 +377,18 @@ mod tests {
     fn extracts_routes_from_sample_manifest() {
         let manifest = include_bytes!("../../podmesh-proxy/tests/sample_manifests/nginx.yml");
         let extraction =
-            extract_gateway_routes(manifest, "my-nginx").expect("route extraction succeeds");
+            extract_sidecar_routes(manifest, "my-nginx").expect("route extraction succeeds");
         assert!(
             extraction
                 .routes
                 .iter()
-                .any(|route| route.source == GatewayRouteKind::Service)
+                .any(|route| route.source == SidecarRouteKind::Service)
         );
         assert!(
             extraction
                 .routes
                 .iter()
-                .any(|route| route.source == GatewayRouteKind::Ingress)
+                .any(|route| route.source == SidecarRouteKind::Ingress)
         );
         let expected_host = format!("demo-nginx.{}", MESH_DOMAIN_SUFFIX);
         assert!(

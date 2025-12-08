@@ -6,10 +6,10 @@ use axum::{Router, routing::get};
 use axum_support::spawn_tcp_listener;
 use podmesh_proxy::{Config, Workload};
 use podmesh_sidecar::{
-    DEFAULT_GATEWAY_APP_PORT, GatewayConfig, GatewayEvent, manifest_routes::extract_gateway_routes,
-    run_gateway_with_shutdown,
+    DEFAULT_SIDECAR_APP_PORT, SidecarConfig, SidecarEvent, manifest_routes::extract_sidecar_routes,
+    run_sidecar_with_shutdown,
 };
-use protocol::machine::{GatewayRouteKind, GatewayRouteSpec};
+use protocol::machine::{SidecarRouteKind, SidecarRouteSpec};
 use reqwest::Client;
 use tokio::{
     net::TcpListener,
@@ -43,7 +43,7 @@ fn build_workload_config(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gateway_discovers_workload_provider() -> Result<()> {
+async fn sidecar_discovers_workload_provider() -> Result<()> {
     init_tracing();
     let mut workloads = Vec::new();
 
@@ -69,23 +69,23 @@ async fn gateway_discovers_workload_provider() -> Result<()> {
                 .await?;
         }
 
-        let gateway_bootstrap_peers: Vec<String> = workloads
+        let sidecar_bootstrap_peers: Vec<String> = workloads
             .iter()
             .map(|node| node.bootstrap_addr.clone())
             .collect();
 
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        let (gateway_cfg, _, _) =
-            build_gateway_config(gateway_bootstrap_peers, DEFAULT_GATEWAY_APP_PORT)?;
+        let (sidecar_cfg, _, _) =
+            build_sidecar_config(sidecar_bootstrap_peers, DEFAULT_SIDECAR_APP_PORT)?;
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
-        let gateway_task = tokio::spawn(async move {
-            run_gateway_with_shutdown(gateway_cfg, shutdown_rx, Some(event_tx))
+        let sidecar_task = tokio::spawn(async move {
+            run_sidecar_with_shutdown(sidecar_cfg, shutdown_rx, Some(event_tx))
                 .await
-                .expect("gateway run");
+                .expect("sidecar run");
         });
 
         let known_peer_ids: HashSet<String> =
@@ -99,12 +99,12 @@ async fn gateway_discovers_workload_provider() -> Result<()> {
             tokio::select! {
                 Some(event) = event_rx.recv() => {
                     match event {
-                        GatewayEvent::Connected { ref peer_id } => {
+                        SidecarEvent::Connected { ref peer_id } => {
                             if known_peer_ids.contains(peer_id) {
                                 connected_peers.insert(peer_id.clone());
                             }
                         }
-                        GatewayEvent::ProviderDiscovered { ref peer_id } => {
+                        SidecarEvent::ProviderDiscovered { ref peer_id } => {
                             if peer_id == &provider_peer_id {
                                 provider_seen = true;
                             }
@@ -119,16 +119,16 @@ async fn gateway_discovers_workload_provider() -> Result<()> {
 
         assert!(
             !connected_peers.is_empty(),
-            "gateway never connected to any workload peer"
+            "sidecar never connected to any workload peer"
         );
         assert!(
             provider_seen,
-            "gateway never observed provider {}",
+            "sidecar never observed provider {}",
             provider_peer_id
         );
 
         let _ = shutdown_tx.send(());
-        let _ = gateway_task.await;
+        let _ = sidecar_task.await;
 
         Ok(())
     }
@@ -142,11 +142,11 @@ async fn gateway_discovers_workload_provider() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ingress_proxies_requests_via_gateway() -> Result<()> {
+async fn ingress_proxies_requests_via_sidecar() -> Result<()> {
     init_tracing();
     let mut handle = start_workload(Vec::new(), true, true)?;
-    let mut gateway_shutdown: Option<oneshot::Sender<()>> = None;
-    let mut gateway_task: Option<JoinHandle<()>> = None;
+    let mut sidecar_shutdown: Option<oneshot::Sender<()>> = None;
+    let mut sidecar_task: Option<JoinHandle<()>> = None;
     let mut app_server: Option<JoinHandle<()>> = None;
     let test_result: Result<()> = async {
         wait_for_kad_ready(handle.kad_rx(), Duration::from_secs(10)).await?;
@@ -158,19 +158,19 @@ async fn ingress_proxies_requests_via_gateway() -> Result<()> {
         app_server = Some(spawn_test_app(app_port, app_body.clone()).await?);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        gateway_shutdown = Some(shutdown_tx);
-        let (gateway_cfg, ingress_host, service_host) =
-            build_gateway_config(vec![handle.bootstrap_addr.clone()], app_port)?;
+        sidecar_shutdown = Some(shutdown_tx);
+        let (sidecar_cfg, ingress_host, service_host) =
+            build_sidecar_config(vec![handle.bootstrap_addr.clone()], app_port)?;
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let provider_peer_id = handle.peer_id.clone();
 
-        gateway_task = Some(tokio::spawn(async move {
-            run_gateway_with_shutdown(gateway_cfg, shutdown_rx, Some(event_tx))
+        sidecar_task = Some(tokio::spawn(async move {
+            run_sidecar_with_shutdown(sidecar_cfg, shutdown_rx, Some(event_tx))
                 .await
-                .expect("gateway run");
+                .expect("sidecar run");
         }));
 
-        wait_for_gateway_peer_ready(&mut event_rx, &provider_peer_id, Duration::from_secs(20))
+        wait_for_sidecar_peer_ready(&mut event_rx, &provider_peer_id, Duration::from_secs(20))
             .await?;
 
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -192,10 +192,10 @@ async fn ingress_proxies_requests_via_gateway() -> Result<()> {
     }
     .await;
 
-    if let Some(tx) = gateway_shutdown.take() {
+    if let Some(tx) = sidecar_shutdown.take() {
         let _ = tx.send(());
     }
-    if let Some(task) = gateway_task.take() {
+    if let Some(task) = sidecar_task.take() {
         let _ = task.await;
     }
     if let Some(server) = app_server.take() {
@@ -339,8 +339,8 @@ async fn wait_for_ingress_response(
     }
 }
 
-async fn wait_for_gateway_peer_ready(
-    rx: &mut mpsc::UnboundedReceiver<GatewayEvent>,
+async fn wait_for_sidecar_peer_ready(
+    rx: &mut mpsc::UnboundedReceiver<SidecarEvent>,
     expected_peer_id: &str,
     timeout: Duration,
 ) -> Result<()> {
@@ -349,18 +349,18 @@ async fn wait_for_gateway_peer_ready(
         let mut provider_seen = false;
         while !(connected && provider_seen) {
             match rx.recv().await {
-                Some(GatewayEvent::Connected { peer_id }) => {
+                Some(SidecarEvent::Connected { peer_id }) => {
                     if peer_id == expected_peer_id {
                         connected = true;
                     }
                 }
-                Some(GatewayEvent::ProviderDiscovered { peer_id }) => {
+                Some(SidecarEvent::ProviderDiscovered { peer_id }) => {
                     if peer_id == expected_peer_id {
                         provider_seen = true;
                     }
                 }
                 None => {
-                    return Err(anyhow!("gateway event channel closed before readiness"));
+                    return Err(anyhow!("sidecar event channel closed before readiness"));
                 }
             }
         }
@@ -369,7 +369,7 @@ async fn wait_for_gateway_peer_ready(
     .await
     .map_err(|_| {
         anyhow!(
-            "gateway did not become ready for provider {}",
+            "sidecar did not become ready for provider {}",
             expected_peer_id
         )
     })??;
@@ -377,12 +377,12 @@ async fn wait_for_gateway_peer_ready(
     Ok(())
 }
 
-fn build_gateway_config(
+fn build_sidecar_config(
     bootstrap_peers: Vec<String>,
     app_port: u16,
-) -> Result<(GatewayConfig, String, String)> {
+) -> Result<(SidecarConfig, String, String)> {
     let (routes, ingress_host, service_host) = demo_routes(app_port)?;
-    let cfg = GatewayConfig {
+    let cfg = SidecarConfig {
         provider_label: PROXY_PROVIDER_LABEL.to_string(),
         bootstrap_peers,
         bootstrap_peer_ip: None,
@@ -400,8 +400,8 @@ fn build_gateway_config(
     Ok((cfg, ingress_host, service_host))
 }
 
-fn demo_routes(app_port: u16) -> Result<(Vec<GatewayRouteSpec>, String, String)> {
-    let extraction = extract_gateway_routes(DEMO_MANIFEST, DEMO_MANIFEST_ID)?;
+fn demo_routes(app_port: u16) -> Result<(Vec<SidecarRouteSpec>, String, String)> {
+    let extraction = extract_sidecar_routes(DEMO_MANIFEST, DEMO_MANIFEST_ID)?;
     let mut routes = extraction.routes;
     for route in routes.iter_mut() {
         route.target_port = app_port;
@@ -409,12 +409,12 @@ fn demo_routes(app_port: u16) -> Result<(Vec<GatewayRouteSpec>, String, String)>
 
     let ingress_host = routes
         .iter()
-        .find(|route| matches!(route.source, GatewayRouteKind::Ingress))
+        .find(|route| matches!(route.source, SidecarRouteKind::Ingress))
         .map(|route| route.host.clone())
         .ok_or_else(|| anyhow!("demo manifest missing ingress route"))?;
     let service_host = routes
         .iter()
-        .find(|route| matches!(route.source, GatewayRouteKind::Service))
+        .find(|route| matches!(route.source, SidecarRouteKind::Service))
         .map(|route| route.host.clone())
         .ok_or_else(|| anyhow!("demo manifest missing service route"))?;
 

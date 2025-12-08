@@ -1,5 +1,4 @@
 use anyhow::Context;
-use base64::Engine;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -19,8 +18,7 @@ pub fn normalize_and_decode_signature(sig_opt: Option<&str>) -> anyhow::Result<V
     } else {
         sig_str
     };
-    base64::engine::general_purpose::STANDARD
-        .decode(b64_part)
+    crate::b64_decode(b64_part)
         .context("failed to base64-decode signature")
 }
 

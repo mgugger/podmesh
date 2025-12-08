@@ -12,7 +12,7 @@ use libp2p::{
 };
 use p2p::http_proxy::{ProxyCodec, ProxyHttpRequest, ProxyHttpResponse};
 use p2p::{
-    build_quic_multiaddr, gateway_manifest::sign_gateway_manifest_record, parse_bootstrap_peer,
+    build_quic_multiaddr, sidecar_manifest::sign_sidecar_manifest_record, parse_bootstrap_peer,
     timestamp_millis,
 };
 use p2p::{
@@ -20,10 +20,10 @@ use p2p::{
     request_response::{HandshakeCodec, ManifestFetchCodec},
 };
 use protocol::libp2p_constants::{
-    GATEWAY_MANIFEST_PROTOCOL, INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX,
+    SIDECAR_MANIFEST_PROTOCOL, INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX,
 };
 use protocol::machine::{
-    GatewayRouteSpec, build_gateway_provider_record, root_as_gateway_manifest_request,
+    SidecarRouteSpec, build_sidecar_provider_record, root_as_sidecar_manifest_request,
 };
 use reqwest::{
     Client, Method,
@@ -31,16 +31,16 @@ use reqwest::{
 };
 use tokio::signal;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info, warn};
+use log::{debug, info, warn};
 
 pub mod manifest_routes;
 
-pub const DEFAULT_GATEWAY_APP_PORT: u16 = 18080;
+pub const DEFAULT_SIDECAR_APP_PORT: u16 = 18080;
 const MANIFEST_RECORD_TTL_MS: u32 = 300_000;
 const MANIFEST_RECORD_VERSION: u16 = 1;
 
 #[derive(Clone, Debug)]
-pub struct GatewayConfig {
+pub struct SidecarConfig {
     pub provider_label: String,
     pub bootstrap_peers: Vec<String>,
     pub bootstrap_peer_ip: Option<String>,
@@ -52,17 +52,17 @@ pub struct GatewayConfig {
     pub manifest_id: String,
     pub ingress_host: String,
     pub app_port: u16,
-    pub routes: Vec<GatewayRouteSpec>,
+    pub routes: Vec<SidecarRouteSpec>,
     pub owner_public_key_b64: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GatewayEvent {
+pub enum SidecarEvent {
     Connected { peer_id: String },
     ProviderDiscovered { peer_id: String },
 }
 
-pub async fn run_gateway(cfg: GatewayConfig) -> Result<()> {
+pub async fn run_sidecar(cfg: SidecarConfig) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     tokio::spawn(async move {
         match signal::ctrl_c().await {
@@ -70,18 +70,18 @@ pub async fn run_gateway(cfg: GatewayConfig) -> Result<()> {
                 let _ = shutdown_tx.send(());
             }
             Err(err) => {
-                warn!(error = %err, "gateway ctrl+c listener failed");
+                warn!("sidecar ctrl+c listener failed error={}", err);
                 let _ = shutdown_tx.send(());
             }
         }
     });
-    run_gateway_with_shutdown(cfg, shutdown_rx, None).await
+    run_sidecar_with_shutdown(cfg, shutdown_rx, None).await
 }
 
-pub async fn run_gateway_with_shutdown(
-    cfg: GatewayConfig,
+pub async fn run_sidecar_with_shutdown(
+    cfg: SidecarConfig,
     mut shutdown: oneshot::Receiver<()>,
-    event_tx: Option<mpsc::UnboundedSender<GatewayEvent>>,
+    event_tx: Option<mpsc::UnboundedSender<SidecarEvent>>,
 ) -> Result<()> {
     let listen_addr = cfg.listen_addr();
     let listen_addr_display = listen_addr
@@ -89,28 +89,28 @@ pub async fn run_gateway_with_shutdown(
         .map(|addr| addr.to_string())
         .unwrap_or_else(|| "none".to_string());
     info!(
-        has_events = event_tx.is_some(),
-        provider = %cfg.provider_label,
-        manifest = %cfg.manifest_id,
-        ingress_host = %cfg.ingress_host,
-        libp2p_host = %cfg.libp2p_host,
-        libp2p_port = cfg.libp2p_port,
-        announce_providers = cfg.announce_providers,
-        lookup_interval_ms = cfg.lookup_interval.as_millis() as u64,
-        announce_interval_ms = cfg.announce_interval.as_millis() as u64,
-        bootstrap_peers = ?cfg.bootstrap_peers,
-        bootstrap_peer_ip = %cfg.bootstrap_peer_ip.as_deref().unwrap_or("none"),
-        listen_addr = %listen_addr_display,
-        app_port = cfg.app_port,
-        routes = cfg.routes.len(),
-        "gateway runtime starting with config"
+        "sidecar runtime starting with config has_events={} provider={} manifest={} ingress_host={} libp2p_host={} libp2p_port={} announce_providers={} lookup_interval_ms={} announce_interval_ms={} bootstrap_peers={:?} bootstrap_peer_ip={} listen_addr={} app_port={} routes={}",
+        event_tx.is_some(),
+        cfg.provider_label,
+        cfg.manifest_id,
+        cfg.ingress_host,
+        cfg.libp2p_host,
+        cfg.libp2p_port,
+        cfg.announce_providers,
+        cfg.lookup_interval.as_millis() as u64,
+        cfg.announce_interval.as_millis() as u64,
+        cfg.bootstrap_peers,
+        cfg.bootstrap_peer_ip.as_deref().unwrap_or("none"),
+        listen_addr_display,
+        cfg.app_port,
+        cfg.routes.len()
     );
 
     let mut swarm = build_swarm(&cfg)?;
     if let Some(addr) = listen_addr {
         swarm
             .listen_on(addr)
-            .context("start gateway libp2p listener")?;
+            .context("start sidecar libp2p listener")?;
     }
 
     dial_bootstrap(&mut swarm, &cfg);
@@ -130,8 +130,8 @@ pub async fn run_gateway_with_shutdown(
 
     let http_client = Client::builder()
         .build()
-        .context("build gateway http client")?;
-    let mut state = GatewayState::new(http_client);
+        .context("build sidecar http client")?;
+    let mut state = SidecarState::new(http_client);
     let (proxy_resp_tx, mut proxy_resp_rx) = mpsc::unbounded_channel();
     let mut handshake_ticker = tokio::time::interval(Duration::from_secs(1));
     handshake_ticker.tick().await;
@@ -156,7 +156,7 @@ pub async fn run_gateway_with_shutdown(
                 }
             },
             _ = &mut shutdown => {
-                info!("gateway shutdown requested");
+                info!("sidecar shutdown requested");
                 break;
             }
             _ = handshake_ticker.tick() => {
@@ -172,16 +172,16 @@ pub async fn run_gateway_with_shutdown(
                                 .behaviour_mut()
                                 .handshake_rr
                                 .send_request(&peer, payload);
-                            debug!(%peer, ?request_id, "gateway handshake request sent");
+                            debug!("sidecar handshake request sent peer={} request_id={:?}", peer, request_id);
                         }
 
                         for peer in actions.drops {
-                            debug!(%peer, "gateway removing peer after failed handshake attempts");
+                            debug!("sidecar removing peer after failed handshake attempts peer={}", peer);
                             swarm.behaviour_mut().kademlia.remove_peer(&peer);
                         }
                     }
                     Err(err) => {
-                        warn!(?err, "gateway handshake drive failed");
+                        warn!("sidecar handshake drive failed err={:?}", err);
                     }
                 }
             },
@@ -192,7 +192,7 @@ pub async fn run_gateway_with_shutdown(
             },
             Some(pending) = proxy_resp_rx.recv() => {
                 if let Err(err) = swarm.behaviour_mut().proxy_rr.send_response(pending.channel, pending.response) {
-                    warn!(error = ?err, "failed to send proxy response to workload");
+                    warn!("failed to send proxy response to workload error={:?}", err);
                 }
             }
         }
@@ -201,7 +201,7 @@ pub async fn run_gateway_with_shutdown(
     Ok(())
 }
 
-impl GatewayConfig {
+impl SidecarConfig {
     pub fn record_key(&self) -> RecordKey {
         RecordKey::new(&self.provider_label)
     }
@@ -222,14 +222,14 @@ impl GatewayConfig {
 }
 
 #[derive(NetworkBehaviour)]
-struct GatewayBehaviour {
+struct SidecarBehaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     handshake_rr: request_response::Behaviour<HandshakeCodec>,
     proxy_rr: request_response::Behaviour<ProxyCodec>,
     manifest_rr: request_response::Behaviour<ManifestFetchCodec>,
 }
 
-struct GatewayState {
+struct SidecarState {
     known_providers: HashSet<String>,
     handshake_states: HashMap<PeerId, HandshakeState>,
     kad_bootstrapped: bool,
@@ -237,7 +237,7 @@ struct GatewayState {
     http_client: Client,
 }
 
-impl GatewayState {
+impl SidecarState {
     fn new(http_client: Client) -> Self {
         Self {
             known_providers: HashSet::new(),
@@ -254,7 +254,7 @@ struct PendingProxyResponse {
     response: ProxyHttpResponse,
 }
 
-fn build_swarm(_cfg: &GatewayConfig) -> Result<Swarm<GatewayBehaviour>> {
+fn build_swarm(_cfg: &SidecarConfig) -> Result<Swarm<SidecarBehaviour>> {
     let swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_quic()
@@ -278,12 +278,12 @@ fn build_swarm(_cfg: &GatewayConfig) -> Result<Swarm<GatewayBehaviour>> {
             );
             let manifest_rr = request_response::Behaviour::new(
                 std::iter::once((
-                    GATEWAY_MANIFEST_PROTOCOL,
+                    SIDECAR_MANIFEST_PROTOCOL,
                     request_response::ProtocolSupport::Full,
                 )),
                 request_response::Config::default(),
             );
-            let mut behaviour = GatewayBehaviour {
+            let mut behaviour = SidecarBehaviour {
                 kademlia: kad::Behaviour::new(peer_id, store),
                 handshake_rr,
                 proxy_rr,
@@ -294,7 +294,7 @@ fn build_swarm(_cfg: &GatewayConfig) -> Result<Swarm<GatewayBehaviour>> {
         })?
         .build();
 
-    debug!("local gateway peer_id={}", swarm.local_peer_id());
+    debug!("local sidecar peer_id={}", swarm.local_peer_id());
     let kad_protocols: Vec<String> = swarm
         .behaviour()
         .kademlia
@@ -302,12 +302,12 @@ fn build_swarm(_cfg: &GatewayConfig) -> Result<Swarm<GatewayBehaviour>> {
         .iter()
         .map(|p| p.to_string())
         .collect();
-    debug!(?kad_protocols, "gateway kad protocols configured");
+    debug!("sidecar kad protocols configured kad_protocols={:?}", kad_protocols);
 
     Ok(swarm)
 }
 
-fn dial_bootstrap(swarm: &mut Swarm<GatewayBehaviour>, cfg: &GatewayConfig) {
+fn dial_bootstrap(swarm: &mut Swarm<SidecarBehaviour>, cfg: &SidecarConfig) {
     for addr in &cfg.bootstrap_peers {
         dial_multiaddr_str(swarm, addr);
     }
@@ -316,40 +316,40 @@ fn dial_bootstrap(swarm: &mut Swarm<GatewayBehaviour>, cfg: &GatewayConfig) {
         dial_multiaddr(swarm, &addr);
     } else if cfg.bootstrap_peer_ip.is_some() {
         warn!(
-            ip = cfg.bootstrap_peer_ip.as_deref().unwrap_or(""),
-            port = cfg.libp2p_port,
-            "gateway bootstrap ip provided but no valid multiaddr could be built"
+            "sidecar bootstrap ip provided but no valid multiaddr could be built ip={} port={}",
+            cfg.bootstrap_peer_ip.as_deref().unwrap_or(""),
+            cfg.libp2p_port
         );
     }
 }
 
-fn trigger_lookup(swarm: &mut Swarm<GatewayBehaviour>, cfg: &GatewayConfig) {
+fn trigger_lookup(swarm: &mut Swarm<SidecarBehaviour>, cfg: &SidecarConfig) {
     let key = cfg.record_key();
     let query_id = swarm.behaviour_mut().kademlia.get_providers(key);
-    debug!(?query_id, provider = %cfg.provider_label, "gateway started provider lookup");
+    debug!("sidecar started provider lookup query_id={:?} provider={}", query_id, cfg.provider_label);
 }
 
-fn announce_provider(swarm: &mut Swarm<GatewayBehaviour>, cfg: &GatewayConfig) {
+fn announce_provider(swarm: &mut Swarm<SidecarBehaviour>, cfg: &SidecarConfig) {
     let key = cfg.record_key();
     match swarm.behaviour_mut().kademlia.start_providing(key) {
         Ok(query_id) => {
-            debug!(?query_id, provider = %cfg.provider_label, "gateway announced provider")
+            debug!("sidecar announced provider query_id={:?} provider={}", query_id, cfg.provider_label)
         }
         Err(err) => {
-            warn!(provider = %cfg.provider_label, error = %err, "gateway provider announce failed")
+            warn!("sidecar provider announce failed provider={} error={}", cfg.provider_label, err)
         }
     }
 }
 
-fn publish_manifest_record(swarm: &mut Swarm<GatewayBehaviour>, cfg: &GatewayConfig) {
+fn publish_manifest_record(swarm: &mut Swarm<SidecarBehaviour>, cfg: &SidecarConfig) {
     let timestamp_ms = timestamp_millis();
     let payload = build_manifest_record_payload(swarm.local_peer_id(), cfg, timestamp_ms);
     let record_key = cfg.manifest_record_key();
     info!(
-        manifest = %cfg.manifest_id,
-        ingress_host = %cfg.ingress_host,
-        ?record_key,
-        "gateway publishing ingress manifest to dht"
+        "sidecar publishing ingress manifest to dht manifest={} ingress_host={} record_key={:?}",
+        cfg.manifest_id,
+        cfg.ingress_host,
+        record_key
     );
 
     let record = Record {
@@ -365,29 +365,29 @@ fn publish_manifest_record(swarm: &mut Swarm<GatewayBehaviour>, cfg: &GatewayCon
         .put_record(record, Quorum::One)
     {
         Ok(query_id) => {
-            debug!(?query_id, manifest = %cfg.manifest_id, "gateway published manifest record")
+            debug!("sidecar published manifest record query_id={:?} manifest={}", query_id, cfg.manifest_id)
         }
         Err(err) => {
-            warn!(manifest = %cfg.manifest_id, error = %err, "gateway failed to publish manifest record")
+            warn!("sidecar failed to publish manifest record manifest={} error={}", cfg.manifest_id, err)
         }
     }
 
     match swarm.behaviour_mut().kademlia.start_providing(record_key) {
         Ok(query_id) => {
-            debug!(?query_id, manifest = %cfg.manifest_id, "gateway announced manifest provider")
+            debug!("sidecar announced manifest provider query_id={:?} manifest={}", query_id, cfg.manifest_id)
         }
         Err(err) => {
-            warn!(manifest = %cfg.manifest_id, error = %err, "gateway manifest provider announce failed")
+            warn!("sidecar manifest provider announce failed manifest={} error={}", cfg.manifest_id, err)
         }
     }
 }
 
 fn build_manifest_record_payload(
     peer_id: &PeerId,
-    cfg: &GatewayConfig,
+    cfg: &SidecarConfig,
     timestamp_ms: u64,
 ) -> Vec<u8> {
-    build_gateway_provider_record(
+    build_sidecar_provider_record(
         &cfg.manifest_id,
         &peer_id.to_string(),
         &cfg.ingress_host,
@@ -400,21 +400,21 @@ fn build_manifest_record_payload(
 }
 
 fn handle_swarm_event(
-    swarm: &mut Swarm<GatewayBehaviour>,
-    event: SwarmEvent<GatewayBehaviourEvent>,
-    cfg: &GatewayConfig,
-    state: &mut GatewayState,
-    event_tx: Option<&mpsc::UnboundedSender<GatewayEvent>>,
+    swarm: &mut Swarm<SidecarBehaviour>,
+    event: SwarmEvent<SidecarBehaviourEvent>,
+    cfg: &SidecarConfig,
+    state: &mut SidecarState,
+    event_tx: Option<&mpsc::UnboundedSender<SidecarEvent>>,
     proxy_resp_tx: &mpsc::UnboundedSender<PendingProxyResponse>,
 ) {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
-            info!(%address, "gateway listening for libp2p peers");
+            info!("sidecar listening for libp2p peers address={}", address);
         }
         SwarmEvent::ConnectionEstablished {
             peer_id, endpoint, ..
         } => {
-            debug!(%peer_id, "gateway connection established");
+            debug!("sidecar connection established peer_id={}", peer_id);
             handshake::track_peer(&mut state.handshake_states, &peer_id);
             let addr = endpoint.get_remote_address().clone();
             swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
@@ -423,17 +423,17 @@ fn handle_swarm_event(
                 match swarm.behaviour_mut().kademlia.bootstrap() {
                     Ok(_) => {
                         state.kad_bootstrapped = true;
-                        debug!("gateway initiated kademlia bootstrap");
+                        debug!("sidecar initiated kademlia bootstrap");
                     }
                     Err(err) => {
-                        debug!(%err, "gateway kademlia bootstrap attempt failed");
+                        debug!("sidecar kademlia bootstrap attempt failed err={}", err);
                     }
                 }
             }
 
             notify(
                 event_tx,
-                GatewayEvent::Connected {
+                SidecarEvent::Connected {
                     peer_id: peer_id.to_string(),
                 },
             );
@@ -443,22 +443,22 @@ fn handle_swarm_event(
             num_established,
             ..
         } => {
-            debug!(%peer_id, "gateway connection closed");
+            debug!("sidecar connection closed peer_id={}", peer_id);
             handshake::untrack_peer(&mut state.handshake_states, &peer_id);
             if num_established == 0 {
                 swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
             }
         }
-        SwarmEvent::Behaviour(GatewayBehaviourEvent::Kademlia(event)) => {
+        SwarmEvent::Behaviour(SidecarBehaviourEvent::Kademlia(event)) => {
             handle_kad_event(swarm, event, cfg, state, event_tx);
         }
-        SwarmEvent::Behaviour(GatewayBehaviourEvent::HandshakeRr(event)) => {
+        SwarmEvent::Behaviour(SidecarBehaviourEvent::HandshakeRr(event)) => {
             handle_handshake_event(swarm, event, state);
         }
-        SwarmEvent::Behaviour(GatewayBehaviourEvent::ProxyRr(event)) => {
+        SwarmEvent::Behaviour(SidecarBehaviourEvent::ProxyRr(event)) => {
             handle_proxy_event(cfg, state, event, proxy_resp_tx);
         }
-        SwarmEvent::Behaviour(GatewayBehaviourEvent::ManifestRr(event)) => {
+        SwarmEvent::Behaviour(SidecarBehaviourEvent::ManifestRr(event)) => {
             handle_manifest_fetch_event(swarm, cfg, event);
         }
         _ => {}
@@ -466,9 +466,9 @@ fn handle_swarm_event(
 }
 
 fn handle_handshake_event(
-    swarm: &mut Swarm<GatewayBehaviour>,
+    swarm: &mut Swarm<SidecarBehaviour>,
     event: request_response::Event<Vec<u8>, Vec<u8>>,
-    state: &mut GatewayState,
+    state: &mut SidecarState,
 ) {
     match event {
         request_response::Event::Message { message, peer, .. } => {
@@ -485,27 +485,27 @@ fn handle_handshake_event(
             );
         }
         request_response::Event::OutboundFailure { peer, error, .. } => {
-            warn!(%peer, ?error, "gateway handshake outbound failure");
+            warn!("sidecar handshake outbound failure peer={} error={:?}", peer, error);
             if matches!(
                 error,
                 request_response::OutboundFailure::UnsupportedProtocols
             ) {
                 handshake::track_peer(&mut state.handshake_states, &peer).confirmed = true;
-                debug!(%peer, "gateway treating peer as handshake-confirmed due to unsupported protocol");
+                debug!("sidecar treating peer as handshake-confirmed due to unsupported protocol peer={}", peer);
             }
         }
         request_response::Event::InboundFailure { peer, error, .. } => {
-            warn!(%peer, ?error, "gateway handshake inbound failure");
+            warn!("sidecar handshake inbound failure peer={} error={:?}", peer, error);
         }
         request_response::Event::ResponseSent { peer, .. } => {
-            debug!(%peer, "gateway handshake response sent");
+            debug!("sidecar handshake response sent peer={}", peer);
         }
     }
 }
 
 fn handle_proxy_event(
-    cfg: &GatewayConfig,
-    state: &GatewayState,
+    cfg: &SidecarConfig,
+    state: &SidecarState,
     event: request_response::Event<ProxyHttpRequest, ProxyHttpResponse>,
     proxy_resp_tx: &mpsc::UnboundedSender<PendingProxyResponse>,
 ) {
@@ -524,12 +524,12 @@ fn handle_proxy_event(
                     request.target_port = cfg.app_port;
                 }
                 info!(
-                    %peer,
-                    manifest = %request.manifest_id,
-                    method = %request.method,
-                    path = %request.path_and_query,
-                    target_port = request.target_port,
-                    "gateway received proxy request"
+                    "sidecar received proxy request peer={} manifest={} method={} path={} target_port={}",
+                    peer,
+                    request.manifest_id,
+                    request.method,
+                    request.path_and_query,
+                    request.target_port
                 );
                 spawn_local_http_request(
                     state.http_client.clone(),
@@ -539,24 +539,24 @@ fn handle_proxy_event(
                 );
             }
             request_response::Message::Response { response, .. } => {
-                debug!(%peer, status = response.status_code, "gateway received proxy response acknowledgement");
+                debug!("sidecar received proxy response acknowledgement peer={} status={}", peer, response.status_code);
             }
         },
         request_response::Event::OutboundFailure { peer, error, .. } => {
-            warn!(%peer, ?error, "gateway proxy outbound failure");
+            warn!("sidecar proxy outbound failure peer={} error={:?}", peer, error);
         }
         request_response::Event::InboundFailure { peer, error, .. } => {
-            warn!(%peer, ?error, "gateway proxy inbound failure");
+            warn!("sidecar proxy inbound failure peer={} error={:?}", peer, error);
         }
         request_response::Event::ResponseSent { peer, .. } => {
-            debug!(%peer, "gateway proxy response sent");
+            debug!("sidecar proxy response sent peer={}", peer);
         }
     }
 }
 
 fn handle_manifest_fetch_event(
-    swarm: &mut Swarm<GatewayBehaviour>,
-    cfg: &GatewayConfig,
+    swarm: &mut Swarm<SidecarBehaviour>,
+    cfg: &SidecarConfig,
     event: request_response::Event<Vec<u8>, Vec<u8>>,
 ) {
     match event {
@@ -568,7 +568,7 @@ fn handle_manifest_fetch_event(
                     match build_manifest_response_bytes(swarm.local_peer_id(), cfg, &request) {
                         Ok(bytes) => bytes,
                         Err(err) => {
-                            warn!(%peer, error = %err, "gateway failed to build manifest response");
+                            log::warn!("sidecar failed to build manifest response peer={} error={}", peer, err);
                             Vec::new()
                         }
                     };
@@ -577,32 +577,32 @@ fn handle_manifest_fetch_event(
                     .manifest_rr
                     .send_response(channel, response)
                 {
-                    warn!(%peer, error = ?err, "gateway failed to send manifest response");
+                    log::warn!("sidecar failed to send manifest response peer={} error={:?}", peer, err);
                 }
             }
             request_response::Message::Response { .. } => {
-                debug!(%peer, "gateway received unexpected manifest response");
+                log::debug!("sidecar received unexpected manifest response peer={}", peer);
             }
         },
         request_response::Event::OutboundFailure { peer, error, .. } => {
-            warn!(%peer, ?error, "gateway manifest outbound failure");
+            log::warn!("sidecar manifest outbound failure peer={} error={:?}", peer, error);
         }
         request_response::Event::InboundFailure { peer, error, .. } => {
-            warn!(%peer, ?error, "gateway manifest inbound failure");
+            log::warn!("sidecar manifest inbound failure peer={} error={:?}", peer, error);
         }
         request_response::Event::ResponseSent { peer, .. } => {
-            debug!(%peer, "gateway manifest response sent");
+            log::debug!("sidecar manifest response sent peer={}", peer);
         }
     }
 }
 
 fn build_manifest_response_bytes(
     peer_id: &PeerId,
-    cfg: &GatewayConfig,
+    cfg: &SidecarConfig,
     request_bytes: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
     let request =
-        root_as_gateway_manifest_request(request_bytes).context("parse manifest fetch request")?;
+        root_as_sidecar_manifest_request(request_bytes).context("parse manifest fetch request")?;
     if request.manifest_id != cfg.manifest_id {
         anyhow::bail!(
             "received manifest request for {} but serving {}",
@@ -613,7 +613,7 @@ fn build_manifest_response_bytes(
 
     let timestamp_ms = timestamp_millis();
     let payload = build_manifest_record_payload(peer_id, cfg, timestamp_ms);
-    sign_gateway_manifest_record(&payload)
+    sign_sidecar_manifest_record(&payload)
 }
 
 fn spawn_local_http_request(
@@ -633,24 +633,16 @@ fn spawn_local_http_request(
         let target_port = request.target_port;
         let response = match execute_local_http_request(client, request).await {
             Ok(resp) => {
-                info!(
-                    manifest = %manifest_id,
-                    method = %method,
-                    path = %path,
-                    target_port,
-                    status = resp.status_code,
-                    "gateway forwarded request to application"
+                log::info!(
+                    "sidecar forwarded request to application manifest={} method={} path={} target_port={} status={}",
+                    manifest_id, method, path, target_port, resp.status_code
                 );
                 resp
             }
             Err(err) => {
-                warn!(
-                    manifest = %manifest_id,
-                    method = %method,
-                    path = %path,
-                    target_port,
-                    error = ?err,
-                    "gateway local http request failed"
+                log::warn!(
+                    "sidecar local http request failed manifest={} method={} path={} target_port={} error={:?}",
+                    manifest_id, method, path, target_port, err
                 );
                 ProxyHttpResponse {
                     status_code: 502,
@@ -709,36 +701,35 @@ async fn execute_local_http_request(
 }
 
 fn handle_kad_event(
-    swarm: &mut Swarm<GatewayBehaviour>,
+    swarm: &mut Swarm<SidecarBehaviour>,
     event: kad::Event,
-    cfg: &GatewayConfig,
-    state: &mut GatewayState,
-    event_tx: Option<&mpsc::UnboundedSender<GatewayEvent>>,
+    cfg: &SidecarConfig,
+    state: &mut SidecarState,
+    event_tx: Option<&mpsc::UnboundedSender<SidecarEvent>>,
 ) {
     match event {
         kad::Event::OutboundQueryProgressed { result, .. } => match result {
             kad::QueryResult::GetProviders(Ok(ok)) => match ok {
                 kad::GetProvidersOk::FoundProviders { key, providers } => {
-                    debug!(key = ?key, expected = ?cfg.record_key(), count = providers.len(), "gateway get_providers result");
+                    log::debug!("sidecar get_providers result key={:?} expected={:?} count={}", key, cfg.record_key(), providers.len());
                     if key == cfg.record_key() {
                         update_provider_cache(providers, state, event_tx);
                     }
                 }
                 kad::GetProvidersOk::FinishedWithNoAdditionalRecord { closest_peers } => {
-                    debug!(
-                        provider = %cfg.provider_label,
-                        closest = closest_peers.len(),
-                        "gateway provider lookup finished without providers"
+                    log::debug!(
+                        "sidecar provider lookup finished without providers provider={} closest={}",
+                        cfg.provider_label, closest_peers.len()
                     );
                 }
             },
             kad::QueryResult::GetProviders(Err(err)) => {
-                warn!(provider = %cfg.provider_label, error = %err, "gateway provider lookup failed");
+                log::warn!("sidecar provider lookup failed provider={} error={}", cfg.provider_label, err);
             }
             kad::QueryResult::Bootstrap(Ok(_)) => {
                 if !state.kad_bootstrap_complete {
                     state.kad_bootstrap_complete = true;
-                    info!("gateway kademlia bootstrap completed, publishing manifest");
+                    log::info!("sidecar kademlia bootstrap completed, publishing manifest");
                     publish_manifest_record(swarm, cfg);
                     if cfg.announce_providers {
                         announce_provider(swarm, cfg);
@@ -746,12 +737,12 @@ fn handle_kad_event(
                 }
             }
             kad::QueryResult::Bootstrap(Err(err)) => {
-                warn!(error = %err, "gateway kademlia bootstrap failed");
+                log::warn!("sidecar kademlia bootstrap failed error={}", err);
             }
             _ => {}
         },
         kad::Event::RoutingUpdated { peer, .. } => {
-            debug!(%peer, "gateway routing entry updated");
+            log::debug!("sidecar routing entry updated peer={}", peer);
         }
         _ => {}
     }
@@ -759,8 +750,8 @@ fn handle_kad_event(
 
 fn update_provider_cache<I>(
     providers: I,
-    state: &mut GatewayState,
-    event_tx: Option<&mpsc::UnboundedSender<GatewayEvent>>,
+    state: &mut SidecarState,
+    event_tx: Option<&mpsc::UnboundedSender<SidecarEvent>>,
 ) where
     I: IntoIterator<Item = libp2p::PeerId>,
 {
@@ -768,10 +759,10 @@ fn update_provider_cache<I>(
     for id in providers {
         let peer = id.to_string();
         if state.known_providers.insert(peer.clone()) {
-            info!(%peer, "gateway discovered provider");
+            log::info!("sidecar discovered provider peer={}", peer);
             notify(
                 event_tx,
-                GatewayEvent::ProviderDiscovered {
+                SidecarEvent::ProviderDiscovered {
                     peer_id: peer.clone(),
                 },
             );
@@ -779,40 +770,40 @@ fn update_provider_cache<I>(
         }
     }
     if changed {
-        debug!(
-            count = state.known_providers.len(),
-            "gateway provider cache updated"
+        log::debug!(
+            "sidecar provider cache updated count={}",
+            state.known_providers.len()
         );
     }
 }
 
-fn dial_multiaddr_str(swarm: &mut Swarm<GatewayBehaviour>, addr: &str) {
+fn dial_multiaddr_str(swarm: &mut Swarm<SidecarBehaviour>, addr: &str) {
     match addr.parse::<Multiaddr>() {
         Ok(ma) => {
             register_kad_peer(swarm, &ma);
             dial_multiaddr(swarm, &ma);
         }
-        Err(err) => warn!(%addr, error = %err, "invalid bootstrap multiaddr"),
+        Err(err) => log::warn!("invalid bootstrap multiaddr addr={} error={}", addr, err),
     }
 }
 
-fn dial_multiaddr(swarm: &mut Swarm<GatewayBehaviour>, addr: &Multiaddr) {
+fn dial_multiaddr(swarm: &mut Swarm<SidecarBehaviour>, addr: &Multiaddr) {
     if let Err(err) = swarm.dial(addr.clone()) {
-        warn!(%addr, error = %err, "gateway failed to dial bootstrap peer");
+        log::warn!("sidecar failed to dial bootstrap peer addr={} error={}", addr, err);
     } else {
-        debug!(%addr, "gateway dialing bootstrap peer");
+        log::debug!("sidecar dialing bootstrap peer addr={}", addr);
     }
 }
 
-fn notify(event_tx: Option<&mpsc::UnboundedSender<GatewayEvent>>, event: GatewayEvent) {
+fn notify(event_tx: Option<&mpsc::UnboundedSender<SidecarEvent>>, event: SidecarEvent) {
     if let Some(tx) = event_tx {
         if let Err(err) = tx.send(event) {
-            warn!(error = %err, "gateway failed to emit event");
+            log::warn!("sidecar failed to emit event error={}", err);
         }
     }
 }
 
-fn register_kad_peer(swarm: &mut Swarm<GatewayBehaviour>, addr: &Multiaddr) {
+fn register_kad_peer(swarm: &mut Swarm<SidecarBehaviour>, addr: &Multiaddr) {
     if let Some((peer_id, base_addr)) = split_peer_multiaddr(addr) {
         swarm
             .behaviour_mut()

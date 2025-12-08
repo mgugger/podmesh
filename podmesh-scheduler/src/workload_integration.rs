@@ -4,18 +4,17 @@
 //! and the new workload manager system. It updates the apply message handler to use
 //! the runtime engines and provider announcement system.
 
-use crate::gateway_sidecar::{
-    GATEWAY_BOOTSTRAP_ENV, GATEWAY_LOG_ENV, GATEWAY_LOG_LEVEL, GATEWAY_METADATA_BLOB_ENV,
-    GATEWAY_SIDECAR_CONTAINER_NAME, GatewaySidecarSettings, build_inline_metadata_blob,
-    gateway_sidecar_settings,
+use crate::sidecar::{
+    SIDECAR_BOOTSTRAP_ENV, SIDECAR_LOG_ENV, SIDECAR_LOG_LEVEL, SIDECAR_METADATA_BLOB_ENV,
+    SIDECAR_CONTAINER_NAME, SidecarSettings, build_inline_metadata_blob,
+    sidecar_settings,
 };
 use crate::podmesh_p2p::behaviour::MyBehaviour;
 use crate::provider::{ProviderConfig, ProviderManager};
 use crate::resource_verifier::ResourceVerifier;
 use crate::runtime::{
-    DeploymentConfig, GatewayInjectionConfig, RuntimeRegistry, create_default_registry,
+    DeploymentConfig, SidecarInjectionConfig, RuntimeRegistry, create_default_registry,
 };
-use base64::Engine;
 use libp2p::Swarm;
 use libp2p::request_response;
 use log::{debug, error, info, warn};
@@ -392,20 +391,20 @@ async fn process_manifest_deployment(
     // Keep the original manifest for metadata/sidecar purposes
     let original_manifest_content = manifest_content.clone();
 
-    let gateway_settings = gateway_sidecar_settings().await;
+    let sidecar_config = sidecar_settings().await;
 
-    // Build inline metadata for the injected gateway sidecar and update the manifest to run on a single node.
+    // Build inline metadata for the injected sidecar and update the manifest to run on a single node.
     let metadata_blob_b64 = build_inline_metadata_blob(
         &manifest_id,
         original_manifest_content.as_slice(),
         owner_pubkey,
-        &gateway_settings.bootstrap_peer,
+        &sidecar_config.bootstrap_peer,
     )?;
 
     let modified_manifest_content = prepare_manifest_for_node(
         &manifest_id,
         &manifest_content,
-        &gateway_settings,
+        &sidecar_config,
         &metadata_blob_b64,
     )?;
 
@@ -415,7 +414,7 @@ async fn process_manifest_deployment(
         &manifest_id,
         &original_manifest_content,
         owner_pubkey,
-        &gateway_settings,
+        &sidecar_config,
     );
 
     // Select appropriate runtime engine based on manifest type
@@ -541,11 +540,11 @@ async fn process_manifest_deployment(
     Ok(workload_info.id)
 }
 
-/// Prepare manifest for node execution (replicas=1, gateway sidecar injection)
+/// Prepare manifest for node execution (replicas=1, sidecar injection)
 fn prepare_manifest_for_node(
     manifest_id: &str,
     manifest_content: &[u8],
-    gateway_settings: &GatewaySidecarSettings,
+    sidecar_config: &SidecarSettings,
     metadata_blob_b64: &str,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut docs = parse_yaml_documents_from_slice(manifest_content)
@@ -559,7 +558,7 @@ fn prepare_manifest_for_node(
     for doc in docs.iter_mut() {
         if supports_workload_resource(doc) {
             enforce_single_replica(doc);
-            if inject_gateway_sidecar(doc, manifest_id, gateway_settings, metadata_blob_b64)? {
+            if inject_sidecar(doc, manifest_id, sidecar_config, metadata_blob_b64)? {
                 injected += 1;
             }
         }
@@ -567,7 +566,7 @@ fn prepare_manifest_for_node(
 
     if injected == 0 {
         warn!(
-            "Manifest {} did not include a pod-spec workload; gateway sidecar injection skipped",
+            "Manifest {} did not include a pod-spec workload; sidecar injection skipped",
             manifest_id
         );
     }
@@ -575,7 +574,7 @@ fn prepare_manifest_for_node(
     let modified_yaml = serialize_yaml_documents(&docs)
         .map_err(|e| format!("failed to serialize modified manifest: {}", e))?;
     info!(
-        "Prepared manifest {} for single-node deployment with gateway sidecar",
+        "Prepared manifest {} for single-node deployment with sidecar",
         manifest_id
     );
     Ok(modified_yaml.into_bytes())
@@ -621,10 +620,10 @@ fn enforce_single_replica(doc: &mut serde_yaml::Value) {
     }
 }
 
-fn inject_gateway_sidecar(
+fn inject_sidecar(
     doc: &mut serde_yaml::Value,
     manifest_id: &str,
-    gateway_settings: &GatewaySidecarSettings,
+    sidecar_config: &SidecarSettings,
     metadata_blob_b64: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let Some(pod_spec) = get_or_insert_pod_spec(doc) else {
@@ -649,37 +648,37 @@ fn inject_gateway_sidecar(
             .as_mapping()
             .and_then(|mapping| mapping.get(&serde_yaml::Value::String("name".to_string())))
             .and_then(|value| value.as_str())
-            .map(|name| name == GATEWAY_SIDECAR_CONTAINER_NAME)
+            .map(|name| name == SIDECAR_CONTAINER_NAME)
             .unwrap_or(false)
     });
 
     if already_present {
         warn!(
             "Manifest {} already declares a {} container; skipping duplicate injection",
-            manifest_id, GATEWAY_SIDECAR_CONTAINER_NAME
+            manifest_id, SIDECAR_CONTAINER_NAME
         );
         return Ok(false);
     }
 
-    containers_seq.push(build_gateway_container_spec(
-        gateway_settings,
+    containers_seq.push(build_sidecar_container_spec(
+        sidecar_config,
         metadata_blob_b64,
     ));
     Ok(true)
 }
 
-fn build_gateway_container_spec(
-    gateway_settings: &GatewaySidecarSettings,
+fn build_sidecar_container_spec(
+    sidecar_config: &SidecarSettings,
     metadata_blob_b64: &str,
 ) -> serde_yaml::Value {
     let mut container = serde_yaml::Mapping::new();
     container.insert(
         serde_yaml::Value::String("name".to_string()),
-        serde_yaml::Value::String(GATEWAY_SIDECAR_CONTAINER_NAME.to_string()),
+        serde_yaml::Value::String(SIDECAR_CONTAINER_NAME.to_string()),
     );
     container.insert(
         serde_yaml::Value::String("image".to_string()),
-        serde_yaml::Value::String(gateway_settings.image.clone()),
+        serde_yaml::Value::String(sidecar_config.image.clone()),
     );
     container.insert(
         serde_yaml::Value::String("imagePullPolicy".to_string()),
@@ -687,12 +686,12 @@ fn build_gateway_container_spec(
     );
 
     let mut env_entries = Vec::new();
-    env_entries.push(build_env_var(GATEWAY_METADATA_BLOB_ENV, metadata_blob_b64));
+    env_entries.push(build_env_var(SIDECAR_METADATA_BLOB_ENV, metadata_blob_b64));
     env_entries.push(build_env_var(
-        GATEWAY_BOOTSTRAP_ENV,
-        &gateway_settings.bootstrap_peer,
+        SIDECAR_BOOTSTRAP_ENV,
+        &sidecar_config.bootstrap_peer,
     ));
-    env_entries.push(build_env_var(GATEWAY_LOG_ENV, GATEWAY_LOG_LEVEL));
+    env_entries.push(build_env_var(SIDECAR_LOG_ENV, SIDECAR_LOG_LEVEL));
     container.insert(
         serde_yaml::Value::String("env".to_string()),
         serde_yaml::Value::Sequence(env_entries),
@@ -824,7 +823,7 @@ async fn decrypt_manifest_content(
     );
 
     // Decode base64-encoded envelope
-    let envelope_bytes = base64::engine::general_purpose::STANDARD.decode(manifest_json)?;
+    let envelope_bytes = crypto::b64_decode(manifest_json)?;
 
     // Parse as flatbuffer envelope
     let envelope = machine::root_as_envelope(&envelope_bytes)?;
@@ -868,7 +867,7 @@ fn create_deployment_config(
     manifest_id: &str,
     original_manifest: &[u8],
     owner_pubkey: &[u8],
-    gateway_settings: &GatewaySidecarSettings,
+    sidecar_config: &SidecarSettings,
 ) -> DeploymentConfig {
     let mut config = DeploymentConfig::default();
 
@@ -882,9 +881,9 @@ fn create_deployment_config(
             .insert("PODMESH_OPERATION_ID".to_string(), operation_id.to_string());
     }
 
-    config.gateway = Some(GatewayInjectionConfig {
-        image: gateway_settings.image.clone(),
-        bootstrap_peer: gateway_settings.bootstrap_peer.clone(),
+    config.sidecar = Some(SidecarInjectionConfig {
+        image: sidecar_config.image.clone(),
+        bootstrap_peer: sidecar_config.bootstrap_peer.clone(),
         manifest_id: manifest_id.to_string(),
         manifest_bytes: original_manifest.to_vec(),
         owner_public_key: owner_pubkey.to_vec(),
@@ -946,7 +945,7 @@ pub async fn process_enhanced_self_apply_request(manifest: &[u8], swarm: &mut Sw
         // Extract owner pubkey from envelope
         let owner_pubkey = envelope
             .pubkey()
-            .and_then(|pk| base64::engine::general_purpose::STANDARD.decode(pk).ok())
+            .and_then(|pk| crypto::b64_decode(pk).ok())
             .unwrap_or_default();
         
         // Extract encrypted payload
@@ -1031,7 +1030,7 @@ pub async fn process_enhanced_self_delete_request(envelope_bytes: &[u8]) -> Resu
 
     let owner_pubkey = envelope
         .pubkey()
-        .and_then(|pk| base64::engine::general_purpose::STANDARD.decode(pk).ok())
+        .and_then(|pk| crypto::b64_decode(pk).ok())
         .ok_or_else(|| "Delete envelope missing owner pubkey".to_string())?;
 
     let encrypted_payload = envelope
@@ -1341,7 +1340,7 @@ services:
     }
 
     #[test]
-    fn test_prepare_manifest_injects_gateway_sidecar() {
+    fn test_prepare_manifest_injects_sidecar() {
         let manifest = r#"
 apiVersion: apps/v1
 kind: Deployment
@@ -1359,7 +1358,7 @@ spec:
         image: nginx:latest
 "#;
 
-        let settings = GatewaySidecarSettings {
+        let settings = SidecarSettings {
             image: "podmesh/sidecar:test".to_string(),
             bootstrap_peer: "/ip4/10.0.0.1/udp/7001/quic-v1".to_string(),
         };
@@ -1388,16 +1387,16 @@ spec:
 
         assert!(containers.iter().any(|container| {
             container.get("name").and_then(|value| value.as_str())
-                == Some(crate::gateway_sidecar::GATEWAY_SIDECAR_CONTAINER_NAME)
+                == Some(crate::sidecar::SIDECAR_CONTAINER_NAME)
         }));
 
         let sidecar_container = containers
             .iter()
             .find(|container| {
                 container.get("name").and_then(|value| value.as_str())
-                    == Some(crate::gateway_sidecar::GATEWAY_SIDECAR_CONTAINER_NAME)
+                    == Some(crate::sidecar::SIDECAR_CONTAINER_NAME)
             })
-            .expect("gateway container present");
+            .expect("sidecar container present");
 
         let env_entries = sidecar_container
             .get("env")
@@ -1406,7 +1405,7 @@ spec:
 
         assert!(env_entries.iter().any(|entry| {
             entry.get("name").and_then(|value| value.as_str())
-                == Some(crate::gateway_sidecar::GATEWAY_METADATA_BLOB_ENV)
+                == Some(crate::sidecar::SIDECAR_METADATA_BLOB_ENV)
         }));
 
         let volumes = doc
@@ -1427,7 +1426,7 @@ spec:
     #[test]
     fn test_prepare_manifest_handles_demo_deployment_yaml() {
         let manifest = include_str!("../../tests/sample_manifests/demo_deployment.yml");
-        let settings = GatewaySidecarSettings {
+        let settings = SidecarSettings {
             image: "podmesh/sidecar:test".to_string(),
             bootstrap_peer: "/ip4/10.0.0.1/udp/7001/quic-v1".to_string(),
         };
@@ -1458,7 +1457,7 @@ spec:
 
         assert!(containers.iter().any(|container| {
             container.get("name").and_then(|value| value.as_str())
-                == Some(crate::gateway_sidecar::GATEWAY_SIDECAR_CONTAINER_NAME)
+                == Some(crate::sidecar::SIDECAR_CONTAINER_NAME)
         }));
     }
 }

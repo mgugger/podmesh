@@ -75,7 +75,7 @@ impl ProtocolLogger {
     pub fn log_failure<E: std::fmt::Debug>(
         protocol: &str,
         direction: &str,
-        peer: libp2p::PeerId,
+        peer: &str,
         error: E,
     ) {
         log::warn!(
@@ -88,7 +88,7 @@ impl ProtocolLogger {
     }
 
     /// Log a successful event with structured format
-    pub fn log_success(protocol: &str, operation: &str, peer: Option<libp2p::PeerId>) {
+    pub fn log_success(protocol: &str, operation: &str, peer: Option<&str>) {
         match peer {
             Some(peer_id) => {
                 log::info!(
@@ -119,7 +119,7 @@ impl CryptoLogger {
     }
 
     /// Log signature verification results
-    pub fn log_signature_verification(valid: bool, peer: Option<libp2p::PeerId>) {
+    pub fn log_signature_verification(valid: bool, peer: Option<&str>) {
         match (valid, peer) {
             (true, Some(peer_id)) => {
                 log::debug!("signature verification successful for peer: {}", peer_id)

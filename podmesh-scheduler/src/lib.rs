@@ -2,16 +2,15 @@
 use axum_support::spawn_tcp_listener;
 #[cfg(unix)]
 use axum_support::spawn_unix_listener;
-use base64::Engine;
 use clap::Parser;
 use env_logger::Env;
 use std::io::Write;
 
-use crate::gateway_sidecar::{
-    DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR, DEFAULT_GATEWAY_IMAGE, GatewaySidecarSettings,
+use crate::sidecar::{
+    DEFAULT_SIDECAR_BOOTSTRAP_MULTIADDR, DEFAULT_SIDECAR_IMAGE, SidecarSettings,
 };
 
-pub mod gateway_sidecar;
+pub mod sidecar;
 pub mod hostapi;
 mod pod_communication;
 pub mod podmesh_p2p;
@@ -97,13 +96,13 @@ pub struct Cli {
     #[arg(long, default_value = "0.0.0.0")]
     pub libp2p_host: String,
 
-    /// Bootstrap peer multiaddr for injected gateway sidecars to join the workload DHT
-    #[arg(long, default_value = DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR)]
-    pub gateway_bootstrap_peer: String,
+    /// Bootstrap peer multiaddr for injected sidecars to join the workload DHT
+    #[arg(long, default_value = DEFAULT_SIDECAR_BOOTSTRAP_MULTIADDR)]
+    pub sidecar_bootstrap_peer: String,
 
-    /// Container image to use for the injected gateway sidecar
-    #[arg(long, default_value = DEFAULT_GATEWAY_IMAGE)]
-    pub gateway_image: String,
+    /// Container image to use for the injected sidecar
+    #[arg(long, default_value = DEFAULT_SIDECAR_IMAGE)]
+    pub sidecar_image: String,
 }
 
 impl Default for Cli {
@@ -126,8 +125,8 @@ impl Default for Cli {
             bootstrap_peer: Vec::new(),
             libp2p_quic_port: 0,
             libp2p_host: "0.0.0.0".to_string(),
-            gateway_bootstrap_peer: DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR.to_string(),
-            gateway_image: DEFAULT_GATEWAY_IMAGE.to_string(),
+            sidecar_bootstrap_peer: DEFAULT_SIDECAR_BOOTSTRAP_MULTIADDR.to_string(),
+            sidecar_image: DEFAULT_SIDECAR_IMAGE.to_string(),
         }
     }
 }
@@ -138,9 +137,9 @@ pub async fn start_machine(cli: Cli) -> anyhow::Result<Vec<tokio::task::JoinHand
     // initialize logger but don't panic if already initialized
     let _ = env_logger::Builder::from_env(Env::default().default_filter_or("warn")).try_init();
 
-    gateway_sidecar::set_gateway_sidecar_settings(GatewaySidecarSettings {
-        image: cli.gateway_image.clone(),
-        bootstrap_peer: cli.gateway_bootstrap_peer.clone(),
+    sidecar::set_sidecar_settings(SidecarSettings {
+        image: cli.sidecar_image.clone(),
+        bootstrap_peer: cli.sidecar_bootstrap_peer.clone(),
     })
     .await;
 
@@ -220,12 +219,10 @@ pub async fn start_machine(cli: Cli) -> anyhow::Result<Vec<tokio::task::JoinHand
             podmesh_p2p::set_node_keypair(kp.clone());
             kp
         } else {
-            let dsa = saorsa_pqc::api::sig::ml_dsa_65();
-            let (pubk, privk) = dsa
-                .generate_keypair()
-                .map_err(|e| anyhow::anyhow!("dsa generate_keypair failed: {:?}", e))?;
-            let pk_bytes = pubk.to_bytes();
-            let sk_bytes = privk.to_bytes();
+            let (pk_bytes, sk_bytes) = crypto::keypair_manager::KeypairManager::generate_fresh_keypair(
+                crypto::keypair_manager::KeypairType::Signing,
+            )
+            .map_err(|e| anyhow::anyhow!("dsa generate_keypair failed: {:?}", e))?;
 
             // Write files with secure mode 0o600
             let mut o = OpenOptions::new();
@@ -270,8 +267,7 @@ pub async fn start_machine(cli: Cli) -> anyhow::Result<Vec<tokio::task::JoinHand
         // Get signing keypair for legacy /api/v1/pubkey endpoint compatibility
         let (signing_pk_bytes, _signing_sk_bytes) = crypto::ensure_keypair_on_disk()
             .map_err(|e| anyhow::anyhow!("Failed to get signing keypair: {}", e))?;
-        let signing_public_key_b64 =
-            base64::engine::general_purpose::STANDARD.encode(&signing_pk_bytes);
+        let signing_public_key_b64 = crypto::b64_encode(&signing_pk_bytes);
 
         std::sync::Arc::new(restapi::envelope_handler::EnvelopeHandler::new(
             kem_sk_bytes,           // KEM private key for decryption

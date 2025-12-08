@@ -1,18 +1,17 @@
 use std::{fs, io::ErrorKind, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
-use base64::Engine;
 use clap::Parser;
-use tracing::{error, warn};
+use log::{error, warn};
 
 use podmesh_sidecar::{
-    DEFAULT_GATEWAY_APP_PORT, GatewayConfig, manifest_routes::extract_gateway_routes, run_gateway,
+    DEFAULT_SIDECAR_APP_PORT, SidecarConfig, manifest_routes::extract_sidecar_routes, run_sidecar,
     split_csv,
 };
 use protocol::{
-    gateway_metadata::{DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR, GatewaySidecarMetadata},
+    sidecar_metadata::{DEFAULT_SIDECAR_BOOTSTRAP_MULTIADDR, SidecarMetadata},
     libp2p_constants::MESH_DOMAIN_SUFFIX,
-    machine::{GatewayRouteKind, GatewayRouteSpec},
+    machine::{SidecarRouteKind, SidecarRouteSpec},
 };
 
 #[derive(Parser, Debug)]
@@ -27,7 +26,7 @@ struct Args {
     #[arg(
         long,
         env = "bootstrap_peers",
-        default_value = DEFAULT_GATEWAY_BOOTSTRAP_MULTIADDR
+        default_value = DEFAULT_SIDECAR_BOOTSTRAP_MULTIADDR
     )]
     bootstrap_peers: String,
     #[arg(long = "bootstrap_ip", env = "bootstrap_ip")]
@@ -46,15 +45,15 @@ struct Args {
     libp2p_port: u16,
     #[arg(
         long = "metadata-path",
-        env = "PODMESH_GATEWAY_METADATA_PATH",
-        default_value = "/var/run/podmesh/gateway/metadata.json"
+        env = "PODMESH_SIDECAR_METADATA_PATH",
+        default_value = "/var/run/podmesh/sidecar/metadata.json"
     )]
     metadata_path: String,
-    #[arg(long = "metadata-b64", env = "PODMESH_GATEWAY_METADATA_B64")]
+    #[arg(long = "metadata-b64", env = "PODMESH_SIDECAR_METADATA_B64")]
     metadata_b64: Option<String>,
 }
 
-impl TryFrom<Args> for GatewayConfig {
+impl TryFrom<Args> for SidecarConfig {
     type Error = anyhow::Error;
 
     fn try_from(args: Args) -> Result<Self> {
@@ -77,15 +76,14 @@ impl TryFrom<Args> for GatewayConfig {
             decode_inline_metadata(blob)?
         } else {
             load_metadata(&args.metadata_path)?.ok_or_else(|| {
-                anyhow::anyhow!("gateway metadata missing at {}", args.metadata_path)
+                anyhow::anyhow!("sidecar metadata missing at {}", args.metadata_path)
             })?
         };
 
-        let manifest_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&metadata.manifest_b64)
+        let manifest_bytes = crypto::b64_decode(&metadata.manifest_b64)
             .context("failed to decode manifest payload from metadata")?;
 
-        let extraction = extract_gateway_routes(&manifest_bytes, &metadata.manifest_id)
+        let extraction = extract_sidecar_routes(&manifest_bytes, &metadata.manifest_id)
             .with_context(|| {
                 format!(
                     "failed to extract routes for manifest {}",
@@ -98,9 +96,9 @@ impl TryFrom<Args> for GatewayConfig {
             derive_manifest_identity(&routes, &metadata.manifest_id);
         if !derived_from_ingress {
             warn!(
-                metadata_manifest = %metadata.manifest_id,
-                manifest = %manifest_id,
-                "no ingress host detected; using fallback manifest id"
+                "no ingress host detected; using fallback manifest id metadata_manifest={} manifest={}",
+                metadata.manifest_id,
+                manifest_id
             );
         }
         update_service_route_hosts(&mut routes, &manifest_id);
@@ -119,7 +117,7 @@ impl TryFrom<Args> for GatewayConfig {
             announce_providers: true,
             manifest_id,
             ingress_host,
-            app_port: DEFAULT_GATEWAY_APP_PORT,
+            app_port: DEFAULT_SIDECAR_APP_PORT,
             routes,
             owner_public_key_b64: metadata.owner_public_key_b64.clone(),
         })
@@ -129,47 +127,46 @@ impl TryFrom<Args> for GatewayConfig {
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
-        error!(error = %err, "workplane gateway failed");
+        error!("podmesh sidecar failed: {}", err);
         std::process::exit(1);
     }
 }
 
 async fn run() -> Result<()> {
-    tracing_support::init_tracing();
+    env_logger::init();
     let args = Args::parse();
-    let cfg = GatewayConfig::try_from(args)?;
-    run_gateway(cfg).await
+    let cfg = SidecarConfig::try_from(args)?;
+    run_sidecar(cfg).await
 }
 
-fn decode_inline_metadata(blob: &str) -> Result<GatewaySidecarMetadata> {
+fn decode_inline_metadata(blob: &str) -> Result<SidecarMetadata> {
     let trimmed = blob.trim();
     if trimmed.is_empty() {
-        return Err(anyhow::anyhow!("inline gateway metadata blob is empty"));
+        return Err(anyhow::anyhow!("inline sidecar metadata blob is empty"));
     }
 
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(trimmed)
-        .context("failed to decode inline gateway metadata blob")?;
+    let decoded = crypto::b64_decode(trimmed)
+        .context("failed to decode inline sidecar metadata blob")?;
 
-    let metadata: GatewaySidecarMetadata =
-        serde_json::from_slice(&decoded).context("failed to parse inline gateway metadata blob")?;
+    let metadata: SidecarMetadata =
+        serde_json::from_slice(&decoded).context("failed to parse inline sidecar metadata blob")?;
     Ok(metadata)
 }
 
-fn load_metadata(path: &str) -> Result<Option<GatewaySidecarMetadata>> {
+fn load_metadata(path: &str) -> Result<Option<SidecarMetadata>> {
     let metadata_path = Path::new(path);
     match fs::read(metadata_path) {
         Ok(bytes) => {
             if bytes.is_empty() {
                 return Ok(None);
             }
-            let metadata: GatewaySidecarMetadata = serde_json::from_slice(&bytes)
-                .with_context(|| format!("failed to parse gateway metadata at {}", path))?;
+            let metadata: SidecarMetadata = serde_json::from_slice(&bytes)
+                .with_context(|| format!("failed to parse sidecar metadata at {}", path))?;
             Ok(Some(metadata))
         }
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
         Err(err) => Err(anyhow::anyhow!(
-            "failed to read gateway metadata file {}: {}",
+            "failed to read sidecar metadata file {}: {}",
             metadata_path.display(),
             err
         )),
@@ -177,12 +174,12 @@ fn load_metadata(path: &str) -> Result<Option<GatewaySidecarMetadata>> {
 }
 
 fn derive_manifest_identity(
-    routes: &[GatewayRouteSpec],
+    routes: &[SidecarRouteSpec],
     metadata_manifest_id: &str,
 ) -> (String, String, bool) {
     if let Some((manifest_id, host)) = routes
         .iter()
-        .filter(|route| matches!(route.source, GatewayRouteKind::Ingress))
+        .filter(|route| matches!(route.source, SidecarRouteKind::Ingress))
         .filter_map(|route| manifest_id_from_host(&route.host).map(|id| (id, route.host.clone())))
         .next()
     {
@@ -231,9 +228,9 @@ fn sanitize_manifest_id(value: &str) -> String {
     }
 }
 
-fn update_service_route_hosts(routes: &mut [GatewayRouteSpec], manifest_id: &str) {
+fn update_service_route_hosts(routes: &mut [SidecarRouteSpec], manifest_id: &str) {
     for route in routes.iter_mut() {
-        if matches!(route.source, GatewayRouteKind::Service) {
+        if matches!(route.source, SidecarRouteKind::Service) {
             route.host = format!(
                 "{}.{}.{}",
                 route.service_name, manifest_id, MESH_DOMAIN_SUFFIX

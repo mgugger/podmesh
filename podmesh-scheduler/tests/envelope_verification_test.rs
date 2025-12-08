@@ -1,5 +1,4 @@
-use base64::Engine;
-use crypto::{ensure_keypair_ephemeral, ensure_pqc_init, sign_envelope};
+use crypto::{b64_encode, ensure_keypair_ephemeral, ensure_pqc_init, sign_envelope};
 use podmesh_scheduler::podmesh_p2p::envelope::verify_flatbuffer_envelope;
 use protocol::machine::{build_envelope_canonical, build_envelope_signed};
 use std::time::Duration;
@@ -71,7 +70,7 @@ fn test_flatbuffer_envelope_invalid_signature() {
         alg,
         "ml-dsa-65",
         "aW52YWxpZC1zaWduYXR1cmU=",
-        &base64::engine::general_purpose::STANDARD.encode(pubb),
+        &b64_encode(&pubb),
         None,
     );
 

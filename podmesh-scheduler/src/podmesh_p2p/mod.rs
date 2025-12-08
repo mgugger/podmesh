@@ -10,11 +10,7 @@ use log::{debug, info, warn};
 use once_cell::sync::OnceCell;
 use std::collections::HashMap as StdHashMap;
 use std::sync::Mutex;
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-    time::Duration,
-};
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{self, Interval};
 
@@ -89,27 +85,8 @@ pub fn setup_libp2p_node(
     let node_config = NodeConfig::new(quic_port, host.to_string(), MACHINE_CLUSTER_TOPIC);
     let (swarm, topic, peer_rx, peer_tx) = p2p::setup_swarm(node_config, |key| {
         debug!("Local PeerId: {}", key.public().to_peer_id());
-        let message_id_fn = |message: &gossipsub::Message| {
-            let mut s = DefaultHasher::new();
-            message.data.hash(&mut s);
-            gossipsub::MessageId::from(s.finish().to_string())
-        };
-        let gossipsub_config = gossipsub::ConfigBuilder::default()
-            .heartbeat_interval(Duration::from_secs(10))
-            .validation_mode(gossipsub::ValidationMode::Strict)
-            .mesh_n_low(1)
-            .mesh_n(3)
-            .mesh_n_high(6)
-            .mesh_outbound_min(1)
-            .message_id_fn(message_id_fn)
-            .allow_self_origin(true)
-            .build()
-            .expect("valid gossipsub config");
-        let gossipsub = gossipsub::Behaviour::new(
-            gossipsub::MessageAuthenticity::Signed(key.clone()),
-            gossipsub_config,
-        )
-        .expect("create gossipsub behaviour");
+        let gossipsub = p2p::create_gossipsub_behaviour(key)
+            .expect("create gossipsub behaviour");
 
         let apply_rr = request_response::Behaviour::new(
             std::iter::once((
@@ -145,14 +122,7 @@ pub fn setup_libp2p_node(
         );
 
         let store = kad::store::MemoryStore::new(key.public().to_peer_id());
-        let mut kademlia_config = kad::Config::default();
-        // Use replication factor of 3 to ensure provider records reach all nodes in small networks
-        kademlia_config.set_replication_factor(std::num::NonZeroUsize::new(3).unwrap());
-        kademlia_config.set_max_packet_size(1024 * 1024);
-        kademlia_config.set_parallelism(std::num::NonZeroUsize::new(3).unwrap());
-        kademlia_config.set_query_timeout(std::time::Duration::from_secs(15));
-        kademlia_config.set_provider_record_ttl(Some(std::time::Duration::from_secs(30)));
-        kademlia_config.set_provider_publication_interval(Some(std::time::Duration::from_secs(5)));
+        let kademlia_config = p2p::default_kademlia_config();
 
         let mut kademlia =
             kad::Behaviour::with_config(key.public().to_peer_id(), store, kademlia_config);

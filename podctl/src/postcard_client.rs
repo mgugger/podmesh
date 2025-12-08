@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use base64::Engine;
 use log::debug;
 use serde_json::Value as JsonValue;
 
@@ -24,7 +23,7 @@ impl FlatbufferClient {
         // Use persistent keypairs from disk to match machine expectations
         crypto::ensure_pqc_init()?;
         let (public_key_bytes, private_key) = crypto::ensure_keypair_on_disk()?;
-        let public_key = base64::engine::general_purpose::STANDARD.encode(&public_key_bytes);
+        let public_key = crypto::b64_encode(&public_key_bytes);
 
         // Obtain or generate a KEM keypair for the CLI so we can advertise our KEM public key
         // to machines (used to encrypt responses back to the CLI).
@@ -78,8 +77,7 @@ impl FlatbufferClient {
 
         log::debug!("Received pubkey response: {}", pubkey_b64);
 
-        let kem_pubkey_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&pubkey_b64)
+        let kem_pubkey_bytes = crypto::b64_decode(&pubkey_b64)
             .context("Failed to decode public key")?;
 
         log::info!(
@@ -108,49 +106,6 @@ impl FlatbufferClient {
         }
     }
 
-    #[allow(dead_code)]
-    async fn send_unencrypted_request(
-        &self,
-        url: &str,
-        payload: &[u8],
-        payload_type: &str,
-    ) -> Result<Vec<u8>> {
-        let kem_pub_b64 = base64::engine::general_purpose::STANDARD.encode(&self.kem_public_key);
-        let envelope = p2p::envelope::create_signed_envelope(
-            payload,
-            payload_type,
-            &self.private_key,
-            &self.public_key,
-            Some("cli-client"),
-            Some(&kem_pub_b64),
-        )?;
-
-        let resp = self
-            .client
-            .post(url)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .header("x-peer-id", "cli-client") // Identify as CLI client
-            .body(envelope)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "HTTP error {}: {}",
-                resp.status(),
-                resp.text().await.unwrap_or_default()
-            ));
-        }
-
-        let response_bytes = resp.bytes().await?.to_vec();
-        log::debug!(
-            "send_unencrypted_request: response_bytes.len()={}",
-            response_bytes.len()
-        );
-
-        Ok(response_bytes)
-    }
-
     /// Send encrypted request to a specific node (end-to-end encryption with target node)
     pub async fn send_encrypted_request_to_node(
         &self,
@@ -159,7 +114,7 @@ impl FlatbufferClient {
         payload_type: &str,
         target_node_kem_pubkey: &[u8],
     ) -> Result<Vec<u8>> {
-        let kem_pub_b64 = base64::engine::general_purpose::STANDARD.encode(&self.kem_public_key);
+        let kem_pub_b64 = crypto::b64_encode(&self.kem_public_key);
         // Encrypt for the target node, not the bootstrap/machine
         let envelope = p2p::envelope::create_encrypted_signed_envelope(
             payload,
@@ -253,7 +208,7 @@ impl FlatbufferClient {
         payload: &[u8],
         payload_type: &str,
     ) -> Result<Vec<u8>> {
-        let kem_pub_b64 = base64::engine::general_purpose::STANDARD.encode(&self.kem_public_key);
+        let kem_pub_b64 = crypto::b64_encode(&self.kem_public_key);
         let envelope = if let Some(machine_pubkey) = &self.machine_public_key {
             p2p::envelope::create_encrypted_signed_envelope(
                 payload,
@@ -448,83 +403,5 @@ impl FlatbufferClient {
                 Ok(peers)
             }
         }
-    }
-
-    pub async fn send_delete_request(&self, url: &str, body: &[u8]) -> Result<Vec<u8>> {
-        let kem_pub_b64 = base64::engine::general_purpose::STANDARD.encode(&self.kem_public_key);
-        let envelope = if let Some(machine_pubkey) = &self.machine_public_key {
-            p2p::envelope::create_encrypted_signed_envelope(
-                body,
-                "delete_request",
-                machine_pubkey,
-                &self.private_key,
-                &self.public_key,
-                Some("cli-client"),
-                Some(&kem_pub_b64),
-            )?
-        } else {
-            p2p::envelope::create_signed_envelope(
-                body,
-                "delete_request",
-                &self.private_key,
-                &self.public_key,
-                Some("cli-client"),
-                Some(&kem_pub_b64),
-            )?
-        };
-
-        let resp = self
-            .client
-            .delete(url)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .header("x-peer-id", "cli-client") // Identify as CLI client
-            .body(envelope)
-            .send()
-            .await?;
-
-        let status = resp.status();
-
-        if !status.is_success() {
-            let body_text = resp.text().await?;
-            anyhow::bail!("Delete request failed: {} {}", status, body_text);
-        }
-
-        let response_bytes = resp.bytes().await?;
-
-        // Try to decrypt if it looks like an encrypted envelope
-        if response_bytes.len() > 100 && self.machine_public_key.is_some() {
-            // Try to parse as envelope first
-            match protocol::machine::root_as_envelope(&response_bytes) {
-                Ok(_envelope) => {
-                    // It's an envelope, try to decrypt
-                    match self.decrypt_from_machine(&response_bytes) {
-                        Ok(decrypted) => {
-                            log::info!(
-                                "send_delete_request: Decryption successful, decrypted length: {}",
-                                decrypted.len()
-                            );
-                            return Ok(decrypted);
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "send_delete_request: Decryption failed: {:?}, returning raw bytes",
-                                e
-                            );
-                            // Decryption failed, return raw bytes
-                            return Ok(response_bytes.to_vec());
-                        }
-                    }
-                }
-                Err(_) => {
-                    log::debug!(
-                        "send_delete_request: Not an envelope, server sent unencrypted response"
-                    );
-                    // Server sent unencrypted response directly, return as-is
-                    return Ok(response_bytes.to_vec());
-                }
-            }
-        }
-
-        Ok(response_bytes.to_vec())
     }
 }

@@ -1,5 +1,4 @@
-use base64::Engine;
-use crypto::{ensure_keypair_ephemeral, ensure_pqc_init, sign_envelope};
+use crypto::{b64_encode, ensure_keypair_ephemeral, ensure_pqc_init, sign_envelope};
 use podmesh_scheduler::podmesh_p2p::envelope::verify_flatbuffer_envelope;
 use protocol::machine::{build_envelope_canonical, build_envelope_signed};
 use std::time::Duration;
@@ -22,7 +21,7 @@ fn test_signature_verification_error_messages() {
 
     {
         let invalid_sig = "not-valid-base64!@#$%";
-        let pub_b64 = base64::engine::general_purpose::STANDARD.encode(&pubb);
+        let pub_b64 = b64_encode(&pubb);
 
         let invalid_sig_envelope = build_envelope_signed(
             payload,
@@ -48,9 +47,8 @@ fn test_signature_verification_error_messages() {
     }
 
     {
-        let invalid_sig = base64::engine::general_purpose::STANDARD
-            .encode(b"invalid signature bytes that are too short");
-        let pub_b64 = base64::engine::general_purpose::STANDARD.encode(&pubb);
+        let invalid_sig = b64_encode(b"invalid signature bytes that are too short");
+        let pub_b64 = b64_encode(&pubb);
 
         let invalid_length_envelope = build_envelope_signed(
             payload,
@@ -78,7 +76,7 @@ fn test_signature_verification_error_messages() {
     {
         let (sig_b64, _pub_b64) = sign_envelope(&privb, &pubb, &canonical_bytes)
             .expect("Failed to sign with correct keypair");
-        let wrong_pub_b64 = base64::engine::general_purpose::STANDARD.encode(&pubb2);
+        let wrong_pub_b64 = b64_encode(&pubb2);
 
         let wrong_key_envelope = build_envelope_signed(
             payload,
@@ -146,7 +144,7 @@ fn test_signature_verification_error_messages() {
         let (sig_b64, _) =
             sign_envelope(&privb, &pubb, &canonical_bytes).expect("Failed to sign envelope");
         let invalid_pub =
-            base64::engine::general_purpose::STANDARD.encode(b"invalid public key bytes");
+            b64_encode(b"invalid public key bytes");
 
         let invalid_pub_envelope = build_envelope_signed(
             payload,

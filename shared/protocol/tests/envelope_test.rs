@@ -1,8 +1,4 @@
-use anyhow::Context;
-use base64::Engine as _;
-use base64::engine::general_purpose;
-
-use crypto::{ensure_keypair_ephemeral, ensure_pqc_init, sign_envelope, verify_envelope};
+use crypto::{b64_decode, ensure_keypair_ephemeral, ensure_pqc_init, sign_envelope, verify_envelope};
 use protocol::machine::{build_envelope_canonical, build_envelope_signed, root_as_envelope};
 
 #[test]
@@ -34,9 +30,7 @@ fn postcard_envelope_sign_and_verify() -> anyhow::Result<()> {
         None,
     );
 
-    let sig_bytes = general_purpose::STANDARD
-        .decode(&sig_b64)
-        .context("decode sig b64")?;
+    let sig_bytes = b64_decode(&sig_b64)?;
 
     verify_envelope(&pub_bytes, &canonical_bytes, &sig_bytes)?;
 

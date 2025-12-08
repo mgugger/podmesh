@@ -10,7 +10,6 @@ use axum::{
     middleware,
     routing::{delete, get, post},
 };
-use base64::Engine;
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 use protocol::libp2p_constants::{FREE_CAPACITY_PREFIX, FREE_CAPACITY_TIMEOUT_MS};
@@ -44,7 +43,7 @@ async fn get_nodes(
 async fn get_kem_public_key(State(_state): State<RestState>) -> String {
     // Get the machine's KEM public key for encryption
     match crypto::ensure_kem_keypair_on_disk() {
-        Ok((kem_pub_bytes, _)) => base64::engine::general_purpose::STANDARD.encode(&kem_pub_bytes),
+        Ok((kem_pub_bytes, _)) => crypto::b64_encode(&kem_pub_bytes),
         Err(e) => format!("ERROR: Failed to get KEM public key: {}", e),
     }
 }
@@ -52,9 +51,7 @@ async fn get_kem_public_key(State(_state): State<RestState>) -> String {
 async fn get_signing_public_key(State(_state): State<RestState>) -> String {
     // Get the machine's signing public key for signature verification
     match crypto::ensure_keypair_on_disk() {
-        Ok((signing_pub_bytes, _)) => {
-            base64::engine::general_purpose::STANDARD.encode(&signing_pub_bytes)
-        }
+        Ok((signing_pub_bytes, _)) => crypto::b64_encode(&signing_pub_bytes),
         Err(e) => format!("ERROR: Failed to get signing public key: {}", e),
     }
 }
@@ -401,7 +398,7 @@ pub async fn get_task_providers(
         // If this is the local peer, get our own KEM public key for encryption
         let pubkey_b64 = if Some(&provider_peer_id) == local_peer_id.as_ref() {
             match crypto::ensure_kem_keypair_on_disk() {
-                Ok((pub_bytes, _)) => base64::engine::general_purpose::STANDARD.encode(&pub_bytes),
+                Ok((pub_bytes, _)) => crypto::b64_encode(&pub_bytes),
                 Err(e) => {
                     warn!("Failed to get local KEM public key: {}", e);
                     String::new()
@@ -564,7 +561,7 @@ pub async fn create_task(
             // Create a proper envelope containing the encrypted payload for decryption
             // The decryption process expects an envelope with payload_type="manifest"
             let envelope_nonce: [u8; 16] = rand::random();
-            let nonce_str = base64::engine::general_purpose::STANDARD.encode(&envelope_nonce);
+            let nonce_str = crypto::b64_encode(&envelope_nonce);
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)

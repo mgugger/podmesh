@@ -637,16 +637,6 @@ impl WorkloadManager {
         Err(WorkloadManagerError::NoRuntimeEngineAvailable)
     }
 
-    /// Internal method to get a runtime engine by name
-    #[allow(dead_code)]
-    fn get_runtime_engine_by_name(&self, name: &str) -> WorkloadManagerResult<String> {
-        if self.fetch_engine(name).is_ok() {
-            Ok(name.to_string())
-        } else {
-            Err(WorkloadManagerError::NoRuntimeEngineAvailable)
-        }
-    }
-
     /// Internal method to validate manifest content
     async fn validate_manifest_content(
         &self,

@@ -15,7 +15,6 @@ RUN rustup target add x86_64-unknown-linux-musl
 COPY . .
 
 RUN cargo build --release --locked -p podmesh-scheduler --target x86_64-unknown-linux-musl
-RUN strip /app/target/x86_64-unknown-linux-musl/release/podmesh-scheduler
 
 # ===============================
 # 2. Fetch static Podman client
