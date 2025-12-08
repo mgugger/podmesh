@@ -19,7 +19,7 @@ use zeroize::Zeroizing;
 use dirs::home_dir;
 
 pub mod envelope_validator;
-pub mod flatbuffer_envelope;
+pub mod nonce_helper;
 pub mod keypair_manager;
 pub mod logging;
 

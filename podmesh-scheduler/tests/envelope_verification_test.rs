@@ -1,11 +1,11 @@
 use crypto::{b64_encode, ensure_keypair_ephemeral, ensure_pqc_init, sign_envelope};
-use podmesh_scheduler::podmesh_p2p::envelope::verify_flatbuffer_envelope;
+use podmesh_scheduler::podmesh_p2p::envelope::verify_envelope;
 use protocol::machine::{build_envelope_canonical, build_envelope_signed};
 use std::time::Duration;
 
 #[test]
-fn test_flatbuffer_envelope_roundtrip() {
-    // Test that FlatBuffer envelopes signed with canonical bytes verify correctly
+fn test_envelope_roundtrip() {
+    // Test that postcard envelopes signed with canonical bytes verify correctly
     ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 
@@ -39,11 +39,11 @@ fn test_flatbuffer_envelope_roundtrip() {
         None,
     );
 
-    let result = verify_flatbuffer_envelope(&signed_envelope, Duration::from_secs(300));
+    let result = verify_envelope(&signed_envelope, Duration::from_secs(300));
 
     assert!(
         result.is_ok(),
-        "FlatBuffer envelope verification failed: {:?}",
+        "Envelope verification failed: {:?}",
         result.err()
     );
 
@@ -52,7 +52,7 @@ fn test_flatbuffer_envelope_roundtrip() {
 }
 
 #[test]
-fn test_flatbuffer_envelope_invalid_signature() {
+fn test_envelope_invalid_signature() {
     ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, _privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 
@@ -74,7 +74,7 @@ fn test_flatbuffer_envelope_invalid_signature() {
         None,
     );
 
-    let result = verify_flatbuffer_envelope(&invalid_envelope, Duration::from_secs(300));
+    let result = verify_envelope(&invalid_envelope, Duration::from_secs(300));
     assert!(
         result.is_err(),
         "Invalid signature should fail verification"
@@ -82,7 +82,7 @@ fn test_flatbuffer_envelope_invalid_signature() {
 }
 
 #[test]
-fn test_flatbuffer_envelope_replay_protection() {
+fn test_envelope_replay_protection() {
     ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 
@@ -115,14 +115,14 @@ fn test_flatbuffer_envelope_replay_protection() {
         None,
     );
 
-    let first_result = verify_flatbuffer_envelope(&envelope, Duration::from_secs(300));
+    let first_result = verify_envelope(&envelope, Duration::from_secs(300));
     assert!(
         first_result.is_ok(),
         "First verification should succeed: {:?}",
         first_result.err()
     );
 
-    let second_result = verify_flatbuffer_envelope(&envelope, Duration::from_secs(300));
+    let second_result = verify_envelope(&envelope, Duration::from_secs(300));
     assert!(
         second_result.is_err(),
         "Replay should be detected and rejected"
@@ -130,7 +130,7 @@ fn test_flatbuffer_envelope_replay_protection() {
 }
 
 #[test]
-fn test_flatbuffer_envelope_signature_prefix_handling() {
+fn test_envelope_signature_prefix_handling() {
     ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 
@@ -157,7 +157,7 @@ fn test_flatbuffer_envelope_signature_prefix_handling() {
         None,
     );
 
-    let result = verify_flatbuffer_envelope(&envelope_with_prefix, Duration::from_secs(300));
+    let result = verify_envelope(&envelope_with_prefix, Duration::from_secs(300));
     assert!(
         result.is_ok(),
         "Envelope with explicit prefix should verify: {:?}",
@@ -175,7 +175,7 @@ fn test_flatbuffer_envelope_signature_prefix_handling() {
 }
 
 #[test]
-fn test_flatbuffer_envelope_empty_payload() {
+fn test_envelope_empty_payload() {
     ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 
@@ -202,7 +202,7 @@ fn test_flatbuffer_envelope_empty_payload() {
         None,
     );
 
-    let result = verify_flatbuffer_envelope(&envelope, Duration::from_secs(300));
+    let result = verify_envelope(&envelope, Duration::from_secs(300));
     assert!(
         result.is_ok(),
         "Empty payload should verify correctly: {:?}",
@@ -214,7 +214,7 @@ fn test_flatbuffer_envelope_empty_payload() {
 }
 
 #[test]
-fn test_flatbuffer_envelope_large_payload() {
+fn test_envelope_large_payload() {
     ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 
@@ -241,7 +241,7 @@ fn test_flatbuffer_envelope_large_payload() {
         None,
     );
 
-    let result = verify_flatbuffer_envelope(&envelope, Duration::from_secs(300));
+    let result = verify_envelope(&envelope, Duration::from_secs(300));
     assert!(
         result.is_ok(),
         "Large payload should verify correctly: {:?}",
@@ -256,9 +256,9 @@ fn test_flatbuffer_envelope_large_payload() {
 }
 
 #[test]
-fn test_flatbuffer_envelope_malformed_data() {
-    let malformed_data = b"this is not a valid flatbuffer";
+fn test_envelope_malformed_data() {
+    let malformed_data = b"this is not a valid postcard envelope";
 
-    let result = verify_flatbuffer_envelope(malformed_data, Duration::from_secs(300));
+    let result = verify_envelope(malformed_data, Duration::from_secs(300));
     assert!(result.is_err(), "Malformed data should fail to parse");
 }

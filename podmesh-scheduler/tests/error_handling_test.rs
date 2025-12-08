@@ -1,5 +1,5 @@
 use crypto::{b64_encode, ensure_keypair_ephemeral, ensure_pqc_init, sign_envelope};
-use podmesh_scheduler::podmesh_p2p::envelope::verify_flatbuffer_envelope;
+use podmesh_scheduler::podmesh_p2p::envelope::verify_envelope;
 use protocol::machine::{build_envelope_canonical, build_envelope_signed};
 use std::time::Duration;
 
@@ -35,7 +35,7 @@ fn test_signature_verification_error_messages() {
             None,
         );
 
-        let result = verify_flatbuffer_envelope(&invalid_sig_envelope, Duration::from_secs(300));
+        let result = verify_envelope(&invalid_sig_envelope, Duration::from_secs(300));
         assert!(result.is_err(), "Invalid signature should fail");
 
         let error_msg = format!("{:?}", result.unwrap_err());
@@ -62,7 +62,7 @@ fn test_signature_verification_error_messages() {
             None,
         );
 
-        let result = verify_flatbuffer_envelope(&invalid_length_envelope, Duration::from_secs(300));
+        let result = verify_envelope(&invalid_length_envelope, Duration::from_secs(300));
         assert!(result.is_err(), "Invalid signature length should fail");
 
         let error_msg = format!("{:?}", result.unwrap_err());
@@ -90,7 +90,7 @@ fn test_signature_verification_error_messages() {
             None,
         );
 
-        let result = verify_flatbuffer_envelope(&wrong_key_envelope, Duration::from_secs(300));
+        let result = verify_envelope(&wrong_key_envelope, Duration::from_secs(300));
         assert!(result.is_err(), "Wrong public key should fail verification");
 
         let error_msg = format!("{:?}", result.unwrap_err());
@@ -129,7 +129,7 @@ fn test_signature_verification_error_messages() {
             None,
         );
 
-        let result = verify_flatbuffer_envelope(&tampered_envelope, Duration::from_secs(300));
+        let result = verify_envelope(&tampered_envelope, Duration::from_secs(300));
         assert!(result.is_err(), "Tampered payload should fail verification");
 
         let error_msg = format!("{:?}", result.unwrap_err());
@@ -158,7 +158,7 @@ fn test_signature_verification_error_messages() {
             None,
         );
 
-        let result = verify_flatbuffer_envelope(&invalid_pub_envelope, Duration::from_secs(300));
+        let result = verify_envelope(&invalid_pub_envelope, Duration::from_secs(300));
         assert!(
             result.is_err(),
             "Invalid public key should fail verification"
@@ -185,7 +185,7 @@ fn test_envelope_parsing_robustness() {
             "Truncated data should not parse as envelope"
         );
 
-        let verify_result = verify_flatbuffer_envelope(truncated_data, Duration::from_secs(300));
+        let verify_result = verify_envelope(truncated_data, Duration::from_secs(300));
         assert!(
             verify_result.is_err(),
             "Truncated envelope should fail verification"
@@ -193,11 +193,11 @@ fn test_envelope_parsing_robustness() {
     }
 
     {
-        let invalid_data = b"this is definitely not a flatbuffer envelope at all";
+        let invalid_data = b"this is definitely not a postcard envelope at all";
         let result = protocol::machine::root_as_envelope(invalid_data);
         assert!(result.is_err(), "Invalid data should not parse as envelope");
 
-        let verify_result = verify_flatbuffer_envelope(invalid_data, Duration::from_secs(300));
+        let verify_result = verify_envelope(invalid_data, Duration::from_secs(300));
         assert!(
             verify_result.is_err(),
             "Invalid envelope should fail verification"
@@ -205,7 +205,7 @@ fn test_envelope_parsing_robustness() {
 
         let error_msg = format!("{:?}", verify_result.unwrap_err());
         assert!(
-            error_msg.contains("parse") || error_msg.contains("flatbuffer"),
+            error_msg.contains("parse") || error_msg.contains("postcard"),
             "Error should mention parsing issue: {}",
             error_msg
         );
@@ -216,7 +216,7 @@ fn test_envelope_parsing_robustness() {
         let result = protocol::machine::root_as_envelope(empty_data);
         assert!(result.is_err(), "Empty data should not parse as envelope");
 
-        let verify_result = verify_flatbuffer_envelope(empty_data, Duration::from_secs(300));
+        let verify_result = verify_envelope(empty_data, Duration::from_secs(300));
         assert!(
             verify_result.is_err(),
             "Empty envelope should fail verification"
@@ -236,7 +236,7 @@ fn test_envelope_parsing_robustness() {
             None,
         );
 
-        let result = verify_flatbuffer_envelope(&envelope_with_empty_sig, Duration::from_secs(300));
+        let result = verify_envelope(&envelope_with_empty_sig, Duration::from_secs(300));
         assert!(
             result.is_err(),
             "Envelope with empty signature should fail verification"
@@ -265,7 +265,7 @@ fn test_envelope_parsing_robustness() {
             None,
         );
 
-        let result = verify_flatbuffer_envelope(&malformed_b64_envelope, Duration::from_secs(300));
+        let result = verify_envelope(&malformed_b64_envelope, Duration::from_secs(300));
         assert!(
             result.is_err(),
             "Envelope with malformed base64 should fail verification"
@@ -312,10 +312,10 @@ fn test_nonce_validation_errors() {
             None,
         );
 
-        let first_result = verify_flatbuffer_envelope(&envelope, Duration::from_secs(300));
+        let first_result = verify_envelope(&envelope, Duration::from_secs(300));
         assert!(first_result.is_ok(), "First verification should succeed");
 
-        let second_result = verify_flatbuffer_envelope(&envelope, Duration::from_secs(300));
+        let second_result = verify_envelope(&envelope, Duration::from_secs(300));
         assert!(
             second_result.is_err(),
             "Second verification should fail due to nonce replay"
@@ -348,7 +348,7 @@ fn test_nonce_validation_errors() {
             None,
         );
 
-        let result = verify_flatbuffer_envelope(&envelope_empty_nonce, Duration::from_secs(300));
+        let result = verify_envelope(&envelope_empty_nonce, Duration::from_secs(300));
         assert!(
             result.is_ok(),
             "Empty nonce should not prevent verification: {:?}",
@@ -388,7 +388,7 @@ fn test_algorithm_mismatch_errors() {
         None,
     );
 
-    let result = verify_flatbuffer_envelope(&envelope, Duration::from_secs(300));
+    let result = verify_envelope(&envelope, Duration::from_secs(300));
     assert!(
         result.is_ok(),
         "Different algorithm string should still verify (canonical consistency): {:?}",
@@ -422,7 +422,7 @@ fn test_timestamp_edge_cases() {
             None,
         );
 
-        let result = verify_flatbuffer_envelope(&envelope_zero_ts, Duration::from_secs(300));
+        let result = verify_envelope(&envelope_zero_ts, Duration::from_secs(300));
         assert!(
             result.is_ok(),
             "Zero timestamp should not prevent verification: {:?}",
@@ -456,7 +456,7 @@ fn test_timestamp_edge_cases() {
             None,
         );
 
-        let result = verify_flatbuffer_envelope(&envelope_max_ts, Duration::from_secs(300));
+        let result = verify_envelope(&envelope_max_ts, Duration::from_secs(300));
         assert!(
             result.is_ok(),
             "Maximum timestamp should not prevent verification: {:?}",
@@ -511,7 +511,7 @@ fn test_concurrent_nonce_validation() {
                 None,
             );
 
-            let result = verify_flatbuffer_envelope(&envelope, Duration::from_secs(300));
+            let result = verify_envelope(&envelope, Duration::from_secs(300));
             if result.is_ok() {
                 let mut count = success_count_clone.lock().unwrap();
                 *count += 1;

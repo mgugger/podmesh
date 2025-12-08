@@ -193,7 +193,7 @@ pub fn root_as_envelope(bytes: &[u8]) -> Result<Envelope, postcard::Error> {
     deserialize(bytes)
 }
 
-pub fn fb_envelope_extract_sig_pub(envelope_bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+pub fn envelope_extract_sig_pub(envelope_bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     let envelope = root_as_envelope(envelope_bytes).ok()?;
     let sig_field = envelope.sig()?;
     let sig_b64 = sig_field
@@ -205,7 +205,7 @@ pub fn fb_envelope_extract_sig_pub(envelope_bytes: &[u8]) -> Option<(Vec<u8>, Ve
     Some((sig_bytes, pub_bytes))
 }
 
-pub fn fb_envelope_extract_sig_pub_legacy(
+pub fn envelope_extract_sig_pub_legacy(
     buf: &[u8],
 ) -> anyhow::Result<(Vec<u8>, Vec<u8>, Vec<u8>, String, String)> {
     let env =

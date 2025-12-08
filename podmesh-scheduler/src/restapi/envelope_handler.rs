@@ -102,14 +102,14 @@ impl EnvelopeHandler {
 
     /// Decrypt an incoming envelope and extract the payload
     pub async fn decrypt_request_envelope(&self, envelope_bytes: &[u8]) -> Result<Vec<u8>> {
-        // Parse the flatbuffer envelope
+        // Parse the postcard envelope
         let envelope = root_as_envelope(envelope_bytes)
             .map_err(|e| anyhow!("Failed to parse envelope: {}", e))?;
 
         // Verify signature using peer-aware verification if peer_id is present
         let nonce_window = std::time::Duration::from_secs(300);
         let peer_id = envelope.peer_id().unwrap_or("global");
-        crate::podmesh_p2p::envelope::verify_flatbuffer_envelope_for_peer(
+        crate::podmesh_p2p::envelope::verify_envelope_for_peer(
             envelope_bytes,
             nonce_window,
             peer_id,
@@ -208,7 +208,7 @@ pub async fn envelope_passthrough_middleware(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
 
-    // Only process flatbuffer envelopes
+    // Only process postcard envelopes
     if content_type == "application/octet-stream" {
         // Extract body bytes and parts
         let (mut parts, body) = request.into_parts();
@@ -266,7 +266,7 @@ pub async fn envelope_passthrough_middleware(
         }
     }
 
-    // For non-flatbuffer requests, add empty metadata and pass through
+    // For non-envelope requests, add empty metadata and pass through
     let (mut parts, body) = request.into_parts();
     let metadata = EnvelopeMetadata {
         signing_pubkey: Vec::new(),
@@ -293,7 +293,7 @@ pub async fn envelope_middleware(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
 
-    // Only process flatbuffer envelopes
+    // Only process postcard envelopes
     if content_type == "application/octet-stream" {
         // Extract body bytes and parts
         let (mut parts, body) = request.into_parts();
@@ -367,7 +367,7 @@ pub async fn envelope_middleware(
         }
     }
 
-    // For non-flatbuffer requests, add empty metadata extension and pass through
+    // For non-envelope requests, add empty metadata extension and pass through
     let (mut parts, body) = request.into_parts();
     let metadata = EnvelopeMetadata {
         signing_pubkey: Vec::new(),
@@ -376,14 +376,14 @@ pub async fn envelope_middleware(
         original_envelope: Vec::new(),
     };
     parts.extensions.insert(metadata);
-    debug!("Added empty envelope metadata for non-flatbuffer request");
+    debug!("Added empty envelope metadata for non-envelope request");
 
     let new_request = Request::from_parts(parts, body);
     let response = next.run(new_request).await;
     Ok(response)
 }
 
-/// Helper to create encrypted flatbuffer responses using provided KEM key
+/// Helper to create encrypted postcard responses using provided KEM key
 pub async fn create_encrypted_response_with_key(
     envelope_handler: &Arc<EnvelopeHandler>,
     payload: &[u8],
@@ -412,7 +412,7 @@ pub async fn create_encrypted_response_with_key(
                         peer_id, e
                     );
 
-                    // Send unencrypted flatbuffer response as a fallback
+                    // Send unencrypted postcard response as a fallback
                     let response = axum::response::Response::builder()
                         .header("content-type", "application/octet-stream")
                         .body(axum::body::Body::from(payload.to_vec()))
@@ -565,7 +565,7 @@ mod tests {
         );
 
         // Step 2: Verify the envelope can be verified directly
-        let verified_parts = crate::podmesh_p2p::envelope::verify_flatbuffer_envelope(
+        let verified_parts = crate::podmesh_p2p::envelope::verify_envelope(
             &encrypted_envelope,
             std::time::Duration::from_secs(300),
         )

@@ -7,8 +7,8 @@ mod util;
 pub use envelope::{
     Envelope, build_encrypted_envelope, build_encrypted_envelope_with_peer,
     build_envelope_canonical, build_envelope_canonical_with_peer, build_envelope_signed,
-    build_envelope_signed_with_peer, fb_envelope_extract_sig_pub,
-    fb_envelope_extract_sig_pub_legacy, root_as_envelope,
+    build_envelope_signed_with_peer, envelope_extract_sig_pub,
+    envelope_extract_sig_pub_legacy, root_as_envelope,
 };
 
 pub use sidecar::{

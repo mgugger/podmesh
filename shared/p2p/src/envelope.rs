@@ -204,13 +204,13 @@ pub fn create_encrypted_signed_envelope(
 }
 
 pub fn normalize_and_decode_signature(sig_opt: Option<&str>) -> anyhow::Result<Vec<u8>> {
-    crypto::flatbuffer_envelope::normalize_and_decode_signature(sig_opt)
+    crypto::nonce_helper::normalize_and_decode_signature(sig_opt)
 }
 
 /// Check replay protection: ensure nonce is not seen in `nonce_window` and insert it.
 /// Returns Err if duplicate or invalid.
 pub fn check_and_insert_nonce(nonce_str: &str, nonce_window: Duration) -> anyhow::Result<()> {
-    crypto::flatbuffer_envelope::check_and_insert_nonce(nonce_str, nonce_window)
+    crypto::nonce_helper::check_and_insert_nonce(nonce_str, nonce_window)
 }
 
 /// Check replay protection for a specific peer: ensure nonce is not seen in `nonce_window` and insert it.
@@ -220,46 +220,46 @@ pub fn check_and_insert_nonce_for_peer(
     nonce_window: Duration,
     peer_id: &str,
 ) -> anyhow::Result<()> {
-    crypto::flatbuffer_envelope::check_and_insert_nonce_for_peer(nonce_str, nonce_window, peer_id)
+    crypto::nonce_helper::check_and_insert_nonce_for_peer(nonce_str, nonce_window, peer_id)
 }
 
-/// Verify a flatbuffer envelope. Reconstructs canonical bytes and verifies signature.
+/// Verify a postcard envelope. Reconstructs canonical bytes and verifies signature.
 /// Returns verified envelope including payload bytes, signing key and timestamp.
-pub fn verify_flatbuffer_envelope(
-    fb_envelope_bytes: &[u8],
+pub fn verify_envelope(
+    envelope_bytes: &[u8],
     nonce_window: Duration,
 ) -> anyhow::Result<VerifiedEnvelope> {
-    verify_flatbuffer_envelope_for_peer(fb_envelope_bytes, nonce_window, "global")
+    verify_envelope_for_peer(envelope_bytes, nonce_window, "global")
 }
 
-/// Verify a flatbuffer envelope for a specific peer. Reconstructs canonical bytes and verifies signature.
+/// Verify a postcard envelope for a specific peer. Reconstructs canonical bytes and verifies signature.
 /// Returns verified envelope including payload bytes, signing key and timestamp.
-pub fn verify_flatbuffer_envelope_for_peer(
-    fb_envelope_bytes: &[u8],
+pub fn verify_envelope_for_peer(
+    envelope_bytes: &[u8],
     nonce_window: Duration,
     peer_id: &str,
 ) -> anyhow::Result<VerifiedEnvelope> {
-    let fb_env = protocol::machine::root_as_envelope(fb_envelope_bytes)
-        .context("failed to parse flatbuffer envelope")?;
+    let env = protocol::machine::root_as_envelope(envelope_bytes)
+        .context("failed to parse postcard envelope")?;
 
-    let sig_str = fb_env.sig().unwrap_or("");
-    let pub_str = fb_env.pubkey().unwrap_or("");
+    let sig_str = env.sig().unwrap_or("");
+    let pub_str = env.pubkey().unwrap_or("");
 
     let sig_bytes = normalize_and_decode_signature(Some(sig_str))?;
     let pub_bytes = crypto::b64_decode(pub_str)
         .context("failed to base64-decode pubkey")?;
 
     // Reconstruct canonical bytes using the same method as signing
-    let payload_vec = fb_env.payload().map(|b| b.to_vec()).unwrap_or_default();
-    let payload_type = fb_env.payload_type().unwrap_or("");
-    let nonce = fb_env.nonce().unwrap_or("");
-    let ts = fb_env.ts();
-    let alg = fb_env.alg().unwrap_or("");
+    let payload_vec = env.payload().map(|b| b.to_vec()).unwrap_or_default();
+    let payload_type = env.payload_type().unwrap_or("");
+    let nonce = env.nonce().unwrap_or("");
+    let ts = env.ts();
+    let alg = env.alg().unwrap_or("");
 
     // Reconstruct canonical bytes using the same method as signing
     // Check if envelope has peer_id and kem_pubkey fields to match signing format
-    let peer_id_opt = fb_env.peer_id();
-    let kem_pubkey_opt = fb_env.kem_pubkey();
+    let peer_id_opt = env.peer_id();
+    let kem_pubkey_opt = env.kem_pubkey();
 
     let canonical = if peer_id_opt.is_some() {
         // Use peer-aware canonical form reconstruction
@@ -300,30 +300,30 @@ pub fn verify_flatbuffer_envelope_for_peer(
     })
 }
 
-/// Verify a flatbuffer envelope without nonce replay checking.
+/// Verify a postcard envelope without nonce replay checking.
 /// This is used when extracting tokens for re-signing, where the same envelope
 /// may be processed multiple times legitimately.
 /// Returns verified envelope.
-pub fn verify_flatbuffer_envelope_skip_nonce_check(
-    fb_envelope_bytes: &[u8],
+pub fn verify_envelope_skip_nonce_check(
+    envelope_bytes: &[u8],
 ) -> anyhow::Result<VerifiedEnvelope> {
-    let fb_env = protocol::machine::root_as_envelope(fb_envelope_bytes)
-        .context("failed to parse flatbuffer envelope")?;
+    let env = protocol::machine::root_as_envelope(envelope_bytes)
+        .context("failed to parse postcard envelope")?;
 
-    let sig_str = fb_env.sig().unwrap_or("");
-    let pub_str = fb_env.pubkey().unwrap_or("");
+    let sig_str = env.sig().unwrap_or("");
+    let pub_str = env.pubkey().unwrap_or("");
 
     let sig_bytes = normalize_and_decode_signature(Some(sig_str))?;
     let pub_bytes = crypto::b64_decode(pub_str)
         .context("failed to base64-decode pubkey")?;
 
-    let payload_vec = fb_env.payload().map(|b| b.to_vec()).unwrap_or_default();
-    let payload_type = fb_env.payload_type().unwrap_or("");
-    let nonce = fb_env.nonce().unwrap_or("");
-    let ts = fb_env.ts();
-    let alg = fb_env.alg().unwrap_or("");
-    let peer_id_opt = fb_env.peer_id();
-    let kem_pubkey_opt = fb_env.kem_pubkey();
+    let payload_vec = env.payload().map(|b| b.to_vec()).unwrap_or_default();
+    let payload_type = env.payload_type().unwrap_or("");
+    let nonce = env.nonce().unwrap_or("");
+    let ts = env.ts();
+    let alg = env.alg().unwrap_or("");
+    let peer_id_opt = env.peer_id();
+    let kem_pubkey_opt = env.kem_pubkey();
 
     let canonical = if peer_id_opt.is_some() {
         protocol::machine::build_envelope_canonical_with_peer(
@@ -368,7 +368,7 @@ mod tests {
     use crypto::{ensure_keypair_ephemeral, ensure_pqc_init, sign_envelope};
 
     #[test]
-    fn test_build_and_verify_flatbuffer_envelope_roundtrip() {
+    fn test_build_and_verify_envelope_roundtrip() {
         ensure_pqc_init().unwrap();
         let (pubb, privb) = ensure_keypair_ephemeral().expect("keypair");
 
@@ -378,8 +378,8 @@ mod tests {
         let timestamp = 1234567890u64;
         let alg = "ml-dsa-65";
 
-        // Create and sign flatbuffer envelope
-        let fb_canonical = protocol::machine::build_envelope_canonical(
+        // Create and sign postcard envelope
+        let canonical = protocol::machine::build_envelope_canonical(
             payload,
             payload_type,
             &nonce,
@@ -387,10 +387,10 @@ mod tests {
             alg,
             None,
         );
-        let (sig_b64, pub_b64) = sign_envelope(&privb, &pubb, &fb_canonical).expect("sign");
+        let (sig_b64, pub_b64) = sign_envelope(&privb, &pubb, &canonical).expect("sign");
 
-        // Build the final signed flatbuffer envelope (fb_envelope) using the original payload
-        let fb_envelope = protocol::machine::build_envelope_signed(
+        // Build the final signed postcard envelope using the original payload
+        let signed_envelope = protocol::machine::build_envelope_signed(
             payload,
             payload_type,
             &nonce,
@@ -402,14 +402,14 @@ mod tests {
             None,
         );
 
-        // Verify the envelope using the fb_envelope and ensure the extracted payload matches
+        // Verify the envelope and ensure the extracted payload matches
         let parts =
-            verify_flatbuffer_envelope(&fb_envelope, Duration::from_secs(300)).expect("verify");
+            verify_envelope(&signed_envelope, Duration::from_secs(300)).expect("verify");
 
         assert_eq!(parts.payload, payload);
 
         // Replay should fail when verifying the same envelope again
-        assert!(verify_flatbuffer_envelope(&fb_envelope, Duration::from_secs(300)).is_err());
+        assert!(verify_envelope(&signed_envelope, Duration::from_secs(300)).is_err());
     }
 
     #[test]

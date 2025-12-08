@@ -170,7 +170,7 @@ pub async fn handle_apply_message_with_workload_manager(
         } => {
             info!("Received apply request from peer={}", peer);
 
-            // Verify request as a FlatBuffer Envelope
+            // Verify request as a postcard Envelope
             let (encrypted_payload, owner_pubkey) =
                 match crate::podmesh_p2p::security::verify_envelope_and_check_nonce_for_peer(
                     &request,
@@ -237,7 +237,7 @@ pub async fn handle_apply_message_with_workload_manager(
                 }
             };
 
-            // Parse the FlatBuffer apply request
+            // Parse the postcard apply request
             match machine::root_as_apply_request(&effective_request) {
                 Ok(apply_req) => {
                     info!(
@@ -825,7 +825,7 @@ async fn decrypt_manifest_content(
     // Decode base64-encoded envelope
     let envelope_bytes = crypto::b64_decode(manifest_json)?;
 
-    // Parse as flatbuffer envelope
+    // Parse as postcard envelope
     let envelope = machine::root_as_envelope(&envelope_bytes)?;
 
     let payload_type = envelope.payload_type().unwrap_or("");
@@ -1016,7 +1016,7 @@ pub async fn process_enhanced_self_apply_request(manifest: &[u8], swarm: &mut Sw
 
 /// Process an encrypted delete request envelope locally (self-delete path)
 pub async fn process_enhanced_self_delete_request(envelope_bytes: &[u8]) -> Result<(), String> {
-    use crate::podmesh_p2p::envelope::verify_flatbuffer_envelope_for_peer;
+    use crate::podmesh_p2p::envelope::verify_envelope_for_peer;
 
     let envelope = protocol::machine::root_as_envelope(envelope_bytes)
         .map_err(|e| format!("Failed to parse delete envelope: {}", e))?;
@@ -1025,7 +1025,7 @@ pub async fn process_enhanced_self_delete_request(envelope_bytes: &[u8]) -> Resu
 
     // Verify signature before processing
     let nonce_window = std::time::Duration::from_secs(300);
-    verify_flatbuffer_envelope_for_peer(envelope_bytes, nonce_window, peer_id)
+    verify_envelope_for_peer(envelope_bytes, nonce_window, peer_id)
         .map_err(|e| format!("Envelope verification failed: {}", e))?;
 
     let owner_pubkey = envelope

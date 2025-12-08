@@ -78,7 +78,7 @@ pub fn delete_message(
                 }
             };
 
-            // Parse the FlatBuffer delete request
+            // Parse the postcard delete request
             match machine::root_as_delete_request(&effective_request) {
                 Ok(delete_req) => {
                     info!(

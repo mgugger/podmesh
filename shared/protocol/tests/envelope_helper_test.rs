@@ -2,11 +2,11 @@ use crypto::{ensure_keypair_ephemeral, ensure_pqc_init, sign_envelope};
 use protocol::machine::build_envelope_signed;
 
 #[test]
-fn fb_helper_roundtrip() {
+fn envelope_helper_roundtrip() {
     ensure_pqc_init().expect("init");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("keypair");
 
-    let payload = b"hello-fb".to_vec();
+    let payload = b"hello-postcard".to_vec();
     let payload_type = "test";
     let nonce = "n-123";
     let ts = 42u64;
@@ -17,8 +17,8 @@ fn fb_helper_roundtrip() {
         protocol::machine::build_envelope_canonical(&payload, payload_type, nonce, ts, alg, None);
     let (sig_b64, pub_b64) = sign_envelope(&privb, &pubb, &canonical).expect("sign");
 
-    // Build a signed flatbuffer envelope using the same format
-    let fb = build_envelope_signed(
+    // Build a signed postcard envelope using the same format
+    let envelope = build_envelope_signed(
         &payload,
         payload_type,
         nonce,
@@ -32,7 +32,7 @@ fn fb_helper_roundtrip() {
 
     // Use helper to extract and verify fields
     let (canon2, sig_bytes, pub_bytes, sig_field, pub_field) =
-        protocol::machine::fb_envelope_extract_sig_pub_legacy(&fb).expect("extract");
+        protocol::machine::envelope_extract_sig_pub_legacy(&envelope).expect("extract");
 
     // canonical bytes should match
     assert_eq!(canonical, canon2);

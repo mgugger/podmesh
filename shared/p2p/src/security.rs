@@ -19,7 +19,7 @@ pub fn require_signed_messages() -> bool {
     crypto::envelope_validator::EnvelopeValidator::require_signed_messages()
 }
 
-/// Verify a FlatBuffer envelope and check nonce for replay protection.
+/// Verify a postcard envelope and check nonce for replay protection.
 /// Returns the verified envelope on successful verification.
 pub fn verify_envelope_and_check_nonce(
     envelope_bytes: &[u8],
@@ -27,13 +27,13 @@ pub fn verify_envelope_and_check_nonce(
     verify_envelope_and_check_nonce_for_peer(envelope_bytes, "global")
 }
 
-/// Verify a FlatBuffer envelope and check nonce for replay protection for a specific peer.
+/// Verify a postcard envelope and check nonce for replay protection for a specific peer.
 /// Returns the verified envelope on successful verification.
 pub fn verify_envelope_and_check_nonce_for_peer(
     envelope_bytes: &[u8],
     peer_id: &str,
 ) -> anyhow::Result<VerifiedEnvelope> {
-    envelope::verify_flatbuffer_envelope_for_peer(
+    envelope::verify_envelope_for_peer(
         envelope_bytes,
         std::time::Duration::from_secs(300),
         peer_id,

@@ -8,7 +8,7 @@ fn test_envelope_payload_extraction() {
 }
 
 #[test]
-fn test_apply_request_flatbuffer_envelope() {
+fn test_apply_request_envelope() {
     ensure_pqc_init().expect("PQC initialization failed");
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 
@@ -52,7 +52,7 @@ fn test_apply_request_flatbuffer_envelope() {
         None,
     );
 
-    let verification_result = podmesh_scheduler::podmesh_p2p::envelope::verify_flatbuffer_envelope(
+    let verification_result = podmesh_scheduler::podmesh_p2p::envelope::verify_envelope(
         &apply_envelope,
         Duration::from_secs(300),
     );
@@ -111,7 +111,7 @@ fn test_envelope_base64_encoding_for_transport() {
     let decoded_envelope = b64_decode(&encoded_envelope)
         .expect("Should decode base64 envelope");
 
-    let verification_result = podmesh_scheduler::podmesh_p2p::envelope::verify_flatbuffer_envelope(
+    let verification_result = podmesh_scheduler::podmesh_p2p::envelope::verify_envelope(
         &decoded_envelope,
         Duration::from_secs(300),
     );

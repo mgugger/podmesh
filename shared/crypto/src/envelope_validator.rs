@@ -122,8 +122,8 @@ impl EnvelopeValidator {
         }
     }
 
-    /// Validate flatbuffer envelope
-    pub fn validate_flatbuffer_envelope(
+    /// Validate postcard envelope
+    pub fn validate_postcard_envelope(
         _request: &[u8],
         _protocol: &str,
         _direction: ValidationDirection,
@@ -132,7 +132,7 @@ impl EnvelopeValidator {
         // This function needs to be imported from the machine crate
         // For now, return an error indicating this needs to be implemented
         Err(EnvelopeError::VerificationFailed(
-            "Flatbuffer envelope verification not yet implemented in crypto crate".to_string(),
+            "Postcard envelope verification not yet implemented in crypto crate".to_string(),
         ))
     }
 

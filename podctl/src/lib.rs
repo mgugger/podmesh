@@ -10,8 +10,8 @@ use std::env;
 use serde_json::Value as JsonValue;
 use std::path::PathBuf;
 
-mod postcard_client;
-use postcard_client::FlatbufferClient;
+mod api_client;
+use api_client::ApiClient;
 
 fn resolve_api_base(override_url: Option<&str>) -> String {
     override_url
@@ -113,16 +113,16 @@ pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> anyhow::Result
     );
 
     let base = resolve_api_base(api_base);
-    debug!("Creating FlatbufferClient with base URL: {}", base);
-    let mut fb_client = FlatbufferClient::new(base)?;
+    debug!("Creating ApiClient with base URL: {}", base);
+    let mut api_client = ApiClient::new(base)?;
 
     debug!("Fetching machine's public key...");
-    fb_client.fetch_machine_public_key().await?;
+    api_client.fetch_machine_public_key().await?;
     debug!("Successfully fetched machine's public key");
 
     // 1) Get candidates for node selection
     debug!("About to call get_candidates...");
-    let peers = fb_client.get_candidates(&manifest_id, replicas).await?;
+    let peers = api_client.get_candidates(&manifest_id, replicas).await?;
     debug!(
         "apply_file: get_candidates completed successfully, found {} peers",
         peers.len()
@@ -167,7 +167,7 @@ pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> anyhow::Result
 
     for (node_id, node_pubkey) in &selected_nodes {
         match send_apply_to_node(
-            &fb_client,
+            &api_client,
             node_id,
             node_pubkey,
             &original_manifest_str,
@@ -222,7 +222,7 @@ pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> anyhow::Result
 }
 
 async fn send_apply_to_node(
-    fb_client: &FlatbufferClient,
+    api_client: &ApiClient,
     node_id: &str,
     node_pubkey_b64: &str,
     manifest_payload: &str,
@@ -265,13 +265,13 @@ async fn send_apply_to_node(
 
     let url = format!(
         "{}/apply_direct/{}",
-        fb_client.base_url.trim_end_matches('/'),
+        api_client.base_url.trim_end_matches('/'),
         node_id
     );
 
     // Encrypt and sign the ApplyRequest for the target worker node (end-to-end encryption)
     // The bootstrap node will route based on URL path without decrypting the payload
-    let response_bytes = fb_client
+    let response_bytes = api_client
         .send_encrypted_request_to_node(&url, &apply_request_bytes, "apply_request", &node_pubkey_bytes)
         .await?;
 
@@ -335,17 +335,17 @@ pub async fn delete_file(
         .map(|s| s.to_string())
         .or_else(|| env::var("PODMESH_API").ok())
         .unwrap_or_else(|| "http://127.0.0.1:3000".to_string());
-    debug!("Creating FlatbufferClient with base URL: {}", base);
-    let mut fb_client = FlatbufferClient::new(base)?;
+    debug!("Creating ApiClient with base URL: {}", base);
+    let mut api_client = ApiClient::new(base)?;
 
     // Fetch machine's public key for encrypted communication
     debug!("Fetching machine's public key...");
-    fb_client.fetch_machine_public_key().await?;
+    api_client.fetch_machine_public_key().await?;
     debug!("Successfully fetched machine's public key");
 
     // Step 1: Discover which nodes are providing this manifest via DHT
     debug!("Discovering providers for manifest_id: {}", manifest_id);
-    let providers = discover_manifest_providers(&fb_client, &manifest_id).await?;
+    let providers = discover_manifest_providers(&api_client, &manifest_id).await?;
 
     if providers.is_empty() {
         info!("No providers found for manifest_id: {}", manifest_id);
@@ -366,7 +366,7 @@ pub async fn delete_file(
 
     for (node_id, node_pubkey_b64) in &providers {
         match send_delete_to_node(
-            &fb_client,
+            &api_client,
             node_id,
             node_pubkey_b64,
             &manifest_id,
@@ -421,19 +421,19 @@ pub async fn delete_file(
 }
 
 async fn discover_manifest_providers(
-    fb_client: &FlatbufferClient,
+    api_client: &ApiClient,
     manifest_id: &str,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let url = format!(
         "{}/tasks/{}/providers",
-        fb_client.base_url.trim_end_matches('/'),
+        api_client.base_url.trim_end_matches('/'),
         manifest_id
     );
 
     debug!("Discovering providers at: {}", url);
 
     // Use a simple GET request to discover providers
-    let response_bytes = fb_client
+    let response_bytes = api_client
         .send_encrypted_request(&url, &[], "providers_request")
         .await?;
 
@@ -465,7 +465,7 @@ async fn discover_manifest_providers(
 }
 
 async fn send_delete_to_node(
-    fb_client: &FlatbufferClient,
+    api_client: &ApiClient,
     node_id: &str,
     node_pubkey_b64: &str,
     manifest_id: &str,
@@ -486,7 +486,7 @@ async fn send_delete_to_node(
 
     let url = format!(
         "{}/delete_direct/{}",
-        fb_client.base_url.trim_end_matches('/'),
+        api_client.base_url.trim_end_matches('/'),
         node_id
     );
 
@@ -496,7 +496,7 @@ async fn send_delete_to_node(
     );
 
     // Encrypt and sign the DeleteRequest for the target worker node (end-to-end encryption)
-    let response_bytes = fb_client
+    let response_bytes = api_client
         .send_encrypted_request_to_node(&url, &delete_request_bytes, "delete_request", &node_pubkey_bytes)
         .await?;
 

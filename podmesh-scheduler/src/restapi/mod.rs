@@ -471,7 +471,7 @@ pub async fn create_task(
     debug!("create_task: parsing decrypted payload from envelope middleware");
 
     // The envelope middleware has already decrypted the payload for us
-    // We receive the inner EncryptedManifest flatbuffer directly
+    // We receive the inner EncryptedManifest postcard message directly
     let payload_bytes_for_parsing = body.to_vec();
 
     log::info!(
@@ -543,7 +543,7 @@ pub async fn create_task(
         manifest_id
     );
 
-    // Parse as EncryptedManifest flatbuffer only (no YAML support)
+    // Parse as EncryptedManifest postcard message only (no YAML support)
     log::info!(
         "create_task: attempting to parse payload_bytes len={} as EncryptedManifest",
         payload_bytes_for_parsing.len()

@@ -82,7 +82,7 @@ impl ProviderAnnouncement {
     /// Serialize announcement to bytes for DHT storage
     pub fn to_bytes(&self) -> Vec<u8> {
         // Create a simple serialization format
-        // In production, you might want to use a more robust format like FlatBuffers
+        // In production, you might want to use a more robust format like postcard
         let mut data = Vec::new();
 
         // Add peer ID
