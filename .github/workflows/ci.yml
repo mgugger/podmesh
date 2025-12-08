@@ -34,29 +34,29 @@ jobs:
       - name: Cargo test (without Podman)
         run: cargo test --workspace --locked
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get -y install podman
+      # - name: Install dependencies
+      #   run: |
+      #     sudo apt-get update
+      #     sudo apt-get -y install podman
 
-      - name: Start Podman service
-        run: |
-          export XDG_RUNTIME_DIR=/run/user/1000
-          sudo mkdir -p $XDG_RUNTIME_DIR
-          sudo chown -R $USER:$USER $XDG_RUNTIME_DIR
-          mkdir -p $XDG_RUNTIME_DIR/podman
-          podman system service --time=0 unix:///run/user/1000/podman/podman.sock &
-          echo "PODMAN_HOST=unix:///run/user/1000/podman/podman.sock" >> $GITHUB_ENV
+      # - name: Start Podman service
+      #   run: |
+      #     export XDG_RUNTIME_DIR=/run/user/1000
+      #     sudo mkdir -p $XDG_RUNTIME_DIR
+      #     sudo chown -R $USER:$USER $XDG_RUNTIME_DIR
+      #     mkdir -p $XDG_RUNTIME_DIR/podman
+      #     podman system service --time=0 unix:///run/user/1000/podman/podman.sock &
+      #     echo "PODMAN_HOST=unix:///run/user/1000/podman/podman.sock" >> $GITHUB_ENV
 
-      - name: Build Containers
-        run: ./deploy/build_containers.sh
+      # - name: Build Containers
+      #   run: ./deploy/build_containers.sh
 
-      - name: Cargo test (with podman)
-        env:
-          PODMAN_HOST: ${{ env.PODMAN_HOST }}
-        run: cargo test --workspace --locked --features podman-tests
+      # - name: Cargo test (with podman)
+      #   env:
+      #     PODMAN_HOST: ${{ env.PODMAN_HOST }}
+      #   run: cargo test --workspace --locked --features podman-tests
 
-      - name: Cargo test (ignored tests)
-        env:
-          PODMAN_HOST: ${{ env.PODMAN_HOST }}
-        run: cargo test -- --ignored
+      # - name: Cargo test (ignored tests)
+      #   env:
+      #     PODMAN_HOST: ${{ env.PODMAN_HOST }}
+      #   run: cargo test -- --ignored

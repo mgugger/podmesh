@@ -15,3 +15,6 @@ EOF
 
 mkdir /run/podman
 podman system service --time=0 unix:///run/podman/podman.sock &
+
+mkdir -p /run/user/1000/podman
+podman system service --time=0 unix:///run/user/1000/podman/podman.sock &
