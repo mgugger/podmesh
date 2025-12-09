@@ -290,6 +290,19 @@ impl SwarmDriver {
     fn handle_handshake_rr_event(&mut self, event: request_response::Event<Vec<u8>, Vec<u8>>) {
         match event {
             request_response::Event::Message { message, peer, .. } => {
+                // Check if this is a response to a KEM pubkey fetch request
+                if let request_response::Message::Response { response, .. } = &message {
+                    if let Some(sender) = control::take_pending_kem_pubkey_request(&peer) {
+                        let kem_pubkey = p2p::handshake::extract_kem_pubkey_from_response(response, &peer);
+                        log::info!(
+                            "Extracted KEM pubkey from handshake response from peer {}: {}",
+                            peer,
+                            kem_pubkey.is_some()
+                        );
+                        let _ = sender.send(kem_pubkey);
+                    }
+                }
+                
                 handshake::handle_request_response_message(
                     message,
                     peer,
@@ -304,6 +317,11 @@ impl SwarmDriver {
                 );
             }
             request_response::Event::OutboundFailure { peer, error, .. } => {
+                // If there was a pending KEM pubkey request, notify of failure
+                if let Some(sender) = control::take_pending_kem_pubkey_request(&peer) {
+                    log::warn!("KEM pubkey fetch failed for peer {}: {:?}", peer, error);
+                    let _ = sender.send(None);
+                }
                 behaviour::handshake_outbound_failure(peer, error);
             }
             request_response::Event::InboundFailure { peer, error, .. } => {

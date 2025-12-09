@@ -432,35 +432,29 @@ async fn discover_manifest_providers(
 
     debug!("Discovering providers at: {}", url);
 
-    // Use a simple GET request to discover providers
+    // Use encrypted request to discover providers
     let response_bytes = api_client
         .send_encrypted_request(&url, &[], "providers_request")
         .await?;
 
     debug!("Received provider discovery response: {} bytes", response_bytes.len());
 
-    // Parse response - expecting JSON with provider list
-    let response_text = String::from_utf8_lossy(&response_bytes);
-    debug!("Provider response text: {}", response_text);
-    
-    let providers_json: serde_json::Value = serde_json::from_str(&response_text)
-        .map_err(|e| anyhow::anyhow!("Failed to parse providers response: {} (response was: {})", e, response_text))?;
+    // Parse response - binary postcard format (same as CandidatesResponse)
+    let providers_response = protocol::machine::root_as_candidates_response(&response_bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to parse providers response: {}", e))?;
 
-    let providers_array = providers_json
-        .get("providers")
-        .and_then(|p| p.as_array())
-        .ok_or_else(|| anyhow::anyhow!("Invalid providers response format"))?;
-
-    let mut result = Vec::new();
-    for provider in providers_array {
-        if let (Some(peer_id), Some(pubkey)) = (
-            provider.get("peer_id").and_then(|p| p.as_str()),
-            provider.get("pubkey").and_then(|p| p.as_str()),
-        ) {
-            result.push((peer_id.into(), pubkey.into()));
-        }
+    if !providers_response.ok() {
+        debug!("Providers response indicates no providers found");
+        return Ok(Vec::new());
     }
 
+    let result: Vec<(String, String)> = providers_response
+        .candidates()
+        .iter()
+        .map(|c| (c.peer_id.clone(), c.public_key.clone()))
+        .collect();
+
+    debug!("Parsed {} providers from response", result.len());
     Ok(result)
 }
 

@@ -2,6 +2,7 @@ use podmesh_scheduler::{
     Cli, sidecar::DEFAULT_SIDECAR_BOOTSTRAP_MULTIADDR,
     sidecar::DEFAULT_SIDECAR_IMAGE, start_machine,
 };
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Once;
 use std::time::Duration;
@@ -10,6 +11,50 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 static CLEANUP_HOOK_INIT: Once = Once::new();
+
+/// Maximum time to wait for a port to become available.
+const PORT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Interval between port availability checks.
+const PORT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Wait for a TCP port to become available for binding.
+/// Returns Ok(()) if the port is available, Err if timeout is reached.
+#[allow(dead_code)]
+pub async fn wait_for_port_available(port: u16, host: &str) -> anyhow::Result<()> {
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid address: {}", e))?;
+
+    let deadline = tokio::time::Instant::now() + PORT_WAIT_TIMEOUT;
+
+    while tokio::time::Instant::now() < deadline {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                // Port is available, drop the listener to release it
+                drop(listener);
+                return Ok(());
+            }
+            Err(_) => {
+                // Port still in use, wait and retry
+                sleep(PORT_CHECK_INTERVAL).await;
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "Timeout waiting for port {} to become available",
+        port
+    ))
+}
+
+/// Wait for multiple ports to become available.
+#[allow(dead_code)]
+pub async fn wait_for_ports_available(ports: &[u16], host: &str) -> anyhow::Result<()> {
+    for port in ports {
+        wait_for_port_available(*port, host).await?;
+    }
+    Ok(())
+}
 
 /// Clean up potentially corrupted key files from ~/.podmesh before tests
 #[allow(dead_code)]
@@ -152,6 +197,24 @@ pub async fn start_nodes_as_processes(clis: Vec<Cli>, startup_delay: Duration) -
     }
 
     for cli in clis {
+        // Collect ports that need to be available before starting this node
+        let mut ports_to_wait: Vec<u16> = Vec::new();
+        if !cli.disable_rest_api {
+            ports_to_wait.push(cli.rest_api_port);
+        }
+        // Only wait for libp2p port if it's not 0 (auto-assigned)
+        if cli.libp2p_quic_port != 0 {
+            ports_to_wait.push(cli.libp2p_quic_port);
+        }
+
+        // Wait for required ports to become available
+        if let Err(e) = wait_for_ports_available(&ports_to_wait, &cli.rest_api_host).await {
+            panic!(
+                "Ports {:?} not available for node (rest_api_port={}): {}",
+                ports_to_wait, cli.rest_api_port, e
+            );
+        }
+
         let mut cmd = Command::new(&machine_binary);
         cmd.arg("--ephemeral")
             .arg("--rest-api-host")
@@ -221,6 +284,24 @@ pub async fn start_nodes(clis: Vec<Cli>, startup_delay: Duration) -> NodeGuard {
         cleaned_up: false,
     };
     for cli in clis {
+        // Collect ports that need to be available before starting this node
+        let mut ports_to_wait: Vec<u16> = Vec::new();
+        if !cli.disable_rest_api {
+            ports_to_wait.push(cli.rest_api_port);
+        }
+        // Only wait for libp2p port if it's not 0 (auto-assigned)
+        if cli.libp2p_quic_port != 0 {
+            ports_to_wait.push(cli.libp2p_quic_port);
+        }
+
+        // Wait for required ports to become available
+        if let Err(e) = wait_for_ports_available(&ports_to_wait, &cli.rest_api_host).await {
+            panic!(
+                "Ports {:?} not available for node (rest_api_port={}): {}",
+                ports_to_wait, cli.rest_api_port, e
+            );
+        }
+
         match start_machine(cli).await {
             Ok(mut handles) => {
                 guard.handles.append(&mut handles);

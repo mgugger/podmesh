@@ -1,6 +1,6 @@
 use libp2p::kad::RecordKey;
 use libp2p::{PeerId, Swarm, gossipsub};
-use log::info;
+use log::{info, warn};
 use once_cell::sync::Lazy;
 use std::collections::HashMap as StdHashMap;
 use std::collections::HashMap;
@@ -204,6 +204,28 @@ pub async fn handle_control_message(
                 manifest_id
             );
         }
+        Libp2pControl::FetchPeerKemPubkey { peer_id, reply_tx } => {
+            // Fetch KEM public key from peer via handshake request
+            // We send a handshake request and the response will contain the peer's KEM pubkey
+            info!("Fetching KEM pubkey from peer {}", peer_id);
+            
+            // Register the pending request so we can extract KEM pubkey from response
+            insert_pending_kem_pubkey_request(peer_id, reply_tx);
+            
+            // Send a handshake request to the peer
+            let request = match p2p::handshake::build_handshake_request_for_kem_fetch(swarm.local_peer_id()) {
+                Ok(req) => req,
+                Err(e) => {
+                    warn!("Failed to build handshake request for KEM fetch: {}", e);
+                    return;
+                }
+            };
+            
+            swarm
+                .behaviour_mut()
+                .handshake_rr
+                .send_request(&peer_id, request);
+        }
     }
 }
 
@@ -261,6 +283,11 @@ static PENDING_PROVIDER_RECORD_QUERIES: Lazy<
     Mutex<std::collections::HashMap<String, mpsc::UnboundedSender<Option<HashMap<String, String>>>>>,
 > = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// Pending KEM pubkey fetch requests: PeerId string -> reply sender (Option<String>)
+static PENDING_KEM_PUBKEY_REQUESTS: Lazy<
+    Mutex<std::collections::HashMap<String, mpsc::UnboundedSender<Option<String>>>>,
+> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+
 /// Insert a pending providers query sender for the given QueryId
 pub fn insert_pending_providers_query(
     id: QueryId,
@@ -296,6 +323,25 @@ pub fn take_pending_provider_record_query(
 ) -> Option<mpsc::UnboundedSender<Option<HashMap<String, String>>>> {
     let key = format!("{:?}", id);
     let mut map = PENDING_PROVIDER_RECORD_QUERIES.lock().unwrap();
+    map.remove(&key)
+}
+
+/// Insert a pending KEM pubkey request sender for the given PeerId
+pub fn insert_pending_kem_pubkey_request(
+    peer_id: libp2p::PeerId,
+    sender: mpsc::UnboundedSender<Option<String>>,
+) {
+    let key = peer_id.to_string();
+    let mut map = PENDING_KEM_PUBKEY_REQUESTS.lock().unwrap();
+    map.insert(key, sender);
+}
+
+/// Take and remove a pending KEM pubkey request sender by PeerId
+pub fn take_pending_kem_pubkey_request(
+    peer_id: &libp2p::PeerId,
+) -> Option<mpsc::UnboundedSender<Option<String>>> {
+    let key = peer_id.to_string();
+    let mut map = PENDING_KEM_PUBKEY_REQUESTS.lock().unwrap();
     map.remove(&key)
 }
 
@@ -422,5 +468,10 @@ pub enum Libp2pControl {
     GetProviderRecord {
         manifest_id: String,
         reply_tx: mpsc::UnboundedSender<Option<HashMap<String, String>>>,
+    },
+    /// Fetch KEM public key from a peer via handshake protocol
+    FetchPeerKemPubkey {
+        peer_id: libp2p::PeerId,
+        reply_tx: mpsc::UnboundedSender<Option<String>>,
     },
 }

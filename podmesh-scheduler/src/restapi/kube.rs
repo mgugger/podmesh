@@ -269,6 +269,7 @@ async fn upsert_deployment(
         last_operation_id: Some(format!("kube:apps/v1:Deployment:{}:{}", namespace, name)),
         owner_pubkey: Vec::new(),
         kube: Some(kube_record),
+        peer_kem_pubkeys: HashMap::new(),
     };
     store.insert(manifest_id.clone(), task_record);
     let record = store.get(&manifest_id).unwrap();

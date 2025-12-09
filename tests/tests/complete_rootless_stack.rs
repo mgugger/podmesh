@@ -16,6 +16,7 @@ use tokio::{process::Command as TokioCommand, time::sleep};
 
 const MACHINE_API_URL: &str = "http://127.0.0.1:3000";
 const ROOTLESS_MANIFEST_PATH: &str = "deploy/podmesh_rootless.yml";
+const ROOTFUL_MANIFEST_PATH: &str = "deploy/podmesh_rootful.yml";
 const SAMPLE_MANIFEST_PATH: &str = "tests/sample_manifests/demo_deployment_without_sidecar.yml";
 const PODMESH_PROXY_URL: &str = "http://127.0.0.1:8080/";
 const EXPECTED_BODY_SUBSTRING: &str = "Welcome to Podmesh";
@@ -23,6 +24,7 @@ const REQUIRED_MACHINE_PEERS: usize = 1;
 const EXPECTED_CONTAINERS: [&str; 2] = ["my-nginx", "sidecar"];
 const PODMESH_NETWORK: &str = "podmesh";
 const ROOTLESS_PODMAN_SOCKET: &str = "/run/user/1000/podman/podman.sock";
+const ROOTFUL_PODMAN_SOCKET: &str = "/run/podman/podman.sock";
 const REQUIRED_IMAGES: [&str; 3] = [
     "localhost/podmesh/scheduler:latest",
     "localhost/podmesh/proxy:latest",
@@ -35,27 +37,36 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
     init_tracing();
 
     if !is_podman_available().await {
-        log::warn!("skipping rootless end-to-end test because podman is unavailable");
+        log::warn!("skipping end-to-end test because podman is unavailable");
         return Ok(());
     }
 
-    if let Err(err) = ensure_rootless_podman_socket() {
+    // Determine which podman socket and manifest to use
+    let (socket_path, manifest_path, mode) = if is_socket_available(ROOTLESS_PODMAN_SOCKET) {
+        (ROOTLESS_PODMAN_SOCKET, ROOTLESS_MANIFEST_PATH, "rootless")
+    } else if is_socket_available(ROOTFUL_PODMAN_SOCKET) {
+        (ROOTFUL_PODMAN_SOCKET, ROOTFUL_MANIFEST_PATH, "rootful")
+    } else {
         log::warn!(
-            "skipping rootless end-to-end test because rootless podman socket {} is unavailable: {err:?}. start it with `systemctl --user start podman.socket`",
-            ROOTLESS_PODMAN_SOCKET
+            "skipping end-to-end test because no podman socket is available. \
+             rootless: {} (start with `systemctl --user start podman.socket`), \
+             rootful: {} (start with `sudo systemctl start podman.socket`)",
+            ROOTLESS_PODMAN_SOCKET,
+            ROOTFUL_PODMAN_SOCKET
         );
         return Ok(());
-    }
+    };
+    log::info!("using {mode} podman socket: {socket_path}");
 
     if let Err(err) = verify_required_images().await {
         log::warn!(
-            "skipping rootless end-to-end test because required container images are not available: {err:?}"
+            "skipping end-to-end test because required container images are not available: {err:?}"
         );
         return Ok(());
     }
 
     let workspace = workspace_root();
-    let stack_manifest = workspace.join(ROOTLESS_MANIFEST_PATH);
+    let stack_manifest = workspace.join(manifest_path);
     let sample_manifest = workspace.join(SAMPLE_MANIFEST_PATH);
 
     let mut stack_guard = PodmanKubeGuard::launch(&stack_manifest).await?;
@@ -105,23 +116,11 @@ async fn is_podman_available() -> bool {
     }
 }
 
-fn ensure_rootless_podman_socket() -> Result<()> {
-    let socket_path = Path::new(ROOTLESS_PODMAN_SOCKET);
-    match std::fs::metadata(socket_path) {
-        Ok(metadata) => {
-            if is_unix_socket(&metadata) {
-                Ok(())
-            } else {
-                Err(anyhow!(
-                    "{} exists but is not detected as a unix socket",
-                    socket_path.display()
-                ))
-            }
-        }
-        Err(err) => Err(anyhow!(
-            "{} unavailable: {err}",
-            socket_path.display()
-        )),
+fn is_socket_available(socket_path: &str) -> bool {
+    let path = Path::new(socket_path);
+    match std::fs::metadata(path) {
+        Ok(metadata) => is_unix_socket(&metadata),
+        Err(_) => false,
     }
 }
 

@@ -425,13 +425,41 @@ impl ResourceVerifier {
         Err("MemTotal not found in /proc/meminfo".to_string())
     }
 
-    /// Get storage information from the system (Linux only)
-    fn get_storage_info() -> Result<u64, String> {
+    /// Get the podman storage root path by querying podman info
+    fn get_podman_storage_root() -> Option<String> {
+        use std::process::Command;
+        let output = Command::new("podman")
+            .args(["info", "--format", "{{.Store.GraphRoot}}"])
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path.is_empty() {
+            return None;
+        }
+
+        Some(path)
+    }
+
+    /// Get storage size for a given path using df
+    fn get_storage_size_for_path(path: &str) -> Result<u64, String> {
         use std::process::Command;
         let output = Command::new("df")
-            .args(&["-B1", "/var/lib/containers/storage"])
+            .args(["-B1", path])
             .output()
-            .map_err(|e| format!("Failed to execute df: {}", e))?;
+            .map_err(|e| format!("Failed to execute df for path '{}': {}", path, e))?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "df command failed for path '{}': {}",
+                path,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let lines: Vec<&str> = stdout.lines().collect();
@@ -445,7 +473,47 @@ impl ResourceVerifier {
                 return Ok(bytes);
             }
         }
-        Err("Failed to parse df output".to_string())
+        Err(format!("Failed to parse df output for path '{}'", path))
+    }
+
+    /// Get storage information from the system (Linux only)
+    ///
+    /// Attempts to detect the podman storage location in the following order:
+    /// 1. Query podman info for GraphRoot
+    /// 2. Check common rootless path (~/.local/share/containers/storage)
+    /// 3. Check common rootful path (/var/lib/containers/storage)
+    /// 4. Fall back to root filesystem (/)
+    fn get_storage_info() -> Result<u64, String> {
+        // First, try to get the storage path from podman itself
+        if let Some(storage_root) = Self::get_podman_storage_root() {
+            debug!("Using podman storage root: {}", storage_root);
+            if let Ok(size) = Self::get_storage_size_for_path(&storage_root) {
+                return Ok(size);
+            }
+        }
+
+        // Try common storage locations as fallback
+        let fallback_paths = [
+            // Rootless podman storage (expand home directory)
+            std::env::var("HOME")
+                .map(|h| format!("{}/.local/share/containers/storage", h))
+                .unwrap_or_default(),
+            // Rootful podman storage
+            "/var/lib/containers/storage".to_string(),
+            // Ultimate fallback to root filesystem
+            "/".to_string(),
+        ];
+
+        for path in fallback_paths.iter().filter(|p| !p.is_empty()) {
+            if std::path::Path::new(path).exists() {
+                debug!("Trying storage path: {}", path);
+                if let Ok(size) = Self::get_storage_size_for_path(path) {
+                    return Ok(size);
+                }
+            }
+        }
+
+        Err("Failed to determine storage size from any known path".to_string())
     }
 
     /// Verify if the node has capacity for a workload request

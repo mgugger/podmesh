@@ -167,6 +167,23 @@ pub async fn get_candidates(
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(1);
+    
+    // Ensure TaskRecord exists for this task_id so we can store assigned peers
+    {
+        let mut store = state.task_store.write().await;
+        if !store.contains_key(&task_id) {
+            log::info!("get_candidates: creating placeholder TaskRecord for task_id={}", task_id);
+            store.insert(task_id.clone(), TaskRecord {
+                manifest_bytes: Vec::new(),
+                created_at: std::time::SystemTime::now(),
+                manifests_distributed: HashMap::new(),
+                assigned_peers: None,
+                manifest_cid: Some(task_id.clone()),
+                last_operation_id: None,
+                owner_pubkey: envelope_metadata.kem_pubkey.clone(),
+            });
+        }
+    }
 
     let request_id = format!(
         "{}:{}:{}",
@@ -314,6 +331,8 @@ pub async fn get_candidates(
                     .map(|(peer_id, _)| peer_id.clone())
                     .collect(),
             );
+        } else {
+            log::warn!("get_candidates: task_id={} not found in task_store", task_id);
         }
     }
 
@@ -359,30 +378,17 @@ pub async fn get_task_providers(
         }
         Err(e) => {
             error!("Failed to discover providers for task_id {}: {}", task_id, e);
-            let error_json = serde_json::json!({
-                "providers": []
-            });
-            let response_data = error_json.to_string().into_bytes();
-            warn!("Returning error response with 0 providers ({} bytes)", response_data.len());
+            let response_data = protocol::machine::build_candidates_response_with_keys(false, &[]);
             return create_response_for_providers(&state, &response_data, &envelope_metadata).await;
         }
     };
 
     if providers.is_empty() {
         info!("No providers found for task_id={}", task_id);
-        let empty_json = serde_json::json!({
-            "providers": []
-        });
-        let response_data = empty_json.to_string().into_bytes();
+        let response_data = protocol::machine::build_candidates_response_with_keys(false, &[]);
         return create_response_for_providers(&state, &response_data, &envelope_metadata).await;
     }
 
-    // Fetch the provider record from DHT to get metadata (including KEM public key)
-    let provider_metadata = fetch_provider_record_metadata(&task_id, &state).await;
-    
-    // For each provider, get their KEM public key from the announcement metadata
-    let mut providers_with_keys = Vec::new();
-    
     // Get local peer ID to check if we're the provider
     let (local_peer_tx, mut local_peer_rx) = tokio::sync::mpsc::unbounded_channel();
     let _ = state.control_tx.send(
@@ -396,42 +402,79 @@ pub async fn get_task_providers(
         _ => None,
     };
 
+    // For each provider, get their KEM public key
+    let mut providers_with_keys: Vec<(String, String)> = Vec::new();
+
     for provider_peer_id in providers {
-        // If this is the local peer, get our own KEM public key for encryption
+        // 1. If this is the local peer, get our own KEM public key
         let pubkey_b64 = if Some(&provider_peer_id) == local_peer_id.as_ref() {
             match crypto::ensure_kem_keypair_on_disk() {
-                Ok((pub_bytes, _)) => crypto::b64_encode(&pub_bytes),
+                Ok((pub_bytes, _)) => {
+                    info!("get_task_providers: using local KEM pubkey for peer {}", provider_peer_id);
+                    crypto::b64_encode(&pub_bytes)
+                }
                 Err(e) => {
                     warn!("Failed to get local KEM public key: {}", e);
                     String::new()
                 }
             }
-        } else {
-            // Try to get the KEM public key from the provider announcement metadata
-            provider_metadata
-                .as_ref()
-                .and_then(|m| m.get("kem_pubkey"))
-                .cloned()
-                .unwrap_or_else(|| {
-                    warn!("No KEM public key found in provider metadata for peer {}", provider_peer_id);
+        }
+        // 2. For remote peers, fetch KEM pubkey via P2P handshake
+        else {
+            match fetch_kem_pubkey_from_peer(&provider_peer_id, &state).await {
+                Some(pubkey) => {
+                    info!("get_task_providers: fetched KEM pubkey from remote peer {}", provider_peer_id);
+                    pubkey
+                }
+                None => {
+                    warn!("get_task_providers: failed to fetch KEM pubkey from peer {}", provider_peer_id);
                     String::new()
-                })
+                }
+            }
         };
 
-        providers_with_keys.push(serde_json::json!({
-            "peer_id": provider_peer_id,
-            "pubkey": pubkey_b64
-        }));
+        providers_with_keys.push((provider_peer_id, pubkey_b64));
     }
 
-    let response_json = serde_json::json!({
-        "providers": providers_with_keys
-    });
-
-    let response_data = response_json.to_string().into_bytes();
+    let response_data = protocol::machine::build_candidates_response_with_keys(true, &providers_with_keys);
     info!("get_task_providers: returning {} providers ({} bytes)", providers_with_keys.len(), response_data.len());
-    debug!("get_task_providers: response JSON: {}", response_json);
     create_response_for_providers(&state, &response_data, &envelope_metadata).await
+}
+
+/// Fetch KEM public key from a remote peer via P2P handshake protocol
+async fn fetch_kem_pubkey_from_peer(peer_id_str: &str, state: &RestState) -> Option<String> {
+    let peer_id = match peer_id_str.parse::<libp2p::PeerId>() {
+        Ok(id) => id,
+        Err(e) => {
+            warn!("fetch_kem_pubkey_from_peer: invalid peer_id {}: {}", peer_id_str, e);
+            return None;
+        }
+    };
+    
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    
+    let control_msg = crate::podmesh_p2p::control::Libp2pControl::FetchPeerKemPubkey {
+        peer_id,
+        reply_tx: tx,
+    };
+    
+    if let Err(e) = state.control_tx.send(control_msg) {
+        warn!("fetch_kem_pubkey_from_peer: failed to send control message: {}", e);
+        return None;
+    }
+    
+    // Wait for response with timeout
+    match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+        Ok(Some(kem_pubkey)) => kem_pubkey,
+        Ok(None) => {
+            warn!("fetch_kem_pubkey_from_peer: channel closed for peer {}", peer_id_str);
+            None
+        }
+        Err(_) => {
+            warn!("fetch_kem_pubkey_from_peer: timeout waiting for KEM pubkey from peer {}", peer_id_str);
+            None
+        }
+    }
 }
 
 async fn create_response_for_providers(
@@ -1246,58 +1289,6 @@ async fn find_manifest_providers(task_id: &str, state: &RestState) -> Result<Vec
                 task_id
             );
             Ok(vec![])
-        }
-    }
-}
-
-/// Fetch provider record metadata from DHT (includes KEM public key)
-async fn fetch_provider_record_metadata(
-    task_id: &str,
-    state: &RestState,
-) -> Option<std::collections::HashMap<String, String>> {
-    info!("fetch_provider_record_metadata: fetching for task_id={}", task_id);
-
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-
-    let control_msg = crate::podmesh_p2p::control::Libp2pControl::GetProviderRecord {
-        manifest_id: task_id.to_string(),
-        reply_tx: tx,
-    };
-
-    if let Err(e) = state.control_tx.send(control_msg) {
-        warn!("fetch_provider_record_metadata: failed to send request: {}", e);
-        return None;
-    }
-
-    // Wait for response with timeout
-    match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
-        Ok(Some(metadata)) => {
-            if metadata.is_some() {
-                info!(
-                    "fetch_provider_record_metadata: found metadata for task_id={}",
-                    task_id
-                );
-            } else {
-                debug!(
-                    "fetch_provider_record_metadata: no metadata found for task_id={}",
-                    task_id
-                );
-            }
-            metadata
-        }
-        Ok(None) => {
-            warn!(
-                "fetch_provider_record_metadata: channel closed for task_id={}",
-                task_id
-            );
-            None
-        }
-        Err(_) => {
-            warn!(
-                "fetch_provider_record_metadata: timeout waiting for metadata for task_id={}",
-                task_id
-            );
-            None
         }
     }
 }

@@ -42,6 +42,8 @@ pub struct VerifiedEnvelope {
     pub signature: Vec<u8>,
     pub timestamp_ms: u64,
     pub payload_type: String,
+    /// KEM public key from the sender (if present in envelope)
+    pub kem_pubkey: Option<Vec<u8>>,
 }
 
 /// Sign `payload` using the node's persisted signing keypair.
@@ -291,12 +293,18 @@ pub fn verify_envelope_for_peer(
     crypto::verify_envelope(&pub_bytes, &canonical, &sig_bytes)
         .context("signature verification failed")?;
 
+    // Decode KEM pubkey if present
+    let kem_pubkey = kem_pubkey_opt
+        .filter(|s| !s.is_empty())
+        .and_then(|s| crypto::b64_decode(s).ok());
+
     Ok(VerifiedEnvelope {
         payload: payload_vec,
         pubkey: pub_bytes,
         signature: sig_bytes,
         timestamp_ms: ts,
         payload_type: payload_type.to_string(),
+        kem_pubkey,
     })
 }
 
@@ -349,12 +357,18 @@ pub fn verify_envelope_skip_nonce_check(
     crypto::verify_envelope(&pub_bytes, &canonical, &sig_bytes)
         .context("signature verification failed")?;
 
+    // Decode KEM pubkey if present
+    let kem_pubkey = kem_pubkey_opt
+        .filter(|s| !s.is_empty())
+        .and_then(|s| crypto::b64_decode(s).ok());
+
     Ok(VerifiedEnvelope {
         payload: payload_vec,
         pubkey: pub_bytes,
         signature: sig_bytes,
         timestamp_ms: ts,
         payload_type: payload_type.to_string(),
+        kem_pubkey,
     })
 }
 

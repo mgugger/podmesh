@@ -152,9 +152,16 @@ fn build_signed_handshake_response(peer: &PeerId) -> Result<Vec<u8>> {
         "podmesh/1.0",
         &peer.to_string(),
     );
+    
+    // Include our KEM public key in the handshake response so peers can encrypt messages to us
+    let kem_pub_b64 = crypto::ensure_kem_keypair_on_disk()
+        .ok()
+        .map(|(pub_bytes, _)| crypto::b64_encode(&pub_bytes));
+    
     let cfg = SignEnvelopeConfig {
         nonce: Some(&nonce),
         timestamp: Some(timestamp),
+        kem_pub_b64: kem_pub_b64.as_deref(),
         ..Default::default()
     };
     Ok(sign_with_node_keys(&payload, "handshake", cfg)?.bytes)
@@ -173,12 +180,39 @@ fn build_signed_handshake_request(
         &local_peer.to_string(),
     );
     let envelope_nonce = format!("handshake_req_{nonce}");
+    
+    // Include our KEM public key in the handshake request so peers can encrypt messages to us
+    let kem_pub_b64 = crypto::ensure_kem_keypair_on_disk()
+        .ok()
+        .map(|(pub_bytes, _)| crypto::b64_encode(&pub_bytes));
+    
     let sign_cfg = SignEnvelopeConfig {
         nonce: Some(&envelope_nonce),
         timestamp: Some(timestamp),
+        kem_pub_b64: kem_pub_b64.as_deref(),
         ..Default::default()
     };
     Ok(sign_with_node_keys(&payload, "handshake", sign_cfg)?.bytes)
+}
+
+/// Build a handshake request specifically for fetching KEM public key from a peer.
+/// This is exposed publicly so it can be called from the scheduler's control module.
+pub fn build_handshake_request_for_kem_fetch(local_peer: &PeerId) -> Result<Vec<u8>> {
+    let cfg = HandshakeDriveConfig::default();
+    build_signed_handshake_request(local_peer, &cfg)
+}
+
+/// Extract KEM public key from a verified handshake response.
+/// Returns the KEM pubkey as base64 string if present.
+pub fn extract_kem_pubkey_from_response(
+    response: &[u8],
+    peer: &PeerId,
+) -> Option<String> {
+    let verified = verify_signed_message(peer, response, |err| {
+        warn!("Failed to verify handshake response for KEM extraction: {}", err);
+    })?;
+    
+    verified.kem_pubkey.map(|bytes| crypto::b64_encode(&bytes))
 }
 
 /// Drive outbound handshake attempts for every unconfirmed peer.
