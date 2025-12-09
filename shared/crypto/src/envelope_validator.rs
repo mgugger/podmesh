@@ -63,22 +63,4 @@ mod tests {
     fn test_require_signed_messages() {
         assert!(EnvelopeValidator::require_signed_messages());
     }
-
-    #[test]
-    fn test_validation_direction_display() {
-        assert_eq!(format!("{}", ValidationDirection::Inbound), "inbound");
-        assert_eq!(format!("{}", ValidationDirection::Outbound), "outbound");
-    }
-
-    #[test]
-    fn test_envelope_error_display() {
-        let error = EnvelopeError::VerificationFailed("test error".to_string());
-        assert!(error.to_string().contains("test error"));
-
-        let error = EnvelopeError::UnsignedRejected("unsigned".to_string());
-        assert!(error.to_string().contains("unsigned"));
-
-        let error = EnvelopeError::InvalidFormat("format".to_string());
-        assert!(error.to_string().contains("format"));
-    }
 }

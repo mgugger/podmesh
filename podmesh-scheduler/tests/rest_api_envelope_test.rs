@@ -11,11 +11,6 @@ fn current_timestamp_ms() -> u64 {
 }
 
 #[test]
-fn test_envelope_payload_extraction() {
-    assert!(true);
-}
-
-#[test]
 fn test_apply_request_envelope() {
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
 

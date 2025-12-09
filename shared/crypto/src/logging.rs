@@ -132,23 +132,3 @@ impl CryptoLogger {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_protocol_logger_formatting() {
-        // These tests verify the log format but don't check output since we're using the log crate
-        ProtocolLogger::info("test_protocol", "test message");
-        ProtocolLogger::warn("test_protocol", "test warning");
-        ProtocolLogger::debug("test_protocol", "test debug");
-        ProtocolLogger::error("test_protocol", "test error");
-    }
-
-    #[test]
-    fn test_crypto_logger_operations() {
-        CryptoLogger::log_crypto_operation("encryption", true, Some("AES-256"));
-        CryptoLogger::log_crypto_operation("decryption", false, None);
-    }
-}

@@ -332,6 +332,12 @@ pub async fn create_default_registry() -> RuntimeRegistry {
         registry.register(Arc::new(mock::MockEngine::new()));
     }
 
+    // Register process engine for testing and debug builds only
+    #[cfg(debug_assertions)]
+    {
+        registry.register(Arc::new(engines::ProcessEngine::new()));
+    }
+
     // Try to set the best available engine as default
     let available = registry.check_available_engines().await;
 
@@ -364,12 +370,35 @@ pub async fn create_mock_only_registry() -> RuntimeRegistry {
     registry
 }
 
+/// Create a process-only runtime registry for testing
+/// This registry only contains the ProcessEngine, useful for integration tests
+/// where we want to test with real processes instead of containers
+#[cfg(debug_assertions)]
+pub async fn create_process_only_registry() -> RuntimeRegistry {
+    let mut registry = RuntimeRegistry::new();
+
+    // Register only the process engine for testing
+    registry.register(Arc::new(engines::ProcessEngine::new()));
+
+    // Set process as the default engine
+    let _ = registry.set_default_engine("process");
+
+    registry
+}
+
 /// Fallback mock-only registry accessor for release builds where the mock engine
 /// is not compiled in. We return the default registry to ensure callers have a
 /// functional runtime configuration without linking the mock implementation.
 #[cfg(not(debug_assertions))]
 pub async fn create_mock_only_registry() -> RuntimeRegistry {
     warn!("mock runtime requested in release build; returning default registry");
+    create_default_registry().await
+}
+
+/// Fallback process-only registry accessor for release builds.
+#[cfg(not(debug_assertions))]
+pub async fn create_process_only_registry() -> RuntimeRegistry {
+    warn!("process runtime requested in release build; returning default registry");
     create_default_registry().await
 }
 

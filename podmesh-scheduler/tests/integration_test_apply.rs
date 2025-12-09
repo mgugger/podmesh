@@ -175,6 +175,9 @@ async fn test_apply_with_real_podman() {
 
 #[serial]
 #[tokio::test]
+// IGNORED: This test is flaky in CI environments due to timing-sensitive mesh formation
+// with replicas. It works locally but fails intermittently under CI resource constraints.
+// The core functionality is covered by test_apply_manifest which tests single-replica deploys.
 #[ignore]
 async fn test_apply_nginx_with_replicas() {
     let (client, ports) = setup_test_environment().await;

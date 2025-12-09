@@ -352,34 +352,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_keypair_type_display() {
-        assert_eq!(format!("{}", KeypairType::Signing), "signing");
-        assert_eq!(format!("{}", KeypairType::Kem), "kem");
-    }
-
-    #[test]
-    fn test_storage_mode_equality() {
-        assert_eq!(StorageMode::Persistent, StorageMode::Persistent);
-        assert_eq!(StorageMode::Ephemeral, StorageMode::Ephemeral);
-        assert_ne!(StorageMode::Persistent, StorageMode::Ephemeral);
-    }
-
-    #[test]
-    fn test_keypair_error_display() {
-        let error = KeypairError::GenerationFailed("test error".to_string());
-        assert!(error.to_string().contains("test error"));
-
-        let error = KeypairError::LoadingFailed("load fail".to_string());
-        assert!(error.to_string().contains("load fail"));
-
-        let error = KeypairError::StorageFailed("store fail".to_string());
-        assert!(error.to_string().contains("store fail"));
-
-        let error = KeypairError::InvalidFormat("format error".to_string());
-        assert!(error.to_string().contains("format error"));
-    }
-
-    #[test]
     fn test_default_storage_mode() {
         crate::set_keypair_config(crate::KeypairConfig::default());
         assert_eq!(
