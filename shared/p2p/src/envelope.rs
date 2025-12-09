@@ -1,8 +1,11 @@
-use anyhow::Context;
+use anyhow::{Context, bail};
 use std::time::Duration;
 use uuid::Uuid;
 
 use crate::util::timestamp_millis;
+
+/// Maximum allowed clock drift for envelope timestamps (5 minutes in milliseconds)
+const MAX_TIMESTAMP_DRIFT_MS: u64 = 5 * 60 * 1000;
 
 /// Signed envelope bytes alongside the generated nonce/timestamp.
 pub struct SignedEnvelope {
@@ -258,6 +261,21 @@ pub fn verify_envelope_for_peer(
     let ts = env.ts();
     let alg = env.alg().unwrap_or("");
 
+    // Validate timestamp is within acceptable drift window to prevent time-manipulation attacks
+    // Note: envelope timestamps may be in seconds or milliseconds depending on creator.
+    // We normalize to milliseconds for comparison.
+    let now_ms = timestamp_millis();
+    // If ts is much smaller than now_ms (by factor of 1000), it's likely in seconds
+    let ts_ms = if ts < now_ms / 100 { ts * 1000 } else { ts };
+    let drift_ms = if ts_ms > now_ms { ts_ms - now_ms } else { now_ms - ts_ms };
+    if drift_ms > MAX_TIMESTAMP_DRIFT_MS {
+        bail!(
+            "envelope timestamp drift {} ms exceeds maximum {} ms",
+            drift_ms,
+            MAX_TIMESTAMP_DRIFT_MS
+        );
+    }
+
     // Reconstruct canonical bytes using the same method as signing
     // Check if envelope has peer_id and kem_pubkey fields to match signing format
     let peer_id_opt = env.peer_id();
@@ -388,7 +406,8 @@ mod tests {
         let payload = b"test payload data";
         let payload_type = "test";
         let nonce = format!("test-nonce-{}", timestamp_millis());
-        let timestamp = 1234567890u64;
+        // Use current timestamp to pass drift validation
+        let timestamp = timestamp_millis();
         let alg = "ed25519";
 
         // Create and sign postcard envelope

@@ -115,7 +115,9 @@ impl KeypairManager {
     /// Get or generate ephemeral signing keypair (cached for process lifetime)
     pub fn get_ephemeral_signing_keypair() -> KeypairResult<(Vec<u8>, Vec<u8>)> {
         let cache = EPHEMERAL_SIGNING_KEYPAIR.get_or_init(|| Mutex::new(None));
-        let mut guard = cache.lock().unwrap();
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(ref keypair) = *guard {
             return Ok(keypair.clone());
@@ -144,7 +146,9 @@ impl KeypairManager {
     /// Get or generate ephemeral KEM keypair (cached for process lifetime)
     pub fn get_ephemeral_kem_keypair() -> KeypairResult<(Vec<u8>, Vec<u8>)> {
         let cache = EPHEMERAL_KEM_KEYPAIR.get_or_init(|| Mutex::new(None));
-        let mut guard = cache.lock().unwrap();
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(ref keypair) = *guard {
             return Ok(keypair.clone());
@@ -268,11 +272,15 @@ impl KeypairManager {
     /// Clear ephemeral keypair caches (useful for testing)
     pub fn clear_ephemeral_caches() {
         if let Some(cache) = EPHEMERAL_SIGNING_KEYPAIR.get() {
-            let mut guard = cache.lock().unwrap();
+            let mut guard = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             *guard = None;
         }
         if let Some(cache) = EPHEMERAL_KEM_KEYPAIR.get() {
-            let mut guard = cache.lock().unwrap();
+            let mut guard = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             *guard = None;
         }
         info!("keypair: cleared ephemeral keypair caches");

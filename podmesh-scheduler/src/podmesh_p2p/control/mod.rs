@@ -128,7 +128,9 @@ pub async fn handle_control_message(
                     // More frequent renewal for local tests - every 2 seconds minimum
                     Instant::now() + Duration::from_millis(std::cmp::max(2000, ttl / 3))
                 };
-                let mut map = ACTIVE_ANNOUNCES.lock().unwrap();
+                let mut map = ACTIVE_ANNOUNCES
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 map.insert(
                     cid,
                     AnnounceEntry {
@@ -157,7 +159,9 @@ pub async fn handle_control_message(
         Libp2pControl::WithdrawProvider { cid, reply_tx } => {
             // Remove from active announces and issue a withdraw (expiry=now)
             {
-                let mut map = ACTIVE_ANNOUNCES.lock().unwrap();
+                let mut map = ACTIVE_ANNOUNCES
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 map.remove(&cid);
             }
             match announce_provider_direct(swarm, cid.clone(), 0) {
@@ -294,7 +298,9 @@ pub fn insert_pending_providers_query(
     sender: mpsc::UnboundedSender<Vec<libp2p::PeerId>>,
 ) {
     let key = format!("{:?}", id);
-    let mut map = PENDING_PROVIDERS_QUERIES.lock().unwrap();
+    let mut map = PENDING_PROVIDERS_QUERIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     map.insert(key, sender);
 }
 
@@ -303,7 +309,9 @@ pub fn take_pending_providers_query(
     id: &QueryId,
 ) -> Option<mpsc::UnboundedSender<Vec<libp2p::PeerId>>> {
     let key = format!("{:?}", id);
-    let mut map = PENDING_PROVIDERS_QUERIES.lock().unwrap();
+    let mut map = PENDING_PROVIDERS_QUERIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     map.remove(&key)
 }
 
@@ -313,7 +321,9 @@ pub fn insert_pending_provider_record_query(
     sender: mpsc::UnboundedSender<Option<HashMap<String, String>>>,
 ) {
     let key = format!("{:?}", id);
-    let mut map = PENDING_PROVIDER_RECORD_QUERIES.lock().unwrap();
+    let mut map = PENDING_PROVIDER_RECORD_QUERIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     map.insert(key, sender);
 }
 
@@ -322,7 +332,9 @@ pub fn take_pending_provider_record_query(
     id: &QueryId,
 ) -> Option<mpsc::UnboundedSender<Option<HashMap<String, String>>>> {
     let key = format!("{:?}", id);
-    let mut map = PENDING_PROVIDER_RECORD_QUERIES.lock().unwrap();
+    let mut map = PENDING_PROVIDER_RECORD_QUERIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     map.remove(&key)
 }
 
@@ -332,7 +344,9 @@ pub fn insert_pending_kem_pubkey_request(
     sender: mpsc::UnboundedSender<Option<String>>,
 ) {
     let key = peer_id.to_string();
-    let mut map = PENDING_KEM_PUBKEY_REQUESTS.lock().unwrap();
+    let mut map = PENDING_KEM_PUBKEY_REQUESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     map.insert(key, sender);
 }
 
@@ -341,13 +355,17 @@ pub fn take_pending_kem_pubkey_request(
     peer_id: &libp2p::PeerId,
 ) -> Option<mpsc::UnboundedSender<Option<String>>> {
     let key = peer_id.to_string();
-    let mut map = PENDING_KEM_PUBKEY_REQUESTS.lock().unwrap();
+    let mut map = PENDING_KEM_PUBKEY_REQUESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     map.remove(&key)
 }
 
 /// Enqueue a control message from inside a behaviour handler. This is synchronous and cheap.
 pub fn enqueue_control(msg: Libp2pControl) {
-    let mut q = ENQUEUED_CONTROLS.lock().unwrap();
+    let mut q = ENQUEUED_CONTROLS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     q.push_back(msg);
 }
 
@@ -360,7 +378,9 @@ pub async fn drain_enqueued_controls(
     // Move queued items into a local vector to minimize lock time
     let mut items = Vec::new();
     {
-        let mut q = ENQUEUED_CONTROLS.lock().unwrap();
+        let mut q = ENQUEUED_CONTROLS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         while let Some(it) = q.pop_front() {
             items.push(it);
         }
@@ -374,7 +394,9 @@ pub async fn drain_enqueued_controls(
 /// Renew any announces that are due. Intended to be called periodically from the libp2p loop.
 pub fn renew_due_providers(swarm: &mut Swarm<MyBehaviour>) {
     let now = Instant::now();
-    let mut map = ACTIVE_ANNOUNCES.lock().unwrap();
+    let mut map = ACTIVE_ANNOUNCES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     for (cid, entry) in map.iter_mut() {
         if entry.ttl_ms == 0 {
             continue;
@@ -391,7 +413,9 @@ pub fn renew_due_providers(swarm: &mut Swarm<MyBehaviour>) {
 /// Withdraw all announces (used on shutdown)
 pub fn withdraw_all_providers(swarm: &mut Swarm<MyBehaviour>) {
     let keys: Vec<String> = {
-        let mut m = ACTIVE_ANNOUNCES.lock().unwrap();
+        let mut m = ACTIVE_ANNOUNCES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         m.drain().map(|(k, _)| k).collect()
     };
     for cid in keys {
@@ -402,7 +426,9 @@ pub fn withdraw_all_providers(swarm: &mut Swarm<MyBehaviour>) {
 
 /// Return a snapshot of active announce CIDs
 pub fn list_active_announces() -> Vec<String> {
-    let map = ACTIVE_ANNOUNCES.lock().unwrap();
+    let map = ACTIVE_ANNOUNCES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     map.keys().cloned().collect()
 }
 

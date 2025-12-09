@@ -3,6 +3,14 @@ use podmesh_scheduler::podmesh_p2p::envelope::verify_envelope;
 use protocol::machine::{build_envelope_canonical, build_envelope_signed};
 use std::time::Duration;
 
+/// Get current timestamp in milliseconds for test envelopes
+fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 #[test]
 fn test_signature_verification_error_messages() {
     let (pubb, privb) = ensure_keypair_ephemeral().expect("Failed to generate keypair");
@@ -13,7 +21,7 @@ fn test_signature_verification_error_messages() {
         payload,
         "test",
         "error-test-nonce",
-        1234567890,
+        current_timestamp_ms(),
         "ed25519",
         None,
     );
@@ -26,7 +34,7 @@ fn test_signature_verification_error_messages() {
             payload,
             "test",
             "invalid-sig-nonce",
-            1234567890,
+            current_timestamp_ms(),
             "ed25519",
             "ed25519",
             invalid_sig,
@@ -53,7 +61,7 @@ fn test_signature_verification_error_messages() {
             payload,
             "test",
             "invalid-length-nonce",
-            1234567890,
+            current_timestamp_ms(),
             "ed25519",
             "ed25519",
             &invalid_sig,
@@ -81,7 +89,7 @@ fn test_signature_verification_error_messages() {
             payload,
             "test",
             "wrong-key-nonce",
-            1234567890,
+            current_timestamp_ms(),
             "ed25519",
             "ed25519",
             &sig_b64,
@@ -108,7 +116,7 @@ fn test_signature_verification_error_messages() {
             original_payload,
             "test",
             "tamper-nonce",
-            1234567890,
+            current_timestamp_ms(),
             "ed25519",
             None,
         );
@@ -120,7 +128,7 @@ fn test_signature_verification_error_messages() {
             tampered_payload,
             "test",
             "tamper-nonce",
-            1234567890,
+            current_timestamp_ms(),
             "ed25519",
             "ed25519",
             &sig_b64,
@@ -149,7 +157,7 @@ fn test_signature_verification_error_messages() {
             payload,
             "test",
             "invalid-pub-nonce",
-            1234567890,
+            current_timestamp_ms(),
             "ed25519",
             "ed25519",
             &sig_b64,
@@ -226,7 +234,7 @@ fn test_envelope_parsing_robustness() {
             b"test payload",
             "test",
             "empty-sig-nonce",
-            1234567890,
+            current_timestamp_ms(),
             "ed25519",
             "ed25519",
             "",
@@ -255,7 +263,7 @@ fn test_envelope_parsing_robustness() {
             b"test payload",
             "test",
             "malformed-b64-nonce",
-            1234567890,
+            current_timestamp_ms(),
             "ed25519",
             "ed25519",
             "malformed-base64-!!!",
@@ -285,11 +293,12 @@ fn test_nonce_validation_errors() {
     let payload = b"nonce validation test";
 
     {
+        let ts = current_timestamp_ms();
         let canonical_bytes = build_envelope_canonical(
             payload,
             "test",
             "duplicate-nonce-123",
-            1234567890,
+            ts,
             "ed25519",
             None,
         );
@@ -301,7 +310,7 @@ fn test_nonce_validation_errors() {
             payload,
             "test",
             "duplicate-nonce-123",
-            1234567890,
+            ts,
             "ed25519",
             "ed25519",
             &sig_b64,
@@ -310,7 +319,7 @@ fn test_nonce_validation_errors() {
         );
 
         let first_result = verify_envelope(&envelope, Duration::from_secs(300));
-        assert!(first_result.is_ok(), "First verification should succeed");
+        assert!(first_result.is_ok(), "First verification should succeed: {:?}", first_result.err());
 
         let second_result = verify_envelope(&envelope, Duration::from_secs(300));
         assert!(
@@ -327,8 +336,9 @@ fn test_nonce_validation_errors() {
     }
 
     {
+        let ts = current_timestamp_ms();
         let canonical_empty_nonce =
-            build_envelope_canonical(payload, "test", "", 1234567890, "ed25519", None);
+            build_envelope_canonical(payload, "test", "", ts, "ed25519", None);
 
         let (sig_b64, pub_b64) = sign_envelope(&privb, &pubb, &canonical_empty_nonce)
             .expect("Failed to sign envelope with empty nonce");
@@ -337,7 +347,7 @@ fn test_nonce_validation_errors() {
             payload,
             "test",
             "",
-            1234567890,
+            ts,
             "ed25519",
             "ed25519",
             &sig_b64,
@@ -360,11 +370,12 @@ fn test_algorithm_mismatch_errors() {
 
     let payload = b"algorithm test payload";
 
+    let ts = current_timestamp_ms();
     let canonical_bytes = build_envelope_canonical(
         payload,
         "test",
         "alg-test-nonce",
-        1234567890,
+        ts,
         "different-algorithm",
         None,
     );
@@ -376,7 +387,7 @@ fn test_algorithm_mismatch_errors() {
         payload,
         "test",
         "alg-test-nonce",
-        1234567890,
+        ts,
         "different-algorithm",
         "ed25519",
         &sig_b64,
@@ -398,6 +409,7 @@ fn test_timestamp_edge_cases() {
 
     let payload = b"timestamp test payload";
 
+    // Test zero timestamp - should now fail due to drift validation
     {
         let canonical_zero_ts =
             build_envelope_canonical(payload, "test", "zero-ts-nonce", 0, "ed25519", None);
@@ -419,12 +431,18 @@ fn test_timestamp_edge_cases() {
 
         let result = verify_envelope(&envelope_zero_ts, Duration::from_secs(300));
         assert!(
-            result.is_ok(),
-            "Zero timestamp should not prevent verification: {:?}",
-            result.err()
+            result.is_err(),
+            "Zero timestamp should fail drift validation"
+        );
+        let error_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            error_msg.contains("drift"),
+            "Error should mention drift: {}",
+            error_msg
         );
     }
 
+    // Test max timestamp - should fail due to drift validation
     {
         let max_timestamp = u64::MAX;
         let canonical_max_ts = build_envelope_canonical(
@@ -453,8 +471,49 @@ fn test_timestamp_edge_cases() {
 
         let result = verify_envelope(&envelope_max_ts, Duration::from_secs(300));
         assert!(
+            result.is_err(),
+            "Maximum timestamp should fail drift validation"
+        );
+        let error_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            error_msg.contains("drift"),
+            "Error should mention drift: {}",
+            error_msg
+        );
+    }
+
+    // Test current timestamp - should succeed
+    {
+        let current_ts = current_timestamp_ms();
+        let nonce = format!("current-ts-nonce-{}", current_ts);
+        let canonical_current_ts = build_envelope_canonical(
+            payload,
+            "test",
+            &nonce,
+            current_ts,
+            "ed25519",
+            None,
+        );
+
+        let (sig_b64, pub_b64) = sign_envelope(&privb, &pubb, &canonical_current_ts)
+            .expect("Failed to sign envelope with current timestamp");
+
+        let envelope_current_ts = build_envelope_signed(
+            payload,
+            "test",
+            &nonce,
+            current_ts,
+            "ed25519",
+            "ed25519",
+            &sig_b64,
+            &pub_b64,
+            None,
+        );
+
+        let result = verify_envelope(&envelope_current_ts, Duration::from_secs(300));
+        assert!(
             result.is_ok(),
-            "Maximum timestamp should not prevent verification: {:?}",
+            "Current timestamp should verify: {:?}",
             result.err()
         );
     }
@@ -481,11 +540,12 @@ fn test_concurrent_nonce_validation() {
         let success_count_clone = Arc::clone(&success_count);
 
         let handle = thread::spawn(move || {
+            let ts = current_timestamp_ms() + i as u64;
             let canonical = build_envelope_canonical(
                 &payload_clone,
                 "test",
                 &nonce,
-                1234567890 + i as u64,
+                ts,
                 "ed25519",
                 None,
             );
@@ -497,7 +557,7 @@ fn test_concurrent_nonce_validation() {
                 &payload_clone,
                 "test",
                 &nonce,
-                1234567890 + i as u64,
+                ts,
                 "ed25519",
                 "ed25519",
                 &sig_b64,

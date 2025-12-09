@@ -317,14 +317,6 @@ pub fn build_encrypted_envelope_with_peer(
 }
 
 fn envelope_nonce_and_timestamp() -> (String, u64) {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    std::time::SystemTime::now().hash(&mut hasher);
-    let nonce = format!("{:x}", hasher.finish());
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    (nonce, ts)
+    // Use cryptographically secure nonce generation from crypto crate
+    crypto::generate_nonce_and_timestamp()
 }

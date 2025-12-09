@@ -3,6 +3,14 @@ use podmesh_scheduler::podmesh_p2p::envelope::verify_envelope;
 use protocol::machine::{build_envelope_canonical, build_envelope_signed};
 use std::time::Duration;
 
+/// Get current timestamp in milliseconds for test envelopes
+fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 #[test]
 fn test_envelope_roundtrip() {
     // Test that postcard envelopes signed with canonical bytes verify correctly
@@ -17,7 +25,7 @@ fn test_envelope_roundtrip() {
             .unwrap()
             .as_nanos()
     );
-    let timestamp = 1234567890u64;
+    let timestamp = current_timestamp_ms();
     let alg = "ed25519";
 
     let canonical_bytes =
@@ -57,7 +65,7 @@ fn test_envelope_invalid_signature() {
     let payload = b"test payload data";
     let payload_type = "test";
     let nonce = "invalid-sig-test";
-    let timestamp = 1234567890u64;
+    let timestamp = current_timestamp_ms();
     let alg = "ed25519";
 
     let invalid_envelope = build_envelope_signed(
@@ -92,7 +100,7 @@ fn test_envelope_replay_protection() {
             .unwrap()
             .as_nanos()
     );
-    let timestamp = 1234567890u64;
+    let timestamp = current_timestamp_ms();
     let alg = "ed25519";
 
     let canonical_bytes =
@@ -132,19 +140,19 @@ fn test_envelope_signature_prefix_handling() {
 
     let payload = b"prefix test payload";
     let payload_type = "test";
-    let nonce = "prefix-test-nonce";
-    let timestamp = 1234567890u64;
+    let nonce = format!("prefix-test-nonce-{}", current_timestamp_ms());
+    let timestamp = current_timestamp_ms();
     let alg = "ed25519";
 
     let canonical_bytes =
-        build_envelope_canonical(payload, payload_type, nonce, timestamp, alg, None);
+        build_envelope_canonical(payload, payload_type, &nonce, timestamp, alg, None);
     let (sig_b64, pub_b64) =
         sign_envelope(&privb, &pubb, &canonical_bytes).expect("Failed to sign envelope");
 
     let envelope_with_prefix = build_envelope_signed(
         payload,
         payload_type,
-        nonce,
+        &nonce,
         timestamp,
         alg,
         "ed25519",
@@ -176,19 +184,19 @@ fn test_envelope_empty_payload() {
 
     let payload = b"";
     let payload_type = "empty";
-    let nonce = "empty-payload-test";
-    let timestamp = 1234567890u64;
+    let nonce = format!("empty-payload-test-{}", current_timestamp_ms());
+    let timestamp = current_timestamp_ms();
     let alg = "ed25519";
 
     let canonical_bytes =
-        build_envelope_canonical(payload, payload_type, nonce, timestamp, alg, None);
+        build_envelope_canonical(payload, payload_type, &nonce, timestamp, alg, None);
     let (sig_b64, pub_b64) =
         sign_envelope(&privb, &pubb, &canonical_bytes).expect("Failed to sign envelope");
 
     let envelope = build_envelope_signed(
         payload,
         payload_type,
-        nonce,
+        &nonce,
         timestamp,
         alg,
         "ed25519",
@@ -214,19 +222,19 @@ fn test_envelope_large_payload() {
 
     let large_payload = vec![0x42u8; 1024 * 1024];
     let payload_type = "large";
-    let nonce = "large-payload-test";
-    let timestamp = 1234567890u64;
+    let nonce = format!("large-payload-test-{}", current_timestamp_ms());
+    let timestamp = current_timestamp_ms();
     let alg = "ed25519";
 
     let canonical_bytes =
-        build_envelope_canonical(&large_payload, payload_type, nonce, timestamp, alg, None);
+        build_envelope_canonical(&large_payload, payload_type, &nonce, timestamp, alg, None);
     let (sig_b64, pub_b64) =
         sign_envelope(&privb, &pubb, &canonical_bytes).expect("Failed to sign envelope");
 
     let envelope = build_envelope_signed(
         &large_payload,
         payload_type,
-        nonce,
+        &nonce,
         timestamp,
         alg,
         "ed25519",

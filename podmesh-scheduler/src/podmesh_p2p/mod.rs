@@ -46,14 +46,16 @@ fn extract_listen_endpoint(addr: &Multiaddr) -> Option<(String, u16)> {
 }
 
 pub fn register_scheduling_preference(peer: PeerId, disabled: bool) {
-    let mut map = scheduling_map().lock().unwrap();
+    let mut map = scheduling_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     map.insert(peer, disabled);
 }
 
 pub fn is_scheduling_disabled_for(peer: &PeerId) -> bool {
     scheduling_map()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(peer)
         .copied()
         .unwrap_or(false)

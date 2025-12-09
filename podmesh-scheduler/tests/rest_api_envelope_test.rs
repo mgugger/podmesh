@@ -2,6 +2,14 @@ use crypto::{b64_decode, b64_encode, ensure_keypair_ephemeral, sign_envelope};
 use protocol::machine::{build_envelope_canonical, build_envelope_signed};
 use std::time::Duration;
 
+/// Get current timestamp in milliseconds for test envelopes
+fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 #[test]
 fn test_envelope_payload_extraction() {
     assert!(true);
@@ -82,19 +90,19 @@ fn test_envelope_base64_encoding_for_transport() {
 
     let payload = b"test transport payload";
     let payload_type = "transport_test";
-    let nonce = "transport-nonce";
-    let timestamp = 1234567890u64;
+    let nonce = format!("transport-nonce-{}", current_timestamp_ms());
+    let timestamp = current_timestamp_ms();
     let alg = "ed25519";
 
     let canonical_bytes =
-        build_envelope_canonical(payload, payload_type, nonce, timestamp, alg, None);
+        build_envelope_canonical(payload, payload_type, &nonce, timestamp, alg, None);
     let (sig_b64, pub_b64) =
         sign_envelope(&privb, &pubb, &canonical_bytes).expect("Failed to sign envelope");
 
     let envelope = build_envelope_signed(
         payload,
         payload_type,
-        nonce,
+        &nonce,
         timestamp,
         alg,
         "ed25519",

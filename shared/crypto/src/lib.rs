@@ -95,6 +95,26 @@ pub fn get_keypair_config() -> KeypairConfig {
         .clone()
 }
 
+/// Generate a cryptographically secure random nonce as a hex string.
+/// Uses OS-provided randomness for security.
+pub fn generate_secure_nonce() -> String {
+    let mut nonce_bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    // Format as hex without external crate
+    nonce_bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Generate a cryptographically secure nonce and current timestamp.
+/// Returns (nonce_hex_string, timestamp_secs).
+pub fn generate_nonce_and_timestamp() -> (String, u64) {
+    let nonce = generate_secure_nonce();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    (nonce, ts)
+}
+
 fn resolve_key_dir(dir_override: Option<&Path>) -> anyhow::Result<PathBuf> {
     if let Some(path) = dir_override {
         return Ok(path.to_path_buf());

@@ -1,7 +1,14 @@
 use anyhow::Context;
+use log::warn;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Maximum number of unique peers to track in the nonce store (prevents memory exhaustion)
+const MAX_TRACKED_PEERS: usize = 10_000;
+
+/// Maximum nonces per peer to prevent memory exhaustion from a single peer
+const MAX_NONCES_PER_PEER: usize = 1_000;
 
 static NONCE_STORE: OnceLock<Mutex<HashMap<String, HashMap<String, Instant>>>> = OnceLock::new();
 
@@ -40,7 +47,28 @@ pub fn check_and_insert_nonce_for_peer(
     }
 
     let now = Instant::now();
-    let mut store = nonce_store().lock().unwrap();
+    let mut store = nonce_store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // Enforce maximum peer count with LRU-like eviction
+    if !store.contains_key(peer_id) && store.len() >= MAX_TRACKED_PEERS {
+        // Evict the peer with the oldest average nonce timestamp
+        if let Some(oldest_peer) = store
+            .iter()
+            .filter_map(|(k, inner)| {
+                inner.values().min().map(|oldest_time| (k.clone(), *oldest_time))
+            })
+            .min_by_key(|(_, time)| *time)
+            .map(|(k, _)| k)
+        {
+            warn!(
+                "nonce store at capacity ({} peers), evicting oldest peer: {}",
+                MAX_TRACKED_PEERS, oldest_peer
+            );
+            store.remove(&oldest_peer);
+        }
+    }
 
     // Get or create peer-specific nonce store
     let peer_store = store
@@ -49,6 +77,22 @@ pub fn check_and_insert_nonce_for_peer(
 
     // prune old nonces for this peer
     peer_store.retain(|_, &mut t| now.duration_since(t) <= nonce_window);
+
+    // Enforce maximum nonces per peer
+    if peer_store.len() >= MAX_NONCES_PER_PEER {
+        // Evict the oldest nonce for this peer
+        if let Some(oldest_nonce) = peer_store
+            .iter()
+            .min_by_key(|(_, time)| *time)
+            .map(|(k, _)| k.clone())
+        {
+            warn!(
+                "peer {} at nonce capacity ({}), evicting oldest nonce",
+                peer_id, MAX_NONCES_PER_PEER
+            );
+            peer_store.remove(&oldest_nonce);
+        }
+    }
 
     if peer_store.contains_key(nonce_str) {
         return Err(anyhow::anyhow!("replay detected: nonce already seen"));

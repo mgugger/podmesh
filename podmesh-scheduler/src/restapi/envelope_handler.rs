@@ -8,6 +8,9 @@ use axum::{
 use log::{debug, error, warn};
 use protocol::machine::{Envelope as FbEnvelope, root_as_envelope};
 
+/// Maximum allowed request body size (16 MB) to prevent memory exhaustion attacks
+const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 use std::sync::Arc;
 
 // Secure envelope metadata stored in request extensions
@@ -212,7 +215,7 @@ pub async fn envelope_passthrough_middleware(
     if content_type == "application/octet-stream" {
         // Extract body bytes and parts
         let (mut parts, body) = request.into_parts();
-        let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
             Ok(bytes) => bytes,
             Err(_) => return Err(StatusCode::BAD_REQUEST),
         };
@@ -297,7 +300,7 @@ pub async fn envelope_middleware(
     if content_type == "application/octet-stream" {
         // Extract body bytes and parts
         let (mut parts, body) = request.into_parts();
-        let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
             Ok(bytes) => bytes,
             Err(_) => return Err(StatusCode::BAD_REQUEST),
         };
