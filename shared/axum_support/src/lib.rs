@@ -9,7 +9,11 @@ use tokio::net::TcpListener;
 use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 
+pub mod rate_limiter;
+pub use rate_limiter::{create_rate_limiter, rate_limit_middleware, RateLimiterState};
+
 /// Spawn a TCP axum server by binding to the provided address inside the task.
+/// This version supports ConnectInfo<SocketAddr> for rate limiting middleware.
 pub fn spawn_tcp_server(
     addr: SocketAddr,
     router: Router,
@@ -29,7 +33,14 @@ pub fn spawn_tcp_server(
                     label,
                     addr
                 );
-                if let Err(err) = axum::serve(listener, router).await {
+                // Use into_make_service_with_connect_info to provide ConnectInfo<SocketAddr>
+                // for rate limiting middleware
+                if let Err(err) = axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                {
                     warn!(
                         target: "axum_support",
                         "axum tcp server stopped (label={}, err={})",
@@ -51,6 +62,7 @@ pub fn spawn_tcp_server(
 }
 
 /// Spawn an axum server on an already-bound TCP listener.
+/// This version supports ConnectInfo<SocketAddr> for rate limiting middleware.
 pub fn spawn_tcp_listener(
     listener: TcpListener,
     router: Router,
@@ -69,7 +81,14 @@ pub fn spawn_tcp_listener(
             label,
             addr
         );
-        if let Err(err) = axum::serve(listener, router).await {
+        // Use into_make_service_with_connect_info to provide ConnectInfo<SocketAddr>
+        // for rate limiting middleware
+        if let Err(err) = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        {
             warn!(
                 target: "axum_support",
                 "axum tcp server stopped (label={}, err={})",

@@ -40,6 +40,14 @@ pub struct CapacityRequest {
     pub memory_bytes: u64,
     pub storage_bytes: u64,
     pub replicas: u32,
+    /// Number of hops remaining before this request stops being forwarded.
+    /// When 0, the request should not be re-broadcast to other peers.
+    #[serde(default = "default_max_hops")]
+    pub max_hops: u8,
+}
+
+fn default_max_hops() -> u8 {
+    crate::libp2p_constants::CAPACITY_REQUEST_DEFAULT_MAX_HOPS
 }
 
 impl CapacityRequest {
@@ -77,6 +85,7 @@ impl Default for CapacityRequest {
             memory_bytes: 0,
             storage_bytes: 0,
             replicas: 1,
+            max_hops: default_max_hops(),
         }
     }
 }
@@ -97,12 +106,31 @@ pub fn build_capacity_request_with_id(
     storage_bytes: u64,
     replicas: u32,
 ) -> Vec<u8> {
+    build_capacity_request_with_hops(
+        request_id,
+        cpu_milli,
+        memory_bytes,
+        storage_bytes,
+        replicas,
+        crate::libp2p_constants::CAPACITY_REQUEST_DEFAULT_MAX_HOPS,
+    )
+}
+
+pub fn build_capacity_request_with_hops(
+    request_id: &str,
+    cpu_milli: u32,
+    memory_bytes: u64,
+    storage_bytes: u64,
+    replicas: u32,
+    max_hops: u8,
+) -> Vec<u8> {
     serialize(&CapacityRequest {
         request_id: request_id.to_string(),
         replicas,
         cpu_milli,
         memory_bytes,
         storage_bytes,
+        max_hops,
     })
 }
 

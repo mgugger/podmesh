@@ -279,7 +279,7 @@ impl SwarmDriver {
         match event {
             MyBehaviourEvent::HandshakeRr(event) => self.handle_handshake_rr_event(event),
             MyBehaviourEvent::ApplyRr(event) => self.handle_apply_rr_event(event).await,
-            MyBehaviourEvent::DeleteRr(event) => self.handle_delete_rr_event(event),
+            MyBehaviourEvent::DeleteRr(event) => self.handle_delete_rr_event(event).await,
             MyBehaviourEvent::Gossipsub(event) => self.handle_gossipsub_event(event),
             MyBehaviourEvent::Kademlia(event) => behaviour::kademlia_event(event, None),
             MyBehaviourEvent::SchedulerRr(event) => {
@@ -355,11 +355,11 @@ impl SwarmDriver {
         }
     }
 
-    fn handle_delete_rr_event(&mut self, event: request_response::Event<Vec<u8>, Vec<u8>>) {
+    async fn handle_delete_rr_event(&mut self, event: request_response::Event<Vec<u8>, Vec<u8>>) {
         match event {
             request_response::Event::Message { message, peer, .. } => {
                 let local_peer = *self.swarm.local_peer_id();
-                behaviour::delete_message(message, peer, &mut self.swarm, local_peer);
+                behaviour::delete_message(message, peer, &mut self.swarm, local_peer).await;
             }
             request_response::Event::OutboundFailure { peer, error, .. } => {
                 behaviour::delete_outbound_failure(peer, error);

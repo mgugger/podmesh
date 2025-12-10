@@ -10,6 +10,7 @@ use axum::{
     middleware,
     routing::{delete, get, post},
 };
+use axum_support::{create_rate_limiter, rate_limit_middleware};
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 use protocol::libp2p_constants::{FREE_CAPACITY_PREFIX, FREE_CAPACITY_TIMEOUT_MS};
@@ -26,18 +27,24 @@ use tokio::{sync::watch, time::Duration};
 pub mod envelope_handler;
 use envelope_handler::{
     EnvelopeHandler, create_encrypted_response_with_key, create_response_for_envelope_metadata,
-    create_response_with_fallback,
 };
 
 async fn get_nodes(
     State(state): State<RestState>,
+    Extension(envelope_metadata): Extension<crate::restapi::envelope_handler::EnvelopeMetadata>,
     _headers: HeaderMap,
 ) -> Result<axum::response::Response<axum::body::Body>, axum::http::StatusCode> {
     let peers = state.peer_rx.borrow().clone();
     let response_data = protocol::machine::build_nodes_response(&peers);
 
-    // No envelope metadata available, return unencrypted response
-    create_response_with_fallback(&response_data).await
+    // Return encrypted response using envelope metadata
+    create_response_for_envelope_metadata(
+        &state.envelope_handler,
+        &response_data,
+        "nodes_response",
+        &envelope_metadata,
+    )
+    .await
 }
 
 async fn get_kem_public_key(State(_state): State<RestState>) -> String {
@@ -85,18 +92,66 @@ pub async fn get_manifest_cid_for_operation(operation_id: &str) -> Option<String
     map.get(operation_id).cloned()
 }
 
+/// TTL for task records in the task store (30 seconds).
+/// Tasks older than this will be cleaned up to prevent memory exhaustion.
+const TASK_STORE_TTL_SECS: u64 = 30;
+
+/// Interval between task store cleanup runs (10 seconds)
+const TASK_STORE_CLEANUP_INTERVAL_SECS: u64 = 10;
+
+/// Default rate limit for REST API (requests per minute per IP)
+pub const DEFAULT_RATE_LIMIT_PER_MINUTE: u32 = 100;
+
 pub fn build_router(
     peer_rx: watch::Receiver<Vec<String>>,
     control_tx: mpsc::UnboundedSender<crate::podmesh_p2p::control::Libp2pControl>,
     envelope_handler: std::sync::Arc<EnvelopeHandler>,
 ) -> Router {
+    build_router_with_rate_limit(peer_rx, control_tx, envelope_handler, DEFAULT_RATE_LIMIT_PER_MINUTE)
+}
+
+pub fn build_router_with_rate_limit(
+    peer_rx: watch::Receiver<Vec<String>>,
+    control_tx: mpsc::UnboundedSender<crate::podmesh_p2p::control::Libp2pControl>,
+    envelope_handler: std::sync::Arc<EnvelopeHandler>,
+    rate_limit_per_minute: u32,
+) -> Router {
     let task_store = Arc::new(RwLock::new(HashMap::new()));
+    let rate_limiter = create_rate_limiter(rate_limit_per_minute);
     
     // Set the global task store reference for workload integration
     tokio::spawn({
         let task_store_clone = Arc::clone(&task_store);
         async move {
             crate::workload_integration::set_task_store(task_store_clone).await;
+        }
+    });
+
+    // Background task to clean up stale task records (30 second TTL)
+    tokio::spawn({
+        let task_store_clone = Arc::clone(&task_store);
+        async move {
+            let cleanup_interval = Duration::from_secs(TASK_STORE_CLEANUP_INTERVAL_SECS);
+            let ttl = Duration::from_secs(TASK_STORE_TTL_SECS);
+            loop {
+                tokio::time::sleep(cleanup_interval).await;
+                let now = std::time::SystemTime::now();
+                let mut store = task_store_clone.write().await;
+                let before_count = store.len();
+                store.retain(|task_id, record| {
+                    match now.duration_since(record.created_at) {
+                        Ok(age) if age > ttl => {
+                            debug!("task_store cleanup: removing stale task_id={} age={:?}", task_id, age);
+                            false
+                        }
+                        _ => true,
+                    }
+                });
+                let removed = before_count - store.len();
+                if removed > 0 {
+                    info!("task_store cleanup: removed {} stale tasks, {} remaining", removed, store.len());
+                }
+            }
         }
     });
     
@@ -106,19 +161,13 @@ pub fn build_router(
         task_store,
         envelope_handler,
     };
-    Router::new()
+    
+    // Build the base router without debug routes
+    #[allow(unused_mut)]
+    let mut router = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/api/v1/kem_pubkey", get(get_kem_public_key))
         .route("/api/v1/signing_pubkey", get(get_signing_public_key))
-        .route("/debug/dht/active_announces", get(debug_active_announces))
-        .route("/debug/dht/peers", get(debug_dht_peers))
-        .route("/debug/peers", get(debug_peers))
-        .route("/debug/tasks", get(debug_all_tasks))
-        .route(
-            "/debug/workloads_by_peer/{peer_id}",
-            get(debug_workloads_by_peer),
-        )
-        .route("/debug/local_peer_id", get(debug_local_peer_id))
         .route("/tasks/{task_id}/manifest_id", get(get_task_manifest_id))
         .route("/tasks", post(create_task))
         .route("/tasks/{task_id}", get(get_task_status))
@@ -135,7 +184,26 @@ pub fn build_router(
         .route(
             "/runtime/workloads/{workload_id}/logs",
             get(get_runtime_workload_logs),
-        )
+        );
+
+    // Debug endpoints only available when debug-endpoints feature is enabled
+    // These are NOT available in production builds for security
+    #[cfg(feature = "debug-endpoints")]
+    {
+        router = router
+            .route("/debug/dht/active_announces", get(debug_active_announces))
+            .route("/debug/dht/peers", get(debug_dht_peers))
+            .route("/debug/peers", get(debug_peers))
+            .route("/debug/tasks", get(debug_all_tasks))
+            .route("/debug/workloads_by_peer/{peer_id}", get(debug_workloads_by_peer))
+            .route("/debug/local_peer_id", get(debug_local_peer_id));
+    }
+
+    router
+        // Add rate limiter state as extension for middleware
+        .layer(Extension(rate_limiter))
+        // Apply rate limiting middleware (requires ConnectInfo<SocketAddr> from server)
+        .layer(middleware::from_fn(rate_limit_middleware))
         // Add envelope middleware to decrypt incoming requests and extract peer keys
         .layer(middleware::from_fn_with_state(
             state.envelope_handler.clone(),
@@ -347,19 +415,18 @@ async fn create_response_for_candidates(
     response_data: &[u8],
     envelope_metadata: &crate::restapi::envelope_handler::EnvelopeMetadata,
 ) -> Result<axum::response::Response<axum::body::Body>, axum::http::StatusCode> {
-    if !envelope_metadata.kem_pubkey.is_empty() {
-        create_encrypted_response_with_key(
-            &state.envelope_handler,
-            response_data,
-            "candidates_response",
-            envelope_metadata.peer_id.as_deref(),
-            &envelope_metadata.kem_pubkey,
-        )
-        .await
-    } else {
-        // No KEM key in metadata, return unencrypted response
-        create_response_with_fallback(response_data).await
+    if envelope_metadata.kem_pubkey.is_empty() {
+        error!("No KEM key in metadata for candidates response - rejecting request");
+        return Err(StatusCode::BAD_REQUEST);
     }
+    create_encrypted_response_with_key(
+        &state.envelope_handler,
+        response_data,
+        "candidates_response",
+        envelope_metadata.peer_id.as_deref(),
+        &envelope_metadata.kem_pubkey,
+    )
+    .await
 }
 
 /// Discover providers for a task/manifest via DHT
@@ -680,22 +747,22 @@ pub async fn create_task(
     );
 
     // Use KEM key directly from envelope metadata for secure response encryption
-    if !envelope_metadata.kem_pubkey.is_empty() {
-        create_encrypted_response_with_key(
-            &state.envelope_handler,
-            &response_data,
-            "task_create_response",
-            envelope_metadata.peer_id.as_deref(),
-            &envelope_metadata.kem_pubkey,
-        )
-        .await
-    } else {
-        // No KEM key in metadata, return unencrypted response
-        create_response_with_fallback(&response_data).await
+    if envelope_metadata.kem_pubkey.is_empty() {
+        error!("No KEM key in metadata for task create response - rejecting request");
+        return Err(StatusCode::BAD_REQUEST);
     }
+    create_encrypted_response_with_key(
+        &state.envelope_handler,
+        &response_data,
+        "task_create_response",
+        envelope_metadata.peer_id.as_deref(),
+        &envelope_metadata.kem_pubkey,
+    )
+    .await
 }
 
 // Debug: return the active announces (provider CIDs) tracked by the control module
+#[cfg(feature = "debug-endpoints")]
 async fn debug_active_announces(State(_state): State<RestState>) -> axum::Json<serde_json::Value> {
     // access the static ACTIVE_ANNOUNCES in control module
     let cids = crate::podmesh_p2p::control::list_active_announces();
@@ -703,6 +770,7 @@ async fn debug_active_announces(State(_state): State<RestState>) -> axum::Json<s
 }
 
 /// Debug endpoint to get local peer ID
+#[cfg(feature = "debug-endpoints")]
 async fn debug_local_peer_id(State(state): State<RestState>) -> axum::Json<serde_json::Value> {
     // Get the local peer ID from the control channel
     use tokio::sync::mpsc;
@@ -735,6 +803,7 @@ async fn debug_local_peer_id(State(state): State<RestState>) -> axum::Json<serde
 }
 
 /// Debug endpoint to get workloads deployed by a specific peer ID
+#[cfg(feature = "debug-endpoints")]
 async fn debug_workloads_by_peer(
     Path(peer_id): Path<String>,
     State(_state): State<RestState>,
@@ -818,6 +887,7 @@ async fn debug_workloads_by_peer(
 }
 
 // Debug: get DHT peer information
+#[cfg(feature = "debug-endpoints")]
 async fn debug_dht_peers(State(state): State<RestState>) -> axum::Json<serde_json::Value> {
     use tokio::sync::mpsc;
 
@@ -854,6 +924,7 @@ async fn debug_dht_peers(State(state): State<RestState>) -> axum::Json<serde_jso
     }
 }
 
+#[cfg(feature = "debug-endpoints")]
 async fn debug_peers(State(state): State<RestState>) -> axum::Json<serde_json::Value> {
     let peers: Vec<String> = state.peer_rx.borrow().clone();
 
@@ -865,6 +936,7 @@ async fn debug_peers(State(state): State<RestState>) -> axum::Json<serde_json::V
 }
 
 // Debug: list all tasks with their manifest CIDs
+#[cfg(feature = "debug-endpoints")]
 async fn debug_all_tasks(State(state): State<RestState>) -> axum::Json<serde_json::Value> {
     let store = state.task_store.read().await;
     let mut tasks = serde_json::Map::new();
@@ -887,15 +959,29 @@ async fn debug_all_tasks(State(state): State<RestState>) -> axum::Json<serde_jso
 async fn get_task_manifest_id(
     Path(task_id): Path<String>,
     State(state): State<RestState>,
+    Extension(envelope_metadata): Extension<crate::restapi::envelope_handler::EnvelopeMetadata>,
     _headers: HeaderMap,
 ) -> Result<axum::response::Response<axum::body::Body>, axum::http::StatusCode> {
+    // Require KEM key for encrypted response
+    if envelope_metadata.kem_pubkey.is_empty() {
+        error!("No KEM key in metadata for get_task_manifest_id - rejecting request");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let maybe = { state.task_store.read().await.get(&task_id).cloned() };
     let task = match maybe {
         Some(t) => t,
         None => {
             let error_response =
                 protocol::machine::build_task_status_response("", "Error", &[], None);
-            return create_response_with_fallback(&error_response).await;
+            return create_encrypted_response_with_key(
+                &state.envelope_handler,
+                &error_response,
+                "task_status_response",
+                envelope_metadata.peer_id.as_deref(),
+                &envelope_metadata.kem_pubkey,
+            )
+            .await;
         }
     };
 
@@ -904,7 +990,14 @@ async fn get_task_manifest_id(
         None => {
             let error_response =
                 protocol::machine::build_task_status_response("", "Error", &[], None);
-            return create_response_with_fallback(&error_response).await;
+            return create_encrypted_response_with_key(
+                &state.envelope_handler,
+                &error_response,
+                "task_status_response",
+                envelope_metadata.peer_id.as_deref(),
+                &envelope_metadata.kem_pubkey,
+            )
+            .await;
         }
     };
 
@@ -934,22 +1027,42 @@ async fn get_task_manifest_id(
                 );
                 let error_response =
                     protocol::machine::build_task_status_response("", "Error", &[], None);
-                return create_response_with_fallback(&error_response).await;
+                return create_encrypted_response_with_key(
+                    &state.envelope_handler,
+                    &error_response,
+                    "task_status_response",
+                    envelope_metadata.peer_id.as_deref(),
+                    &envelope_metadata.kem_pubkey,
+                )
+                .await;
             }
         }
     };
 
     let response_data = serde_json::json!({"ok": true, "manifest_id": &manifest_id});
     let response_str = serde_json::to_string(&response_data).unwrap_or_default();
-    // No envelope metadata available, return unencrypted response
-    create_response_with_fallback(response_str.as_bytes()).await
+    create_encrypted_response_with_key(
+        &state.envelope_handler,
+        response_str.as_bytes(),
+        "task_manifest_id_response",
+        envelope_metadata.peer_id.as_deref(),
+        &envelope_metadata.kem_pubkey,
+    )
+    .await
 }
 
 pub async fn get_task_status(
     Path(task_id): Path<String>,
     State(state): State<RestState>,
+    Extension(envelope_metadata): Extension<crate::restapi::envelope_handler::EnvelopeMetadata>,
     _headers: HeaderMap,
 ) -> Result<axum::response::Response<axum::body::Body>, axum::http::StatusCode> {
+    // Require KEM key for encrypted response
+    if envelope_metadata.kem_pubkey.is_empty() {
+        error!("No KEM key in metadata for get_task_status - rejecting request");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let maybe = { state.task_store.read().await.get(&task_id).cloned() };
     if let Some(r) = maybe {
         let assigned = r.assigned_peers.unwrap_or_default();
@@ -960,10 +1073,24 @@ pub async fn get_task_status(
             &assigned,
             r.manifest_cid.as_deref(),
         );
-        return create_response_with_fallback(&response_data).await;
+        return create_encrypted_response_with_key(
+            &state.envelope_handler,
+            &response_data,
+            "task_status_response",
+            envelope_metadata.peer_id.as_deref(),
+            &envelope_metadata.kem_pubkey,
+        )
+        .await;
     }
     let error_response = protocol::machine::build_task_status_response("", "Error", &[], None);
-    create_response_with_fallback(&error_response).await
+    create_encrypted_response_with_key(
+        &state.envelope_handler,
+        &error_response,
+        "task_status_response",
+        envelope_metadata.peer_id.as_deref(),
+        &envelope_metadata.kem_pubkey,
+    )
+    .await
 }
 
 /// Delete a task by task ID - discovers providers and sends delete requests
@@ -1366,6 +1493,12 @@ pub async fn apply_direct(
         body.to_vec()
     };
 
+    // Require KEM key for encrypted response
+    if envelope_metadata.kem_pubkey.is_empty() {
+        error!("No KEM key in metadata for apply_direct - rejecting request");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     // Parse the peer string into a PeerId
     let target_peer_id: libp2p::PeerId = match peer_id.parse() {
         Ok(id) => id,
@@ -1376,7 +1509,14 @@ pub async fn apply_direct(
                 "unknown",
                 &format!("Invalid peer ID: {}", e),
             );
-            return create_response_with_fallback(&error_response).await;
+            return create_encrypted_response_with_key(
+                &state.envelope_handler,
+                &error_response,
+                "apply_response",
+                envelope_metadata.peer_id.as_deref(),
+                &envelope_metadata.kem_pubkey,
+            )
+            .await;
         }
     };
 
@@ -1395,7 +1535,14 @@ pub async fn apply_direct(
             "unknown",
             "Failed to forward request to libp2p",
         );
-        return create_response_with_fallback(&error_response).await;
+        return create_encrypted_response_with_key(
+            &state.envelope_handler,
+            &error_response,
+            "apply_response",
+            envelope_metadata.peer_id.as_deref(),
+            &envelope_metadata.kem_pubkey,
+        )
+        .await;
     }
 
     // Wait for response with timeout
@@ -1426,8 +1573,15 @@ pub async fn apply_direct(
         }
     };
 
-    // Return response (simplified - no encryption needed for this case)
-    create_response_with_fallback(&result).await
+    // Return encrypted response
+    create_encrypted_response_with_key(
+        &state.envelope_handler,
+        &result,
+        "apply_response",
+        envelope_metadata.peer_id.as_deref(),
+        &envelope_metadata.kem_pubkey,
+    )
+    .await
 }
 
 /// Forward a DeleteRequest directly to a specific peer via libp2p (passthrough with end-to-end encryption)
@@ -1448,6 +1602,12 @@ pub async fn delete_direct(
         body.to_vec()
     };
 
+    // Require KEM key for encrypted response
+    if envelope_metadata.kem_pubkey.is_empty() {
+        error!("No KEM key in metadata for delete_direct - rejecting request");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     // Parse the peer string into a PeerId
     let target_peer_id: libp2p::PeerId = match peer_id.parse() {
         Ok(id) => id,
@@ -1460,7 +1620,14 @@ pub async fn delete_direct(
                 "unknown",
                 &[],
             );
-            return create_response_with_fallback(&error_response).await;
+            return create_encrypted_response_with_key(
+                &state.envelope_handler,
+                &error_response,
+                "delete_response",
+                envelope_metadata.peer_id.as_deref(),
+                &envelope_metadata.kem_pubkey,
+            )
+            .await;
         }
     };
 
@@ -1481,7 +1648,14 @@ pub async fn delete_direct(
             "unknown",
             &[],
         );
-        return create_response_with_fallback(&error_response).await;
+        return create_encrypted_response_with_key(
+            &state.envelope_handler,
+            &error_response,
+            "delete_response",
+            envelope_metadata.peer_id.as_deref(),
+            &envelope_metadata.kem_pubkey,
+        )
+        .await;
     }
 
     // Wait for response with timeout
@@ -1518,8 +1692,15 @@ pub async fn delete_direct(
         }
     };
 
-    // Return response
-    create_response_with_fallback(&result).await
+    // Return encrypted response
+    create_encrypted_response_with_key(
+        &state.envelope_handler,
+        &result,
+        "delete_response",
+        envelope_metadata.peer_id.as_deref(),
+        &envelope_metadata.kem_pubkey,
+    )
+    .await
 }
 
 #[derive(Serialize)]

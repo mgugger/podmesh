@@ -11,7 +11,7 @@ tokio = { workspace = true }
 podmesh-proxy = { workspace = true }
 podmesh-sidecar = { workspace = true }
 protocol = { workspace = true }
-podmesh-scheduler = { workspace = true }
+podmesh-scheduler = { workspace = true, features = ["debug-endpoints"] }
 podctl = { workspace = true }
 crypto = { workspace = true }
 axum = { workspace = true }

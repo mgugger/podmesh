@@ -141,6 +141,8 @@ struct CapacityReservation {
     memory_bytes: u64,
     storage_bytes: u64,
     manifest_id: Option<String>,
+    /// Owner's public key (base64-encoded) to bind reservation to specific owner
+    owner_pubkey: Option<String>,
     expires_at: Instant,
 }
 
@@ -189,10 +191,17 @@ impl ResourceVerifier {
 
     /// Reserve capacity for a request for a limited time window. Returns Ok when the reservation was
     /// accepted or refreshed, and Err when the resources are no longer available.
+    /// 
+    /// # Arguments
+    /// * `request_id` - Unique ID for this capacity request
+    /// * `manifest_id` - Optional manifest ID to bind the reservation to
+    /// * `owner_pubkey` - Owner's public key (base64) to bind reservation to specific owner
+    /// * `request` - Resource requirements for the reservation
     pub async fn reserve_capacity(
         &self,
         request_id: &str,
         manifest_id: Option<&str>,
+        owner_pubkey: Option<&str>,
         request: &ResourceRequest,
     ) -> anyhow::Result<()> {
         self.prune_expired_reservations().await;
@@ -204,6 +213,7 @@ impl ResourceVerifier {
                 if let Some(manifest) = manifest_id {
                     existing.manifest_id = Some(manifest.to_string());
                 }
+                // Note: We don't update owner_pubkey on refresh - it must match the original
                 return Ok(());
             }
         }
@@ -264,6 +274,7 @@ impl ResourceVerifier {
                 memory_bytes: request_memory,
                 storage_bytes: request_storage,
                 manifest_id: manifest_id.map(|m| m.to_string()),
+                owner_pubkey: owner_pubkey.map(|p| p.to_string()),
                 expires_at: Instant::now() + Self::reservation_hold_duration(),
             },
         );
@@ -272,12 +283,52 @@ impl ResourceVerifier {
     }
 
     /// Check whether a manifest has an active reservation created by a prior capacity reply.
-    pub async fn has_active_reservation_for_manifest(&self, manifest_id: &str) -> bool {
+    /// Also verifies that the owner's public key matches if provided.
+    /// 
+    /// # Arguments
+    /// * `manifest_id` - The manifest ID to check
+    /// * `owner_pubkey` - Optional owner's public key (base64) to verify ownership
+    /// 
+    /// # Returns
+    /// `true` if an active reservation exists for the manifest AND (if owner_pubkey is provided)
+    /// the owner matches the reservation's recorded owner.
+    pub async fn has_active_reservation_for_manifest(
+        &self,
+        manifest_id: &str,
+        owner_pubkey: Option<&str>,
+    ) -> bool {
         self.prune_expired_reservations().await;
         let reservations = self.reservations.read().await;
-        reservations
-            .values()
-            .any(|reservation| reservation.manifest_id.as_deref() == Some(manifest_id))
+        reservations.values().any(|reservation| {
+            let manifest_matches = reservation.manifest_id.as_deref() == Some(manifest_id);
+            if !manifest_matches {
+                return false;
+            }
+            
+            // If owner verification is requested, check that the owner matches
+            if let Some(requesting_owner) = owner_pubkey {
+                // Reservation must have an owner recorded and it must match
+                match &reservation.owner_pubkey {
+                    Some(reserved_owner) => reserved_owner == requesting_owner,
+                    None => {
+                        // Reservation has no owner - reject for security
+                        log::warn!(
+                            "Reservation for manifest {} has no owner recorded, rejecting claim by {}",
+                            manifest_id,
+                            requesting_owner
+                        );
+                        false
+                    }
+                }
+            } else {
+                // No owner verification requested - allow (backward compat, but log warning)
+                log::warn!(
+                    "Reservation check for manifest {} without owner verification",
+                    manifest_id
+                );
+                true
+            }
+        })
     }
 
     /// Update system resources by collecting metrics from the host
@@ -823,13 +874,20 @@ mod tests {
         );
 
         verifier
-            .reserve_capacity("req-test", Some("manifest-test"), &request)
+            .reserve_capacity("req-test", Some("manifest-test"), Some("owner-pubkey-test"), &request)
             .await
             .expect("reservation should succeed");
 
         assert!(
             verifier
-                .has_active_reservation_for_manifest("manifest-test")
+                .has_active_reservation_for_manifest("manifest-test", Some("owner-pubkey-test"))
+                .await
+        );
+
+        // Verify that a different owner cannot claim this reservation
+        assert!(
+            !verifier
+                .has_active_reservation_for_manifest("manifest-test", Some("different-owner"))
                 .await
         );
 
@@ -864,7 +922,7 @@ mod tests {
         );
 
         verifier
-            .reserve_capacity("req-expire", Some("manifest-expire"), &request)
+            .reserve_capacity("req-expire", Some("manifest-expire"), Some("owner-expire"), &request)
             .await
             .expect("reservation should succeed");
 
@@ -877,7 +935,7 @@ mod tests {
 
         assert!(
             !verifier
-                .has_active_reservation_for_manifest("manifest-expire")
+                .has_active_reservation_for_manifest("manifest-expire", Some("owner-expire"))
                 .await,
             "Expired reservation should no longer be reported as active"
         );

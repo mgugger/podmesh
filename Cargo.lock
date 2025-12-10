@@ -286,6 +286,8 @@ dependencies = [
  "anyhow",
  "axum",
  "log",
+ "lru",
+ "parking_lot",
  "tokio",
 ]
 
@@ -2448,6 +2450,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "uuid",
 ]
@@ -2513,10 +2516,12 @@ dependencies = [
  "futures",
  "libp2p",
  "log",
+ "lru",
  "once_cell",
  "p2p",
  "parking_lot",
  "podctl",
+ "podmesh-scheduler",
  "protocol",
  "rand 0.8.5",
  "reqwest",

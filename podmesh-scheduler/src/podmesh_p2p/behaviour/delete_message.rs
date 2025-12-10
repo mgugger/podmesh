@@ -8,18 +8,16 @@ const UNKNOWN_OPERATION: &str = "unknown";
 const UNKNOWN_MANIFEST: &str = "unknown";
 const UNSIGNED_MESSAGE: &str = "unsigned or invalid envelope";
 const INVALID_FORMAT: &str = "invalid delete request format";
-const ACK_MESSAGE: &str = "delete request received and processing";
 
 fn delete_error_response(message: &str) -> Vec<u8> {
     machine::build_delete_response(false, UNKNOWN_OPERATION, message, UNKNOWN_MANIFEST, &[])
 }
 
-fn delete_ack_response(operation_id: &str, manifest_id: &str) -> Vec<u8> {
-    machine::build_delete_response(true, operation_id, ACK_MESSAGE, manifest_id, &[])
-}
-
 /// Handle a delete message (request or response)
-pub fn delete_message(
+/// 
+/// This function is async to allow waiting for workload termination before responding,
+/// ensuring the caller receives the actual deletion result rather than just an ACK.
+pub async fn delete_message(
     message: request_response::Message<Vec<u8>, Vec<u8>>,
     peer: libp2p::PeerId,
     swarm: &mut libp2p::Swarm<super::MyBehaviour>,
@@ -88,47 +86,38 @@ pub fn delete_message(
                         delete_req.force()
                     );
 
-                    // Process the delete request asynchronously
                     let manifest_id = delete_req.manifest_id().unwrap_or("").to_string();
                     let operation_id = delete_req.operation_id().unwrap_or("").to_string();
-                    let force = delete_req.force();
                     let requesting_peer = peer.to_string();
                     let envelope_pubkey_inner = envelope_pubkey.clone();
 
-                    tokio::spawn(async move {
-                        let (success, message, removed_workloads) = process_delete_request(
-                            &manifest_id,
-                            force,
-                            &envelope_pubkey_inner,
-                            &requesting_peer,
-                        )
-                        .await;
+                    // Process delete synchronously to ensure workload termination completes
+                    // before responding - this prevents race conditions where the caller
+                    // receives success but the workload hasn't actually been removed yet
+                    let (success, message, removed_workloads) = process_delete_request(
+                        &manifest_id,
+                        &envelope_pubkey_inner,
+                        &requesting_peer,
+                    )
+                    .await;
 
-                        let _response = machine::build_delete_response(
-                            success,
-                            &operation_id,
-                            &message,
-                            &manifest_id,
-                            &removed_workloads,
-                        );
+                    info!(
+                        "Delete request processed: success={} message={} removed_workloads={:?}",
+                        success, message, removed_workloads
+                    );
 
-                        // Note: In a real implementation, we'd need to send this response back through a channel
-                        // For now, we'll just log the result
-                        info!(
-                            "Delete request processed: success={} message={} removed_workloads={:?}",
-                            success, message, removed_workloads
-                        );
-                    });
-
-                    // Send immediate acknowledgment (the actual processing happens async)
-                    let ack_response = delete_ack_response(
-                        delete_req.operation_id().unwrap_or(UNKNOWN_OPERATION),
-                        delete_req.manifest_id().unwrap_or(UNKNOWN_MANIFEST),
+                    // Send the actual result, not just an ACK
+                    let response = machine::build_delete_response(
+                        success,
+                        &operation_id,
+                        &message,
+                        &manifest_id,
+                        &removed_workloads,
                     );
                     let _ = swarm
                         .behaviour_mut()
                         .delete_rr
-                        .send_response(channel, ack_response);
+                        .send_response(channel, response);
                 }
                 Err(e) => {
                     error!("Failed to parse delete request: {}", e);
@@ -165,7 +154,6 @@ pub fn delete_message(
 /// Process a delete request by verifying ownership and removing workloads
 pub(crate) async fn process_delete_request(
     manifest_id: &str,
-    force: bool,
     envelope_pubkey: &[u8],
     _requesting_peer: &str,
 ) -> (bool, String, Vec<String>) {
@@ -190,18 +178,12 @@ pub(crate) async fn process_delete_request(
             info!("Delete ownership verified for manifest_id={}", manifest_id);
         }
         OwnershipStatus::Mismatch => {
-            if force {
-                warn!(
-                    "Forced delete proceeding despite ownership mismatch for manifest_id={}",
-                    manifest_id
-                );
-            } else {
-                warn!(
-                    "Delete ownership mismatch for manifest_id={}, denying request",
-                    manifest_id
-                );
-                return (false, "ownership verification failed".to_string(), vec![]);
-            }
+            // Force delete bypass removed for security - always enforce ownership
+            warn!(
+                "Delete ownership mismatch for manifest_id={}, denying request",
+                manifest_id
+            );
+            return (false, "ownership verification failed".to_string(), vec![]);
         }
         OwnershipStatus::Unknown => {
             warn!(

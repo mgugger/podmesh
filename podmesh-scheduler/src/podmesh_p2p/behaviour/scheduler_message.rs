@@ -70,8 +70,12 @@ fn handle_scheduler_request(
     let crate::podmesh_p2p::security::VerifiedEnvelope {
         payload: effective_request,
         timestamp_ms,
+        pubkey: requester_pubkey,
         ..
     } = verified;
+    
+    // Convert requester's pubkey to base64 for storage in reservation
+    let requester_pubkey_b64 = crypto::b64_encode(&requester_pubkey);
 
     let Some(request_ctx) = parse_capacity_request(&effective_request, timestamp_ms, &peer) else {
         return;
@@ -94,6 +98,7 @@ fn handle_scheduler_request(
         &request_ctx.resource_request,
         &request_ctx.request_id,
         &request_ctx.manifest_id,
+        Some(&requester_pubkey_b64),
     ) {
         return;
     }
@@ -201,16 +206,19 @@ fn reserve_capacity_for_request(
     resource_request: &ResourceRequest,
     request_id: &str,
     manifest_id: &str,
+    owner_pubkey: Option<&str>,
 ) -> bool {
     let reserve_handle = tokio::runtime::Handle::current();
     let verifier_clone = verifier.clone();
     let request_clone = resource_request.clone();
     let reserve_request_id = request_id.to_string();
     let reserve_manifest_id = manifest_id.to_string();
+    let reserve_owner_pubkey = owner_pubkey.map(|s| s.to_string());
     let reservation = std::thread::spawn(move || {
         reserve_handle.block_on(verifier_clone.reserve_capacity(
             &reserve_request_id,
             Some(reserve_manifest_id.as_str()),
+            reserve_owner_pubkey.as_deref(),
             &request_clone,
         ))
     })

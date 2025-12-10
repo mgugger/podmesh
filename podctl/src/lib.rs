@@ -39,17 +39,25 @@ fn compute_manifest_id_for_owner(
     manifest_json: &JsonValue,
     owner_pubkey: &[u8],
 ) -> anyhow::Result<String> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use sha2::{Digest, Sha256};
 
     let manifest_name = extract_manifest_name_from_json(manifest_json).ok_or_else(|| {
         anyhow::anyhow!("Manifest must have a name field in metadata for deployment")
     })?;
 
-    let mut hasher = DefaultHasher::new();
-    owner_pubkey.hash(&mut hasher);
-    manifest_name.hash(&mut hasher);
-    Ok(format!("{:016x}", hasher.finish()))
+    // Use SHA-256 for cryptographically secure manifest ID generation.
+    // Hash format: SHA256(owner_pubkey || manifest_name)
+    let mut hasher = Sha256::new();
+    hasher.update(owner_pubkey);
+    hasher.update(manifest_name.as_bytes());
+    let result = hasher.finalize();
+    // Use first 16 bytes (128 bits) encoded as hex for the manifest ID
+    // Format as lowercase hex string manually to avoid hex dependency
+    let hex_chars: String = result[..16]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    Ok(hex_chars)
 }
 
 fn parse_selected_nodes(peers: &[String]) -> anyhow::Result<Vec<(String, String)>> {

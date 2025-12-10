@@ -27,12 +27,17 @@ thiserror = { workspace = true }
 p2p = { workspace = true }
 axum-support = { workspace = true }
 parking_lot = { workspace = true }
+lru = { workspace = true }
 
 [dev-dependencies]
 podctl = { workspace = true }
 reqwest = { workspace = true }
 serial_test = { workspace = true }
+# Enable debug-endpoints for integration tests in this crate
+podmesh-scheduler = { path = ".", features = ["debug-endpoints"] }
 
 [features]
 default = []
 podman-tests = []
+# Enable debug REST endpoints (/debug/*) - only enable for testing
+debug-endpoints = []

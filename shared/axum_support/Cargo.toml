@@ -8,3 +8,5 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true }
+parking_lot = { workspace = true }
+lru = { workspace = true }

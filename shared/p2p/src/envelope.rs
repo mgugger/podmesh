@@ -4,8 +4,10 @@ use uuid::Uuid;
 
 use crate::util::timestamp_millis;
 
-/// Maximum allowed clock drift for envelope timestamps (5 minutes in milliseconds)
-const MAX_TIMESTAMP_DRIFT_MS: u64 = 5 * 60 * 1000;
+/// Maximum allowed clock drift for envelope timestamps (90 seconds in milliseconds).
+/// This is tighter than the original 5 minutes to reduce replay attack windows
+/// while still allowing for reasonable clock skew between nodes.
+const MAX_TIMESTAMP_DRIFT_MS: u64 = 90 * 1000;
 
 /// Signed envelope bytes alongside the generated nonce/timestamp.
 pub struct SignedEnvelope {

@@ -266,18 +266,20 @@ pub async fn handle_apply_message_with_workload_manager(
                             return;
                         }
 
+                        // Verify the reservation exists AND belongs to this owner
+                        let owner_pubkey_b64 = crypto::b64_encode(&owner_pubkey);
                         let reservation_ok = get_global_resource_verifier()
-                            .has_active_reservation_for_manifest(manifest_id)
+                            .has_active_reservation_for_manifest(manifest_id, Some(&owner_pubkey_b64))
                             .await;
                         if !reservation_ok {
                             warn!(
-                                "Apply request for manifest_id={} from peer={} without prior reservation",
+                                "Apply request for manifest_id={} from peer={} without prior reservation or owner mismatch",
                                 manifest_id, peer
                             );
                             let error_response = machine::build_apply_response(
                                 false,
                                 manifest_id,
-                                "no active capacity reservation",
+                                "no active capacity reservation for this owner",
                             );
                             let _ = swarm
                                 .behaviour_mut()
@@ -1064,12 +1066,11 @@ pub async fn process_enhanced_self_delete_request(envelope_bytes: &[u8]) -> Resu
         .operation_id()
         .unwrap_or("unknown-operation")
         .to_string();
-    let force = delete_req.force();
+    // force parameter removed - ownership is always enforced
 
     let (success, message, removed_workloads) =
         crate::podmesh_p2p::behaviour::delete_message::process_delete_request(
             &manifest_id,
-            force,
             &owner_pubkey,
             peer_id,
         )

@@ -409,64 +409,44 @@ pub async fn create_encrypted_response_with_key(
                     Ok(response)
                 }
                 Err(e) => {
-                    // If encryption fails, log the issue and fall back to unencrypted response
+                    // Encryption failed - return error, do NOT fall back to unencrypted
                     error!(
-                        "Failed to encrypt response for peer {}: {} - falling back to unencrypted response",
+                        "Failed to encrypt response for peer {}: {} - rejecting request",
                         peer_id, e
                     );
-
-                    // Send unencrypted postcard response as a fallback
-                    let response = axum::response::Response::builder()
-                        .header("content-type", "application/octet-stream")
-                        .body(axum::body::Body::from(payload.to_vec()))
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                    Ok(response)
+                    Err(StatusCode::INTERNAL_SERVER_ERROR)
                 }
             }
         }
         None => {
-            // No peer ID provided, send unencrypted response
-            let response = axum::response::Response::builder()
-                .header("content-type", "application/octet-stream")
-                .body(axum::body::Body::from(payload.to_vec()))
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            Ok(response)
+            // No peer ID provided - return error, do NOT send unencrypted
+            error!("No peer ID provided for encrypted response - rejecting request");
+            Err(StatusCode::BAD_REQUEST)
         }
     }
 }
 
-/// Helper to create responses that fall back to unencrypted when no envelope metadata is available
-pub async fn create_response_with_fallback(
-    payload: &[u8],
-) -> Result<axum::response::Response<axum::body::Body>, StatusCode> {
-    // Since we removed caching, we can only return unencrypted responses
-    // for endpoints that don't have envelope metadata
-    let response = axum::response::Response::builder()
-        .header("content-type", "application/octet-stream")
-        .body(axum::body::Body::from(payload.to_vec()))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(response)
-}
-
-/// Create an encrypted response when metadata provides the recipient KEM key
+/// Create an encrypted response when metadata provides the recipient KEM key.
+/// Returns an error if no KEM key is available - all responses MUST be encrypted.
 pub async fn create_response_for_envelope_metadata(
     envelope_handler: &Arc<EnvelopeHandler>,
     payload: &[u8],
     payload_type: &str,
     metadata: &EnvelopeMetadata,
 ) -> Result<axum::response::Response<axum::body::Body>, StatusCode> {
-    if !metadata.kem_pubkey.is_empty() {
-        return create_encrypted_response_with_key(
-            envelope_handler,
-            payload,
-            payload_type,
-            metadata.peer_id.as_deref(),
-            &metadata.kem_pubkey,
-        )
-        .await;
+    if metadata.kem_pubkey.is_empty() {
+        error!("No KEM public key in envelope metadata - cannot encrypt response, rejecting request");
+        return Err(StatusCode::BAD_REQUEST);
     }
 
-    create_response_with_fallback(payload).await
+    create_encrypted_response_with_key(
+        envelope_handler,
+        payload,
+        payload_type,
+        metadata.peer_id.as_deref(),
+        &metadata.kem_pubkey,
+    )
+    .await
 }
 
 /// Extract peer ID from request state/headers

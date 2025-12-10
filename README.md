@@ -6,7 +6,7 @@ A scheduler for pods built with libp2p.
 * podmesh-proxy is the ingress / egress node
 * podmesh-sidecar is the sidecar in the pod that connects to the proxy
 
-* See deploy/README.md for usage
+* See deploy/README.md for usage and local deployment
 
 ## Testing
 

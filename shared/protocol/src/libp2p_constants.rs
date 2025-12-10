@@ -150,3 +150,9 @@ pub const GOSSIPSUB_MESH_N_HIGH: usize = 6;
 
 /// Minimum outbound mesh size for gossipsub
 pub const GOSSIPSUB_MESH_OUTBOUND_MIN: usize = 1;
+
+// === CAPACITY REQUEST CONSTANTS ===
+
+/// Default maximum hops for capacity requests before they stop being forwarded.
+/// This limits amplification attacks while still allowing mesh-wide discovery.
+pub const CAPACITY_REQUEST_DEFAULT_MAX_HOPS: u8 = 3;
