@@ -259,12 +259,17 @@ pub async fn get_candidates(
         task_id,
         uuid::Uuid::new_v4()
     );
-    let capacity_fb = protocol::machine::build_capacity_request_with_id(
+    // Include the CLI's signing pubkey as owner so worker nodes create reservations
+    // bound to the actual owner, not the relay/bootstrap scheduler.
+    let owner_pubkey_b64 = crypto::b64_encode(&envelope_metadata.signing_pubkey);
+    let capacity_fb = protocol::machine::build_capacity_request_full(
         &request_id,
         500u32,
         512u64 * 1024 * 1024,
         10u64 * 1024 * 1024 * 1024,
         requested_replicas as u32,
+        protocol::libp2p_constants::CAPACITY_REQUEST_DEFAULT_MAX_HOPS,
+        &owner_pubkey_b64,
     );
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<String>();
     let _ = state.control_tx.send(

@@ -42,14 +42,15 @@ fn forward_capacity_request(
     new_hops: u8,
     request_id: &str,
 ) {
-    // Build a new capacity request with the decremented hop count
-    let forwarded_payload = protocol::machine::build_capacity_request_with_hops(
+    // Build a new capacity request with the decremented hop count, preserving owner_pubkey
+    let forwarded_payload = protocol::machine::build_capacity_request_full(
         request_id,
         cap_req.cpu_milli,
         cap_req.memory_bytes,
         cap_req.storage_bytes,
         cap_req.replicas,
         new_hops,
+        &cap_req.owner_pubkey,
     );
 
     // Sign and publish the forwarded request
@@ -207,10 +208,15 @@ pub fn gossipsub_message(
         }
 
         // Reserve resources for a short period to back the bid.
-        // Include the requester's public key to bind the reservation to the specific owner.
+        // Use the owner_pubkey from the capacity request if present (this is the CLI's pubkey),
+        // otherwise fall back to the envelope sender's pubkey for backward compatibility.
         let reserve_request_id = orig_request_id.clone();
         let reserve_manifest_id = manifest_id.clone();
-        let reserve_owner_pubkey = requester_pubkey_b64.clone();
+        let reserve_owner_pubkey = if !cap_req.owner_pubkey.is_empty() {
+            cap_req.owner_pubkey.clone()
+        } else {
+            requester_pubkey_b64.clone()
+        };
         let verifier_for_reserve = verifier.clone();
         let resource_request_for_reserve = resource_request.clone();
         let reserve_handle = tokio::runtime::Handle::current();

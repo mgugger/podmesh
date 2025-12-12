@@ -44,6 +44,10 @@ pub struct CapacityRequest {
     /// When 0, the request should not be re-broadcast to other peers.
     #[serde(default = "default_max_hops")]
     pub max_hops: u8,
+    /// Base64-encoded public key of the owner (CLI) who initiated this request.
+    /// Used for reservation ownership verification when apply requests arrive.
+    #[serde(default)]
+    pub owner_pubkey: String,
 }
 
 fn default_max_hops() -> u8 {
@@ -86,6 +90,7 @@ impl Default for CapacityRequest {
             storage_bytes: 0,
             replicas: 1,
             max_hops: default_max_hops(),
+            owner_pubkey: String::new(),
         }
     }
 }
@@ -124,6 +129,26 @@ pub fn build_capacity_request_with_hops(
     replicas: u32,
     max_hops: u8,
 ) -> Vec<u8> {
+    build_capacity_request_full(
+        request_id,
+        cpu_milli,
+        memory_bytes,
+        storage_bytes,
+        replicas,
+        max_hops,
+        "",
+    )
+}
+
+pub fn build_capacity_request_full(
+    request_id: &str,
+    cpu_milli: u32,
+    memory_bytes: u64,
+    storage_bytes: u64,
+    replicas: u32,
+    max_hops: u8,
+    owner_pubkey: &str,
+) -> Vec<u8> {
     serialize(&CapacityRequest {
         request_id: request_id.to_string(),
         replicas,
@@ -131,6 +156,7 @@ pub fn build_capacity_request_with_hops(
         memory_bytes,
         storage_bytes,
         max_hops,
+        owner_pubkey: owner_pubkey.to_string(),
     })
 }
 

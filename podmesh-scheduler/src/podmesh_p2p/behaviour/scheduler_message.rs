@@ -93,12 +93,20 @@ fn handle_scheduler_request(
         return;
     }
 
+    // Use the owner_pubkey from the capacity request if present (CLI's pubkey),
+    // otherwise fall back to the envelope sender's pubkey for backward compatibility.
+    let effective_owner_pubkey = if !request_ctx.owner_pubkey.is_empty() {
+        request_ctx.owner_pubkey.clone()
+    } else {
+        requester_pubkey_b64.clone()
+    };
+
     if !reserve_capacity_for_request(
         &verifier,
         &request_ctx.resource_request,
         &request_ctx.request_id,
         &request_ctx.manifest_id,
-        Some(&requester_pubkey_b64),
+        Some(&effective_owner_pubkey),
     ) {
         return;
     }
@@ -118,6 +126,9 @@ struct CapacityRequestContext {
     request_id: String,
     manifest_id: String,
     resource_request: ResourceRequest,
+    /// Owner pubkey from the capacity request (CLI's pubkey for reservation binding).
+    /// Empty string means no explicit owner was specified.
+    owner_pubkey: String,
 }
 
 fn parse_capacity_request(
@@ -170,6 +181,7 @@ fn parse_capacity_request(
         request_id: orig_request_id.into(),
         manifest_id,
         resource_request,
+        owner_pubkey: cap_req.owner_pubkey.clone(),
     })
 }
 

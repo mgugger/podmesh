@@ -294,6 +294,14 @@ async fn wait_for_peer_registration(
                     Err(err) => last_err = Some(err.into()),
                 }
             }
+            Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
+                // debug-endpoints feature not enabled in container, skip peer check
+                log::warn!(
+                    "debug/peers endpoint not available (404), skipping peer registration check. \
+                     Build container with debug-endpoints feature to enable this check."
+                );
+                return Ok(());
+            }
             Ok(response) => {
                 last_err = Some(anyhow!("peer debug endpoint status {}", response.status()));
             }

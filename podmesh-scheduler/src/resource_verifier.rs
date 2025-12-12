@@ -299,6 +299,24 @@ impl ResourceVerifier {
     ) -> bool {
         self.prune_expired_reservations().await;
         let reservations = self.reservations.read().await;
+        
+        log::debug!(
+            "Checking reservation for manifest_id={} owner={:?} active_reservations={}",
+            manifest_id,
+            owner_pubkey.map(|p| &p[..p.len().min(16)]),
+            reservations.len()
+        );
+        
+        for (req_id, reservation) in reservations.iter() {
+            log::debug!(
+                "  Reservation req_id={} manifest_id={:?} owner={:?} expires_in={:?}",
+                req_id,
+                reservation.manifest_id,
+                reservation.owner_pubkey.as_ref().map(|p| &p[..p.len().min(16)]),
+                reservation.expires_at.saturating_duration_since(std::time::Instant::now())
+            );
+        }
+        
         reservations.values().any(|reservation| {
             let manifest_matches = reservation.manifest_id.as_deref() == Some(manifest_id);
             if !manifest_matches {

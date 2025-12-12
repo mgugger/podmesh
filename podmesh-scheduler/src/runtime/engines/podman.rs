@@ -1193,8 +1193,10 @@ impl RuntimeEngine for PodmanEngine {
 mod tests {
     use super::*;
     use serde_yaml::Value;
+    use serial_test::serial;
 
     #[tokio::test]
+    #[serial]
     async fn test_podman_engine_creation() {
         PodmanEngine::configure_runtime(None, false);
         let engine = PodmanEngine::new();
@@ -1234,6 +1236,7 @@ spec:
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_parse_manifest_metadata() {
         PodmanEngine::configure_runtime(None, false);
         let engine = PodmanEngine::new();
@@ -1258,6 +1261,7 @@ spec:
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_workload_id_generation() {
         PodmanEngine::configure_runtime(None, false);
         let engine = PodmanEngine::new();
@@ -1284,6 +1288,7 @@ spec:
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_force_remote_configuration() {
         PodmanEngine::configure_runtime(Some("/run/podman/podman.sock".to_string()), true);
         let engine = PodmanEngine::new();
