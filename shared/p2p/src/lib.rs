@@ -8,6 +8,7 @@ pub mod request_response;
 pub mod security;
 pub mod util;
 
+pub use libp2p_stream;
 pub use multiaddr::{build_quic_multiaddr, parse_bootstrap_peer};
 pub use util::{split_csv, timestamp_millis, timestamp_secs};
 

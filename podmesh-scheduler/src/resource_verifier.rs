@@ -10,6 +10,7 @@ use protocol::libp2p_constants::{
     DEFAULT_CPU_REQUEST_MILLI, DEFAULT_MEMORY_REQUEST_BYTES, DEFAULT_STORAGE_REQUEST_BYTES,
     MAX_CPU_ALLOCATION_PERCENT, MAX_MEMORY_ALLOCATION_PERCENT, MAX_STORAGE_ALLOCATION_PERCENT,
     MAX_WORKLOADS_PER_NODE, MIN_FREE_MEMORY_BYTES, MIN_FREE_STORAGE_BYTES,
+    RESERVATION_HOLD_SECS,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -146,7 +147,22 @@ struct CapacityReservation {
     expires_at: Instant,
 }
 
-const RESERVATION_HOLD_SECS: u64 = 3;
+/// Status of a capacity reservation check.
+/// Provides detailed information about why a reservation lookup succeeded or failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReservationStatus {
+    /// An active reservation exists and the owner matches (if verification was requested)
+    Active,
+    /// A reservation existed for this manifest but has expired.
+    /// Client should retry the candidates request to obtain a fresh reservation.
+    Expired,
+    /// No reservation was ever created for this manifest ID.
+    NotFound,
+    /// A reservation exists but the requesting owner does not match the recorded owner.
+    OwnerMismatch,
+    /// A reservation exists but has no owner recorded (security violation).
+    MissingOwner,
+}
 
 impl ResourceVerifier {
     /// Create a new resource verifier
@@ -287,23 +303,24 @@ impl ResourceVerifier {
     /// 
     /// # Arguments
     /// * `manifest_id` - The manifest ID to check
-    /// * `owner_pubkey` - Optional owner's public key (base64) to verify ownership
+    /// * `owner_pubkey` - Owner's public key (base64) to verify ownership
     /// 
     /// # Returns
-    /// `true` if an active reservation exists for the manifest AND (if owner_pubkey is provided)
-    /// the owner matches the reservation's recorded owner.
-    pub async fn has_active_reservation_for_manifest(
+    /// A `ReservationStatus` indicating whether the reservation is active, expired,
+    /// not found, or has an owner mismatch.
+    pub async fn check_reservation_status(
         &self,
         manifest_id: &str,
-        owner_pubkey: Option<&str>,
-    ) -> bool {
-        self.prune_expired_reservations().await;
+        owner_pubkey: &str,
+    ) -> ReservationStatus {
+        // First check for expired reservations WITHOUT pruning to detect expiry
         let reservations = self.reservations.read().await;
+        let now = Instant::now();
         
         log::debug!(
-            "Checking reservation for manifest_id={} owner={:?} active_reservations={}",
+            "Checking reservation for manifest_id={} owner={} active_reservations={}",
             manifest_id,
-            owner_pubkey.map(|p| &p[..p.len().min(16)]),
+            &owner_pubkey[..owner_pubkey.len().min(16)],
             reservations.len()
         );
         
@@ -313,40 +330,78 @@ impl ResourceVerifier {
                 req_id,
                 reservation.manifest_id,
                 reservation.owner_pubkey.as_ref().map(|p| &p[..p.len().min(16)]),
-                reservation.expires_at.saturating_duration_since(std::time::Instant::now())
+                reservation.expires_at.saturating_duration_since(now)
             );
         }
         
-        reservations.values().any(|reservation| {
-            let manifest_matches = reservation.manifest_id.as_deref() == Some(manifest_id);
-            if !manifest_matches {
-                return false;
-            }
-            
-            // If owner verification is requested, check that the owner matches
-            if let Some(requesting_owner) = owner_pubkey {
-                // Reservation must have an owner recorded and it must match
+        // Look for a reservation matching this manifest
+        let matching_reservation = reservations.values().find(|r| {
+            r.manifest_id.as_deref() == Some(manifest_id)
+        });
+        
+        match matching_reservation {
+            None => ReservationStatus::NotFound,
+            Some(reservation) => {
+                // Check if expired
+                if reservation.expires_at <= now {
+                    log::info!(
+                        "Reservation for manifest {} has expired, client should retry candidates",
+                        manifest_id
+                    );
+                    return ReservationStatus::Expired;
+                }
+                
+                // Check owner
                 match &reservation.owner_pubkey {
-                    Some(reserved_owner) => reserved_owner == requesting_owner,
                     None => {
-                        // Reservation has no owner - reject for security
                         log::warn!(
                             "Reservation for manifest {} has no owner recorded, rejecting claim by {}",
                             manifest_id,
-                            requesting_owner
+                            &owner_pubkey[..owner_pubkey.len().min(16)]
                         );
-                        false
+                        ReservationStatus::MissingOwner
+                    }
+                    Some(reserved_owner) if reserved_owner == owner_pubkey => {
+                        ReservationStatus::Active
+                    }
+                    Some(reserved_owner) => {
+                        log::warn!(
+                            "Reservation owner mismatch for manifest {}: expected {}, got {}",
+                            manifest_id,
+                            &reserved_owner[..reserved_owner.len().min(16)],
+                            &owner_pubkey[..owner_pubkey.len().min(16)]
+                        );
+                        ReservationStatus::OwnerMismatch
                     }
                 }
-            } else {
-                // No owner verification requested - allow (backward compat, but log warning)
+            }
+        }
+    }
+
+    /// Legacy wrapper for backward compatibility.
+    /// Prefer `check_reservation_status` for new code.
+    pub async fn has_active_reservation_for_manifest(
+        &self,
+        manifest_id: &str,
+        owner_pubkey: Option<&str>,
+    ) -> bool {
+        match owner_pubkey {
+            Some(owner) => {
+                self.check_reservation_status(manifest_id, owner).await == ReservationStatus::Active
+            }
+            None => {
                 log::warn!(
                     "Reservation check for manifest {} without owner verification",
                     manifest_id
                 );
-                true
+                // Prune and check if any reservation exists for this manifest
+                self.prune_expired_reservations().await;
+                let reservations = self.reservations.read().await;
+                reservations.values().any(|r| {
+                    r.manifest_id.as_deref() == Some(manifest_id)
+                })
             }
-        })
+        }
     }
 
     /// Update system resources by collecting metrics from the host

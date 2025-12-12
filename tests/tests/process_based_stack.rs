@@ -220,6 +220,11 @@ async fn wait_for_sidecar_peer_ready(
                         provider_seen = true;
                     }
                 }
+                Some(SidecarEvent::ProxyPeerDiscovered { .. })
+                | Some(SidecarEvent::EgressTunnelEstablished { .. })
+                | Some(SidecarEvent::EgressTunnelFailed { .. }) => {
+                    // Ignored in this helper
+                }
                 None => {
                     return Err(anyhow!("sidecar event channel closed before readiness"));
                 }
@@ -258,6 +263,8 @@ fn build_sidecar_config(
         app_port,
         routes,
         owner_public_key_b64: None,
+        enable_egress: false,
+        http_proxy_port: None,
     };
     Ok((cfg, ingress_host, service_host))
 }
@@ -532,6 +539,11 @@ async fn sidecar_discovers_provider_in_process_mesh() -> Result<()> {
                                 provider_seen = true;
                                 log::info!("Sidecar discovered provider: {}", peer_id);
                             }
+                        }
+                        SidecarEvent::ProxyPeerDiscovered { .. }
+                        | SidecarEvent::EgressTunnelEstablished { .. }
+                        | SidecarEvent::EgressTunnelFailed { .. } => {
+                            // Ignored in this test
                         }
                     }
                 }

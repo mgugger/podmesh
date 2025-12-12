@@ -21,6 +21,13 @@ pub const MESH_DOMAIN_SUFFIX: &str = "mesh.local";
 pub const INGRESS_PROXY_PROTOCOL: &str = "/podmesh/ingress-proxy/1.0.0";
 /// Protocol ID for sidecar manifest fetch RPCs between proxies and sidecars.
 pub const SIDECAR_MANIFEST_PROTOCOL: &str = "/podmesh/sidecar-manifest/1.0.0";
+/// Protocol ID for egress tunnel streams from sidecars to proxy nodes.
+pub const EGRESS_TUNNEL_PROTOCOL: &str = "/podmesh/egress-tunnel/1.0.0";
+
+/// DHT provider key for proxy nodes that can handle egress traffic.
+/// Proxies announce themselves as providers for this key, and sidecars
+/// query this key to discover available proxy nodes.
+pub const PROXY_PROVIDER_KEY: &str = "podmesh-proxy-node";
 
 // === GOSSIPSUB TOPICS ===
 
@@ -156,3 +163,20 @@ pub const GOSSIPSUB_MESH_OUTBOUND_MIN: usize = 1;
 /// Default maximum hops for capacity requests before they stop being forwarded.
 /// This limits amplification attacks while still allowing mesh-wide discovery.
 pub const CAPACITY_REQUEST_DEFAULT_MAX_HOPS: u8 = 3;
+
+// === RESERVATION AND CACHE TTL CONSTANTS ===
+
+/// Time in seconds to hold a capacity reservation before expiration.
+/// This should be long enough to handle network latency between capacity reply
+/// and apply request, but short enough to prevent resource starvation.
+pub const RESERVATION_HOLD_SECS: u64 = 10;
+
+/// TTL in milliseconds for sidecar manifest records published to the DHT.
+/// Sidecars republish before this expires to maintain discoverability.
+/// Type is u32 to match the wire format in SidecarProviderRecord.
+pub const MANIFEST_RECORD_TTL_MS: u32 = 300_000;
+
+/// Fraction of MANIFEST_RECORD_TTL_MS to use for proxy cache entries.
+/// Using 80% of the publish TTL ensures cache entries expire before stale
+/// records could be served, triggering a fresh DHT lookup.
+pub const MANIFEST_CACHE_TTL_RATIO: f64 = 0.8;

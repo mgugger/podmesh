@@ -20,7 +20,7 @@ use tokio::{
 
 use podmesh_integration_tests::support::{allocate_tcp_port, allocate_udp_port, init_ephemeral_keys, init_tracing};
 
-const PROXY_PROVIDER_LABEL: &str = "podmesh-proxy-node";
+const SIDECAR_PROVIDER_LABEL: &str = "podmesh-proxy-node";
 const DEMO_MANIFEST_ID: &str = "demo-nginx";
 const DEMO_MANIFEST: &[u8] = include_bytes!("../sample_manifests/demo_deployment.yml");
 
@@ -111,6 +111,11 @@ async fn sidecar_discovers_workload_provider() -> Result<()> {
                             if peer_id == &provider_peer_id {
                                 provider_seen = true;
                             }
+                        }
+                        SidecarEvent::ProxyPeerDiscovered { .. } 
+                        | SidecarEvent::EgressTunnelEstablished { .. }
+                        | SidecarEvent::EgressTunnelFailed { .. } => {
+                            // Ignored in this test
                         }
                     }
                 }
@@ -207,6 +212,206 @@ async fn ingress_proxies_requests_via_sidecar() -> Result<()> {
         server.abort();
         let _ = server.await;
     }
+    handle.workload.close().await;
+    test_result
+}
+
+/// Tests that a sidecar with egress enabled discovers the proxy provider via DHT.
+///
+/// This test verifies:
+/// 1. Proxy node announces itself as provider for `podmesh-proxy-node` key
+/// 2. Sidecar with enable_egress=true queries DHT for proxy providers
+/// 3. Sidecar receives ProxyPeerDiscovered event with proxy's peer ID
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn sidecar_discovers_egress_proxy_via_dht() -> Result<()> {
+    init_tracing();
+    init_ephemeral_keys();
+    
+    // Start a workload node that acts as the proxy provider
+    let mut handle = start_workload(Vec::new(), true, false)?;
+    let proxy_peer_id = handle.peer_id.clone();
+    
+    let test_result: Result<()> = async {
+        // Wait for proxy to be ready and announce itself
+        wait_for_kad_ready(handle.kad_rx(), Duration::from_secs(10)).await?;
+        wait_for_proxy_provider(handle.proxy_provider_rx(), Duration::from_secs(10)).await?;
+        
+        // Create sidecar with egress enabled
+        let (mut sidecar_cfg, _, _) = build_sidecar_config_with_egress(
+            vec![handle.bootstrap_addr.clone()],
+            DEFAULT_SIDECAR_APP_PORT,
+            true, // enable_egress
+        )?;
+        // Use a faster lookup interval for testing
+        sidecar_cfg.lookup_interval = Duration::from_secs(1);
+        
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        
+        let sidecar_task = tokio::spawn(async move {
+            run_sidecar_with_shutdown(sidecar_cfg, shutdown_rx, Some(event_tx))
+                .await
+                .expect("sidecar run");
+        });
+        
+        // Wait for sidecar to discover the proxy peer
+        let mut connected = false;
+        let mut proxy_discovered = false;
+        let deadline = tokio::time::sleep(Duration::from_secs(30));
+        tokio::pin!(deadline);
+        
+        while !(connected && proxy_discovered) {
+            tokio::select! {
+                Some(event) = event_rx.recv() => {
+                    match event {
+                        SidecarEvent::Connected { peer_id } => {
+                            if peer_id == proxy_peer_id {
+                                connected = true;
+                                log::info!("sidecar connected to proxy peer={}", peer_id);
+                            }
+                        }
+                        SidecarEvent::ProxyPeerDiscovered { peer_id } => {
+                            if peer_id == proxy_peer_id {
+                                proxy_discovered = true;
+                                log::info!("sidecar discovered proxy peer for egress peer={}", peer_id);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ = &mut deadline => {
+                    break;
+                }
+            }
+        }
+        
+        assert!(connected, "sidecar never connected to proxy node");
+        assert!(proxy_discovered, "sidecar never discovered proxy peer {} for egress", proxy_peer_id);
+        
+        let _ = shutdown_tx.send(());
+        let _ = sidecar_task.await;
+        
+        Ok(())
+    }
+    .await;
+    
+    handle.workload.close().await;
+    test_result
+}
+
+/// Tests that HTTP traffic can be routed through the sidecar's HTTP CONNECT proxy
+/// to an external HTTP server via the egress tunnel through the proxy node.
+///
+/// This test verifies the complete egress path:
+/// 1. Proxy node announces itself and handles egress tunnel streams
+/// 2. Sidecar discovers proxy and starts HTTP CONNECT proxy
+/// 3. HTTP client uses sidecar's HTTP CONNECT proxy
+/// 4. Traffic flows: client -> sidecar HTTP proxy -> P2P tunnel -> proxy node -> target HTTP server
+/// 5. Response flows back through the same path
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
+    init_tracing();
+    init_ephemeral_keys();
+    
+    // Start target HTTP server
+    let target_port = allocate_tcp_port();
+    let target_body = "hello-from-egress-target".to_string();
+    let target_server = spawn_test_app(target_port, target_body.clone()).await?;
+    
+    // Start proxy node that will handle egress tunnel streams
+    let mut handle = start_workload(Vec::new(), true, false)?;
+    let proxy_peer_id = handle.peer_id.clone();
+    
+    let test_result: Result<()> = async {
+        // Wait for proxy to be ready
+        wait_for_kad_ready(handle.kad_rx(), Duration::from_secs(10)).await?;
+        wait_for_proxy_provider(handle.proxy_provider_rx(), Duration::from_secs(10)).await?;
+        
+        // Allocate port for sidecar's HTTP CONNECT proxy
+        let http_proxy_port = allocate_tcp_port();
+        
+        // Create sidecar with HTTP proxy enabled (no transparent proxy/NFT rules needed)
+        let (mut sidecar_cfg, _, _) = build_sidecar_config_full(
+            vec![handle.bootstrap_addr.clone()],
+            DEFAULT_SIDECAR_APP_PORT,
+            false, // enable_egress=false: transparent proxy not needed, http_proxy_port triggers DHT lookups
+            Some(http_proxy_port),
+        )?;
+        sidecar_cfg.lookup_interval = Duration::from_secs(1);
+        
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        
+        let sidecar_task = tokio::spawn(async move {
+            run_sidecar_with_shutdown(sidecar_cfg, shutdown_rx, Some(event_tx))
+                .await
+                .expect("sidecar run");
+        });
+        
+        // Wait for sidecar to discover the proxy peer
+        let mut proxy_discovered = false;
+        let deadline = tokio::time::sleep(Duration::from_secs(30));
+        tokio::pin!(deadline);
+        
+        while !proxy_discovered {
+            tokio::select! {
+                Some(event) = event_rx.recv() => {
+                    match event {
+                        SidecarEvent::ProxyPeerDiscovered { peer_id } => {
+                            if peer_id == proxy_peer_id {
+                                proxy_discovered = true;
+                                log::info!("sidecar discovered proxy peer for egress peer={}", peer_id);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ = &mut deadline => {
+                    break;
+                }
+            }
+        }
+        
+        assert!(proxy_discovered, "sidecar never discovered proxy peer {} for egress", proxy_peer_id);
+        
+        // Give the HTTP CONNECT proxy a moment to start
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        
+        // Create HTTP client that uses the sidecar's HTTP CONNECT proxy
+        let proxy_url = format!("http://127.0.0.1:{}", http_proxy_port);
+        let client = Client::builder()
+            .proxy(reqwest::Proxy::all(&proxy_url).expect("valid proxy URL"))
+            .build()
+            .expect("build http client with proxy");
+        
+        // Make HTTP request through the proxy tunnel
+        let target_url = format!("http://127.0.0.1:{}/hello", target_port);
+        let response = tokio::time::timeout(
+            Duration::from_secs(15),
+            client.get(&target_url).send()
+        )
+        .await
+        .map_err(|_| anyhow!("HTTP request through egress proxy timed out"))?
+        .map_err(|e| anyhow!("HTTP request through egress proxy failed: {}", e))?;
+        
+        assert!(response.status().is_success(), "expected success status, got {}", response.status());
+        
+        let body = response.text().await?;
+        assert_eq!(body, target_body, "response body mismatch");
+        
+        log::info!("egress HTTP proxy test succeeded - traffic routed through tunnel");
+        
+        let _ = shutdown_tx.send(());
+        let _ = sidecar_task.await;
+        
+        Ok(())
+    }
+    .await;
+    
+    target_server.abort();
+    let _ = target_server.await;
     handle.workload.close().await;
     test_result
 }
@@ -364,6 +569,11 @@ async fn wait_for_sidecar_peer_ready(
                         provider_seen = true;
                     }
                 }
+                Some(SidecarEvent::ProxyPeerDiscovered { .. })
+                | Some(SidecarEvent::EgressTunnelEstablished { .. })
+                | Some(SidecarEvent::EgressTunnelFailed { .. }) => {
+                    // Ignore these events in this helper
+                }
                 None => {
                     return Err(anyhow!("sidecar event channel closed before readiness"));
                 }
@@ -386,9 +596,26 @@ fn build_sidecar_config(
     bootstrap_peers: Vec<String>,
     app_port: u16,
 ) -> Result<(SidecarConfig, String, String)> {
+    build_sidecar_config_with_egress(bootstrap_peers, app_port, false)
+}
+
+fn build_sidecar_config_with_egress(
+    bootstrap_peers: Vec<String>,
+    app_port: u16,
+    enable_egress: bool,
+) -> Result<(SidecarConfig, String, String)> {
+    build_sidecar_config_full(bootstrap_peers, app_port, enable_egress, None)
+}
+
+fn build_sidecar_config_full(
+    bootstrap_peers: Vec<String>,
+    app_port: u16,
+    enable_egress: bool,
+    http_proxy_port: Option<u16>,
+) -> Result<(SidecarConfig, String, String)> {
     let (routes, ingress_host, service_host) = demo_routes(app_port)?;
     let cfg = SidecarConfig {
-        provider_label: PROXY_PROVIDER_LABEL.to_string(),
+        provider_label: SIDECAR_PROVIDER_LABEL.to_string(),
         bootstrap_peers,
         bootstrap_peer_ip: None,
         lookup_interval: Duration::from_secs(2),
@@ -401,6 +628,8 @@ fn build_sidecar_config(
         app_port,
         routes,
         owner_public_key_b64: None,
+        enable_egress,
+        http_proxy_port,
     };
     Ok((cfg, ingress_host, service_host))
 }

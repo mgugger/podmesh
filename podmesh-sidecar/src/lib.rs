@@ -4,13 +4,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use futures::{StreamExt, future};
 use libp2p::{
-    Multiaddr, PeerId, Swarm,
+    Multiaddr, PeerId, Swarm, StreamProtocol,
     kad::{self, Quorum, Record, RecordKey},
     multiaddr::Protocol,
     request_response,
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 use p2p::http_proxy::{ProxyCodec, ProxyHttpRequest, ProxyHttpResponse};
+use p2p::libp2p_stream;
 use p2p::{
     build_quic_multiaddr, sidecar_manifest::sign_sidecar_manifest_record, parse_bootstrap_peer,
     timestamp_millis,
@@ -21,6 +22,7 @@ use p2p::{
 };
 use protocol::libp2p_constants::{
     SIDECAR_MANIFEST_PROTOCOL, INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX,
+    MANIFEST_RECORD_TTL_MS, EGRESS_TUNNEL_PROTOCOL, PROXY_PROVIDER_KEY,
 };
 use protocol::machine::{
     SidecarRouteSpec, build_sidecar_provider_record, root_as_sidecar_manifest_request,
@@ -33,10 +35,14 @@ use tokio::signal;
 use tokio::sync::{mpsc, oneshot};
 use log::{debug, info, warn};
 
+pub mod egress_nft;
+pub mod egress_proxy;
+pub mod http_connect_proxy;
 pub mod manifest_routes;
 
+pub use http_connect_proxy::HTTP_CONNECT_PROXY_PORT;
+
 pub const DEFAULT_SIDECAR_APP_PORT: u16 = 18080;
-const MANIFEST_RECORD_TTL_MS: u32 = 300_000;
 const MANIFEST_RECORD_VERSION: u16 = 1;
 
 #[derive(Clone, Debug)]
@@ -54,12 +60,23 @@ pub struct SidecarConfig {
     pub app_port: u16,
     pub routes: Vec<SidecarRouteSpec>,
     pub owner_public_key_b64: Option<String>,
+    /// Enable transparent egress proxy (requires CAP_NET_ADMIN)
+    pub enable_egress: bool,
+    /// Port for HTTP CONNECT proxy (explicit proxy mode)
+    /// If set to 0, uses the default port. If None, HTTP CONNECT proxy is disabled.
+    pub http_proxy_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidecarEvent {
     Connected { peer_id: String },
     ProviderDiscovered { peer_id: String },
+    /// Proxy peer discovered for egress tunneling
+    ProxyPeerDiscovered { peer_id: String },
+    /// Egress tunnel established to destination
+    EgressTunnelEstablished { dest_host: String, dest_port: u16 },
+    /// Egress tunnel failed
+    EgressTunnelFailed { dest_host: String, dest_port: u16, error: String },
 }
 
 pub async fn run_sidecar(cfg: SidecarConfig) -> Result<()> {
@@ -89,7 +106,7 @@ pub async fn run_sidecar_with_shutdown(
         .map(|addr| addr.to_string())
         .unwrap_or_else(|| "none".to_string());
     info!(
-        "sidecar runtime starting with config has_events={} provider={} manifest={} ingress_host={} libp2p_host={} libp2p_port={} announce_providers={} lookup_interval_ms={} announce_interval_ms={} bootstrap_peers={:?} bootstrap_peer_ip={} listen_addr={} app_port={} routes={}",
+        "sidecar runtime starting with config has_events={} provider={} manifest={} ingress_host={} libp2p_host={} libp2p_port={} announce_providers={} lookup_interval_ms={} announce_interval_ms={} bootstrap_peers={:?} bootstrap_peer_ip={} listen_addr={} app_port={} routes={} enable_egress={}",
         event_tx.is_some(),
         cfg.provider_label,
         cfg.manifest_id,
@@ -103,7 +120,8 @@ pub async fn run_sidecar_with_shutdown(
         cfg.bootstrap_peer_ip.as_deref().unwrap_or("none"),
         listen_addr_display,
         cfg.app_port,
-        cfg.routes.len()
+        cfg.routes.len(),
+        cfg.enable_egress
     );
 
     let mut swarm = build_swarm(&cfg)?;
@@ -112,6 +130,59 @@ pub async fn run_sidecar_with_shutdown(
             .listen_on(addr)
             .context("start sidecar libp2p listener")?;
     }
+
+    // Set up egress proxy if enabled
+    let egress_nft_cleanup_needed = if cfg.enable_egress {
+        match egress_nft::setup_egress_rules(&egress_nft::EgressNftConfig::default()) {
+            Ok(()) => {
+                info!("egress nftables rules configured successfully");
+                true
+            }
+            Err(err) => {
+                warn!("failed to setup egress nftables rules (requires CAP_NET_ADMIN): {}", err);
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    // Create channel for tunnel requests from egress proxy
+    let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<egress_proxy::TunnelRequest>(256);
+
+    // Start transparent egress proxy listener if enabled
+    let _egress_proxy_handle = if cfg.enable_egress {
+        let egress_config = egress_proxy::EgressProxyConfig::default();
+        let proxy = egress_proxy::EgressProxy::new(egress_config, tunnel_tx.clone());
+        Some(tokio::spawn(async move {
+            if let Err(err) = proxy.run().await {
+                log::error!("egress proxy failed: {}", err);
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Start HTTP CONNECT proxy if configured
+    let _http_proxy_handle = if let Some(port) = cfg.http_proxy_port {
+        let http_config = http_connect_proxy::HttpConnectProxyConfig {
+            listen_port: if port == 0 { http_connect_proxy::HTTP_CONNECT_PROXY_PORT } else { port },
+            listen_host: "127.0.0.1".to_string(),
+        };
+        let proxy = http_connect_proxy::HttpConnectProxy::new(http_config, tunnel_tx.clone());
+        Some(tokio::spawn(async move {
+            if let Err(err) = proxy.run().await {
+                log::error!("HTTP CONNECT proxy failed: {}", err);
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Get stream control for egress tunneling
+    let egress_control = swarm.behaviour().egress_stream.new_control();
+    let egress_protocol = StreamProtocol::try_from_owned(EGRESS_TUNNEL_PROTOCOL.to_string())
+        .expect("valid egress protocol");
 
     dial_bootstrap(&mut swarm, &cfg);
 
@@ -137,6 +208,15 @@ pub async fn run_sidecar_with_shutdown(
     handshake_ticker.tick().await;
     let mut manifest_ticker = tokio::time::interval(cfg.announce_interval);
     manifest_ticker.tick().await;
+    // Proxy lookup ticker (active if any egress mode is enabled)
+    let needs_egress_proxy = cfg.enable_egress || cfg.http_proxy_port.is_some();
+    let mut proxy_lookup_ticker = if needs_egress_proxy {
+        let mut ticker = tokio::time::interval(Duration::from_secs(60)); // Refresh proxy peers every 60s
+        ticker.tick().await; // Skip first immediate tick
+        Some(ticker)
+    } else {
+        None
+    };
     // Don't publish manifest immediately - wait for bootstrap to complete
     loop {
         tokio::select! {
@@ -153,6 +233,18 @@ pub async fn run_sidecar_with_shutdown(
             } => {
                 if cfg.announce_providers && state.kad_bootstrap_complete {
                     announce_provider(&mut swarm, &cfg);
+                }
+            },
+            // Periodic proxy provider refresh
+            _ = async {
+                if let Some(ticker) = proxy_lookup_ticker.as_mut() {
+                    ticker.tick().await;
+                } else {
+                    future::pending::<()>().await;
+                }
+            } => {
+                if needs_egress_proxy && state.kad_bootstrap_complete {
+                    trigger_proxy_lookup(&mut swarm, &mut state);
                 }
             },
             _ = &mut shutdown => {
@@ -194,7 +286,33 @@ pub async fn run_sidecar_with_shutdown(
                 if let Err(err) = swarm.behaviour_mut().proxy_rr.send_response(pending.channel, pending.response) {
                     warn!("failed to send proxy response to workload error={:?}", err);
                 }
+            },
+            // Handle egress tunnel requests
+            Some(tunnel_req) = tunnel_rx.recv() => {
+                if let Some(proxy_peer) = state.get_proxy_peer() {
+                    let control = egress_control.clone();
+                    let protocol = egress_protocol.clone();
+                    tokio::spawn(async move {
+                        handle_egress_tunnel(control, proxy_peer, protocol, tunnel_req).await;
+                    });
+                } else {
+                    // No proxy peer known yet, try to discover one
+                    if needs_egress_proxy && !state.proxy_query_pending {
+                        trigger_proxy_lookup(&mut swarm, &mut state);
+                    }
+                    warn!("egress tunnel request dropped - no proxy peer discovered yet dest={}:{}", 
+                          tunnel_req.dest_host, tunnel_req.dest_port);
+                }
             }
+        }
+    }
+
+    // Clean up nftables rules on shutdown
+    if egress_nft_cleanup_needed {
+        if let Err(err) = egress_nft::cleanup_egress_rules() {
+            warn!("failed to cleanup egress nftables rules: {}", err);
+        } else {
+            info!("egress nftables rules cleaned up");
         }
     }
 
@@ -227,6 +345,8 @@ struct SidecarBehaviour {
     handshake_rr: request_response::Behaviour<HandshakeCodec>,
     proxy_rr: request_response::Behaviour<ProxyCodec>,
     manifest_rr: request_response::Behaviour<ManifestFetchCodec>,
+    /// Stream behaviour for bidirectional egress tunneling
+    egress_stream: libp2p_stream::Behaviour,
 }
 
 struct SidecarState {
@@ -235,6 +355,10 @@ struct SidecarState {
     kad_bootstrapped: bool,
     kad_bootstrap_complete: bool,
     http_client: Client,
+    /// Discovered proxy peers for egress tunneling (from DHT provider queries)
+    proxy_peers: Vec<PeerId>,
+    /// Whether we have an active proxy provider query
+    proxy_query_pending: bool,
 }
 
 impl SidecarState {
@@ -245,7 +369,14 @@ impl SidecarState {
             kad_bootstrapped: false,
             kad_bootstrap_complete: false,
             http_client,
+            proxy_peers: Vec::new(),
+            proxy_query_pending: false,
         }
+    }
+
+    /// Get a proxy peer for egress tunneling, if available
+    fn get_proxy_peer(&self) -> Option<PeerId> {
+        self.proxy_peers.first().copied()
     }
 }
 
@@ -283,11 +414,14 @@ fn build_swarm(_cfg: &SidecarConfig) -> Result<Swarm<SidecarBehaviour>> {
                 )),
                 request_response::Config::default(),
             );
+            // Stream behaviour for bidirectional egress tunneling
+            let egress_stream = libp2p_stream::Behaviour::new();
             let mut behaviour = SidecarBehaviour {
                 kademlia: kad::Behaviour::new(peer_id, store),
                 handshake_rr,
                 proxy_rr,
                 manifest_rr,
+                egress_stream,
             };
             behaviour.kademlia.set_mode(Some(kad::Mode::Client));
             behaviour
@@ -707,12 +841,19 @@ fn handle_kad_event(
     state: &mut SidecarState,
     event_tx: Option<&mpsc::UnboundedSender<SidecarEvent>>,
 ) {
+    let proxy_record_key = RecordKey::new(&PROXY_PROVIDER_KEY);
     match event {
         kad::Event::OutboundQueryProgressed { result, .. } => match result {
             kad::QueryResult::GetProviders(Ok(ok)) => match ok {
                 kad::GetProvidersOk::FoundProviders { key, providers } => {
-                    log::debug!("sidecar get_providers result key={:?} expected={:?} count={}", key, cfg.record_key(), providers.len());
+                    log::debug!("sidecar get_providers result key={:?} count={}", key, providers.len());
+                    // Check both conditions independently to handle overlapping keys
+                    if key == proxy_record_key {
+                        // Proxy provider discovery result for egress
+                        update_proxy_peers(providers.clone(), state, event_tx);
+                    }
                     if key == cfg.record_key() {
+                        // Provider discovery for our provider_label (may overlap with proxy key)
                         update_provider_cache(providers, state, event_tx);
                     }
                 }
@@ -721,10 +862,13 @@ fn handle_kad_event(
                         "sidecar provider lookup finished without providers provider={} closest={}",
                         cfg.provider_label, closest_peers.len()
                     );
+                    // Mark proxy query as complete if this was a proxy query
+                    state.proxy_query_pending = false;
                 }
             },
             kad::QueryResult::GetProviders(Err(err)) => {
                 log::warn!("sidecar provider lookup failed provider={} error={}", cfg.provider_label, err);
+                state.proxy_query_pending = false;
             }
             kad::QueryResult::Bootstrap(Ok(_)) => {
                 if !state.kad_bootstrap_complete {
@@ -733,6 +877,11 @@ fn handle_kad_event(
                     publish_manifest_record(swarm, cfg);
                     if cfg.announce_providers {
                         announce_provider(swarm, cfg);
+                    }
+                    // Trigger initial proxy discovery if any egress mode is enabled
+                    let needs_egress_proxy = cfg.enable_egress || cfg.http_proxy_port.is_some();
+                    if needs_egress_proxy {
+                        trigger_proxy_lookup(swarm, state);
                     }
                 }
             }
@@ -775,6 +924,201 @@ fn update_provider_cache<I>(
             state.known_providers.len()
         );
     }
+}
+
+/// Updates the list of known proxy peers for egress tunneling
+fn update_proxy_peers<I>(
+    providers: I,
+    state: &mut SidecarState,
+    event_tx: Option<&mpsc::UnboundedSender<SidecarEvent>>,
+) where
+    I: IntoIterator<Item = libp2p::PeerId>,
+{
+    let new_peers: Vec<PeerId> = providers.into_iter().collect();
+    if new_peers.is_empty() {
+        log::debug!("no proxy providers found");
+    } else {
+        log::info!(
+            "discovered {} proxy provider(s) for egress: {:?}",
+            new_peers.len(),
+            new_peers
+        );
+        // Emit events for newly discovered proxy peers
+        for peer in &new_peers {
+            notify(
+                event_tx,
+                SidecarEvent::ProxyPeerDiscovered {
+                    peer_id: peer.to_string(),
+                },
+            );
+        }
+        state.proxy_peers = new_peers;
+    }
+    state.proxy_query_pending = false;
+}
+
+/// Triggers a DHT lookup for proxy providers
+fn trigger_proxy_lookup(swarm: &mut Swarm<SidecarBehaviour>, state: &mut SidecarState) {
+    if state.proxy_query_pending {
+        log::debug!("proxy provider query already pending, skipping");
+        return;
+    }
+    let record_key = RecordKey::new(&PROXY_PROVIDER_KEY);
+    let query_id = swarm.behaviour_mut().kademlia.get_providers(record_key);
+    state.proxy_query_pending = true;
+    log::info!("initiated proxy provider discovery query_id={:?}", query_id);
+}
+
+/// Handles an egress tunnel request by opening a stream to the proxy peer
+/// and piping data bidirectionally.
+async fn handle_egress_tunnel(
+    mut control: libp2p_stream::Control,
+    proxy_peer: PeerId,
+    protocol: StreamProtocol,
+    tunnel_req: egress_proxy::TunnelRequest,
+) {
+    use futures::io::{AsyncReadExt, AsyncWriteExt};
+    use protocol::egress::{EgressTunnelRequest, EgressTunnelResponse};
+
+    log::info!(
+        "handling egress tunnel request dest={}:{} protocol={:?}",
+        tunnel_req.dest_host,
+        tunnel_req.dest_port,
+        tunnel_req.protocol
+    );
+
+    // Open stream to proxy peer
+    let mut p2p_stream = match control.open_stream(proxy_peer, protocol).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            log::error!(
+                "failed to open egress stream to proxy peer={} dest={}:{} error={:?}",
+                proxy_peer,
+                tunnel_req.dest_host,
+                tunnel_req.dest_port,
+                err
+            );
+            return;
+        }
+    };
+
+    // Send tunnel request header (using postcard, same as proxy)
+    let request = EgressTunnelRequest::tcp(&tunnel_req.dest_host, tunnel_req.dest_port);
+    let request_bytes = match postcard::to_allocvec(&request) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            log::error!("failed to serialize egress request: {}", err);
+            return;
+        }
+    };
+
+    // Write length-prefixed request (little-endian, same as proxy)
+    let len_bytes = (request_bytes.len() as u32).to_le_bytes();
+    if let Err(err) = p2p_stream.write_all(&len_bytes).await {
+        log::error!("failed to write egress request length: {}", err);
+        return;
+    }
+    if let Err(err) = p2p_stream.write_all(&request_bytes).await {
+        log::error!("failed to write egress request: {}", err);
+        return;
+    }
+    if let Err(err) = p2p_stream.flush().await {
+        log::error!("failed to flush egress request: {}", err);
+        return;
+    }
+
+    // Read response (little-endian length prefix)
+    let mut len_buf = [0u8; 4];
+    if let Err(err) = p2p_stream.read_exact(&mut len_buf).await {
+        log::error!("failed to read egress response length: {}", err);
+        return;
+    }
+    let resp_len = u32::from_le_bytes(len_buf) as usize;
+    if resp_len > 1024 * 1024 {
+        log::error!("egress response too large: {} bytes", resp_len);
+        return;
+    }
+
+    let mut resp_buf = vec![0u8; resp_len];
+    if let Err(err) = p2p_stream.read_exact(&mut resp_buf).await {
+        log::error!("failed to read egress response: {}", err);
+        return;
+    }
+
+    let response: EgressTunnelResponse = match postcard::from_bytes(&resp_buf) {
+        Ok(resp) => resp,
+        Err(err) => {
+            log::error!("failed to deserialize egress response: {}", err);
+            return;
+        }
+    };
+
+    if !response.success {
+        log::error!(
+            "egress tunnel failed dest={}:{} error={:?}",
+            tunnel_req.dest_host,
+            tunnel_req.dest_port,
+            response.error
+        );
+        return;
+    }
+
+    log::info!(
+        "egress tunnel established dest={}:{}",
+        tunnel_req.dest_host,
+        tunnel_req.dest_port
+    );
+
+    // Now pipe data bidirectionally between client_stream and p2p_stream
+    // Use tokio's bidirectional copy which works with the Stream type
+    let mut client_stream = tunnel_req.client_stream;
+    
+    // Send HTTP 200 response if this is an HTTP CONNECT proxy request
+    if tunnel_req.send_http_200 {
+        use tokio::io::AsyncWriteExt;
+        let response = "HTTP/1.1 200 Connection Established\r\n\r\n";
+        if let Err(err) = client_stream.write_all(response.as_bytes()).await {
+            log::error!("failed to send HTTP 200 response: {}", err);
+            return;
+        }
+    }
+    
+    // Convert libp2p Stream to tokio-compatible using compat layer
+    let p2p_compat = tokio_util::compat::FuturesAsyncReadCompatExt::compat(p2p_stream);
+    let (mut p2p_read, mut p2p_write) = tokio::io::split(p2p_compat);
+    
+    // If there's initial data (for plain HTTP proxy), send it to the destination first
+    if let Some(initial_data) = tunnel_req.initial_data {
+        use tokio::io::AsyncWriteExt;
+        if let Err(err) = p2p_write.write_all(&initial_data).await {
+            log::error!("failed to send initial data through tunnel: {}", err);
+            return;
+        }
+    }
+    
+    let (mut client_read, mut client_write) = client_stream.into_split();
+
+    // Wait for either direction to complete (or error)
+    tokio::select! {
+        result = tokio::io::copy(&mut client_read, &mut p2p_write) => {
+            match result {
+                Ok(bytes) => log::debug!("egress client->proxy completed bytes={}", bytes),
+                Err(err) => log::debug!("egress client->proxy error: {}", err),
+            }
+        }
+        result = tokio::io::copy(&mut p2p_read, &mut client_write) => {
+            match result {
+                Ok(bytes) => log::debug!("egress proxy->client completed bytes={}", bytes),
+                Err(err) => log::debug!("egress proxy->client error: {}", err),
+            }
+        }
+    }
+
+    log::debug!(
+        "egress tunnel closed dest={}:{}",
+        tunnel_req.dest_host,
+        tunnel_req.dest_port
+    );
 }
 
 fn dial_multiaddr_str(swarm: &mut Swarm<SidecarBehaviour>, addr: &str) {

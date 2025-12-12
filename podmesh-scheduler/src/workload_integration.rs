@@ -11,7 +11,7 @@ use crate::sidecar::{
 };
 use crate::podmesh_p2p::behaviour::MyBehaviour;
 use crate::provider::{ProviderConfig, ProviderManager};
-use crate::resource_verifier::ResourceVerifier;
+use crate::resource_verifier::{ResourceVerifier, ReservationStatus};
 use crate::runtime::{
     DeploymentConfig, SidecarInjectionConfig, RuntimeRegistry, create_default_registry,
 };
@@ -268,18 +268,46 @@ pub async fn handle_apply_message_with_workload_manager(
 
                         // Verify the reservation exists AND belongs to this owner
                         let owner_pubkey_b64 = crypto::b64_encode(&owner_pubkey);
-                        let reservation_ok = get_global_resource_verifier()
-                            .has_active_reservation_for_manifest(manifest_id, Some(&owner_pubkey_b64))
+                        let reservation_status = get_global_resource_verifier()
+                            .check_reservation_status(manifest_id, &owner_pubkey_b64)
                             .await;
-                        if !reservation_ok {
-                            warn!(
-                                "Apply request for manifest_id={} from peer={} without prior reservation or owner mismatch",
-                                manifest_id, peer
-                            );
+                        
+                        if reservation_status != ReservationStatus::Active {
+                            let error_message = match reservation_status {
+                                ReservationStatus::Active => unreachable!(),
+                                ReservationStatus::Expired => {
+                                    warn!(
+                                        "Apply request for manifest_id={} from peer={}: reservation expired",
+                                        manifest_id, peer
+                                    );
+                                    "capacity reservation expired, please retry candidates request"
+                                }
+                                ReservationStatus::NotFound => {
+                                    warn!(
+                                        "Apply request for manifest_id={} from peer={}: no reservation found",
+                                        manifest_id, peer
+                                    );
+                                    "no capacity reservation found for this manifest"
+                                }
+                                ReservationStatus::OwnerMismatch => {
+                                    warn!(
+                                        "Apply request for manifest_id={} from peer={}: owner mismatch",
+                                        manifest_id, peer
+                                    );
+                                    "capacity reservation belongs to a different owner"
+                                }
+                                ReservationStatus::MissingOwner => {
+                                    warn!(
+                                        "Apply request for manifest_id={} from peer={}: reservation has no owner",
+                                        manifest_id, peer
+                                    );
+                                    "capacity reservation has no owner recorded (security violation)"
+                                }
+                            };
                             let error_response = machine::build_apply_response(
                                 false,
                                 manifest_id,
-                                "no active capacity reservation for this owner",
+                                error_message,
                             );
                             let _ = swarm
                                 .behaviour_mut()
@@ -702,6 +730,22 @@ fn build_sidecar_container_spec(
     container.insert(
         serde_yaml::Value::String("env".to_string()),
         serde_yaml::Value::Sequence(env_entries),
+    );
+
+    // Add securityContext with CAP_NET_ADMIN for transparent egress proxy
+    let mut security_context = serde_yaml::Mapping::new();
+    let mut capabilities = serde_yaml::Mapping::new();
+    capabilities.insert(
+        serde_yaml::Value::String("add".to_string()),
+        serde_yaml::Value::Sequence(vec![serde_yaml::Value::String("NET_ADMIN".to_string())]),
+    );
+    security_context.insert(
+        serde_yaml::Value::String("capabilities".to_string()),
+        serde_yaml::Value::Mapping(capabilities),
+    );
+    container.insert(
+        serde_yaml::Value::String("securityContext".to_string()),
+        serde_yaml::Value::Mapping(security_context),
     );
 
     serde_yaml::Value::Mapping(container)

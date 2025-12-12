@@ -51,6 +51,13 @@ struct Args {
     metadata_path: String,
     #[arg(long = "metadata-b64", env = "PODMESH_SIDECAR_METADATA_B64")]
     metadata_b64: Option<String>,
+    /// Enable transparent egress proxy (requires CAP_NET_ADMIN for nftables)
+    #[arg(long = "enable-egress", env = "PODMESH_ENABLE_EGRESS", default_value_t = false)]
+    enable_egress: bool,
+    /// Port for HTTP CONNECT proxy (explicit proxy mode, 0 to use default port)
+    /// If not specified, HTTP CONNECT proxy is disabled.
+    #[arg(long = "http-proxy-port", env = "PODMESH_HTTP_PROXY_PORT")]
+    http_proxy_port: Option<u16>,
 }
 
 impl TryFrom<Args> for SidecarConfig {
@@ -120,6 +127,8 @@ impl TryFrom<Args> for SidecarConfig {
             app_port: DEFAULT_SIDECAR_APP_PORT,
             routes,
             owner_public_key_b64: metadata.owner_public_key_b64.clone(),
+            enable_egress: args.enable_egress,
+            http_proxy_port: args.http_proxy_port,
         })
     }
 }

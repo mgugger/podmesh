@@ -4,11 +4,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, Swarm, autonat, gossipsub, identify, kad, relay, request_response,
+    Multiaddr, PeerId, Swarm, StreamProtocol, autonat, gossipsub, identify, kad, relay, request_response,
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 use p2p::{
-    CoreBehaviourAccess, NodeConfig,
+    CoreBehaviourAccess, NodeConfig, libp2p_stream,
     sidecar_manifest::verify_sidecar_manifest_envelope,
     handshake::{self, HandshakeDriveConfig, HandshakeState},
     http_proxy::{ProxyCodec, ProxyHttpRequest, ProxyHttpResponse},
@@ -16,8 +16,10 @@ use p2p::{
 };
 use protocol::libp2p_constants::{
     SIDECAR_MANIFEST_PROTOCOL, INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX,
-    WORKLOAD_CLUSTER_TOPIC,
+    WORKLOAD_CLUSTER_TOPIC, MANIFEST_RECORD_TTL_MS, MANIFEST_CACHE_TTL_RATIO,
+    EGRESS_TUNNEL_PROTOCOL,
 };
+use protocol::egress::{EgressTunnelRequest, EgressTunnelResponse};
 use protocol::machine::{SidecarProviderRecordOwned, build_sidecar_manifest_request};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -25,8 +27,7 @@ use log::{debug, error, info, warn};
 
 use crate::config::Config;
 
-const PROXY_PROVIDER_KEY: &str = "podmesh-proxy-node";
-const DEFAULT_MANIFEST_RECORD_TTL_MS: u64 = 30_000;
+use protocol::libp2p_constants::PROXY_PROVIDER_KEY;
 const MAX_MANIFEST_FETCH_PEERS: usize = 4;
 
 enum P2pCommand {
@@ -88,6 +89,7 @@ pub struct WorkloadBehaviour {
     pub identify: identify::Behaviour,
     pub proxy_rr: request_response::Behaviour<ProxyCodec>,
     pub manifest_rr: request_response::Behaviour<ManifestFetchCodec>,
+    pub egress_stream: libp2p_stream::Behaviour,
 }
 
 impl CoreBehaviourAccess for WorkloadBehaviour {
@@ -210,6 +212,7 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
             identify,
             proxy_rr,
             manifest_rr,
+            egress_stream: libp2p_stream::Behaviour::new(),
         }
     })?;
 
@@ -256,6 +259,17 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
     let local_peer_id = swarm.local_peer_id().to_string();
     let kad_ready_tx = kad_ready_tx;
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    
+    // Set up egress tunnel stream handler
+    let egress_protocol = StreamProtocol::try_from_owned(EGRESS_TUNNEL_PROTOCOL.to_string())
+        .expect("valid egress protocol");
+    let mut incoming_egress = swarm
+        .behaviour()
+        .egress_stream
+        .new_control()
+        .accept(egress_protocol)
+        .expect("accept egress tunnel protocol");
+    
     let task = tokio::spawn({
         let mut cmd_rx = cmd_rx;
         let mut handshake_states = handshake_states;
@@ -427,8 +441,18 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
                             Err(err) => warn!("workload handshake drive failed err={:?}", err),
                         }
                     }
+                    // Handle incoming egress tunnel streams from sidecars
+                    Some((peer, stream)) = incoming_egress.next() => {
+                        debug!("incoming egress tunnel stream from peer={}", peer);
+                        tokio::spawn(async move {
+                            if let Err(err) = handle_egress_stream(peer, stream).await {
+                                warn!("egress tunnel error peer={} error={:?}", peer, err);
+                            }
+                        });
+                    }
                     _ = interval.tick() => {
-                        publish_peer_snapshot(&swarm, &mut peer_tx)
+                        publish_peer_snapshot(&swarm, &mut peer_tx);
+                        prune_expired_cache_entries(&mut sidecar_cache);
                     }
                 }
             }
@@ -444,6 +468,23 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
         _proxy_provider_announced_tx: proxy_announced_tx,
         command_tx: cmd_tx,
     })
+}
+
+/// Removes expired entries from the sidecar cache to prevent unbounded growth.
+fn prune_expired_cache_entries(sidecar_cache: &mut HashMap<String, SidecarCacheEntry>) {
+    let now = Instant::now();
+    let before_count = sidecar_cache.len();
+    sidecar_cache.retain(|manifest_id, entry| {
+        let keep = entry.expires_at > now;
+        if !keep {
+            debug!("evicting expired cache entry manifest={}", manifest_id);
+        }
+        keep
+    });
+    let removed = before_count - sidecar_cache.len();
+    if removed > 0 {
+        info!("pruned {} expired cache entries, {} remaining", removed, sidecar_cache.len());
+    }
 }
 
 fn publish_peer_snapshot(
@@ -719,12 +760,19 @@ fn store_sidecar_record(
     if !should_replace {
         return;
     }
-    let ttl_ms = if record.ttl_ms == 0 {
-        DEFAULT_MANIFEST_RECORD_TTL_MS
+    // Use record's TTL if provided, else fall back to shared constant
+    let record_ttl_ms = if record.ttl_ms == 0 {
+        MANIFEST_RECORD_TTL_MS as u64
     } else {
         record.ttl_ms as u64
     };
-    let expires_at = Instant::now() + Duration::from_millis(ttl_ms);
+    // Apply cache TTL ratio to ensure cache expires before stale records could be served
+    let cache_ttl_ms = (record_ttl_ms as f64 * MANIFEST_CACHE_TTL_RATIO) as u64;
+    let expires_at = Instant::now() + Duration::from_millis(cache_ttl_ms);
+    info!(
+        "caching sidecar record manifest={} ttl_ms={} cache_ttl_ms={}",
+        manifest_id, record_ttl_ms, cache_ttl_ms
+    );
     sidecar_cache.insert(
         manifest_id.to_string(),
         SidecarCacheEntry {
@@ -992,4 +1040,131 @@ fn extract_peer_id(mut addr: Multiaddr) -> Option<(PeerId, Multiaddr)> {
         Some(libp2p::multiaddr::Protocol::P2p(peer_id)) => Some((peer_id, addr)),
         _ => None,
     }
+}
+
+/// Handles an incoming egress tunnel stream from a sidecar.
+///
+/// Protocol:
+/// 1. Read EgressTunnelRequest (postcard-encoded with length prefix)
+/// 2. Connect to target host:port
+/// 3. Send EgressTunnelResponse
+/// 4. If successful, bidirectionally copy data between streams
+async fn handle_egress_stream(
+    peer: PeerId,
+    stream: libp2p::Stream,
+) -> anyhow::Result<()> {
+    use futures::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
+    
+    let (mut reader, mut writer) = stream.split();
+    
+    // Read length-prefixed request
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf).await?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    
+    if len > 1024 {
+        let response = EgressTunnelResponse::err("request too large");
+        let response_bytes = postcard::to_allocvec(&response)?;
+        let len_bytes = (response_bytes.len() as u32).to_le_bytes();
+        writer.write_all(&len_bytes).await?;
+        writer.write_all(&response_bytes).await?;
+        writer.flush().await?;
+        return Err(anyhow!("egress request too large len={}", len));
+    }
+    
+    let mut request_buf = vec![0u8; len];
+    reader.read_exact(&mut request_buf).await?;
+    
+    let request: EgressTunnelRequest = postcard::from_bytes(&request_buf)
+        .map_err(|e| anyhow!("failed to deserialize egress request: {}", e))?;
+    
+    info!(
+        "egress tunnel request peer={} target={}:{} protocol={}",
+        peer, request.target_host, request.target_port, request.protocol
+    );
+    
+    // Only TCP is supported for now
+    if request.protocol != "tcp" {
+        let response = EgressTunnelResponse::err(format!("unsupported protocol: {}", request.protocol));
+        let response_bytes = postcard::to_allocvec(&response)?;
+        let len_bytes = (response_bytes.len() as u32).to_le_bytes();
+        writer.write_all(&len_bytes).await?;
+        writer.write_all(&response_bytes).await?;
+        writer.flush().await?;
+        return Err(anyhow!("unsupported egress protocol: {}", request.protocol));
+    }
+    
+    // Connect to target with timeout
+    let target_addr = format!("{}:{}", request.target_host, request.target_port);
+    let connect_timeout = Duration::from_secs(30);
+    
+    let target_stream = match tokio::time::timeout(
+        connect_timeout,
+        tokio::net::TcpStream::connect(&target_addr),
+    ).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            let response = EgressTunnelResponse::err(format!("connection failed: {}", e));
+            let response_bytes = postcard::to_allocvec(&response)?;
+            let len_bytes = (response_bytes.len() as u32).to_le_bytes();
+            writer.write_all(&len_bytes).await?;
+            writer.write_all(&response_bytes).await?;
+            writer.flush().await?;
+            return Err(anyhow!("failed to connect to {}: {}", target_addr, e));
+        }
+        Err(_) => {
+            let response = EgressTunnelResponse::err("connection timeout");
+            let response_bytes = postcard::to_allocvec(&response)?;
+            let len_bytes = (response_bytes.len() as u32).to_le_bytes();
+            writer.write_all(&len_bytes).await?;
+            writer.write_all(&response_bytes).await?;
+            writer.flush().await?;
+            return Err(anyhow!("connection timeout to {}", target_addr));
+        }
+    };
+    
+    // Send success response
+    let response = EgressTunnelResponse::ok();
+    let response_bytes = postcard::to_allocvec(&response)?;
+    let len_bytes = (response_bytes.len() as u32).to_le_bytes();
+    writer.write_all(&len_bytes).await?;
+    writer.write_all(&response_bytes).await?;
+    writer.flush().await?;
+    
+    info!(
+        "egress tunnel established peer={} target={}",
+        peer, target_addr
+    );
+    
+    // Reunite reader and writer back into a single stream for bidirectional copy
+    let p2p_stream = reader.reunite(writer)?;
+    
+    // Convert libp2p stream (futures::io) to tokio io
+    let p2p_stream = p2p_stream.compat();
+    let (mut p2p_reader, mut p2p_writer) = tokio::io::split(p2p_stream);
+    
+    // Split TCP stream
+    let (mut tcp_reader, mut tcp_writer) = target_stream.into_split();
+    
+    // Bidirectional copy
+    let client_to_server = tokio::io::copy(&mut p2p_reader, &mut tcp_writer);
+    let server_to_client = tokio::io::copy(&mut tcp_reader, &mut p2p_writer);
+    
+    match tokio::try_join!(client_to_server, server_to_client) {
+        Ok((c2s, s2c)) => {
+            debug!(
+                "egress tunnel closed peer={} target={} c2s_bytes={} s2c_bytes={}",
+                peer, target_addr, c2s, s2c
+            );
+        }
+        Err(e) => {
+            debug!(
+                "egress tunnel error peer={} target={} error={}",
+                peer, target_addr, e
+            );
+        }
+    }
+    
+    Ok(())
 }
