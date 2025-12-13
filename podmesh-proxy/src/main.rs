@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use tokio::signal;
 use log::{error, info};
@@ -85,7 +85,26 @@ async fn run() -> Result<()> {
         info!("workplane bootstrap node started");
     }
 
-    signal::ctrl_c().await.context("wait for ctrl+c")?;
+    // Wait for either SIGTERM or SIGINT to gracefully shutdown
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            info!("received SIGINT");
+        }
+        _ = async {
+            #[cfg(unix)]
+            {
+                let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+                    .expect("failed to install SIGTERM handler");
+                sigterm.recv().await;
+            }
+            #[cfg(not(unix))]
+            {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            info!("received SIGTERM");
+        }
+    }
 
     info!("shutting down workplane bootstrap node");
     workload.close().await;

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use podctl::{apply_file, delete_file};
-use podmesh_integration_tests::support::init_tracing;
+use podmesh_integration_tests::support::{init_ephemeral_keys, init_tracing};
 use protocol::libp2p_constants::MESH_DOMAIN_SUFFIX;
 use reqwest::Client;
 use serde_json::Value;
@@ -35,6 +35,7 @@ const REQUIRED_IMAGES: [&str; 3] = [
 #[serial]
 async fn complete_rootless_stack_serves_ingress() -> Result<()> {
     init_tracing();
+    init_ephemeral_keys();
 
     if !is_podman_available().await {
         log::warn!("skipping end-to-end test because podman is unavailable");

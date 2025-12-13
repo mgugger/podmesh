@@ -82,15 +82,29 @@ pub enum SidecarEvent {
 pub async fn run_sidecar(cfg: SidecarConfig) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     tokio::spawn(async move {
-        match signal::ctrl_c().await {
-            Ok(_) => {
-                let _ = shutdown_tx.send(());
+        // Wait for either SIGTERM or SIGINT to gracefully shutdown
+        tokio::select! {
+            result = signal::ctrl_c() => {
+                match result {
+                    Ok(_) => info!("sidecar received SIGINT"),
+                    Err(err) => warn!("sidecar ctrl+c listener failed error={}", err),
+                }
             }
-            Err(err) => {
-                warn!("sidecar ctrl+c listener failed error={}", err);
-                let _ = shutdown_tx.send(());
-            }
+            _ = async {
+                #[cfg(unix)]
+                {
+                    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+                        .expect("failed to install SIGTERM handler");
+                    sigterm.recv().await;
+                    info!("sidecar received SIGTERM");
+                }
+                #[cfg(not(unix))]
+                {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
         }
+        let _ = shutdown_tx.send(());
     });
     run_sidecar_with_shutdown(cfg, shutdown_rx, None).await
 }
