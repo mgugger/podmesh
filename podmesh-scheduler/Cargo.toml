@@ -28,6 +28,7 @@ p2p = { workspace = true }
 axum-support = { workspace = true }
 parking_lot = { workspace = true }
 lru = { workspace = true }
+redb = { workspace = true }
 
 [dev-dependencies]
 podctl = { workspace = true }

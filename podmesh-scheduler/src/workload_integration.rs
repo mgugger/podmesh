@@ -15,6 +15,9 @@ use crate::resource_verifier::{ResourceVerifier, ReservationStatus};
 use crate::runtime::{
     DeploymentConfig, SidecarInjectionConfig, RuntimeRegistry, create_default_registry,
 };
+use crate::storage::{StateStore, DeploymentRecord};
+#[cfg(not(debug_assertions))]
+use crate::storage::StateStoreConfig;
 use libp2p::Swarm;
 use libp2p::request_response;
 use log::{debug, error, info, warn};
@@ -37,7 +40,11 @@ static PROVIDER_MANAGER: Lazy<Arc<RwLock<Option<ProviderManager>>>> =
 static RESOURCE_VERIFIER: Lazy<Arc<ResourceVerifier>> =
     Lazy::new(|| Arc::new(ResourceVerifier::new()));
 
-/// Node-local cache mapping manifest IDs to owner public keys.
+/// Global persistent state store (redb-backed)
+static STATE_STORE: Lazy<Arc<RwLock<Option<StateStore>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(None)));
+
+/// Fallback in-memory cache (used when persistence is disabled)
 static MANIFEST_OWNER_MAP: Lazy<RwLock<HashMap<String, Vec<u8>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
@@ -107,23 +114,78 @@ pub async fn initialize_workload_manager(
         warn!("Failed to update system resources: {}", e);
     }
 
+    // Initialize persistent state store
+    // In debug builds, use ephemeral storage to avoid lock conflicts between parallel tests
+    info!("Initializing persistent state store");
+    #[cfg(debug_assertions)]
+    let store_result = StateStore::open_ephemeral();
+    #[cfg(not(debug_assertions))]
+    let store_result = StateStore::open(&StateStoreConfig::default());
+    
+    match store_result {
+        Ok(store) => {
+            let mut global_store = STATE_STORE.write().await;
+            *global_store = Some(store);
+            info!("Persistent state store initialized");
+        }
+        Err(e) => {
+            warn!("Failed to initialize persistent state store: {}. Using in-memory fallback.", e);
+        }
+    }
+
     info!("Runtime registry and provider manager initialized successfully");
     Ok(())
 }
 
 /// Record the owner public key for a manifest on this node.
+/// Uses persistent storage if available, falls back to in-memory.
 pub async fn record_manifest_owner(manifest_id: &str, owner_pubkey: &[u8]) {
+    // Try persistent store first
+    let store_guard = STATE_STORE.read().await;
+    if let Some(ref store) = *store_guard {
+        match store.set_manifest_owner(manifest_id, owner_pubkey) {
+            Ok(()) => {
+                info!(
+                    "record_manifest_owner: persisted owner_pubkey len={} for manifest_id={}",
+                    owner_pubkey.len(),
+                    manifest_id
+                );
+                return;
+            }
+            Err(e) => {
+                warn!("Failed to persist manifest owner, using in-memory fallback: {}", e);
+            }
+        }
+    }
+    drop(store_guard);
+
+    // Fallback to in-memory
     let mut map = MANIFEST_OWNER_MAP.write().await;
     map.insert(manifest_id.to_string(), owner_pubkey.to_vec());
     info!(
-        "record_manifest_owner: stored owner_pubkey len={} for manifest_id={}",
+        "record_manifest_owner: stored owner_pubkey len={} for manifest_id={} (in-memory)",
         owner_pubkey.len(),
         manifest_id
     );
 }
 
 /// Retrieve the owner public key for a manifest if known.
+/// Checks persistent storage first, then in-memory cache.
 pub async fn get_manifest_owner(manifest_id: &str) -> Option<Vec<u8>> {
+    // Try persistent store first
+    let store_guard = STATE_STORE.read().await;
+    if let Some(ref store) = *store_guard {
+        match store.get_manifest_owner(manifest_id) {
+            Ok(Some(owner)) => return Some(owner),
+            Ok(None) => {}
+            Err(e) => {
+                warn!("Failed to read manifest owner from store: {}", e);
+            }
+        }
+    }
+    drop(store_guard);
+
+    // Fallback to in-memory
     let map = MANIFEST_OWNER_MAP.read().await;
     map.get(manifest_id).cloned()
 }
@@ -136,9 +198,101 @@ pub async fn set_task_store(task_store: Arc<RwLock<HashMap<String, crate::restap
 }
 
 /// Remove the owner mapping for a manifest.
+/// Removes from both persistent storage and in-memory cache.
 pub async fn remove_manifest_owner(manifest_id: &str) -> Option<Vec<u8>> {
+    let mut result = None;
+
+    // Try persistent store first
+    let store_guard = STATE_STORE.read().await;
+    if let Some(ref store) = *store_guard {
+        match store.remove_manifest_owner(manifest_id) {
+            Ok(owner) => {
+                result = owner;
+                info!("remove_manifest_owner: removed from persistent store for manifest_id={}", manifest_id);
+            }
+            Err(e) => {
+                warn!("Failed to remove manifest owner from store: {}", e);
+            }
+        }
+    }
+    drop(store_guard);
+
+    // Also remove from in-memory (in case it was stored there as fallback)
     let mut map = MANIFEST_OWNER_MAP.write().await;
-    map.remove(manifest_id)
+    if let Some(owner) = map.remove(manifest_id) {
+        if result.is_none() {
+            result = Some(owner);
+        }
+    }
+
+    result
+}
+
+/// Record a deployment to persistent storage.
+pub async fn record_deployment(
+    manifest_id: &str,
+    workload_id: &str,
+    owner_pubkey: &[u8],
+    runtime_engine: &str,
+) {
+    let store_guard = STATE_STORE.read().await;
+    if let Some(ref store) = *store_guard {
+        let record = DeploymentRecord::new(
+            workload_id.to_string(),
+            manifest_id.to_string(),
+            "running".to_string(),
+            runtime_engine.to_string(),
+            owner_pubkey.to_vec(),
+        );
+        if let Err(e) = store.set_deployment(&record) {
+            warn!("Failed to persist deployment record: {}", e);
+        } else {
+            info!(
+                "Persisted deployment record: manifest_id={}, workload_id={}",
+                manifest_id, workload_id
+            );
+        }
+    }
+}
+
+/// Update the status of an existing deployment.
+pub async fn update_deployment_status(workload_id: &str, status: &str) {
+    let store_guard = STATE_STORE.read().await;
+    if let Some(ref store) = *store_guard {
+        if let Err(e) = store.update_deployment_status(workload_id, status) {
+            warn!("Failed to update deployment status: {}", e);
+        } else {
+            debug!("Updated deployment status: workload_id={}, status={}", workload_id, status);
+        }
+    }
+}
+
+/// Remove a deployment record.
+pub async fn remove_deployment(workload_id: &str) {
+    let store_guard = STATE_STORE.read().await;
+    if let Some(ref store) = *store_guard {
+        if let Err(e) = store.remove_deployment(workload_id) {
+            warn!("Failed to remove deployment record: {}", e);
+        } else {
+            info!("Removed deployment record: workload_id={}", workload_id);
+        }
+    }
+}
+
+/// Get all deployment records (for recovery/status queries).
+pub async fn list_deployments() -> Vec<DeploymentRecord> {
+    let store_guard = STATE_STORE.read().await;
+    if let Some(ref store) = *store_guard {
+        match store.list_deployments() {
+            Ok(deployments) => deployments,
+            Err(e) => {
+                warn!("Failed to list deployments: {}", e);
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    }
 }
 
 /// Get access to the global runtime registry (for testing and debug endpoints)
@@ -511,6 +665,9 @@ async fn process_manifest_deployment(
         "Workload deployed successfully: {} using engine '{}', status: {:?}",
         workload_info.id, engine_name, workload_info.status
     );
+
+    // Persist deployment record for recovery
+    record_deployment(&manifest_id, &workload_info.id, owner_pubkey, &engine_name).await;
 
     // Announce as provider if deployment successful
     if let Some(provider_manager) = PROVIDER_MANAGER.read().await.as_ref() {
@@ -1233,6 +1390,8 @@ pub async fn remove_workloads_by_manifest_id(
                                         "Successfully removed workload: {} from engine '{}'",
                                         workload.id, engine_name
                                     );
+                                    // Remove from persistent storage
+                                    remove_deployment(&workload.id).await;
                                     removed_workloads.push(workload.id);
                                 }
                                 Err(e) => {

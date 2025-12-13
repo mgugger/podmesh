@@ -13,3 +13,5 @@ crypto = { workspace = true }
 postcard = { workspace = true }
 serde_bytes = { workspace = true }
 serde_yaml = { workspace = true }
+regorus = { workspace = true }
+log = { workspace = true }

@@ -19,6 +19,7 @@ pub mod resource_verifier;
 pub mod restapi;
 pub mod runtime;
 pub mod scheduler;
+pub mod storage;
 pub mod workload_integration;
 pub mod workload_manager;
 

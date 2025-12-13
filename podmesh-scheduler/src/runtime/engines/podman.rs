@@ -10,6 +10,7 @@ use crate::runtime::{
 use async_trait::async_trait;
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
+use protocol::manifest_policy;
 use protocol::manifest_yaml::{
     parse_yaml_documents_from_slice, parse_yaml_documents_from_str, serialize_yaml_documents,
 };
@@ -563,7 +564,10 @@ impl RuntimeEngine for PodmanEngine {
     }
 
     async fn validate_manifest(&self, manifest_content: &[u8]) -> RuntimeResult<()> {
-        let docs = parse_yaml_documents_from_str(&String::from_utf8_lossy(manifest_content))
+        let manifest_str = String::from_utf8_lossy(manifest_content);
+        
+        // First validate basic YAML structure
+        let docs = parse_yaml_documents_from_str(&manifest_str)
             .map_err(|e| RuntimeError::InvalidManifest(format!("YAML parse error: {}", e)))?;
 
         if docs.is_empty() {
@@ -585,6 +589,22 @@ impl RuntimeEngine for PodmanEngine {
                     idx + 1
                 )));
             }
+        }
+
+        // Then validate against security policies
+        let policy_result = manifest_policy::validate_manifest(&manifest_str)
+            .map_err(|e| RuntimeError::InvalidManifest(format!("Policy validation error: {}", e)))?;
+        
+        if !policy_result.allowed {
+            let violations = if policy_result.violations.is_empty() {
+                "policy violation".to_string()
+            } else {
+                policy_result.violations.join("; ")
+            };
+            return Err(RuntimeError::InvalidManifest(format!(
+                "Policy validation failed: {}",
+                violations
+            )));
         }
 
         info!("Manifest validation passed for {} documents", docs.len());

@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: unauthorized-net-admin
+spec:
+  containers:
+    - name: my-app
+      image: docker.io/library/nginx
+      ports:
+        - containerPort: 80
+      securityContext:
+        capabilities:
+          add:
+            - NET_ADMIN

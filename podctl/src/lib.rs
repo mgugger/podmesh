@@ -3,6 +3,7 @@ use log::debug;
 use log::error;
 use log::info;
 use protocol::machine::parse_peer_with_pubkey;
+use protocol::manifest_policy::validate_and_mutate_manifest;
 use protocol::manifest_yaml::parse_manifest_to_json;
 use uuid::Uuid;
 use std::env;
@@ -92,9 +93,21 @@ pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> anyhow::Result
         contents.len()
     );
 
-    // Parse manifest to JSON if possible, else wrap raw
+    // Validate manifest against policies and apply mutations (inject defaults)
+    let validated_contents = match validate_and_mutate_manifest(&contents) {
+        Ok(mutated) => {
+            info!("Manifest passed policy validation");
+            mutated
+        }
+        Err(e) => {
+            error!("Manifest failed policy validation: {}", e);
+            anyhow::bail!("Policy validation failed: {}", e);
+        }
+    };
+
+    // Parse validated manifest to JSON
     let manifest_json =
-        parse_manifest_to_json(&contents).unwrap_or_else(|_| serde_json::json!({"raw": contents}));
+        parse_manifest_to_json(&validated_contents).unwrap_or_else(|_| serde_json::json!({"raw": validated_contents}));
     debug!("apply_file: manifest parsed successfully");
 
     // Extract replicas count from manifest (check spec.replicas or top-level replicas, default to 1)
@@ -169,7 +182,8 @@ pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> anyhow::Result
     debug!("Selected nodes with pubkeys: {:?}", selected_nodes);
 
     let ts = p2p::timestamp_millis();
-    let original_manifest_str = contents;
+    // Use validated (and possibly mutated) manifest for deployment
+    let manifest_to_deploy = validated_contents;
     let mut succeeded_nodes = Vec::new();
     let mut failed_nodes: Vec<(String, String)> = Vec::new();
 
@@ -178,7 +192,7 @@ pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> anyhow::Result
             &api_client,
             node_id,
             node_pubkey,
-            &original_manifest_str,
+            &manifest_to_deploy,
             &manifest_id,
             ts,
         )
@@ -515,6 +529,185 @@ async fn send_delete_to_node(
 
     debug!("Direct delete successful for node {}", node_id);
     Ok(())
+}
+
+/// List all workloads from the scheduler.
+/// Returns a JSON array of workload information.
+pub async fn get_pods(api_base: Option<&str>) -> anyhow::Result<String> {
+    let base = resolve_api_base(api_base);
+    let url = format!("{}/runtime/workloads", base);
+    
+    debug!("Fetching workloads from {}", url);
+    
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to scheduler: {}", e))?;
+    
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("Failed to get workloads: {} - {}", status, body);
+    }
+    
+    let body = response.text().await
+        .map_err(|e| anyhow::anyhow!("Failed to read response: {}", e))?;
+    
+    Ok(body)
+}
+
+/// Get details of a specific workload by ID.
+pub async fn get_pod(workload_id: &str, api_base: Option<&str>) -> anyhow::Result<String> {
+    let base = resolve_api_base(api_base);
+    let url = format!("{}/runtime/workloads/{}", base, workload_id);
+    
+    debug!("Fetching workload {} from {}", workload_id, url);
+    
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to scheduler: {}", e))?;
+    
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("Workload '{}' not found", workload_id);
+    }
+    
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("Failed to get workload: {} - {}", status, body);
+    }
+    
+    let body = response.text().await
+        .map_err(|e| anyhow::anyhow!("Failed to read response: {}", e))?;
+    
+    Ok(body)
+}
+
+/// Get logs for a specific workload.
+pub async fn get_logs(workload_id: &str, tail: Option<usize>, api_base: Option<&str>) -> anyhow::Result<String> {
+    let base = resolve_api_base(api_base);
+    let url = if let Some(n) = tail {
+        format!("{}/runtime/workloads/{}/logs?tail={}", base, workload_id, n)
+    } else {
+        format!("{}/runtime/workloads/{}/logs", base, workload_id)
+    };
+    
+    debug!("Fetching logs for workload {} from {}", workload_id, url);
+    
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to scheduler: {}", e))?;
+    
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("Workload '{}' not found", workload_id);
+    }
+    
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("Failed to get logs: {} - {}", status, body);
+    }
+    
+    let body = response.text().await
+        .map_err(|e| anyhow::anyhow!("Failed to read response: {}", e))?;
+    
+    Ok(body)
+}
+
+/// Format workload list for human-readable output.
+pub fn format_workloads_table(json_response: &str) -> String {
+    let workloads: Result<Vec<serde_json::Value>, _> = serde_json::from_str(json_response);
+    
+    match workloads {
+        Ok(list) if list.is_empty() => "No workloads found.".to_string(),
+        Ok(list) => {
+            let mut output = String::new();
+            output.push_str(&format!(
+                "{:<40} {:<15} {:<20} {:<10}\n",
+                "NAME", "STATUS", "RUNTIME", "AGE"
+            ));
+            output.push_str(&"-".repeat(85));
+            output.push('\n');
+            
+            for workload in list {
+                let name = workload.get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let status = workload.get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let runtime = workload.get("runtime_engine")
+                    .or_else(|| workload.get("runtime"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let created = workload.get("created_at")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                
+                output.push_str(&format!(
+                    "{:<40} {:<15} {:<20} {:<10}\n",
+                    truncate_str(name, 38),
+                    status,
+                    runtime,
+                    created
+                ));
+            }
+            output
+        }
+        Err(_) => {
+            // If we can't parse as array, just return raw JSON
+            json_response.to_string()
+        }
+    }
+}
+
+/// Format single workload for human-readable output.
+pub fn format_workload_details(json_response: &str) -> String {
+    let workload: Result<serde_json::Value, _> = serde_json::from_str(json_response);
+    
+    match workload {
+        Ok(w) => {
+            let mut output = String::new();
+            output.push_str("Workload Details:\n");
+            output.push_str(&"-".repeat(40));
+            output.push('\n');
+            
+            if let Some(id) = w.get("id").and_then(|v| v.as_str()) {
+                output.push_str(&format!("ID:       {}\n", id));
+            }
+            if let Some(status) = w.get("status").and_then(|v| v.as_str()) {
+                output.push_str(&format!("Status:   {}\n", status));
+            }
+            if let Some(runtime) = w.get("runtime_engine").or_else(|| w.get("runtime")).and_then(|v| v.as_str()) {
+                output.push_str(&format!("Runtime:  {}\n", runtime));
+            }
+            if let Some(manifest) = w.get("manifest_id").and_then(|v| v.as_str()) {
+                output.push_str(&format!("Manifest: {}\n", manifest));
+            }
+            if let Some(created) = w.get("created_at").and_then(|v| v.as_str()) {
+                output.push_str(&format!("Created:  {}\n", created));
+            }
+            
+            output
+        }
+        Err(_) => json_response.to_string(),
+    }
+}
+
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len - 3])
+    }
 }
 
 #[cfg(test)]

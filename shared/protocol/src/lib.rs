@@ -2,6 +2,7 @@ pub mod sidecar_metadata;
 pub mod libp2p_constants;
 pub mod machine;
 pub mod manifest_yaml;
+pub mod manifest_policy;
 pub mod egress;
 
 #[cfg(test)]
