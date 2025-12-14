@@ -19,6 +19,8 @@ pub const SIDECAR_BOOTSTRAP_ENV: &str = BOOTSTRAP_ENV_VAR;
 pub const SIDECAR_LOG_ENV: &str = "RUST_LOG";
 /// Default log level used for injected sidecars.
 pub const SIDECAR_LOG_LEVEL: &str = "debug";
+/// Environment variable to enable transparent egress proxy in the sidecar.
+pub const SIDECAR_ENABLE_EGRESS_ENV: &str = "PODMESH_ENABLE_EGRESS";
 
 /// Settings that control global sidecar behavior.
 #[derive(Debug, Clone)]

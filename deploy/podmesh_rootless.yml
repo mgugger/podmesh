@@ -107,6 +107,7 @@ spec:
       image: podmesh/proxy:latest
       args:
         - "--enable-ingress"
+        - "--enable-proxy-provider"
       env:
         - name: libp2p_quic_port
           value: "4002"

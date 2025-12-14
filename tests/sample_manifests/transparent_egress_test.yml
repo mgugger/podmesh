@@ -1,0 +1,25 @@
+# Test manifest for transparent egress proxy validation
+# Deploys an Alpine container that can make outbound HTTP requests
+# alongside a sidecar with CAP_NET_ADMIN for nftables-based transparent proxying
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: egress-test
+spec:
+  selector:
+    matchLabels:
+      run: egress-test
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        run: egress-test
+    spec:
+      containers:
+        - name: curl-client
+          image: docker.io/curlimages/curl:latest
+          command: ["sleep", "3600"]
+          resources:
+            limits:
+              memory: "64Mi"
+              cpu: "100m"

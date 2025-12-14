@@ -5,8 +5,8 @@
 //! the runtime engines and provider announcement system.
 
 use crate::sidecar::{
-    SIDECAR_BOOTSTRAP_ENV, SIDECAR_LOG_ENV, SIDECAR_LOG_LEVEL, SIDECAR_METADATA_BLOB_ENV,
-    SIDECAR_CONTAINER_NAME, SidecarSettings, build_inline_metadata_blob,
+    SIDECAR_BOOTSTRAP_ENV, SIDECAR_ENABLE_EGRESS_ENV, SIDECAR_LOG_ENV, SIDECAR_LOG_LEVEL,
+    SIDECAR_METADATA_BLOB_ENV, SIDECAR_CONTAINER_NAME, SidecarSettings, build_inline_metadata_blob,
     sidecar_settings,
 };
 use crate::podmesh_p2p::behaviour::MyBehaviour;
@@ -884,6 +884,8 @@ fn build_sidecar_container_spec(
         &sidecar_config.bootstrap_peer,
     ));
     env_entries.push(build_env_var(SIDECAR_LOG_ENV, SIDECAR_LOG_LEVEL));
+    // Enable transparent egress proxy (requires CAP_NET_ADMIN which is added below)
+    env_entries.push(build_env_var(SIDECAR_ENABLE_EGRESS_ENV, "true"));
     container.insert(
         serde_yaml::Value::String("env".to_string()),
         serde_yaml::Value::Sequence(env_entries),

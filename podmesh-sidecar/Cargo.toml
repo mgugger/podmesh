@@ -23,11 +23,11 @@ serde_yaml = { workspace = true }
 base64 = { workspace = true }
 
 # Egress proxy dependencies
-nftables = "0.6"
+rustables = "0.8"
 libc = "0.2"
 nix = { version = "0.29", features = ["net", "socket"] }
 socket2 = "0.5"
-ipnetwork = "0.20"
+ipnetwork = "0.21"
 tokio-util = { version = "0.7", features = ["compat"] }
 postcard = { workspace = true }
 
