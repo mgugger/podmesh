@@ -243,6 +243,8 @@ async fn sidecar_discovers_egress_proxy_via_dht() -> Result<()> {
             DEFAULT_SIDECAR_APP_PORT,
             true, // enable_egress
         )?;
+        // Proxy discovery is all this test needs; skip nftables so the test works without CAP_NET_ADMIN
+        sidecar_cfg.skip_egress_nft = true;
         // Use a faster lookup interval for testing
         sidecar_cfg.lookup_interval = Duration::from_secs(1);
         
@@ -629,6 +631,7 @@ fn build_sidecar_config_full(
         routes,
         owner_public_key_b64: None,
         enable_egress,
+        skip_egress_nft: false,
         http_proxy_port,
     };
     Ok((cfg, ingress_host, service_host))

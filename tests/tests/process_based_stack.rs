@@ -264,6 +264,7 @@ fn build_sidecar_config(
         routes,
         owner_public_key_b64: None,
         enable_egress: false,
+        skip_egress_nft: false,
         http_proxy_port: None,
     };
     Ok((cfg, ingress_host, service_host))

@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result};
 use ipnetwork::IpNetwork;
+use std::fs;
 use rustables::{
     expr::{Cmp, CmpOp, Immediate, Meta, MetaType, Nat, NatType, Register, VerdictKind},
     Batch, Chain, ChainPolicy, ChainType, Hook, HookClass, MsgType, Protocol, ProtocolFamily, Rule,
@@ -33,6 +34,9 @@ const EXCLUDED_NETWORKS: &[&str] = &[
     "10.0.2.0/24",    // Pasta/slirp4netns default
     "169.254.0.0/16", // Link-local
 ];
+
+/// Capability bit for CAP_NET_ADMIN in the /proc status mask
+const CAP_NET_ADMIN_BIT: u32 = 12;
 
 /// Configuration for egress nftables setup
 #[derive(Debug, Clone)]
@@ -194,6 +198,36 @@ fn try_delete_existing_table() -> Result<()> {
     batch.send().context("Failed to delete existing table")
 }
 
+/// Returns true when the current process has CAP_NET_ADMIN in the effective set
+pub fn has_net_admin_capability() -> bool {
+    match fs::read_to_string("/proc/self/status") {
+        Ok(contents) => {
+            if let Some(mask) = parse_cap_eff_mask(&contents) {
+                return mask_has_net_admin(mask);
+            }
+            false
+        }
+        Err(err) => {
+            log::debug!("failed to read /proc/self/status to check capabilities: {}", err);
+            false
+        }
+    }
+}
+
+fn parse_cap_eff_mask(contents: &str) -> Option<u64> {
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .and_then(|rest| {
+            let value = rest.trim();
+            u64::from_str_radix(value, 16).ok()
+        })
+}
+
+fn mask_has_net_admin(mask: u64) -> bool {
+    mask & (1u64 << CAP_NET_ADMIN_BIT) != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +249,16 @@ mod tests {
             .iter()
             .any(|n| n.to_string() == "127.0.0.0/8");
         assert!(has_loopback);
+    }
+
+    #[test]
+    fn parses_cap_eff_mask_values() {
+        let sample = "Name:\ttest\nCapEff:\t0000000000001000\n";
+        let mask = super::parse_cap_eff_mask(sample).expect("mask parse");
+        assert!(super::mask_has_net_admin(mask));
+
+        let sample_no_cap = "CapEff:\t0000000000000000\n";
+        let mask = super::parse_cap_eff_mask(sample_no_cap).expect("mask parse");
+        assert!(!super::mask_has_net_admin(mask));
     }
 }

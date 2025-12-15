@@ -54,6 +54,9 @@ struct Args {
     /// Enable transparent egress proxy (requires CAP_NET_ADMIN for nftables)
     #[arg(long = "enable-egress", env = "PODMESH_ENABLE_EGRESS", default_value_t = false)]
     enable_egress: bool,
+    /// Skip nftables programming even when egress is enabled (useful for tests or restricted hosts)
+    #[arg(long = "skip-egress-nft", env = "PODMESH_SKIP_EGRESS_NFT", default_value_t = false)]
+    skip_egress_nft: bool,
     /// Port for HTTP CONNECT proxy (explicit proxy mode, 0 to use default port)
     /// If not specified, HTTP CONNECT proxy is disabled.
     #[arg(long = "http-proxy-port", env = "PODMESH_HTTP_PROXY_PORT")]
@@ -128,6 +131,7 @@ impl TryFrom<Args> for SidecarConfig {
             routes,
             owner_public_key_b64: metadata.owner_public_key_b64.clone(),
             enable_egress: args.enable_egress,
+            skip_egress_nft: args.skip_egress_nft,
             http_proxy_port: args.http_proxy_port,
         })
     }

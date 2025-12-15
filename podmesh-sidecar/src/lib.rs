@@ -62,6 +62,8 @@ pub struct SidecarConfig {
     pub owner_public_key_b64: Option<String>,
     /// Enable transparent egress proxy (requires CAP_NET_ADMIN)
     pub enable_egress: bool,
+    /// Skip nftables programming even when egress is enabled (useful for tests or restricted hosts)
+    pub skip_egress_nft: bool,
     /// Port for HTTP CONNECT proxy (explicit proxy mode)
     /// If set to 0, uses the default port. If None, HTTP CONNECT proxy is disabled.
     pub http_proxy_port: Option<u16>,
@@ -120,7 +122,7 @@ pub async fn run_sidecar_with_shutdown(
         .map(|addr| addr.to_string())
         .unwrap_or_else(|| "none".to_string());
     info!(
-        "sidecar runtime starting with config has_events={} provider={} manifest={} ingress_host={} libp2p_host={} libp2p_port={} announce_providers={} lookup_interval_ms={} announce_interval_ms={} bootstrap_peers={:?} bootstrap_peer_ip={} listen_addr={} app_port={} routes={} enable_egress={}",
+        "sidecar runtime starting with config has_events={} provider={} manifest={} ingress_host={} libp2p_host={} libp2p_port={} announce_providers={} lookup_interval_ms={} announce_interval_ms={} bootstrap_peers={:?} bootstrap_peer_ip={} listen_addr={} app_port={} routes={} enable_egress={} skip_egress_nft={}",
         event_tx.is_some(),
         cfg.provider_label,
         cfg.manifest_id,
@@ -135,7 +137,8 @@ pub async fn run_sidecar_with_shutdown(
         listen_addr_display,
         cfg.app_port,
         cfg.routes.len(),
-        cfg.enable_egress
+        cfg.enable_egress,
+        cfg.skip_egress_nft
     );
 
     let mut swarm = build_swarm(&cfg)?;
@@ -146,16 +149,21 @@ pub async fn run_sidecar_with_shutdown(
     }
 
     // Set up egress proxy if enabled
-    let egress_nft_cleanup_needed = if cfg.enable_egress {
-        match egress_nft::setup_egress_rules(&egress_nft::EgressNftConfig::default()) {
-            Ok(()) => {
-                info!("egress nftables rules configured successfully");
-                true
+    let egress_nft_cleanup_needed = if cfg.enable_egress && !cfg.skip_egress_nft {
+        if egress_nft::has_net_admin_capability() {
+            match egress_nft::setup_egress_rules(&egress_nft::EgressNftConfig::default()) {
+                Ok(()) => {
+                    info!("egress nftables rules configured successfully");
+                    true
+                }
+                Err(err) => {
+                    warn!("failed to setup egress nftables rules (requires CAP_NET_ADMIN): {}", err);
+                    false
+                }
             }
-            Err(err) => {
-                warn!("failed to setup egress nftables rules (requires CAP_NET_ADMIN): {}", err);
-                false
-            }
+        } else {
+            warn!("skipping egress nftables setup: CAP_NET_ADMIN capability not available");
+            false
         }
     } else {
         false
