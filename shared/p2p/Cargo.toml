@@ -7,7 +7,7 @@ edition = "2024"
 anyhow = { workspace = true }
 libp2p = { workspace = true }
 log = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
 protocol = { path = "../protocol" }
 crypto = { path = "../crypto" }
 base64 = { workspace = true }

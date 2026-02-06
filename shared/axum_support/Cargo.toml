@@ -7,6 +7,6 @@ edition = "2024"
 anyhow = { workspace = true }
 axum = { workspace = true }
 log = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt"] }
 parking_lot = { workspace = true }
 lru = { workspace = true }

@@ -4,7 +4,7 @@
 //! It integrates the Podman runtime engine with provider announcement and discovery
 //! systems to provide a unified workload management experience.
 
-use crate::provider::{ProviderConfig, ProviderManager};
+use crate::provider::{ProviderBackend, ProviderConfig, ProviderManager};
 use crate::runtime::{
     DeploymentConfig, RuntimeEngine, RuntimeRegistry, WorkloadInfo, WorkloadStatus,
     create_default_registry,
@@ -97,7 +97,7 @@ pub struct WorkloadManager {
     /// Registry of available runtime engines
     runtime_registry: Arc<RwLock<RuntimeRegistry>>,
     /// Provider manager for announcements and discovery
-    provider_manager: Arc<ProviderManager>,
+    provider_manager: Arc<dyn ProviderBackend>,
     /// Currently deployed workloads
     deployments: Arc<RwLock<HashMap<String, DeploymentStatus>>>,
     /// Configuration
@@ -155,11 +155,12 @@ impl WorkloadManager {
             default_ttl_seconds: config.provider_ttl_seconds,
             ..Default::default()
         };
-        let provider_manager = ProviderManager::new(provider_config);
+        let provider_manager: Arc<dyn ProviderBackend> =
+            Arc::new(ProviderManager::new(provider_config));
 
         Ok(Self {
             runtime_registry: Arc::new(RwLock::new(runtime_registry)),
-            provider_manager: Arc::new(provider_manager),
+            provider_manager,
             deployments: Arc::new(RwLock::new(HashMap::new())),
             config,
             event_sender: None,

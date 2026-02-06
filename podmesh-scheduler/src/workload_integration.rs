@@ -10,7 +10,7 @@ use crate::sidecar::{
     sidecar_settings,
 };
 use crate::podmesh_p2p::behaviour::MyBehaviour;
-use crate::provider::{ProviderConfig, ProviderManager};
+use crate::provider::{ProviderBackend, ProviderConfig, ProviderManager};
 use crate::resource_verifier::{ResourceVerifier, ReservationStatus};
 use crate::runtime::{
     DeploymentConfig, SidecarInjectionConfig, RuntimeRegistry, create_default_registry,
@@ -33,7 +33,7 @@ static RUNTIME_REGISTRY: Lazy<Arc<RwLock<Option<RuntimeRegistry>>>> =
     Lazy::new(|| Arc::new(RwLock::new(None)));
 
 /// Global provider manager for announcements
-static PROVIDER_MANAGER: Lazy<Arc<RwLock<Option<ProviderManager>>>> =
+static PROVIDER_MANAGER: Lazy<Arc<RwLock<Option<Arc<dyn ProviderBackend>>>>> =
     Lazy::new(|| Arc::new(RwLock::new(None)));
 
 /// Global resource verifier for capacity checks
@@ -100,7 +100,8 @@ pub async fn initialize_workload_manager(
         default_ttl_seconds: 3600, // 1 hour
         ..Default::default()
     };
-    let provider_manager = ProviderManager::new(provider_config);
+    let provider_manager: Arc<dyn ProviderBackend> =
+        Arc::new(ProviderManager::new(provider_config));
 
     {
         let mut global_provider_manager = PROVIDER_MANAGER.write().await;

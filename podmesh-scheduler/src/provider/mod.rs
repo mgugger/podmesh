@@ -4,10 +4,8 @@
 //! of specific manifests and for other nodes to discover which nodes are hosting
 //! which manifests. This is more efficient than using gossipsub for discovery.
 
-use libp2p::kad::RecordKey;
 use libp2p::{PeerId, Swarm};
-use log::{debug, error, info, warn};
-use parking_lot::Mutex;
+use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -15,8 +13,15 @@ use tokio::sync::mpsc;
 
 use crate::podmesh_p2p::behaviour::MyBehaviour;
 
+pub mod store;
+pub mod network;
+
 pub mod announcements;
 pub mod discovery;
+
+use async_trait::async_trait;
+use network::{DhtProviderNetwork, ProviderNetwork};
+use store::{InMemoryProviderStore, ProviderStore};
 
 /// Errors that can occur during provider operations
 #[derive(Debug, thiserror::Error)]
@@ -72,12 +77,10 @@ impl ProviderInfo {
 
 /// Manager for provider announcements and discovery
 pub struct ProviderManager {
-    /// Local providers (manifests this node is hosting)
-    local_providers: Arc<Mutex<HashMap<String, ProviderInfo>>>,
-    /// Remote providers (manifests hosted by other nodes)
-    remote_providers: Arc<Mutex<HashMap<String, Vec<ProviderInfo>>>>,
-    /// Pending provider queries
-    pending_queries: Arc<Mutex<HashMap<String, Vec<mpsc::UnboundedSender<Vec<ProviderInfo>>>>>>,
+    /// Storage backend for provider data
+    store: Arc<dyn ProviderStore>,
+    /// Network backend for DHT interactions
+    network: Arc<dyn ProviderNetwork>,
     /// Configuration
     config: ProviderConfig,
 }
@@ -113,9 +116,8 @@ impl ProviderManager {
     /// Create a new provider manager
     pub fn new(config: ProviderConfig) -> Self {
         Self {
-            local_providers: Arc::new(Mutex::new(HashMap::new())),
-            remote_providers: Arc::new(Mutex::new(HashMap::new())),
-            pending_queries: Arc::new(Mutex::new(HashMap::new())),
+            store: Arc::new(InMemoryProviderStore::new()),
+            network: DhtProviderNetwork::new(),
             config,
         }
     }
@@ -132,7 +134,7 @@ impl ProviderManager {
         manifest_id: &str,
         metadata: HashMap<String, String>,
     ) -> ProviderResult<()> {
-        let local_peer_id = *swarm.local_peer_id();
+        let local_peer_id = self.network.local_peer_id(swarm);
 
         info!(
             "Announcing provider for manifest: {} from peer: {}",
@@ -150,13 +152,11 @@ impl ProviderManager {
         };
 
         // Store locally
-        {
-            let mut local_providers = self.local_providers.lock();
-            local_providers.insert(manifest_id.to_string(), provider_info);
-        }
+        self.store
+            .insert_local(manifest_id.to_string(), provider_info);
 
         // Announce via DHT
-        self.announce_via_dht(swarm, manifest_id)?;
+        self.network.start_providing(swarm, manifest_id)?;
 
         debug!(
             "Successfully announced provider for manifest: {}",
@@ -172,8 +172,7 @@ impl ProviderManager {
             manifest_id
         );
 
-        let mut local_providers = self.local_providers.lock();
-        if local_providers.remove(manifest_id).is_some() {
+        if self.store.remove_local(manifest_id).is_some() {
             debug!("Removed local provider for manifest: {}", manifest_id);
             Ok(())
         } else {
@@ -194,24 +193,20 @@ impl ProviderManager {
         debug!("Discovering providers for manifest: {}", manifest_id);
 
         // Check if we have cached providers
-        {
-            let remote_providers = self.remote_providers.lock();
-            if let Some(providers) = remote_providers.get(manifest_id) {
-                // Filter out expired providers
-                let valid_providers: Vec<ProviderInfo> = providers
-                    .iter()
-                    .filter(|p| !p.is_expired())
-                    .cloned()
-                    .collect();
+        let cached_providers = self.store.get_remote(manifest_id);
+        if !cached_providers.is_empty() {
+            let valid_providers: Vec<ProviderInfo> = cached_providers
+                .into_iter()
+                .filter(|provider| !provider.is_expired())
+                .collect();
 
-                if !valid_providers.is_empty() {
-                    debug!(
-                        "Found {} cached providers for manifest: {}",
-                        valid_providers.len(),
-                        manifest_id
-                    );
-                    return Ok(valid_providers);
-                }
+            if !valid_providers.is_empty() {
+                debug!(
+                    "Found {} cached providers for manifest: {}",
+                    valid_providers.len(),
+                    manifest_id
+                );
+                return Ok(valid_providers);
             }
         }
 
@@ -221,35 +216,19 @@ impl ProviderManager {
 
     /// Get all manifests this node is providing
     pub fn get_local_providers(&self) -> Vec<ProviderInfo> {
-        let local_providers = self.local_providers.lock();
-        local_providers.values().cloned().collect()
+        self.store.list_local()
     }
 
     /// Get providers for a specific manifest (including expired ones)
     pub fn get_providers_for_manifest(&self, manifest_id: &str) -> Vec<ProviderInfo> {
-        let remote_providers = self.remote_providers.lock();
-        remote_providers
-            .get(manifest_id)
-            .cloned()
-            .unwrap_or_default()
+        self.store.get_remote(manifest_id)
     }
 
     /// Clean up expired providers
     pub fn cleanup_expired_providers(&self) {
         debug!("Cleaning up expired providers");
 
-        let mut removed_count = 0;
-        {
-            let mut remote_providers = self.remote_providers.lock();
-            for (_manifest_id, providers) in remote_providers.iter_mut() {
-                let original_len = providers.len();
-                providers.retain(|p| !p.is_expired());
-                removed_count += original_len - providers.len();
-            }
-
-            // Remove manifests with no providers
-            remote_providers.retain(|_, providers| !providers.is_empty());
-        }
+        let removed_count = self.store.cleanup_expired_remote();
 
         if removed_count > 0 {
             debug!("Cleaned up {} expired providers", removed_count);
@@ -260,10 +239,7 @@ impl ProviderManager {
     pub fn reannounce_local_providers(&self, swarm: &mut Swarm<MyBehaviour>) {
         debug!("Re-announcing local providers");
 
-        let manifest_ids: Vec<String> = {
-            let local_providers = self.local_providers.lock();
-            local_providers.keys().cloned().collect()
-        };
+        let manifest_ids = self.store.list_local_ids();
 
         let manifest_count = manifest_ids.len();
 
@@ -281,13 +257,12 @@ impl ProviderManager {
 
     /// Start background tasks for provider management
     pub fn start_background_tasks(&self, _swarm: &mut Swarm<MyBehaviour>) {
-        let _local_providers = Arc::clone(&self.local_providers);
-        let remote_providers = Arc::clone(&self.remote_providers);
+        let store = Arc::clone(&self.store);
         let config = self.config.clone();
 
         // Start cleanup task
         {
-            let remote_providers_clone = Arc::clone(&remote_providers);
+            let store = Arc::clone(&store);
             let cleanup_interval = Duration::from_secs(config.cleanup_interval_seconds);
 
             tokio::spawn(async move {
@@ -295,17 +270,7 @@ impl ProviderManager {
                 loop {
                     interval.tick().await;
 
-                    // Clean up expired providers
-                    let mut removed_count = 0;
-                    {
-                        let mut providers = remote_providers_clone.lock();
-                        for providers_list in providers.values_mut() {
-                            let original_len = providers_list.len();
-                            providers_list.retain(|p| !p.is_expired());
-                            removed_count += original_len - providers_list.len();
-                        }
-                        providers.retain(|_, providers_list| !providers_list.is_empty());
-                    }
+                    let removed_count = store.cleanup_expired_remote();
 
                     if removed_count > 0 {
                         debug!(
@@ -326,30 +291,7 @@ impl ProviderManager {
         swarm: &mut Swarm<MyBehaviour>,
         manifest_id: &str,
     ) -> ProviderResult<()> {
-        // Create a provider record key
-        let provider_key = format!("provider:{}", manifest_id);
-        let record_key = RecordKey::new(&provider_key);
-
-        // Start provider announcement
-        match swarm.behaviour_mut().kademlia.start_providing(record_key) {
-            Ok(query_id) => {
-                debug!(
-                    "Started DHT provider announcement for manifest {} (query_id: {:?})",
-                    manifest_id, query_id
-                );
-                Ok(())
-            }
-            Err(e) => {
-                error!(
-                    "Failed to start DHT provider announcement for manifest {}: {}",
-                    manifest_id, e
-                );
-                Err(ProviderError::DhtError(format!(
-                    "Failed to start providing: {}",
-                    e
-                )))
-            }
-        }
+        self.network.start_providing(swarm, manifest_id)
     }
 
     /// Internal method to query DHT for providers
@@ -358,27 +300,14 @@ impl ProviderManager {
         swarm: &mut Swarm<MyBehaviour>,
         manifest_id: &str,
     ) -> ProviderResult<Vec<ProviderInfo>> {
-        let provider_key = format!("provider:{}", manifest_id);
-        let record_key = RecordKey::new(&provider_key);
-
         // Create a channel to receive results
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         // Store the sender for this query
-        {
-            let mut pending_queries = self.pending_queries.lock();
-            pending_queries
-                .entry(manifest_id.to_string())
-                .or_insert_with(Vec::new)
-                .push(tx);
-        }
+        self.store.add_pending_query(manifest_id, tx);
 
         // Start the DHT query
-        let query_id = swarm.behaviour_mut().kademlia.get_providers(record_key);
-        debug!(
-            "Started DHT provider query for manifest {} (query_id: {:?})",
-            manifest_id, query_id
-        );
+        self.network.get_providers(swarm, manifest_id)?;
 
         // Wait for results with timeout
         let timeout = Duration::from_secs(self.config.discovery_timeout_seconds);
@@ -391,10 +320,8 @@ impl ProviderManager {
                 );
 
                 // Cache the results
-                {
-                    let mut remote_providers = self.remote_providers.lock();
-                    remote_providers.insert(manifest_id.to_string(), providers.clone());
-                }
+                self.store
+                    .set_remote(manifest_id.to_string(), providers.clone());
 
                 Ok(providers)
             }
@@ -432,54 +359,26 @@ impl ProviderManager {
         };
 
         // Add to remote providers
-        {
-            let mut remote_providers = self.remote_providers.lock();
-            let providers = remote_providers
-                .entry(manifest_id.to_string())
-                .or_insert_with(Vec::new);
-
-            // Check if we already have this provider
-            if let Some(existing) = providers.iter_mut().find(|p| p.peer_id == provider_peer) {
-                existing.update_last_seen();
-            } else {
-                // Limit the number of providers per manifest
-                if providers.len() >= self.config.max_providers_per_manifest {
-                    // Remove the oldest provider
-                    if let Some(oldest_idx) = providers
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, p)| p.last_seen)
-                        .map(|(idx, _)| idx)
-                    {
-                        providers.remove(oldest_idx);
-                    }
-                }
-                providers.push(provider_info);
-            }
-        }
+        self.store.upsert_remote_provider(
+            manifest_id,
+            provider_info,
+            self.config.max_providers_per_manifest,
+        );
 
         // Notify any pending queries
-        {
-            let mut pending_queries = self.pending_queries.lock();
-            if let Some(senders) = pending_queries.remove(manifest_id) {
-                let providers = self.get_providers_for_manifest(manifest_id);
-                for sender in senders {
-                    let _ = sender.send(providers.clone());
-                }
+        if let Some(senders) = self.store.take_pending_queries(manifest_id) {
+            let providers = self.get_providers_for_manifest(manifest_id);
+            for sender in senders {
+                let _ = sender.send(providers.clone());
             }
         }
     }
 
     /// Get statistics about the provider manager
     pub fn get_stats(&self) -> ProviderStats {
-        let local_count = self.local_providers.lock().len();
-        let (remote_manifests, total_remote_providers) = {
-            let remote_providers = self.remote_providers.lock();
-            let manifests = remote_providers.len();
-            let total_providers = remote_providers.values().map(|v| v.len()).sum();
-            (manifests, total_providers)
-        };
-        let pending_queries = self.pending_queries.lock().len();
+        let local_count = self.store.local_count();
+        let (remote_manifests, total_remote_providers) = self.store.remote_stats();
+        let pending_queries = self.store.pending_query_count();
 
         ProviderStats {
             local_providers: local_count,
@@ -487,6 +386,90 @@ impl ProviderManager {
             total_remote_providers,
             pending_queries,
         }
+    }
+}
+
+#[async_trait]
+pub trait ProviderBackend: Send + Sync {
+    fn announce_provider(
+        &self,
+        swarm: &mut Swarm<MyBehaviour>,
+        manifest_id: &str,
+        metadata: HashMap<String, String>,
+    ) -> ProviderResult<()>;
+
+    fn stop_providing(&self, manifest_id: &str) -> ProviderResult<()>;
+
+    async fn discover_providers(
+        &self,
+        swarm: &mut Swarm<MyBehaviour>,
+        manifest_id: &str,
+    ) -> ProviderResult<Vec<ProviderInfo>>;
+
+    fn get_local_providers(&self) -> Vec<ProviderInfo>;
+
+    fn get_providers_for_manifest(&self, manifest_id: &str) -> Vec<ProviderInfo>;
+
+    fn cleanup_expired_providers(&self);
+
+    fn reannounce_local_providers(&self, swarm: &mut Swarm<MyBehaviour>);
+
+    fn start_background_tasks(&self, swarm: &mut Swarm<MyBehaviour>);
+
+    fn handle_provider_found(&self, manifest_id: &str, provider_peer: PeerId);
+
+    fn get_stats(&self) -> ProviderStats;
+}
+
+#[async_trait]
+impl ProviderBackend for ProviderManager {
+    fn announce_provider(
+        &self,
+        swarm: &mut Swarm<MyBehaviour>,
+        manifest_id: &str,
+        metadata: HashMap<String, String>,
+    ) -> ProviderResult<()> {
+        ProviderManager::announce_provider(self, swarm, manifest_id, metadata)
+    }
+
+    fn stop_providing(&self, manifest_id: &str) -> ProviderResult<()> {
+        ProviderManager::stop_providing(self, manifest_id)
+    }
+
+    async fn discover_providers(
+        &self,
+        swarm: &mut Swarm<MyBehaviour>,
+        manifest_id: &str,
+    ) -> ProviderResult<Vec<ProviderInfo>> {
+        ProviderManager::discover_providers(self, swarm, manifest_id).await
+    }
+
+    fn get_local_providers(&self) -> Vec<ProviderInfo> {
+        ProviderManager::get_local_providers(self)
+    }
+
+    fn get_providers_for_manifest(&self, manifest_id: &str) -> Vec<ProviderInfo> {
+        ProviderManager::get_providers_for_manifest(self, manifest_id)
+    }
+
+    fn cleanup_expired_providers(&self) {
+        ProviderManager::cleanup_expired_providers(self)
+    }
+
+    fn reannounce_local_providers(&self, swarm: &mut Swarm<MyBehaviour>) {
+        ProviderManager::reannounce_local_providers(self, swarm)
+    }
+
+    fn start_background_tasks(&self, swarm: &mut Swarm<MyBehaviour>) {
+        ProviderManager::start_background_tasks(self, swarm)
+    }
+
+    fn handle_provider_found(&self, manifest_id: &str, provider_peer: PeerId) {
+        ProviderManager::handle_provider_found(self, manifest_id, provider_peer)
+    }
+
+    fn get_stats(&self) -> ProviderStats {
+        ProviderManager::get_stats(self)
     }
 }
 
@@ -563,18 +546,15 @@ mod tests {
         let manager = ProviderManager::new_default();
 
         // Add an expired provider
-        {
-            let mut remote_providers = manager.remote_providers.lock();
-            let expired_provider = ProviderInfo {
-                peer_id: PeerId::random(),
-                manifest_id: "test".to_string(),
-                announced_at: SystemTime::now() - Duration::from_secs(7200), // 2 hours ago
-                last_seen: SystemTime::now(),
-                ttl_seconds: 3600, // 1 hour TTL
-                metadata: HashMap::new(),
-            };
-            remote_providers.insert("test".to_string(), vec![expired_provider]);
-        }
+        let expired_provider = ProviderInfo {
+            peer_id: PeerId::random(),
+            manifest_id: "test".to_string(),
+            announced_at: SystemTime::now() - Duration::from_secs(7200), // 2 hours ago
+            last_seen: SystemTime::now(),
+            ttl_seconds: 3600, // 1 hour TTL
+            metadata: HashMap::new(),
+        };
+        manager.test_insert_remote_provider("test", expired_provider);
 
         // Stats should show 1 remote provider
         assert_eq!(manager.get_stats().total_remote_providers, 1);
@@ -582,5 +562,13 @@ mod tests {
         // Cleanup should remove it
         manager.cleanup_expired_providers();
         assert_eq!(manager.get_stats().total_remote_providers, 0);
+    }
+}
+
+#[cfg(test)]
+impl ProviderManager {
+    fn test_insert_remote_provider(&self, manifest_id: &str, provider: ProviderInfo) {
+        self.store
+            .set_remote(manifest_id.to_string(), vec![provider]);
     }
 }
