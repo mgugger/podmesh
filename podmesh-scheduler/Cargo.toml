@@ -29,8 +29,15 @@ axum-support = { workspace = true }
 parking_lot = { workspace = true }
 lru = { workspace = true }
 redb = { workspace = true }
+blake3 = { workspace = true }
+zeroize = { workspace = true }
+postcard = { workspace = true }
+chacha20poly1305 = { workspace = true }
+x25519-dalek = { workspace = true }
+ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 podctl = { workspace = true }
 reqwest = { workspace = true }
 serial_test = { workspace = true }

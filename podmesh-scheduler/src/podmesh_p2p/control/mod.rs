@@ -14,10 +14,15 @@ use libp2p::kad::QueryId;
 mod query_capacity;
 mod send_apply_request;
 mod send_delete_request;
+pub mod seal_and_assign;
+pub mod discover_custodians;
+pub mod deploy_dispatch;
+pub mod dispatch_to_worker;
 
-pub use query_capacity::handle_query_capacity_with_payload;
+pub use query_capacity::{handle_query_capacity_with_payload, insert_pending_resource_query, take_pending_resource_query};
 pub use send_apply_request::handle_send_apply_request;
 pub use send_delete_request::handle_send_delete_request;
+pub use seal_and_assign::notify_custodian_candidate;
 
 /// Handle incoming control messages from other parts of the host (REST handlers)
 pub async fn handle_control_message(
@@ -69,7 +74,7 @@ pub async fn handle_control_message(
             );
             let query_id = swarm.behaviour_mut().kademlia.get_providers(record_key);
             // Register pending sender so the kademlia_event handler can reply when results arrive
-            insert_pending_providers_query(query_id, reply_tx);
+            insert_pending_providers_query(&swarm.local_peer_id().to_string(), query_id, reply_tx);
             info!(
                 "DHT: initiated find_providers for manifest (query_id={:?})",
                 query_id
@@ -230,6 +235,61 @@ pub async fn handle_control_message(
                 .handshake_rr
                 .send_request(&peer_id, request);
         }
+
+        Libp2pControl::SealAndAssignWorkload { submission, reply_tx } => {
+            seal_and_assign::handle_seal_and_assign(
+                submission,
+                reply_tx,
+                swarm,
+                topic,
+                pending_queries,
+            )
+            .await;
+        }
+
+        Libp2pControl::DiscoverCustodians { max, reply_tx } => {
+            discover_custodians::handle_discover_custodians(max, reply_tx, swarm, topic).await;
+        }
+
+        Libp2pControl::DeployDispatchedWorkload { dispatch, worker_peer_id } => {
+            deploy_dispatch::handle_deploy_dispatched_workload(dispatch, worker_peer_id, swarm).await;
+        }
+
+        Libp2pControl::DispatchToWorker { sealed_spec, all_custodian_peers, required_capabilities, replica_count } => {
+            dispatch_to_worker::handle_dispatch_to_worker(
+                sealed_spec,
+                all_custodian_peers,
+                required_capabilities,
+                replica_count,
+                swarm,
+                topic,
+                pending_queries,
+            ).await;
+        }
+
+        Libp2pControl::SendWorkloadDispatch { worker_peer_id_str, worker_kem_pub_b64, sealed_spec, all_custodian_peers, required_capabilities } => {
+            dispatch_to_worker::handle_send_workload_dispatch(
+                worker_peer_id_str,
+                worker_kem_pub_b64,
+                sealed_spec,
+                all_custodian_peers,
+                required_capabilities,
+                swarm,
+            );
+        }
+
+        Libp2pControl::SendSignedWorkloadDispatch { worker_peer_id_str, worker_kem_pub_b64, sealed_spec, all_custodian_peers, required_capabilities, signed_dispatch, dispatch } => {
+            dispatch_to_worker::handle_send_signed_workload_dispatch(
+                worker_peer_id_str,
+                worker_kem_pub_b64,
+                sealed_spec,
+                all_custodian_peers,
+                required_capabilities,
+                signed_dispatch,
+                dispatch,
+                swarm,
+            );
+        }
     }
 }
 
@@ -274,8 +334,10 @@ static ACTIVE_ANNOUNCES: Lazy<Mutex<HashMap<String, AnnounceEntry>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Queue for control messages enqueued from inside the libp2p behaviours.
-static ENQUEUED_CONTROLS: Lazy<Mutex<std::collections::VecDeque<Libp2pControl>>> =
-    Lazy::new(|| Mutex::new(std::collections::VecDeque::new()));
+/// Keyed by the target node's peer_id string so in-process multi-node tests
+/// don't cross-deliver controls to the wrong swarm.
+static ENQUEUED_CONTROLS: Lazy<Mutex<std::collections::HashMap<String, std::collections::VecDeque<Libp2pControl>>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
 /// Pending provider lookup queries: QueryId string -> reply sender (Vec<PeerId>)
 static PENDING_PROVIDERS_QUERIES: Lazy<
@@ -292,12 +354,18 @@ static PENDING_KEM_PUBKEY_REQUESTS: Lazy<
     Mutex<std::collections::HashMap<String, mpsc::UnboundedSender<Option<String>>>>,
 > = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// Pending apply response senders: OutboundRequestId debug string -> reply sender
+static PENDING_APPLY_RESPONSES: Lazy<
+    Mutex<std::collections::HashMap<String, mpsc::UnboundedSender<Result<String, String>>>>,
+> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+
 /// Insert a pending providers query sender for the given QueryId
 pub fn insert_pending_providers_query(
+    local_peer_id: &str,
     id: QueryId,
     sender: mpsc::UnboundedSender<Vec<libp2p::PeerId>>,
 ) {
-    let key = format!("{:?}", id);
+    let key = format!("{}:{:?}", local_peer_id, id);
     let mut map = PENDING_PROVIDERS_QUERIES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -306,9 +374,10 @@ pub fn insert_pending_providers_query(
 
 /// Take and remove a pending providers query sender by QueryId
 pub fn take_pending_providers_query(
+    local_peer_id: &str,
     id: &QueryId,
 ) -> Option<mpsc::UnboundedSender<Vec<libp2p::PeerId>>> {
-    let key = format!("{:?}", id);
+    let key = format!("{}:{:?}", local_peer_id, id);
     let mut map = PENDING_PROVIDERS_QUERIES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -361,12 +430,34 @@ pub fn take_pending_kem_pubkey_request(
     map.remove(&key)
 }
 
-/// Enqueue a control message from inside a behaviour handler. This is synchronous and cheap.
-pub fn enqueue_control(msg: Libp2pControl) {
+/// Insert a pending apply response sender keyed by the OutboundRequestId debug string
+pub fn insert_pending_apply_response(
+    request_id_key: String,
+    sender: mpsc::UnboundedSender<Result<String, String>>,
+) {
+    let mut map = PENDING_APPLY_RESPONSES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.insert(request_id_key, sender);
+}
+
+/// Take and remove a pending apply response sender by request ID key
+pub fn take_pending_apply_response(
+    request_id_key: &str,
+) -> Option<mpsc::UnboundedSender<Result<String, String>>> {
+    let mut map = PENDING_APPLY_RESPONSES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.remove(request_id_key)
+}
+
+/// Enqueue a control message for a specific node. This is synchronous and cheap.
+/// `target_peer_id` must be the local peer_id of the swarm that should process this control.
+pub fn enqueue_control(target_peer_id: &str, msg: Libp2pControl) {
     let mut q = ENQUEUED_CONTROLS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    q.push_back(msg);
+    q.entry(target_peer_id.to_string()).or_default().push_back(msg);
 }
 
 /// Drain and handle enqueued controls. Should be called from the libp2p task (async context).
@@ -375,14 +466,17 @@ pub async fn drain_enqueued_controls(
     topic: &gossipsub::IdentTopic,
     pending_queries: &mut StdHashMap<String, Vec<mpsc::UnboundedSender<String>>>,
 ) {
+    let local_peer_id = swarm.local_peer_id().to_string();
     // Move queued items into a local vector to minimize lock time
     let mut items = Vec::new();
     {
         let mut q = ENQUEUED_CONTROLS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while let Some(it) = q.pop_front() {
-            items.push(it);
+        if let Some(deque) = q.get_mut(&local_peer_id) {
+            while let Some(it) = deque.pop_front() {
+                items.push(it);
+            }
         }
     }
 
@@ -499,5 +593,59 @@ pub enum Libp2pControl {
     FetchPeerKemPubkey {
         peer_id: libp2p::PeerId,
         reply_tx: mpsc::UnboundedSender<Option<String>>,
+    },
+
+    /// Discover custodian nodes, seal the workload, send WorkloadAssignment to each custodian.
+    /// Returns (manifest_id, custodian_peer_ids) on success.
+    SealAndAssignWorkload {
+        submission: protocol::machine::WorkloadSubmission,
+        reply_tx: tokio::sync::oneshot::Sender<Result<Vec<String>, String>>,
+    },
+
+    /// Discover available custodian nodes and return their peer IDs + KEM pubkeys.
+    /// Used by GET /api/v1/custodians so podctl can seal workloads client-side.
+    DiscoverCustodians {
+        /// Max number of custodians to wait for.
+        max: usize,
+        reply_tx: tokio::sync::oneshot::Sender<Vec<protocol::machine::CustodianInfo>>,
+    },
+
+    /// Phase 5: after receiving a WorkloadDispatch, collect shares from custodians,
+    /// unseal the spec, and deploy via the runtime engine.
+    DeployDispatchedWorkload {
+        dispatch: protocol::machine::WorkloadDispatch,
+        /// The peer_id of the node that received the dispatch (captured at enqueue time).
+        worker_peer_id: libp2p::PeerId,
+    },
+
+    /// Phase 5: coordinator discovers a worker and sends it a WorkloadDispatch.
+    DispatchToWorker {
+        sealed_spec: protocol::machine::SealedSpec,
+        all_custodian_peers: Vec<String>,
+        required_capabilities: Vec<String>,
+        /// Number of replicas to deploy (dispatch to this many workers).
+        replica_count: u8,
+    },
+
+    /// Phase 5: send WorkloadDispatch to the elected worker (non-blocking follow-up).
+    SendWorkloadDispatch {
+        worker_peer_id_str: String,
+        worker_kem_pub_b64: String,
+        sealed_spec: protocol::machine::SealedSpec,
+        all_custodian_peers: Vec<String>,
+        required_capabilities: Vec<String>,
+    },
+
+    /// Phase 5: send a pre-built signed WorkloadDispatch envelope to the worker.
+    /// Used by the coordinator after async share collection completes.
+    SendSignedWorkloadDispatch {
+        worker_peer_id_str: String,
+        worker_kem_pub_b64: String,
+        sealed_spec: protocol::machine::SealedSpec,
+        all_custodian_peers: Vec<String>,
+        required_capabilities: Vec<String>,
+        signed_dispatch: Vec<u8>,
+        /// The decoded dispatch, used for local (self) delivery without network round-trip.
+        dispatch: protocol::machine::WorkloadDispatch,
     },
 }

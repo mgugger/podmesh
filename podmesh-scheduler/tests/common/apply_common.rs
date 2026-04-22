@@ -96,7 +96,41 @@ pub async fn get_peer_ids(client: &reqwest::Client, ports: &[u16]) -> StdHashMap
     port_to_peer_id
 }
 
-/// Wait until the libp2p mesh has at least two peer connections across provided ports.
+/// Wait until `GET /api/v1/custodians?max=N` on `port` returns at least `min_count` custodians.
+#[allow(dead_code)]
+pub async fn wait_for_custodians(
+    client: &reqwest::Client,
+    port: u16,
+    min_count: usize,
+    timeout: Duration,
+) -> bool {
+    let start = Instant::now();
+    loop {
+        let url = format!("http://127.0.0.1:{}/api/v1/custodians?max={}", port, min_count + 2);
+        if let Ok(resp) = client.get(&url).send().await {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                let count = json
+                    .get("custodians")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                if count >= min_count {
+                    log::info!("wait_for_custodians: found {} custodians on port {}", count, port);
+                    return true;
+                }
+            }
+        }
+
+        if start.elapsed() > timeout {
+            log::warn!("wait_for_custodians: timed out after {:?}", timeout);
+            return false;
+        }
+
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+
 #[allow(dead_code)]
 pub async fn wait_for_mesh_formation(
     client: &reqwest::Client,

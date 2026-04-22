@@ -17,6 +17,10 @@ pub mod envelope_validator;
 pub mod nonce_helper;
 pub mod keypair_manager;
 pub mod logging;
+pub mod key_release;
+pub mod shamir;
+pub use key_release::{KeyReleaseOracle, ShareRequest, ShareResponse};
+pub use shamir::{seal_shamir, unseal_shamir, ShamirSealOutput, WrappedShare};
 
 pub const KEY_DIR: &str = ".podmesh";
 pub const PUBKEY_FILE: &str = "pubkey.bin";
@@ -485,6 +489,19 @@ pub fn verify_envelope(
         .map_err(|e| anyhow::anyhow!("signature verification failed: {}", e))?;
     
     Ok(())
+}
+
+/// Sign arbitrary data with the provided Ed25519 private key bytes.
+/// Returns the raw signature bytes (64 bytes).
+pub fn sign_data_with_key(sk_bytes: &[u8], data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if sk_bytes.len() != ED25519_PRIVATE_KEY_SIZE {
+        anyhow::bail!("Invalid private key size: expected {}, got {}", ED25519_PRIVATE_KEY_SIZE, sk_bytes.len());
+    }
+    let sk_arr: [u8; 32] = sk_bytes.try_into()
+        .map_err(|_| anyhow::anyhow!("Invalid private key"))?;
+    let signing_key = SigningKey::from_bytes(&sk_arr);
+    let signature = signing_key.sign(data);
+    Ok(signature.to_bytes().to_vec())
 }
 
 #[cfg(test)]

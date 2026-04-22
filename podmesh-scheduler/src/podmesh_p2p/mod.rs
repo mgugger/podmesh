@@ -20,9 +20,32 @@ use p2p::{
 };
 use protocol::libp2p_constants::MACHINE_CLUSTER_TOPIC;
 
+use crate::NodeMode;
+
 // Global control sender for distributed operations
 static CONTROL_SENDER: OnceCell<mpsc::UnboundedSender<control::Libp2pControl>> = OnceCell::new();
 static DISABLED_SCHEDULING: OnceCell<Mutex<StdHashMap<PeerId, bool>>> = OnceCell::new();
+static NODE_MODE: std::sync::OnceLock<NodeMode> = std::sync::OnceLock::new();
+/// Maps peer_id -> a known multiaddr, populated on every connection established.
+static PEER_ADDRESSES: OnceCell<Mutex<StdHashMap<PeerId, Multiaddr>>> = OnceCell::new();
+
+/// Returns the first known multiaddr for a peer, if any.
+pub fn get_peer_address(peer_id: &PeerId) -> Option<Multiaddr> {
+    PEER_ADDRESSES
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|map| map.get(peer_id).cloned())
+}
+
+/// Set the operating mode for this node. Must be called before `setup_libp2p_node`.
+pub fn set_node_mode(mode: NodeMode) {
+    let _ = NODE_MODE.set(mode);
+}
+
+/// Get the operating mode for this node (defaults to `Both`).
+pub fn get_node_mode() -> NodeMode {
+    NODE_MODE.get().copied().unwrap_or(NodeMode::Both)
+}
 
 fn scheduling_map() -> &'static Mutex<StdHashMap<PeerId, bool>> {
     DISABLED_SCHEDULING.get_or_init(|| Mutex::new(StdHashMap::new()))
@@ -198,6 +221,7 @@ struct SwarmDriver {
     handshake_states: HandshakeMap,
     handshake_interval: Interval,
     renew_interval: Interval,
+    heartbeat_interval: Interval,
     handshake_config: HandshakeDriveConfig,
 }
 
@@ -217,6 +241,9 @@ impl SwarmDriver {
             handshake_states: HandshakeMap::new(),
             handshake_interval: time::interval(Duration::from_secs(1)),
             renew_interval: time::interval(Duration::from_millis(500)),
+            heartbeat_interval: time::interval(Duration::from_secs(
+                crate::custodian::heartbeat::HEARTBEAT_INTERVAL_SECS,
+            )),
             handshake_config: HandshakeDriveConfig::default(),
         }
     }
@@ -234,6 +261,7 @@ impl SwarmDriver {
                 }
                 _ = self.handshake_interval.tick() => self.drive_handshakes().await,
                 _ = self.renew_interval.tick() => self.handle_renewals().await,
+                _ = self.heartbeat_interval.tick() => self.handle_heartbeat_tick().await,
             }
         }
 
@@ -263,7 +291,11 @@ impl SwarmDriver {
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
             } => {
-                self.on_connection_established(peer_id, endpoint.get_remote_address().clone());
+                // Only record the address if we are the dialer — the remote address is then
+                // the peer's listen address, which other nodes can use to dial them.
+                // When we are the listener, `get_remote_address()` is the dialer's ephemeral port.
+                let addr = endpoint.get_remote_address().clone();
+                self.on_connection_established(peer_id, addr, endpoint.is_dialer());
             }
             SwarmEvent::ConnectionClosed {
                 peer_id,
@@ -281,7 +313,27 @@ impl SwarmDriver {
             MyBehaviourEvent::ApplyRr(event) => self.handle_apply_rr_event(event).await,
             MyBehaviourEvent::DeleteRr(event) => self.handle_delete_rr_event(event).await,
             MyBehaviourEvent::Gossipsub(event) => self.handle_gossipsub_event(event),
-            MyBehaviourEvent::Kademlia(event) => behaviour::kademlia_event(event, None),
+            MyBehaviourEvent::Kademlia(event) => behaviour::kademlia_event(event, None, &self.swarm.local_peer_id().to_string()),
+            MyBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. }) => {
+                // Use the listen addresses from Identify to update PEER_ADDRESSES.
+                // Prefer loopback (127.0.0.1) addresses so in-process tests work reliably;
+                // fall back to the first address in the list.
+                let addrs = info.listen_addrs;
+                let best = addrs.iter()
+                    .find(|a| a.to_string().contains("/ip4/127.0.0.1/"))
+                    .or_else(|| addrs.first())
+                    .cloned();
+                if let Some(addr) = best {
+                    PEER_ADDRESSES
+                        .get_or_init(|| Mutex::new(StdHashMap::new()))
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(peer_id, addr.clone());
+                    self.swarm.add_peer_address(peer_id, addr.clone());
+                    self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                }
+            }
+            MyBehaviourEvent::Identify(_) => {}
             MyBehaviourEvent::SchedulerRr(event) => {
                 self.handle_scheduler_rr_event(event).await;
             }
@@ -386,11 +438,16 @@ impl SwarmDriver {
                     &mut self.pending_queries,
                 );
             }
-            request_response::Event::OutboundFailure { peer, error, .. } => {
+            request_response::Event::OutboundFailure { peer, error, request_id, .. } => {
                 warn!(
                     "libp2p: scheduler request outbound failure for peer {}: {:?}",
                     peer, error
                 );
+                let request_id_str = format!("{:?}", request_id);
+                let local_peer_id = self.swarm.local_peer_id().to_string();
+                crate::podmesh_p2p::control::dispatch_to_worker::handle_workload_dispatch_outbound_failure(&local_peer_id, &request_id_str);
+                // If this was a ShareRequest, signal the waiting task so it can fail fast.
+                crate::podmesh_p2p::control::deploy_dispatch::notify_share_request_failed(&local_peer_id, &request_id);
             }
             request_response::Event::InboundFailure { peer, error, .. } => {
                 warn!(
@@ -427,7 +484,7 @@ impl SwarmDriver {
         }
     }
 
-    fn on_connection_established(&mut self, peer_id: PeerId, address: Multiaddr) {
+    fn on_connection_established(&mut self, peer_id: PeerId, address: Multiaddr, is_dialer: bool) {
         info!(
             "DHT: Connection established with peer {}, adding to Kademlia",
             peer_id
@@ -436,7 +493,17 @@ impl SwarmDriver {
         self.swarm
             .behaviour_mut()
             .kademlia
-            .add_address(&peer_id, address);
+            .add_address(&peer_id, address.clone());
+
+        // Only store the peer's listen address when we are the dialer — when we are the
+        // listener, `address` is the dialer's ephemeral source port and is not dialable.
+        if is_dialer {
+            PEER_ADDRESSES
+                .get_or_init(|| Mutex::new(StdHashMap::new()))
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(peer_id, address);
+        }
 
         let connected_peers: Vec<_> = self.swarm.connected_peers().cloned().collect();
         if connected_peers.len() >= 2 {
@@ -511,5 +578,91 @@ impl SwarmDriver {
         control::drain_enqueued_controls(&mut self.swarm, &self.topic, &mut self.pending_queries)
             .await;
         control::renew_due_providers(&mut self.swarm);
+    }
+
+    /// Phase 6: broadcast heartbeat if custodian; check for and evict expired peers.
+    async fn handle_heartbeat_tick(&mut self) {
+        use crate::custodian::heartbeat;
+
+        if get_node_mode().is_custodian() {
+            // Collect manifest IDs we hold shares for
+            let manifest_ids = crate::storage::get_custodian_store()
+                .map(|store| store.manifest_ids().unwrap_or_default())
+                .unwrap_or_default();
+
+            let local_peer_id = self.swarm.local_peer_id().to_string();
+            match heartbeat::build_heartbeat_ping(&local_peer_id, manifest_ids) {
+                Ok(ping) => {
+                    let ping_bytes = ping.to_bytes();
+                    match behaviour::gossipsub_message::sign_and_publish(
+                        &mut self.swarm,
+                        &self.topic,
+                        &ping_bytes,
+                        "heartbeat_ping",
+                    ) {
+                        Ok(_) => debug!("heartbeat: broadcast for peer={}", local_peer_id),
+                        Err(e) => warn!("heartbeat: publish failed: {:?}", e),
+                    }
+                }
+                Err(e) => warn!("heartbeat: build_heartbeat_ping failed: {}", e),
+            }
+        }
+
+        // Expiry check: emit CustodianWithdraw for dead custodians
+        let expired = heartbeat::expired_custodians();
+        for (dead_peer_id, manifest_ids) in expired {
+            warn!(
+                "heartbeat: custodian {} has expired (no heartbeat for {}s)",
+                dead_peer_id, heartbeat::HEARTBEAT_EXPIRY_SECS
+            );
+            heartbeat::remove_liveness_entry(&dead_peer_id);
+
+            // Broadcast CustodianWithdraw for each manifest this peer held
+            for manifest_id in &manifest_ids {
+                self.broadcast_custodian_withdraw(&dead_peer_id, manifest_id).await;
+            }
+        }
+    }
+
+    /// Broadcast a `CustodianWithdraw` for a given peer+manifest on the custodian topic.
+    async fn broadcast_custodian_withdraw(&mut self, peer_id: &str, manifest_id: &str) {
+        use protocol::machine::CustodianWithdraw;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let timestamp_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut withdraw = CustodianWithdraw {
+            manifest_id: manifest_id.to_string(),
+            owner_pubkey: String::new(), // best-effort — we don't have owner pubkey here
+            custodian_peer_id: peer_id.to_string(),
+            timestamp_secs,
+            sig: String::new(),
+        };
+
+        // Sign if we have a keypair
+        if let Ok((_, sk)) = crypto::ensure_keypair_on_disk() {
+            let canonical = withdraw.canonical_bytes();
+            if let Ok(sig_bytes) = crypto::sign_data_with_key(&sk, &canonical) {
+                withdraw.sig = crypto::b64_encode(&sig_bytes);
+            }
+        }
+
+        let withdraw_bytes = withdraw.to_bytes();
+        if let Err(e) = behaviour::gossipsub_message::sign_and_publish(
+            &mut self.swarm,
+            &self.topic,
+            &withdraw_bytes,
+            "custodian_withdraw",
+        ) {
+            warn!("heartbeat: failed to publish CustodianWithdraw for peer={} manifest={}: {:?}", peer_id, manifest_id, e);
+        } else {
+            info!(
+                "heartbeat: broadcast CustodianWithdraw for dead peer={} manifest={}",
+                peer_id, manifest_id
+            );
+        }
     }
 }

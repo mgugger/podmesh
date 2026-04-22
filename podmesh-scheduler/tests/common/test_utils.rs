@@ -161,6 +161,11 @@ pub fn make_test_cli(
         libp2p_quic_port,
         libp2p_host: "0.0.0.0".to_string(),
         disable_scheduling,
+        mode: if disable_scheduling {
+            podmesh_scheduler::NodeMode::Custodian
+        } else {
+            podmesh_scheduler::NodeMode::Both
+        },
         mock_only_runtime: true,
         podman_socket: std::env::var("PODMAN_HOST").ok().and_then(|value| {
             let trimmed = value.trim().to_string();
@@ -324,6 +329,8 @@ pub fn setup_cleanup_hook() {
             default_hook(info);
         }));
     });
+    // Reset process-global state that must not leak between tests.
+    crypto::nonce_helper::reset_nonce_store_for_test();
 }
 
 /// Global cleanup function that runs system commands to clean up test artifacts

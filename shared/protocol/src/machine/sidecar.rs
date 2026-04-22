@@ -70,6 +70,16 @@ pub struct SidecarManifestRequest {
     pub manifest_id: String,
 }
 
+impl SidecarManifestRequest {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serialize(self)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        deserialize(bytes)
+    }
+}
+
 pub fn build_sidecar_provider_record(
     manifest_id: &str,
     peer_id: &str,

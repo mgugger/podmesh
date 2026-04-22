@@ -23,10 +23,12 @@ use p2p::{
 use protocol::libp2p_constants::{
     SIDECAR_MANIFEST_PROTOCOL, INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX,
     MANIFEST_RECORD_TTL_MS, EGRESS_TUNNEL_PROTOCOL, PROXY_PROVIDER_KEY,
+    SIDECAR_REGISTRATION_PROTOCOL,
 };
 use protocol::machine::{
     SidecarRouteSpec, build_sidecar_provider_record, root_as_sidecar_manifest_request,
 };
+use protocol::{SidecarRegistration, SidecarRegistrationAck, SidecarRoute};
 use reqwest::{
     Client, Method,
     header::{HeaderName, HeaderValue},
@@ -369,6 +371,8 @@ struct SidecarBehaviour {
     manifest_rr: request_response::Behaviour<ManifestFetchCodec>,
     /// Stream behaviour for bidirectional egress tunneling
     egress_stream: libp2p_stream::Behaviour,
+    /// Request-response for sidecar→proxy registration
+    registration_rr: request_response::Behaviour<p2p::request_response::ByteCodec>,
 }
 
 struct SidecarState {
@@ -381,6 +385,10 @@ struct SidecarState {
     proxy_peers: Vec<PeerId>,
     /// Whether we have an active proxy provider query
     proxy_query_pending: bool,
+    /// Whether we have triggered the tenant proxy registration lookup
+    tenant_proxy_lookup_triggered: bool,
+    /// Pending outbound registration request id
+    pending_registration_id: Option<request_response::OutboundRequestId>,
 }
 
 impl SidecarState {
@@ -393,6 +401,8 @@ impl SidecarState {
             http_client,
             proxy_peers: Vec::new(),
             proxy_query_pending: false,
+            tenant_proxy_lookup_triggered: false,
+            pending_registration_id: None,
         }
     }
 
@@ -438,12 +448,20 @@ fn build_swarm(_cfg: &SidecarConfig) -> Result<Swarm<SidecarBehaviour>> {
             );
             // Stream behaviour for bidirectional egress tunneling
             let egress_stream = libp2p_stream::Behaviour::new();
+            let registration_rr = request_response::Behaviour::new(
+                std::iter::once((
+                    SIDECAR_REGISTRATION_PROTOCOL,
+                    request_response::ProtocolSupport::Outbound,
+                )),
+                request_response::Config::default(),
+            );
             let mut behaviour = SidecarBehaviour {
                 kademlia: kad::Behaviour::new(peer_id, store),
                 handshake_rr,
                 proxy_rr,
                 manifest_rr,
                 egress_stream,
+                registration_rr,
             };
             behaviour.kademlia.set_mode(Some(kad::Mode::Client));
             behaviour
@@ -616,6 +634,9 @@ fn handle_swarm_event(
         }
         SwarmEvent::Behaviour(SidecarBehaviourEvent::ManifestRr(event)) => {
             handle_manifest_fetch_event(swarm, cfg, event);
+        }
+        SwarmEvent::Behaviour(SidecarBehaviourEvent::RegistrationRr(event)) => {
+            handle_registration_rr_event(event, state);
         }
         _ => {}
     }
@@ -864,6 +885,10 @@ fn handle_kad_event(
     event_tx: Option<&mpsc::UnboundedSender<SidecarEvent>>,
 ) {
     let proxy_record_key = RecordKey::new(&PROXY_PROVIDER_KEY);
+    // Compute the tenant-specific proxy DHT key if owner pubkey is available
+    let tenant_proxy_key: Option<RecordKey> = cfg.owner_public_key_b64.as_deref()
+        .and_then(|pk| compute_tenant_proxy_dht_key(pk).ok())
+        .map(|k| RecordKey::new(&k));
     match event {
         kad::Event::OutboundQueryProgressed { result, .. } => match result {
             kad::QueryResult::GetProviders(Ok(ok)) => match ok {
@@ -876,7 +901,15 @@ fn handle_kad_event(
                     }
                     if key == cfg.record_key() {
                         // Provider discovery for our provider_label (may overlap with proxy key)
-                        update_provider_cache(providers, state, event_tx);
+                        update_provider_cache(providers.clone(), state, event_tx);
+                    }
+                    // Phase 7.3: if this is a tenant proxy lookup result, register with the proxy
+                    if let Some(ref tpk) = tenant_proxy_key {
+                        if &key == tpk {
+                            for proxy_peer in providers {
+                                send_sidecar_registration(swarm, cfg, proxy_peer, state);
+                            }
+                        }
                     }
                 }
                 kad::GetProvidersOk::FinishedWithNoAdditionalRecord { closest_peers } => {
@@ -904,6 +937,10 @@ fn handle_kad_event(
                     let needs_egress_proxy = cfg.enable_egress || cfg.http_proxy_port.is_some();
                     if needs_egress_proxy {
                         trigger_proxy_lookup(swarm, state);
+                    }
+                    // Phase 7.3: trigger tenant proxy DHT lookup for sidecar registration
+                    if !state.tenant_proxy_lookup_triggered {
+                        trigger_tenant_proxy_lookup(swarm, cfg, state);
                     }
                 }
             }
@@ -1188,3 +1225,139 @@ fn split_peer_multiaddr(addr: &Multiaddr) -> Option<(PeerId, Multiaddr)> {
 
 // Re-export split_csv from shared p2p crate
 pub use p2p::split_csv;
+
+// ── Phase 7.3: sidecar→proxy registration ──────────────────────────────────
+
+/// Compute the opaque DHT key for the tenant proxy: sha256(owner_pubkey || "proxy").
+pub fn compute_tenant_proxy_dht_key(owner_pubkey_b64: &str) -> anyhow::Result<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+    let pk_bytes = crypto::b64_decode(owner_pubkey_b64)?;
+    let mut input = pk_bytes;
+    input.extend_from_slice(b"proxy");
+    let hash = Sha256::digest(&input);
+    Ok(hash.to_vec())
+}
+
+/// Trigger a DHT lookup for the tenant proxy (opaque key based on owner pubkey).
+fn trigger_tenant_proxy_lookup(
+    swarm: &mut Swarm<SidecarBehaviour>,
+    cfg: &SidecarConfig,
+    state: &mut SidecarState,
+) {
+    let Some(ref owner_pub) = cfg.owner_public_key_b64 else {
+        log::debug!("sidecar has no owner pubkey, skipping tenant proxy lookup");
+        return;
+    };
+    match compute_tenant_proxy_dht_key(owner_pub) {
+        Ok(key) => {
+            let record_key = RecordKey::new(&key);
+            let query_id = swarm.behaviour_mut().kademlia.get_providers(record_key);
+            state.tenant_proxy_lookup_triggered = true;
+            log::info!("sidecar triggered tenant proxy DHT lookup query_id={:?}", query_id);
+        }
+        Err(err) => {
+            log::warn!("failed to compute tenant proxy DHT key: {}", err);
+        }
+    }
+}
+
+/// Sign `manifest_id || sidecar_peer_id` with the node's Ed25519 signing key.
+fn sign_registration_payload(manifest_id: &str, sidecar_peer_id: &str) -> anyhow::Result<String> {
+    let data = format!("{}{}", manifest_id, sidecar_peer_id);
+    let (_pub_bytes, priv_bytes) = crypto::ensure_keypair_on_disk()?;
+    let sig_bytes = crypto::sign_data_with_key(&priv_bytes, data.as_bytes())?;
+    Ok(crypto::b64_encode(&sig_bytes))
+}
+
+/// Send a SidecarRegistration to the given proxy peer.
+fn send_sidecar_registration(
+    swarm: &mut Swarm<SidecarBehaviour>,
+    cfg: &SidecarConfig,
+    proxy_peer: PeerId,
+    state: &mut SidecarState,
+) {
+    let Some(ref owner_pub) = cfg.owner_public_key_b64 else {
+        return;
+    };
+
+    let sidecar_peer_id = swarm.local_peer_id().to_string();
+    let sig = match sign_registration_payload(&cfg.manifest_id, &sidecar_peer_id) {
+        Ok(s) => s,
+        Err(err) => {
+            log::warn!("sidecar failed to sign registration payload: {}", err);
+            return;
+        }
+    };
+
+    let routes: Vec<SidecarRoute> = cfg
+        .routes
+        .iter()
+        .map(|r| SidecarRoute {
+            path_prefix: r.path_prefix.clone(),
+            port: r.target_port,
+        })
+        .collect();
+
+    let reg = SidecarRegistration {
+        manifest_id: cfg.manifest_id.clone(),
+        routes,
+        sidecar_peer_id: sidecar_peer_id.clone(),
+        owner_pubkey: owner_pub.clone(),
+        sig,
+    };
+
+    log::info!(
+        "sidecar sending registration to proxy peer={} manifest={} routes={}",
+        proxy_peer, cfg.manifest_id, cfg.routes.len()
+    );
+    let request_id = swarm
+        .behaviour_mut()
+        .registration_rr
+        .send_request(&proxy_peer, reg.to_bytes());
+    state.pending_registration_id = Some(request_id);
+}
+
+/// Handle incoming registration ack from proxy.
+fn handle_registration_rr_event(
+    event: request_response::Event<Vec<u8>, Vec<u8>>,
+    state: &mut SidecarState,
+) {
+    match event {
+        request_response::Event::Message { peer, message, .. } => match message {
+            request_response::Message::Response { request_id, response, .. } => {
+                if Some(request_id) == state.pending_registration_id {
+                    state.pending_registration_id = None;
+                }
+                match SidecarRegistrationAck::from_bytes(&response) {
+                    Ok(ack) => {
+                        if ack.ok {
+                            log::info!(
+                                "sidecar registration acknowledged by proxy peer={} manifest={}",
+                                peer, ack.manifest_id
+                            );
+                        } else {
+                            log::warn!(
+                                "sidecar registration rejected by proxy peer={} manifest={} reason={}",
+                                peer, ack.manifest_id, ack.message
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        log::warn!("failed to deserialize registration ack from peer={}: {}", peer, err);
+                    }
+                }
+            }
+            request_response::Message::Request { .. } => {
+                log::warn!("unexpected inbound registration request on sidecar");
+            }
+        },
+        request_response::Event::OutboundFailure { peer, error, .. } => {
+            log::warn!("sidecar registration outbound failure peer={} error={:?}", peer, error);
+            state.pending_registration_id = None;
+        }
+        request_response::Event::InboundFailure { peer, error, .. } => {
+            log::warn!("sidecar registration inbound failure peer={} error={:?}", peer, error);
+        }
+        request_response::Event::ResponseSent { .. } => {}
+    }
+}

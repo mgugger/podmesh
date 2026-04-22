@@ -8,6 +8,9 @@ pub struct Config {
     pub disable_rest_api: bool,
     pub enable_proxy_provider: bool,
     pub enable_ingress: bool,
+    /// Base64-encoded Ed25519 owner public key. When set, the proxy announces
+    /// itself under the opaque DHT key `sha256(owner_pubkey_bytes || "proxy")`.
+    pub owner_pubkey: Option<String>,
 }
 
 impl Config {

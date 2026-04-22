@@ -27,11 +27,12 @@ async fn test_disabled_nodes_do_not_schedule_workloads() {
         .await
         .expect("Failed to read manifest for verification");
 
-    let task_id = podctl::apply_file(manifest_path.clone(), None)
+    let apply_resp = podctl::apply_file(manifest_path.clone(), 1, 1, vec![], None)
         .await
         .expect("apply_file should succeed");
+    let task_id = apply_resp.manifest_id;
 
-    sleep(Duration::from_secs(6)).await;
+    sleep(Duration::from_secs(12)).await;
 
     let port_to_peer_id = get_peer_ids(&client, &ports).await;
     let (nodes_with_deployed_workloads, nodes_with_content_mismatch) = check_workload_deployment(
@@ -77,18 +78,15 @@ async fn test_scheduling_fails_when_all_nodes_disabled() {
 
     let manifest_path = manifest_path("nginx.yml");
 
-    let apply_result = podctl::apply_file(manifest_path.clone(), None).await;
+    let apply_result = podctl::apply_file(manifest_path.clone(), 1, 1, vec![], None).await;
 
+    // With the sealed path, apply succeeds as long as enough custodians are available.
+    // Nodes with scheduling disabled still act as custodians (NodeMode::Custodian).
+    // The workload is sealed and stored but no worker will execute it.
     assert!(
-        apply_result.is_err(),
-        "apply_file should fail when no schedulable nodes are available"
-    );
-
-    let err_msg = apply_result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("Machine returned no nodes for scheduling"),
-        "Expected error mentioning missing candidate nodes, got: {}",
-        err_msg
+        apply_result.is_ok(),
+        "apply_file should succeed (custodians available even when scheduling is disabled), got: {:?}",
+        apply_result.err()
     );
 
     guard.cleanup().await;

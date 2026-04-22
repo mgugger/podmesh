@@ -69,6 +69,10 @@ impl Envelope {
     pub fn kem_pubkey(&self) -> Option<&str> {
         opt_str(&self.kem_pubkey)
     }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        deserialize(bytes)
+    }
 }
 
 fn base_envelope(

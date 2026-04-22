@@ -40,6 +40,8 @@ struct Args {
         default_value_t = false
     )]
     enable_ingress: bool,
+    #[arg(long = "owner-pubkey", env = "PODMESH_OWNER_PUBKEY")]
+    owner_pubkey: Option<String>,
 }
 
 #[tokio::main]
@@ -62,6 +64,7 @@ async fn run() -> Result<()> {
         disable_rest_api,
         enable_proxy_provider,
         enable_ingress,
+        owner_pubkey,
     } = Args::parse();
 
     let mut cfg = Config {
@@ -73,6 +76,7 @@ async fn run() -> Result<()> {
         disable_rest_api,
         enable_proxy_provider,
         enable_ingress,
+        owner_pubkey,
     };
     cfg.apply_defaults();
 

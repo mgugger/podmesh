@@ -1,45 +1,126 @@
-# **Podmesh**
+# Podmesh
 
-A scheduler for pods built with libp2p. 
+A decentralized, zero-trust, multi-tenant compute mesh built on [libp2p](https://libp2p.io/).
 
-* podmesh-scheduler is the podman scheduler
-* podmesh-proxy is the ingress / egress node
-* podmesh-sidecar is the sidecar in the pod that connects to the proxy
+Workload specs are **encrypted client-side** before submission. No single node — including the scheduler — ever sees plaintext workload specs or raw decryption keys.
 
-* See deploy/README.md for usage and local deployment
+**License**: GPL-3.0-only
+
+---
+
+## Architecture
+
+```
+podctl  ──────────────────────────────────────────────────────────────┐
+  │  seal spec client-side (Umbral PRE)                               │
+  │  encrypt under owner Umbral key                                   │
+  │  generate N kfrags, wrap each to a custodian's X25519 KEM pubkey  │
+  │                                                                   │
+  ▼                                                                   ▼
+podmesh-scheduler ◄──── libp2p gossipsub/kad/request-response ──► custodian nodes
+  │  routes sealed WorkloadSubmission                                 │
+  │  never sees plaintext                                             │  hold kfrags
+  ▼                                                                   │
+worker nodes ◄──── collect threshold cfrags ────────────────────────┘
+  │  reconstruct via Umbral PRE, decrypt spec, deploy
+  ▼
+container runtime (Podman / mock)
+```
+
+### Components
+
+| Crate | Description |
+|---|---|
+| `podmesh-scheduler` | libp2p node: scheduler, worker, and custodian roles (co-located by default). Exposes a REST API on port 3000. |
+| `podctl` | CLI client: seals workload specs, submits to the scheduler, manages deployments. |
+| `shared/crypto` | Cryptographic primitives: X25519 KEM, Ed25519 signing, XChaCha20-Poly1305 AEAD, Umbral PRE (v2). |
+| `shared/protocol` | Shared message types: `SealedSpec`, `WorkloadSubmission`, `WorkloadDispatch`, `NodeCert`, etc. |
+| `shared/p2p` | libp2p swarm helpers. |
+| `podmesh-proxy` | Ingress/egress proxy node. |
+| `podmesh-sidecar` | In-pod sidecar that connects to the proxy. |
+
+---
+
+## Trust Model
+
+- **Sealing**: happens entirely in `podctl`. The plaintext spec never leaves the client.
+- **Umbral PRE**: The spec is encrypted under the owner's Umbral pubkey. The owner generates N key fragments (kfrags), each wrapped to a custodian's X25519 KEM pubkey. Custodians re-encrypt to the target worker's Umbral pubkey — the scheduler sees only capsule bytes and wrapped kfrags, never plaintext.
+- **NodeCerts**: Each node self-signs a certificate advertising its capabilities and KEM pubkey. Custodians and workers verify cert chains before accepting assignments.
+
+---
+
+## Quick Start
+
+### Build
+
+```bash
+# Build everything (excludes podmesh-sidecar which requires libclang)
+cargo build -p podmesh-scheduler -p podctl
+```
+
+### Run a local node (co-located scheduler + worker + custodian)
+
+```bash
+./target/debug/podmesh-scheduler --mode both --api-port 3000
+```
+
+### Submit a workload
+
+```bash
+./target/debug/podctl --api-url http://localhost:3000 submit -f deploy/demo_deployment.yml \
+  --worker-umbral-pk <hex-or-base64-worker-umbral-pk>
+```
+
+### Verify peers / debug
+
+```bash
+curl localhost:3000/debug/dht/peers
+curl localhost:3000/api/v1/custodians
+```
+
+---
+
+## Local Podman Deployment
+
+See [deploy/README.md](deploy/README.md) for running the full stack with Podman.
+
+---
 
 ## Testing
 
-### Running Tests
+Run all tests (excluding Podman-dependent tests):
 
-Run all tests (excluding podman-dependent tests):
 ```bash
-cargo test
+cargo test -p podmesh-scheduler -p protocol -p crypto -p podctl
 ```
 
-Run all tests including podman-dependent integration tests:
+Run integration tests (no Podman required):
+
 ```bash
-cargo test --features podman-tests
+cargo test -p podmesh-scheduler --test '*'
 ```
 
-Run only podman-dependent tests in the integration test crate:
-```bash
-cargo test --package podmesh-integration-tests --features podman-tests
-```
+Run Podman-dependent tests (requires running Podman socket and pre-built images):
 
-Run only podman-dependent tests in the scheduler crate:
 ```bash
 cargo test --package podmesh-scheduler --features podman-tests
 ```
 
-Run all podman tests across all crates:
-```bash
-cargo test --workspace --features podman-tests
+**Prerequisites for Podman tests:**
+- Podman installed and available in `PATH`
+- Rootless Podman socket running: `systemctl --user start podman.socket`
+- Container images built: `./deploy/build_containers.sh`
+
+---
+
+## Key Files
+
 ```
-
-**Prerequisites for podman tests:**
-- Podman must be installed and available in PATH
-- Rootless podman socket must be running: `systemctl --user start podman.socket`
-- Required container images must be built: `./deploy/build_containers.sh`
-
-**License**: Apache 2.0
+podmesh-scheduler/      main node binary (scheduler + worker + custodian)
+podctl/                 CLI client
+shared/
+  crypto/               cryptographic primitives (KEM, Shamir, Umbral PRE)
+  protocol/             shared wire types
+  p2p/                  libp2p helpers
+deploy/                 Podman deployment manifests and demo YAMLs
+```

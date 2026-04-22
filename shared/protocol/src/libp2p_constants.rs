@@ -24,6 +24,9 @@ pub const SIDECAR_MANIFEST_PROTOCOL: &str = "/podmesh/sidecar-manifest/1.0.0";
 /// Protocol ID for egress tunnel streams from sidecars to proxy nodes.
 pub const EGRESS_TUNNEL_PROTOCOL: &str = "/podmesh/egress-tunnel/1.0.0";
 
+/// Protocol ID for sidecar→proxy registration (Phase 7).
+pub const SIDECAR_REGISTRATION_PROTOCOL: &str = "/podmesh/sidecar-registration/1.0.0";
+
 /// DHT provider key for proxy nodes that can handle egress traffic.
 /// Proxies announce themselves as providers for this key, and sidecars
 /// query this key to discover available proxy nodes.

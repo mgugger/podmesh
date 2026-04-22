@@ -20,9 +20,10 @@ axum-support = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 postcard = { workspace = true }
+sha2 = { workspace = true }
+crypto = { workspace = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }
-crypto = { workspace = true }
 serial_test = { workspace = true }
 

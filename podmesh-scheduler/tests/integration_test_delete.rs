@@ -45,7 +45,7 @@ async fn test_delete_task_endpoint() {
     set_env_var("PODMESH_API", "http://127.0.0.1:3000");
 
     let manifest_path = manifest_path();
-    let task_id_result = podctl::apply_file(manifest_path.clone(), None).await;
+    let task_id_result = podctl::apply_file(manifest_path.clone(), 1, 1, vec![], None).await;
     println!("Apply result: {:?}", task_id_result);
 
     sleep(Duration::from_millis(500)).await;
@@ -67,7 +67,7 @@ async fn test_delete_task_with_force() {
     set_env_var("PODMESH_API", "http://127.0.0.1:3000");
 
     let manifest_path = manifest_path();
-    let task_id_result = podctl::apply_file(manifest_path.clone(), None).await;
+    let task_id_result = podctl::apply_file(manifest_path.clone(), 1, 1, vec![], None).await;
     println!("Apply result: {:?}", task_id_result);
 
     sleep(Duration::from_millis(500)).await;
@@ -127,8 +127,8 @@ async fn test_delete_on_remote_node() {
     let manifest_path = manifest_path();
     
     // Apply should succeed - workload goes to the worker node (not bootstrap)
-    let task_id_result = podctl::apply_file(manifest_path.clone(), None).await;
-    let manifest_id = task_id_result.expect("Apply should succeed");
+    let task_id_result = podctl::apply_file(manifest_path.clone(), 1, 1, vec![], None).await;
+    let manifest_id = task_id_result.expect("Apply should succeed").manifest_id;
     println!("Apply result: manifest_id={}", manifest_id);
 
     // Wait for DHT provider announcement to propagate

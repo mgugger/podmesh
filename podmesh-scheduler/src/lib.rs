@@ -2,7 +2,7 @@
 use axum_support::spawn_tcp_listener;
 #[cfg(unix)]
 use axum_support::spawn_unix_listener;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use env_logger::Env;
 use std::io::Write;
 
@@ -11,6 +11,7 @@ use crate::sidecar::{
 };
 
 pub mod sidecar;
+pub mod custodian;
 pub mod hostapi;
 mod pod_communication;
 pub mod podmesh_p2p;
@@ -27,6 +28,44 @@ pub use scheduler::{
     NodeCandidate, NodeCapabilities, Scheduler, SchedulerConfig, SchedulerStats, SchedulingError,
     SchedulingPlan, SchedulingStrategy,
 };
+
+/// Operating mode of a podmesh node.
+///
+/// - `Worker`    — participates in workload scheduling and execution only.
+/// - `Custodian` — holds DEK shares for owners; does NOT run workloads.
+/// - `Both`      — acts as both worker and custodian (default, safe for dev).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum NodeMode {
+    Worker,
+    Custodian,
+    Both,
+}
+
+impl NodeMode {
+    pub fn is_worker(&self) -> bool {
+        matches!(self, NodeMode::Worker | NodeMode::Both)
+    }
+
+    pub fn is_custodian(&self) -> bool {
+        matches!(self, NodeMode::Custodian | NodeMode::Both)
+    }
+}
+
+impl Default for NodeMode {
+    fn default() -> Self {
+        NodeMode::Both
+    }
+}
+
+impl std::fmt::Display for NodeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeMode::Worker => write!(f, "worker"),
+            NodeMode::Custodian => write!(f, "custodian"),
+            NodeMode::Both => write!(f, "both"),
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -50,9 +89,15 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub disable_machine_api: bool,
 
-    /// Disable participation in scheduling (no capacity replies)
+    /// Disable participation in scheduling (no capacity replies).
+    /// Deprecated: prefer --mode instead.
     #[arg(long, default_value_t = false)]
     pub disable_scheduling: bool,
+
+    /// Operating mode: worker, custodian, or both (default: both).
+    /// Overrides --disable-scheduling when set explicitly.
+    #[arg(long, value_enum, default_value_t = NodeMode::Both)]
+    pub mode: NodeMode,
 
     /// Custom node name (optional)
     #[arg(long)]
@@ -115,6 +160,7 @@ impl Default for Cli {
             disable_rest_api: false,
             disable_machine_api: false,
             disable_scheduling: false,
+            mode: NodeMode::Both,
             node_name: None,
             mock_only_runtime: false,
             podman_socket: None,
@@ -144,7 +190,23 @@ pub async fn start_machine(cli: Cli) -> anyhow::Result<Vec<tokio::task::JoinHand
     })
     .await;
 
-    let scheduling_enabled = !cli.disable_scheduling;
+    let scheduling_enabled = !cli.disable_scheduling && cli.mode.is_worker();
+    let custodian_enabled = cli.mode.is_custodian();
+
+    log::info!("node mode: {} (worker={}, custodian={})", cli.mode, scheduling_enabled, custodian_enabled);
+
+    // Initialize custodian store if this node acts as a custodian.
+    if custodian_enabled {
+        let ephemeral_store = cli.ephemeral || cli.ephemeral_keys;
+        if let Err(e) = storage::custodian_store::init_custodian_store(ephemeral_store) {
+            log::warn!("Failed to initialize custodian store: {}. Custodian features may be unavailable.", e);
+        } else {
+            log::info!("Custodian store initialized.");
+        }
+    }
+
+    // Register local node mode so other modules can query it.
+    podmesh_p2p::set_node_mode(cli.mode);
 
     let signing_ephemeral = cli.signing_ephemeral || cli.ephemeral_keys;
     let kem_ephemeral = cli.kem_ephemeral || cli.ephemeral_keys;

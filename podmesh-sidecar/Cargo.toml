@@ -28,4 +28,5 @@ socket2 = "0.5"
 ipnetwork = "0.21"
 tokio-util = { version = "0.7", features = ["compat"] }
 postcard = { workspace = true }
+sha2 = { workspace = true }
 

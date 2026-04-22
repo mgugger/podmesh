@@ -536,9 +536,31 @@ pub async fn handle_apply_message_with_workload_manager(
                 }
             }
         }
-        request_response::Message::Response { .. } => {
+        request_response::Message::Response { request_id, response, .. } => {
             debug!("Received apply response from peer={}", peer);
-            // Handle response if needed
+            // Resolve the pending reply channel for this apply request
+            let key = format!("{}:{:?}", swarm.local_peer_id(), request_id);
+            if let Some(tx) = crate::podmesh_p2p::control::take_pending_apply_response(&key) {
+                // Try to parse the apply response to get a meaningful message
+                let msg = if let Ok(apply_resp) = machine::root_as_apply_response(&response) {
+                    if apply_resp.ok() {
+                        Ok(format!(
+                            "Apply confirmed by peer={} operation_id={}",
+                            peer,
+                            apply_resp.operation_id().unwrap_or("unknown")
+                        ))
+                    } else {
+                        Err(format!(
+                            "Apply rejected by peer={}: {}",
+                            peer,
+                            apply_resp.message().unwrap_or("unknown error")
+                        ))
+                    }
+                } else {
+                    Ok(format!("Apply response received from peer={}", peer))
+                };
+                let _ = tx.send(msg);
+            }
         }
     }
 }
@@ -670,30 +692,8 @@ async fn process_manifest_deployment(
     // Persist deployment record for recovery
     record_deployment(&manifest_id, &workload_info.id, owner_pubkey, &engine_name).await;
 
-    // Announce as provider if deployment successful
-    if let Some(provider_manager) = PROVIDER_MANAGER.read().await.as_ref() {
-        let mut metadata = HashMap::new();
-        metadata.insert("runtime_engine".to_string(), engine_name.clone());
-        metadata.insert("workload_id".to_string(), workload_info.id.clone());
-        metadata.insert("node_type".to_string(), "podmesh-machine".to_string());
-
-        // Include our KEM public key in the announcement so other nodes can encrypt messages to us
-        if let Ok((kem_pub_bytes, _)) = crypto::ensure_kem_keypair_on_disk() {
-            metadata.insert("kem_pubkey".to_string(), crypto::b64_encode(&kem_pub_bytes));
-        }
-
-        if let Err(e) = provider_manager.announce_provider(swarm, &manifest_id, metadata) {
-            warn!(
-                "Failed to announce as provider for manifest {}: {}",
-                manifest_id, e
-            );
-        } else {
-            info!(
-                "Announced as provider for manifest_id: {} using engine '{}'",
-                manifest_id, engine_name
-            );
-        }
-    }
+    // NOTE: Phase 7 — sidecar routing is now handled via direct sidecar→proxy registration.
+    // DHT provider records for individual manifests are no longer published here.
 
     // Update task store with ourselves as the assigned peer
     // This enables fast provider discovery without waiting for DHT propagation

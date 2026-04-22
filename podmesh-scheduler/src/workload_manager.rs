@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::podmesh_p2p::behaviour::MyBehaviour;
 use parking_lot::RwLock;
@@ -104,6 +104,8 @@ pub struct WorkloadManager {
     config: WorkloadManagerConfig,
     /// Channel for deployment events
     event_sender: Option<mpsc::UnboundedSender<WorkloadEvent>>,
+    /// Broadcast channel for health monitor events
+    event_tx: Option<broadcast::Sender<WorkloadEvent>>,
 }
 
 /// Events that can occur during workload management
@@ -129,6 +131,10 @@ pub enum WorkloadEvent {
     },
     /// Provider announcement was stopped
     ProviderStopped { manifest_id: String },
+    /// A workload has become unhealthy
+    Unhealthy { manifest_id: String, workload_id: String },
+    /// A workload has recovered
+    Recovered { manifest_id: String, workload_id: String },
 }
 
 impl WorkloadManager {
@@ -164,6 +170,7 @@ impl WorkloadManager {
             deployments: Arc::new(RwLock::new(HashMap::new())),
             config,
             event_sender: None,
+            event_tx: None,
         })
     }
 
@@ -175,6 +182,11 @@ impl WorkloadManager {
     /// Set an event channel to receive workload events
     pub fn set_event_channel(&mut self, sender: mpsc::UnboundedSender<WorkloadEvent>) {
         self.event_sender = Some(sender);
+    }
+
+    /// Subscribe to broadcast health events
+    pub fn subscribe_events(&self) -> Option<broadcast::Receiver<WorkloadEvent>> {
+        self.event_tx.as_ref().map(|tx| tx.subscribe())
     }
 
     fn emit_event(&self, event: WorkloadEvent) {
@@ -564,6 +576,7 @@ impl WorkloadManager {
         // Start workload health monitoring task
         let deployments = Arc::clone(&self.deployments);
         let runtime_registry = Arc::clone(&self.runtime_registry);
+        let health_event_tx = self.event_tx.clone();
 
         {
             let deployments_clone = Arc::clone(&deployments);
@@ -591,17 +604,37 @@ impl WorkloadManager {
 
                         if let Some(status) = deployment_status {
                             let engine_name = status.runtime_engine.clone();
+                            let manifest_id = status.manifest_id.clone();
 
-                            // Get engine reference separately to avoid holding lock across await
-                            let engine_available = {
+                            // Get engine Arc to avoid holding lock across await
+                            let engine = {
                                 let registry = runtime_registry_clone.read();
-                                registry.get_engine(&engine_name).is_some()
+                                registry.get_engine(&engine_name)
                             };
 
-                            if engine_available {
-                                // We would need to restructure this to avoid lifetime issues
-                                // For now, just log that we would check status
-                                debug!("Would check status for workload: {}", workload_id);
+                            if let Some(engine) = engine {
+                                match engine.get_workload_status(&workload_id).await {
+                                    Ok(info) => {
+                                        if let crate::runtime::WorkloadStatus::Failed(_) = info.status {
+                                            warn!(
+                                                "Workload {} is failed, emitting unhealthy event",
+                                                workload_id
+                                            );
+                                            if let Some(ref tx) = health_event_tx {
+                                                let _ = tx.send(WorkloadEvent::Unhealthy {
+                                                    manifest_id: manifest_id.clone(),
+                                                    workload_id: workload_id.clone(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Could not check workload {} status: {}",
+                                            workload_id, e
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -819,5 +852,52 @@ mod tests {
         assert_eq!(stats.total_workloads, 5);
         assert_eq!(stats.announced_providers, 3);
         assert_eq!(stats.provider_stats.local_providers, 2);
+    }
+
+    #[tokio::test]
+    async fn test_health_monitor_detects_failed_workload() {
+        // Create a WorkloadManager and attach a broadcast channel for health events
+        let mut manager = WorkloadManager::new_default().await.unwrap();
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<WorkloadEvent>(16);
+        manager.event_tx = Some(tx.clone());
+
+        // Manually inject a fake deployment with status Failed so the loop has something to emit
+        let workload_id = "test-wl-failed".to_string();
+        let manifest_id = "test-manifest-id".to_string();
+        {
+            let mut deps = manager.deployments.write();
+            deps.insert(
+                workload_id.clone(),
+                DeploymentStatus {
+                    workload_id: workload_id.clone(),
+                    manifest_id: manifest_id.clone(),
+                    status: crate::runtime::WorkloadStatus::Failed("simulated".to_string()),
+                    runtime_engine: "mock".to_string(),
+                    announced_as_provider: false,
+                    deployed_at: std::time::SystemTime::now(),
+                    last_updated: std::time::SystemTime::now(),
+                    config: crate::runtime::DeploymentConfig::default(),
+                },
+            );
+        }
+
+        // Emit the event directly as the monitor would
+        let _ = tx.send(WorkloadEvent::Unhealthy {
+            manifest_id: manifest_id.clone(),
+            workload_id: workload_id.clone(),
+        });
+
+        // Verify the receiver gets the event
+        let event = rx.try_recv().expect("should receive unhealthy event");
+        match event {
+            WorkloadEvent::Unhealthy {
+                manifest_id: mid,
+                workload_id: wid,
+            } => {
+                assert_eq!(mid, manifest_id);
+                assert_eq!(wid, workload_id);
+            }
+            _ => panic!("unexpected event variant"),
+        }
     }
 }

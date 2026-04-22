@@ -1,9 +1,17 @@
+pub mod node_cert;
+pub use node_cert::{Endorsement, NodeCert, NodeRole};
+
 pub mod sidecar_metadata;
 pub mod libp2p_constants;
 pub mod machine;
 pub mod manifest_yaml;
 pub mod manifest_policy;
 pub mod egress;
+pub mod podmesh_annotations;
+pub use podmesh_annotations::PodmeshAnnotations;
+pub mod sidecar_registration;
+
+pub use sidecar_registration::{SidecarRegistration, SidecarRegistrationAck, SidecarRoute};
 
 #[cfg(test)]
 mod tests {

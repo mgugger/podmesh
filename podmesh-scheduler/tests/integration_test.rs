@@ -1,5 +1,6 @@
 use env_logger::Env;
 use log::info;
+use serial_test::serial;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -9,7 +10,7 @@ use common::test_utils::{make_test_cli, setup_cleanup_hook, start_nodes};
 // IGNORED: This test is flaky due to timing-sensitive mesh formation with 3 nodes.
 // The assertion requires exactly 2 peers to be visible but mesh discovery can be
 // slower in some environments. Consider increasing timeouts or relaxing assertions.
-#[ignore]
+#[serial]
 #[tokio::test]
 async fn test_run_host_application() {
     setup_cleanup_hook();
@@ -33,7 +34,14 @@ async fn test_run_host_application() {
 
     let mut guard = start_nodes(vec![cli1, cli2, cli3], Duration::from_secs(1)).await;
 
-    let verify_peers = wait_for_peers(Duration::from_secs(15)).await;
+    let client = reqwest::Client::new();
+
+    // Only node 1 (port 3000) has REST enabled. Wait until it sees both other nodes (2 peers).
+    let mesh_formed = wait_for_node_peer_count(&client, 3000, 2, Duration::from_secs(20)).await;
+    assert!(mesh_formed, "Node 1 did not see 2 peers within 20s");
+
+    // Verify peers from node 1's perspective
+    let verify_peers = verify_peers().await;
     let health = check_health().await;
 
     let kem_pubkey_result = check_pubkey("kem_pubkey").await;
@@ -48,7 +56,7 @@ async fn test_run_host_application() {
             .expect("peers should be an array")
             .len()
             == 2,
-        "Expected at least two peers in the mesh, got {:?}",
+        "Expected exactly two peers in the mesh, got {:?}",
         verify_peers
     );
     assert!(
@@ -100,20 +108,33 @@ async fn verify_peers() -> serde_json::Value {
     json.unwrap_or_default()
 }
 
-async fn wait_for_peers(timeout: Duration) -> serde_json::Value {
+/// Wait until the node at `port` reports at least `expected_peers` peers.
+async fn wait_for_node_peer_count(
+    client: &reqwest::Client,
+    port: u16,
+    expected_peers: usize,
+    timeout: Duration,
+) -> bool {
+    let url = format!("http://127.0.0.1:{}/debug/peers", port);
     let start = tokio::time::Instant::now();
     loop {
-        let nodes = verify_peers().await;
-        if !nodes["peers"]
-            .as_array()
-            .map(|a| a.is_empty())
-            .unwrap_or(true)
-        {
-            return nodes;
+        let peer_count = match client.get(&url).send().await {
+            Ok(resp) => match resp.json::<serde_json::Value>().await {
+                Ok(json) => json
+                    .get("peers")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0),
+                Err(_) => 0,
+            },
+            Err(_) => 0,
+        };
+        if peer_count >= expected_peers {
+            return true;
         }
         if start.elapsed() > timeout {
-            return nodes;
+            return false;
         }
-        sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_millis(500)).await;
     }
 }

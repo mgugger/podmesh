@@ -151,4 +151,12 @@ impl AppliedManifest {
     pub fn serialize_vec(self) -> Vec<u8> {
         build_applied_manifest(self)
     }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serialize(self)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        deserialize(bytes)
+    }
 }

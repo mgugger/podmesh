@@ -320,6 +320,17 @@ impl RuntimeEngine for MockEngine {
         Ok(())
     }
 
+    async fn deploy_workload_with_peer(
+        &self,
+        manifest_id: &str,
+        manifest_content: &[u8],
+        config: &DeploymentConfig,
+        local_peer_id: libp2p::PeerId,
+    ) -> RuntimeResult<WorkloadInfo> {
+        // Delegate to the inherent method which properly stores local_peer_id in metadata.
+        MockEngine::deploy_workload_with_peer(self, manifest_id, manifest_content, config, local_peer_id).await
+    }
+
     async fn deploy_workload(
         &self,
         manifest_id: &str,

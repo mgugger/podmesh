@@ -3,10 +3,15 @@ name = "crypto"
 version = "0.1.0"
 edition = "2024"
 description = "Crypto parts of podmesh"
+license = "GPL-3.0-only"
 
 [dependencies]
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+postcard = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
 rand = { workspace = true }
 base64 = { workspace = true }
 dirs = { workspace = true }
@@ -17,3 +22,8 @@ log = { workspace = true }
 zeroize = { workspace = true }
 once_cell = { workspace = true }
 thiserror = { workspace = true }
+blake3 = { workspace = true }
+vsss-rs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

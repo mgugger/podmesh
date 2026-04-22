@@ -13,9 +13,9 @@ use protocol::libp2p_constants::FREE_CAPACITY_PREFIX;
 /// Lightweight helpers to centralize common envelope signing and broadcast logic.
 pub fn make_nonce(prefix: Option<&str>) -> String {
     if let Some(p) = prefix {
-        format!("{}_{}", p, rand::thread_rng().r#gen::<u32>())
+        format!("{}_{}", p, rand::thread_rng().r#gen::<u64>())
     } else {
-        format!("nonce_{}", rand::thread_rng().r#gen::<u32>())
+        format!("nonce_{}", rand::thread_rng().r#gen::<u64>())
     }
 }
 

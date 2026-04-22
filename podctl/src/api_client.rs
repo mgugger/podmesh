@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use log::debug;
-use serde_json::Value as JsonValue;
 
 /// API client for direct communication with the machine using postcard-serialized messages
 pub struct ApiClient {
@@ -312,95 +311,6 @@ impl ApiClient {
                 self.machine_public_key.is_some()
             );
             Ok(response_bytes.to_vec())
-        }
-    }
-
-    /// Get candidates using postcard capacity request
-    pub async fn get_candidates(&self, task_id: &str, replicas: usize) -> Result<Vec<String>> {
-        let requested = std::cmp::max(1, replicas);
-        log::debug!(
-            "get_candidates: called with task_id={} replicas={}",
-            task_id,
-            requested
-        );
-        let url = format!(
-            "{}/tasks/{}/candidates?replicas={}",
-            self.base_url.trim_end_matches('/'),
-            task_id,
-            requested
-        );
-        log::debug!("get_candidates: requesting URL: {}", url);
-
-        // Send empty payload for GET-like request
-        log::debug!("get_candidates: sending request...");
-        let response_bytes = self
-            .send_encrypted_request(&url, &[], "candidates_request")
-            .await?;
-
-        log::info!(
-            "get_candidates: received response, {} bytes",
-            response_bytes.len()
-        );
-
-        // Try to parse as postcard CandidatesResponse first
-        log::debug!(
-            "get_candidates: attempting to parse {} bytes as postcard",
-            response_bytes.len()
-        );
-        match protocol::machine::root_as_candidates_response(&response_bytes) {
-            Ok(candidates_response) => {
-                log::debug!(
-                    "get_candidates: successfully parsed postcard, ok={}",
-                    candidates_response.ok()
-                );
-                if candidates_response.ok() {
-                    let responders: Vec<String> = candidates_response
-                        .candidates()
-                        .iter()
-                        .filter_map(|candidate| {
-                            let peer_id = candidate.peer_id()?;
-                            let public_key = candidate.public_key().unwrap_or("");
-                            Some(format!("{}:{}", peer_id, public_key))
-                        })
-                        .collect();
-                    log::debug!("get_candidates: found {} responders", responders.len());
-                    Ok(responders)
-                } else {
-                    log::debug!("get_candidates: postcard response indicates error, returning empty");
-                    Ok(vec![])
-                }
-            }
-            Err(e) => {
-                // Fallback to JSON parsing for compatibility
-                log::warn!("Failed to parse candidates response as postcard: {:?}", e);
-                log::warn!(
-                    "First 100 bytes of response: {:?}",
-                    &response_bytes[..std::cmp::min(100, response_bytes.len())]
-                );
-                let response_str = String::from_utf8(response_bytes.clone())?;
-                log::warn!(
-                    "Response string length: {}, content: '{}'",
-                    response_str.len(),
-                    response_str
-                );
-                if response_str.trim().is_empty() {
-                    log::warn!("Response is empty, returning empty candidates list");
-                    return Ok(vec![]);
-                }
-                let response_json: JsonValue = serde_json::from_str(&response_str)?;
-                let responders = response_json
-                    .get("responders")
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-
-                let peers: Vec<String> = responders
-                    .into_iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect();
-
-                Ok(peers)
-            }
         }
     }
 }

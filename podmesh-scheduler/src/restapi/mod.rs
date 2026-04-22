@@ -63,6 +63,84 @@ async fn get_signing_public_key(State(_state): State<RestState>) -> String {
     }
 }
 
+/// GET /api/v1/custodians
+///
+/// Discover available custodian nodes on the mesh and return their peer IDs and KEM pubkeys.
+/// podctl calls this before sealing a workload so it can wrap DEK shares client-side.
+async fn get_custodians(
+    State(state): State<RestState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::Json<protocol::machine::CustodiansResponse>, (StatusCode, String)> {
+    let max: usize = params
+        .get("max")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    state
+        .control_tx
+        .send(crate::podmesh_p2p::control::Libp2pControl::DiscoverCustodians { max, reply_tx })
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("control channel error: {}", e)))?;
+
+    match reply_rx.await {
+        Ok(custodians) => Ok(axum::Json(protocol::machine::CustodiansResponse { custodians })),
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "libp2p task dropped reply".to_string())),
+    }
+}
+
+/// POST /api/v1/workloads/submit
+///
+/// Accept a pre-sealed `WorkloadSubmission` from podctl and distribute the
+/// per-custodian `WorkloadAssignment` messages.  The scheduler never sees the
+/// plaintext spec — sealing is done entirely by podctl before this call.
+///
+/// Returns `WorkloadSubmissionResponse` on success.
+async fn submit_workload(
+    State(state): State<RestState>,
+    axum::Json(submission): axum::Json<protocol::machine::WorkloadSubmission>,
+) -> Result<axum::Json<protocol::machine::WorkloadSubmissionResponse>, (StatusCode, String)> {
+    let manifest_id = submission.sealed_spec.manifest_id.clone();
+    info!("submit_workload: received pre-sealed submission for manifest_id={}", manifest_id);
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+
+    state
+        .control_tx
+        .send(crate::podmesh_p2p::control::Libp2pControl::SealAndAssignWorkload {
+            submission,
+            reply_tx,
+        })
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to enqueue workload submission: {}", e),
+            )
+        })?;
+
+    match reply_rx.await {
+        Ok(Ok(custodian_peers)) => {
+            info!(
+                "submit_workload: manifest_id={} distributed to {} custodians",
+                manifest_id,
+                custodian_peers.len()
+            );
+            Ok(axum::Json(protocol::machine::WorkloadSubmissionResponse {
+                manifest_id,
+                custodians_assigned: custodian_peers.len(),
+                custodian_peers,
+            }))
+        }
+        Ok(Err(msg)) => {
+            warn!("submit_workload: distribution failed: {}", msg);
+            Err((StatusCode::SERVICE_UNAVAILABLE, msg))
+        }
+        Err(_) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "libp2p task dropped the reply channel".to_string(),
+        )),
+    }
+}
+
 #[derive(Clone)]
 pub struct RestState {
     pub peer_rx: watch::Receiver<Vec<String>>,
@@ -168,6 +246,8 @@ pub fn build_router_with_rate_limit(
         .route("/health", get(|| async { "ok" }))
         .route("/api/v1/kem_pubkey", get(get_kem_public_key))
         .route("/api/v1/signing_pubkey", get(get_signing_public_key))
+        .route("/api/v1/custodians", get(get_custodians))
+        .route("/api/v1/workloads/submit", post(submit_workload))
         .route("/tasks/{task_id}/manifest_id", get(get_task_manifest_id))
         .route("/tasks", post(create_task))
         .route("/tasks/{task_id}", get(get_task_status))
@@ -262,13 +342,13 @@ pub async fn get_candidates(
     // Include the CLI's signing pubkey as owner so worker nodes create reservations
     // bound to the actual owner, not the relay/bootstrap scheduler.
     let owner_pubkey_b64 = crypto::b64_encode(&envelope_metadata.signing_pubkey);
-    let capacity_fb = protocol::machine::build_capacity_request_full(
+    let capacity_fb = protocol::machine::build_resource_query(
         &request_id,
         500u32,
         512u64 * 1024 * 1024,
         10u64 * 1024 * 1024 * 1024,
         requested_replicas as u32,
-        protocol::libp2p_constants::CAPACITY_REQUEST_DEFAULT_MAX_HOPS,
+        "",    // role_filter: any
         &owner_pubkey_b64,
     );
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<String>();

@@ -3,8 +3,7 @@ use log::{debug, info};
 use tokio::sync::mpsc;
 
 use crate::podmesh_p2p::behaviour::MyBehaviour;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use crate::podmesh_p2p::control::{insert_pending_apply_response};
 
 /// Handle SendApplyRequest control message
 pub async fn handle_send_apply_request(
@@ -30,31 +29,6 @@ pub async fn handle_send_apply_request(
     }
 
     // For remote peers, use the normal RequestResponse protocol
-    // Before sending the apply, create a capability token tied to this manifest and
-    // send it to the target peer so they can store it in their keystore.
-    // Compute a manifest_id deterministically when possible (follow same heuristic as apply_message)
-    let _manifest_id = if let Ok(apply_req) = protocol::machine::root_as_apply_request(&manifest) {
-        if let (Some(operation_id), Some(manifest_json)) =
-            (apply_req.operation_id(), apply_req.manifest_json())
-        {
-            let mut hasher = DefaultHasher::new();
-            operation_id.hash(&mut hasher);
-            manifest_json.hash(&mut hasher);
-            format!("{:x}", hasher.finish())
-        } else {
-            // Fallback to hashing raw bytes
-            let mut hasher = DefaultHasher::new();
-            manifest.hash(&mut hasher);
-            format!("{:x}", hasher.finish())
-        }
-    } else {
-        let mut hasher = DefaultHasher::new();
-        manifest.hash(&mut hasher);
-        format!("{:x}", hasher.finish())
-    };
-
-    // No capability token needed - direct manifest application
-
     // The apply request should already be signed by the owner (CLI/podctl) when coming through apply_direct
     // Forward as-is to preserve the original owner's signature - never re-sign
     let request_id = swarm
@@ -66,6 +40,8 @@ pub async fn handle_send_apply_request(
         peer_id, request_id
     );
 
-    // For now, just send success immediately - proper response handling is done elsewhere
-    let _ = reply_tx.send(Ok(format!("Apply request sent to {}", peer_id)));
+    // Store the reply channel keyed by the OutboundRequestId so we can resolve it
+    // when the remote peer sends back an ApplyResponse.
+    let key = format!("{}:{:?}", swarm.local_peer_id(), request_id);
+    insert_pending_apply_response(key, reply_tx);
 }

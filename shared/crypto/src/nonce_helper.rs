@@ -102,6 +102,14 @@ pub fn check_and_insert_nonce_for_peer(
 }
 
 #[cfg(test)]
+pub fn reset_nonce_store_for_test() {
+    nonce_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;

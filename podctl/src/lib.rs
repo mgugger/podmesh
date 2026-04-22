@@ -1,10 +1,7 @@
-use crypto::{encrypt_payload_for_recipient, ensure_keypair_on_disk};
+use anyhow::Context;
 use log::debug;
 use log::error;
 use log::info;
-use protocol::machine::parse_peer_with_pubkey;
-use protocol::manifest_policy::validate_and_mutate_manifest;
-use protocol::manifest_yaml::parse_manifest_to_json;
 use uuid::Uuid;
 use std::env;
 
@@ -13,6 +10,9 @@ use std::path::PathBuf;
 
 mod api_client;
 use api_client::ApiClient;
+
+pub mod cert;
+pub mod seal;
 
 fn resolve_api_base(override_url: Option<&str>) -> String {
     override_url
@@ -61,256 +61,68 @@ fn compute_manifest_id_for_owner(
     Ok(hex_chars)
 }
 
-fn parse_selected_nodes(peers: &[String]) -> anyhow::Result<Vec<(String, String)>> {
-    peers
-        .iter()
-        .map(|entry| {
-            parse_peer_with_pubkey(entry).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Invalid candidate format: expected 'peer_id:pubkey_b64', got '{}'",
-                    entry
-                )
-            })
-        })
-        .collect()
-}
 
-pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> anyhow::Result<String> {
+pub async fn apply_file(
+    path: PathBuf,
+    shares: u8,
+    threshold: u8,
+    required_capabilities: Vec<String>,
+    api_base: Option<&str>,
+) -> anyhow::Result<protocol::machine::WorkloadSubmissionResponse> {
     debug!("apply_file called for path: {:?}", path);
 
-    if !path.exists() {
-        error!("apply_file: file not found: {}", path.display());
-        anyhow::bail!("file not found: {}", path.display());
-    }
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {:?}", path))?;
 
-    let contents = tokio::fs::read_to_string(&path).await?;
-    debug!(
-        "apply_file: file contents read successfully, length: {}",
-        contents.len()
-    );
-    info!(
-        "File contents read successfully, length: {}",
-        contents.len()
-    );
-
-    // Validate manifest against policies and apply mutations (inject defaults)
-    let validated_contents = match validate_and_mutate_manifest(&contents) {
-        Ok(mutated) => {
-            info!("Manifest passed policy validation");
-            mutated
-        }
-        Err(e) => {
-            error!("Manifest failed policy validation: {}", e);
-            anyhow::bail!("Policy validation failed: {}", e);
-        }
+    // Parse YAML → JSON string
+    let spec_json = {
+        let value: serde_json::Value = serde_yaml::from_str(&raw)
+            .or_else(|_| serde_json::from_str::<serde_json::Value>(&raw))
+            .with_context(|| "failed to parse spec as YAML or JSON")?;
+        serde_json::to_string(&value)?
     };
 
-    // Parse validated manifest to JSON
-    let manifest_json =
-        parse_manifest_to_json(&validated_contents).unwrap_or_else(|_| serde_json::json!({"raw": validated_contents}));
-    debug!("apply_file: manifest parsed successfully");
+    // Load owner keypair
+    let (owner_pk, owner_sk) = crypto::ensure_keypair_on_disk()
+        .context("loading owner signing keypair")?;
 
-    // Extract replicas count from manifest (check spec.replicas or top-level replicas, default to 1)
-    let replicas = manifest_json
-        .get("spec")
-        .and_then(|s| s.get("replicas"))
-        .and_then(|r| r.as_u64())
-        .or_else(|| manifest_json.get("replicas").and_then(|r| r.as_u64()))
-        .unwrap_or(1) as usize;
+    // Discover custodians
+    let custodians = get_custodians(api_base, shares as usize).await
+        .context("discovering custodians")?;
 
-    info!("Manifest requires {} replicas", replicas);
-
-    // Ensure CLI keypair - always use persistent keypairs for consistency
-    let (pk_bytes, _sk_bytes) = ensure_keypair_on_disk()?;
-
-    let manifest_id = compute_manifest_id_for_owner(&manifest_json, &pk_bytes)?;
-    if let Some(name) = extract_manifest_name_from_json(&manifest_json) {
-        debug!("CLI: Using manifest name '{}' for manifest_id", name);
-    }
-    debug!(
-        "CLI: Computed manifest_id: {} with pubkey: {:02x?}",
-        manifest_id,
-        &pk_bytes[..8]
+    anyhow::ensure!(
+        custodians.len() >= shares as usize,
+        "need {} custodians, scheduler returned {}",
+        shares,
+        custodians.len()
     );
+
+    let (submission, _) = seal::seal_workload(
+        &spec_json,
+        &custodians,
+        &owner_pk,
+        &owner_sk,
+        shares,
+        threshold,
+        required_capabilities,
+    )?;
+
+    let manifest_id = submission.sealed_spec.manifest_id.clone();
+    info!("apply_file: sealed manifest_id={}", manifest_id);
 
     let base = resolve_api_base(api_base);
-    debug!("Creating ApiClient with base URL: {}", base);
-    let mut api_client = ApiClient::new(base)?;
-
-    debug!("Fetching machine's public key...");
-    api_client.fetch_machine_public_key().await?;
-    debug!("Successfully fetched machine's public key");
-
-    // 1) Get candidates for node selection
-    debug!("About to call get_candidates...");
-    let peers = api_client.get_candidates(&manifest_id, replicas).await?;
-    debug!(
-        "apply_file: get_candidates completed successfully, found {} peers",
-        peers.len()
-    );
-
-    if peers.is_empty() {
-        anyhow::bail!("Machine returned no nodes for scheduling");
-    }
-
-    if peers.len() < replicas {
-        anyhow::bail!(
-            "Machine returned insufficient nodes: need {}, got {}",
-            replicas,
-            peers.len()
-        );
-    }
-
-    let mut selected_nodes = parse_selected_nodes(&peers)?;
-    if selected_nodes.len() > replicas {
-        selected_nodes.truncate(replicas);
-    }
-
-    if selected_nodes.len() < replicas {
-        anyhow::bail!(
-            "Machine returned invalid node assignments (expected {} entries)",
-            replicas
-        );
-    }
-
-    info!(
-        "Scheduled {} nodes for {} replicas via machine selection: {:?}",
-        selected_nodes.len(),
-        replicas,
-        selected_nodes.iter().map(|(id, _)| id).collect::<Vec<_>>()
-    );
-    debug!("Selected nodes with pubkeys: {:?}", selected_nodes);
-
-    let ts = p2p::timestamp_millis();
-    // Use validated (and possibly mutated) manifest for deployment
-    let manifest_to_deploy = validated_contents;
-    let mut succeeded_nodes = Vec::new();
-    let mut failed_nodes: Vec<(String, String)> = Vec::new();
-
-    for (node_id, node_pubkey) in &selected_nodes {
-        match send_apply_to_node(
-            &api_client,
-            node_id,
-            node_pubkey,
-            &manifest_to_deploy,
-            &manifest_id,
-            ts,
-        )
-        .await
-        {
-            Ok(_) => {
-                succeeded_nodes.push(node_id.clone());
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            }
-            Err(err) => {
-                let err_msg = err.to_string();
-                log::error!("Direct apply failed for node {}: {}", node_id, err_msg);
-                failed_nodes.push((node_id.to_string(), err_msg));
-            }
-        }
-    }
-
-    if failed_nodes.is_empty() {
-        info!(
-            "Apply completed for manifest_id {} distributed to {} nodes (all will announce same ID to DHT)",
-            manifest_id,
-            succeeded_nodes.len()
-        );
-        return Ok(manifest_id);
-    }
-
-    if !succeeded_nodes.is_empty() {
-        log::warn!(
-            "Apply partially succeeded for manifest {} ({} ok / {} failed); some nodes already received the workload",
-            manifest_id,
-            succeeded_nodes.len(),
-            failed_nodes.len()
-        );
-    }
-
-    let failure_count = failed_nodes.len();
-    let failure_summary = failed_nodes
-        .into_iter()
-        .map(|(node, err)| format!("{node}: {err}"))
-        .collect::<Vec<_>>()
-        .join("; ");
-
-    anyhow::bail!(
-        "Apply failed for {} of {} target nodes: {}",
-        failure_count,
-        selected_nodes.len(),
-        failure_summary
-    );
+    let url = format!("{}/api/v1/workloads/submit", base);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .json(&submission)
+        .send()
+        .await?
+        .error_for_status()?;
+    let result: protocol::machine::WorkloadSubmissionResponse = resp.json().await?;
+    Ok(result)
 }
 
-async fn send_apply_to_node(
-    api_client: &ApiClient,
-    node_id: &str,
-    node_pubkey_b64: &str,
-    manifest_payload: &str,
-    manifest_id: &str,
-    timestamp_ms: u64,
-) -> anyhow::Result<()> {
-    debug!("Creating encrypted task for node: {}", node_id);
-
-    let node_pubkey_bytes = crypto::b64_decode(node_pubkey_b64)
-        .map_err(|e| anyhow::anyhow!("Failed to decode node public key for {}: {}", node_id, e))?;
-
-    let encrypted_blob =
-        encrypt_payload_for_recipient(&node_pubkey_bytes, manifest_payload.as_bytes())?;
-
-    let encrypted_manifest_bytes = protocol::machine::build_envelope_canonical_with_peer(
-        &encrypted_blob,
-        "manifest",
-        "",
-        timestamp_ms,
-        "x25519",
-        "",
-        None,
-    );
-
-    debug!(
-        "Sending ApplyRequest directly to node {} with manifest_id {}",
-        node_id, manifest_id
-    );
-
-    let operation_id = Uuid::new_v4().to_string();
-    let manifest_json_b64 = crypto::b64_encode(&encrypted_manifest_bytes);
-
-    let apply_request_bytes = protocol::machine::build_apply_request(
-        1,
-        &operation_id,
-        &manifest_json_b64,
-        "",
-        manifest_id,
-    );
-
-    let url = format!(
-        "{}/apply_direct/{}",
-        api_client.base_url.trim_end_matches('/'),
-        node_id
-    );
-
-    // Encrypt and sign the ApplyRequest for the target worker node (end-to-end encryption)
-    // The bootstrap node will route based on URL path without decrypting the payload
-    let response_bytes = api_client
-        .send_encrypted_request_to_node(&url, &apply_request_bytes, "apply_request", &node_pubkey_bytes)
-        .await?;
-
-    let apply_response = protocol::machine::root_as_apply_response(&response_bytes)
-        .map_err(|e| anyhow::anyhow!("Failed to parse ApplyResponse: {}", e))?;
-
-    if !apply_response.ok() {
-        anyhow::bail!(
-            "Direct apply failed for node {}: {}",
-            node_id,
-            apply_response.message().unwrap_or("unknown error")
-        );
-    }
-
-    debug!("Direct apply successful for node {}", node_id);
-    Ok(())
-}
 
 pub async fn delete_file(
     path: PathBuf,
@@ -334,23 +146,25 @@ pub async fn delete_file(
         contents.len()
     );
 
-    // Parse manifest to JSON if possible
-    let manifest_json =
-        parse_manifest_to_json(&contents).unwrap_or_else(|_| serde_json::json!({"raw": contents}));
+    // Parse manifest to JSON — same normalization as apply_file uses before sealing
+    let spec_json = {
+        let value: serde_json::Value = serde_yaml::from_str(&contents)
+            .or_else(|_| serde_json::from_str::<serde_json::Value>(&contents))
+            .with_context(|| "failed to parse spec as YAML or JSON")?;
+        serde_json::to_string(&value)?
+    };
     debug!("delete_file: manifest parsed successfully");
 
-    // Ensure CLI keypair - always use persistent keypairs for consistency
-    let (pk_bytes, _sk_bytes) = ensure_keypair_on_disk()?;
-
-    let manifest_id = compute_manifest_id_for_owner(&manifest_json, &pk_bytes)?;
-    if let Some(name) = extract_manifest_name_from_json(&manifest_json) {
-        debug!("CLI: Using manifest name '{}' for manifest_id", name);
-    }
-    debug!(
-        "CLI: Computed manifest_id for deletion: {} with pubkey: {:02x?}",
-        manifest_id,
-        &pk_bytes[..8]
-    );
+    // Compute manifest_id using the same scheme as apply_file/seal_workload:
+    // blake3(spec_json)[..8] encoded as lowercase hex (16 hex chars).
+    let manifest_id = {
+        let hash = blake3::hash(spec_json.as_bytes());
+        hash.as_bytes()[..8]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+    };
+    debug!("CLI: Computed manifest_id for deletion: {}", manifest_id);
 
     // API base URL can be overridden with PODMESH_API env var
     let base = api_base
@@ -713,24 +527,7 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_selected_nodes_success() {
-        let peers = vec!["peer1:dGVzdDE=".into(), "peer2:dGVzdDI=".into()];
-
-        let parsed = parse_selected_nodes(&peers).expect("parse should succeed");
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].0, "peer1");
-        assert_eq!(parsed[0].1, "dGVzdDE=");
-        assert_eq!(parsed[1].0, "peer2");
-    }
-
-    #[test]
-    fn test_parse_selected_nodes_invalid_format() {
-        let peers = vec!["invalid".into()];
-        let result = parse_selected_nodes(&peers);
-        assert!(result.is_err());
-    }
+    use protocol::manifest_yaml::parse_manifest_to_json;
 
     #[test]
     fn test_extract_manifest_name_multi_doc_first_manifest() {
@@ -767,3 +564,21 @@ metadata:
         assert_eq!(name.as_deref(), Some("actual"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Workload submission (client-side sealing)
+// ---------------------------------------------------------------------------
+
+/// Discover available custodian nodes from the scheduler.
+pub async fn get_custodians(
+    api_base: Option<&str>,
+    max: usize,
+) -> anyhow::Result<Vec<protocol::machine::CustodianInfo>> {
+    let base = resolve_api_base(api_base);
+    let url = format!("{}/api/v1/custodians?max={}", base, max);
+    let client = reqwest::Client::new();
+    let resp = client.get(&url).send().await?.error_for_status()?;
+    let body: protocol::machine::CustodiansResponse = resp.json().await?;
+    Ok(body.custodians)
+}
+

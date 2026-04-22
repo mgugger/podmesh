@@ -57,6 +57,7 @@ fn build_proxy_config(
         disable_rest_api: false,
         enable_proxy_provider,
         enable_ingress,
+        owner_pubkey: None,
     }
 }
 

@@ -2,6 +2,8 @@ use clap::{Parser, Subcommand};
 use podctl::{apply_file, delete_file, get_pods, get_pod, get_logs, format_workloads_table, format_workload_details};
 use std::path::PathBuf;
 
+mod convert;
+
 #[derive(Parser, Debug)]
 #[command(name = "podctl", about = "podmesh CLI - manage workloads on podmesh cluster")]
 struct Cli {
@@ -22,8 +24,17 @@ enum Commands {
         /// Filename, e.g. -f ./pod.yaml
         #[arg(short = 'f', long = "file", value_name = "FILE")]
         file: PathBuf,
+        /// Total shares to generate (distributed to n custodians)
+        #[arg(long, default_value = "5")]
+        shares: u8,
+        /// Minimum shares required to reconstruct
+        #[arg(long, default_value = "3")]
+        threshold: u8,
+        /// Required worker capabilities (repeatable, e.g. --capability gpu)
+        #[arg(long = "capability", value_name = "CAP")]
+        capabilities: Vec<String>,
     },
-    /// Delete a configuration from the cluster  
+    /// Delete a configuration from the cluster
     Delete {
         /// Filename, e.g. -f ./pod.yaml
         #[arg(short = 'f', long = "file", value_name = "FILE")]
@@ -45,6 +56,11 @@ enum Commands {
         #[arg(long = "tail", short = 'n')]
         tail: Option<usize>,
     },
+    /// Convert a Kubernetes manifest to podmesh format
+    Convert {
+        #[arg(short, long)]
+        file: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -65,9 +81,14 @@ async fn main() -> anyhow::Result<()> {
     let use_json = output.to_lowercase() == "json";
 
     match command {
-        Commands::Apply { file } => {
-            let manifest_id = apply_file(file, api_url.as_deref()).await?;
-            println!("Applied manifest: {}", manifest_id);
+        Commands::Apply { file, shares, threshold, capabilities } => {
+            let resp = apply_file(file, shares, threshold, capabilities, api_url.as_deref()).await?;
+            println!(
+                "Applied manifest_id={} to {} custodians: {}",
+                resp.manifest_id,
+                resp.custodians_assigned,
+                resp.custodian_peers.join(", ")
+            );
         }
         Commands::Delete { file, force } => {
             delete_file(file, force, api_url.as_deref()).await?;
@@ -96,6 +117,14 @@ async fn main() -> anyhow::Result<()> {
         Commands::Logs { workload_id, tail } => {
             let logs = get_logs(&workload_id, tail, api_url.as_deref()).await?;
             print!("{}", logs);
+        }
+        Commands::Convert { file } => {
+            let yaml = std::fs::read_to_string(&file)?;
+            let (output, warnings) = convert::convert_manifest(&yaml)?;
+            for w in &warnings {
+                eprintln!("{}", w);
+            }
+            print!("{}", output);
         }
     }
 

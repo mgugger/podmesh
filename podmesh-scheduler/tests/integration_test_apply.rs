@@ -41,11 +41,12 @@ async fn test_apply_functionality() {
         .await
         .expect("Failed to read original manifest file for verification");
 
-    let task_id = podctl::apply_file(manifest_path.clone(), None)
+    let apply_resp = podctl::apply_file(manifest_path.clone(), 1, 1, vec![], None)
         .await
         .expect("apply_file should succeed");
+    let task_id = apply_resp.manifest_id;
 
-    sleep(Duration::from_secs(6)).await;
+    sleep(Duration::from_secs(12)).await;
 
     let port_to_peer_id = get_peer_ids(&client, &ports).await;
     let (nodes_with_deployed_workloads, nodes_with_content_mismatch) = check_workload_deployment(
@@ -89,9 +90,10 @@ async fn test_apply_with_real_podman() {
     sleep(Duration::from_secs(3)).await;
 
     let nginx_manifest_path = manifest_path("nginx.yml");
-    let task_id = podctl::apply_file(nginx_manifest_path.clone(), None)
+    let task_id = podctl::apply_file(nginx_manifest_path.clone(), 5, 3, vec![], None)
         .await
-        .expect("apply_file should succeed with real Podman");
+        .expect("apply_file should succeed with real Podman")
+        .manifest_id;
 
     sleep(Duration::from_secs(5)).await;
 
@@ -130,9 +132,10 @@ async fn test_apply_with_real_podman() {
     cleanup_podman_resources(&task_id).await;
 
     let demo_manifest_path = manifest_path("demo_deployment.yml");
-    let demo_task_id = podctl::apply_file(demo_manifest_path.clone(), None)
+    let demo_task_id = podctl::apply_file(demo_manifest_path.clone(), 5, 3, vec![], None)
         .await
-        .expect("apply_file should succeed for demo manifest");
+        .expect("apply_file should succeed for demo manifest")
+        .manifest_id;
 
     sleep(Duration::from_secs(5)).await;
 
@@ -175,10 +178,6 @@ async fn test_apply_with_real_podman() {
 
 #[serial]
 #[tokio::test]
-// IGNORED: This test is flaky in CI environments due to timing-sensitive mesh formation
-// with replicas. It works locally but fails intermittently under CI resource constraints.
-// The core functionality is covered by test_apply_manifest which tests single-replica deploys.
-#[ignore]
 async fn test_apply_nginx_with_replicas() {
     let (client, ports) = setup_test_environment().await;
     let mut guard = start_cluster_nodes(&[false, false, false]).await;
@@ -199,11 +198,12 @@ async fn test_apply_nginx_with_replicas() {
         .await
         .expect("Failed to read nginx_with_replicas manifest file for verification");
 
-    let task_id = podctl::apply_file(manifest_path.clone(), None)
+    let apply_resp = podctl::apply_file(manifest_path.clone(), 3, 2, vec![], None)
         .await
         .expect("apply_file should succeed for nginx_with_replicas");
+    let task_id = apply_resp.manifest_id;
 
-    sleep(Duration::from_secs(5)).await;
+    sleep(Duration::from_secs(12)).await;
 
     let port_to_peer_id = get_peer_ids(&client, &ports).await;
     let (nodes_with_deployed_workloads, nodes_with_content_mismatch) = check_workload_deployment(
@@ -241,6 +241,74 @@ async fn test_apply_nginx_with_replicas() {
 
     log::info!(
         "✓ MockEngine verification passed: nginx_with_replicas manifest {} deployed on {:?}",
+        task_id,
+        nodes_with_deployed_workloads
+    );
+
+    guard.cleanup().await;
+}
+
+#[serial]
+#[tokio::test]
+async fn test_apply_nginx_with_replicas_3_of_3() {
+    let (client, ports) = setup_test_environment().await;
+    let mut guard = start_cluster_nodes(&[false, false, false]).await;
+
+    sleep(Duration::from_secs(3)).await;
+    let mesh_formed = wait_for_mesh_formation(&client, &ports, Duration::from_secs(20)).await;
+    if !mesh_formed {
+        log::warn!("Mesh formation incomplete, but proceeding with test");
+    }
+    sleep(Duration::from_secs(3)).await;
+
+    let manifest_path = manifest_path("nginx_with_replicas.yml");
+    let original_content = tokio::fs::read_to_string(manifest_path.clone())
+        .await
+        .expect("Failed to read nginx_with_replicas manifest file for verification");
+
+    let apply_resp = podctl::apply_file(manifest_path.clone(), 3, 3, vec![], None)
+        .await
+        .expect("apply_file should succeed for nginx_with_replicas 3-of-3");
+    let task_id = apply_resp.manifest_id;
+
+    sleep(Duration::from_secs(12)).await;
+
+    let port_to_peer_id = get_peer_ids(&client, &ports).await;
+    let (nodes_with_deployed_workloads, nodes_with_content_mismatch) = check_workload_deployment(
+        &client,
+        &ports,
+        &task_id,
+        &original_content,
+        &port_to_peer_id,
+        true,
+    )
+    .await;
+
+    assert_eq!(
+        nodes_with_deployed_workloads.len(),
+        3,
+        "Expected exactly 3 nodes to have workload deployed (3-of-3), found {:?}",
+        nodes_with_deployed_workloads
+    );
+
+    let mut sorted_nodes = nodes_with_deployed_workloads.clone();
+    sorted_nodes.sort();
+    let mut expected_nodes = ports.clone();
+    expected_nodes.sort();
+    assert_eq!(
+        sorted_nodes, expected_nodes,
+        "Expected workloads on nodes {:?}, found {:?}",
+        expected_nodes, sorted_nodes
+    );
+
+    assert!(
+        nodes_with_content_mismatch.is_empty(),
+        "Manifest content verification failed on nodes: {:?}",
+        nodes_with_content_mismatch
+    );
+
+    log::info!(
+        "✓ MockEngine verification passed: nginx_with_replicas 3-of-3 manifest {} deployed on {:?}",
         task_id,
         nodes_with_deployed_workloads
     );
@@ -483,4 +551,33 @@ async fn cleanup_podman_resources(task_id: &str) {
             }
         }
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_apply_awaits_remote_confirmation() {
+    // This test verifies that the pending_apply_responses mechanism is wired correctly:
+    // sending an apply to a remote peer stores the reply_tx in the pending map rather than
+    // resolving immediately with a placeholder message.
+    //
+    // We test the mechanism at the unit level: insert a sender, take it back, verify it works.
+    use tokio::sync::mpsc;
+    use podmesh_scheduler::podmesh_p2p::control::{insert_pending_apply_response, take_pending_apply_response};
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<Result<String, String>>();
+    let key = "OutboundRequestId(42)".to_string();
+
+    insert_pending_apply_response(key.clone(), tx);
+
+    // Simulate the response arriving: take the sender and resolve it
+    let sender = take_pending_apply_response(&key)
+        .expect("sender should be present in pending map");
+    sender.send(Ok("Apply confirmed by peer=12D...".to_string())).unwrap();
+
+    let result = rx.try_recv().expect("should receive confirmation");
+    assert!(result.is_ok());
+    assert!(result.unwrap().contains("Apply confirmed"));
+
+    // A second take should return None (entry consumed)
+    assert!(take_pending_apply_response(&key).is_none());
 }

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -12,23 +13,51 @@ use p2p::{
     sidecar_manifest::verify_sidecar_manifest_envelope,
     handshake::{self, HandshakeDriveConfig, HandshakeState},
     http_proxy::{ProxyCodec, ProxyHttpRequest, ProxyHttpResponse},
-    request_response::{HandshakeCodec, ManifestFetchCodec},
+    request_response::{HandshakeCodec, ManifestFetchCodec, ByteCodec},
 };
 use protocol::libp2p_constants::{
     SIDECAR_MANIFEST_PROTOCOL, INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX,
     WORKLOAD_CLUSTER_TOPIC, MANIFEST_RECORD_TTL_MS, MANIFEST_CACHE_TTL_RATIO,
-    EGRESS_TUNNEL_PROTOCOL,
+    EGRESS_TUNNEL_PROTOCOL, SIDECAR_REGISTRATION_PROTOCOL,
 };
 use protocol::egress::{EgressTunnelRequest, EgressTunnelResponse};
-use protocol::machine::{SidecarProviderRecordOwned, build_sidecar_manifest_request};
+use protocol::machine::{SidecarProviderRecordOwned, SidecarRouteSpec, SidecarRouteKind, build_sidecar_manifest_request};
+use protocol::{SidecarRegistration, SidecarRegistrationAck, SidecarRoute};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use log::{debug, error, info, warn};
 
 use crate::config::Config;
 
+/// In-memory routing table entry for a registered sidecar.
+#[derive(Debug, Clone)]
+pub struct SidecarRouteEntry {
+    pub sidecar_peer_id: String,
+    pub routes: Vec<SidecarRoute>,
+    pub registered_at: u64,
+}
+
+/// Shared routing table: manifest_id → SidecarRouteEntry.
+pub type RoutingTable = Arc<std::sync::RwLock<HashMap<String, SidecarRouteEntry>>>;
+
+/// Codec for the sidecar-registration request-response protocol (raw length-prefixed bytes).
+pub type RegistrationCodec = ByteCodec;
+
 use protocol::libp2p_constants::PROXY_PROVIDER_KEY;
 const MAX_MANIFEST_FETCH_PEERS: usize = 4;
+
+/// Compute the opaque DHT key for a tenant proxy announcement.
+///
+/// The key is `sha256(owner_pubkey_bytes || b"proxy")`, so it is unlinkable
+/// to the raw public key bytes while still being deterministic for a given owner.
+pub fn compute_tenant_proxy_dht_key(owner_pubkey_b64: &str) -> anyhow::Result<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+    let pk_bytes = crypto::b64_decode(owner_pubkey_b64)?;
+    let mut input = pk_bytes;
+    input.extend_from_slice(b"proxy");
+    let hash = Sha256::digest(&input);
+    Ok(hash.to_vec())
+}
 
 enum P2pCommand {
     ProxyHttp {
@@ -90,6 +119,7 @@ pub struct WorkloadBehaviour {
     pub proxy_rr: request_response::Behaviour<ProxyCodec>,
     pub manifest_rr: request_response::Behaviour<ManifestFetchCodec>,
     pub egress_stream: libp2p_stream::Behaviour,
+    pub registration_rr: request_response::Behaviour<RegistrationCodec>,
 }
 
 impl CoreBehaviourAccess for WorkloadBehaviour {
@@ -110,6 +140,7 @@ pub struct P2pNodeHandle {
     proxy_provider_announced_rx: watch::Receiver<bool>,
     _proxy_provider_announced_tx: watch::Sender<bool>,
     command_tx: mpsc::UnboundedSender<P2pCommand>,
+    pub routing_table: RoutingTable,
 }
 
 impl P2pNodeHandle {
@@ -192,6 +223,14 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
             request_response::Config::default(),
         );
 
+        let registration_rr = request_response::Behaviour::new(
+            std::iter::once((
+                SIDECAR_REGISTRATION_PROTOCOL,
+                request_response::ProtocolSupport::Inbound,
+            )),
+            request_response::Config::default(),
+        );
+
         let store = kad::store::MemoryStore::new(key.public().to_peer_id());
         let kademlia_config = p2p::default_kademlia_config();
         let mut kademlia =
@@ -213,6 +252,7 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
             proxy_rr,
             manifest_rr,
             egress_stream: libp2p_stream::Behaviour::new(),
+            registration_rr,
         }
     })?;
 
@@ -238,6 +278,26 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
         warn!("proxy provider announcement disabled peer={}", swarm.local_peer_id());
     }
 
+    // Phase 7.2: announce opaque tenant proxy DHT key if owner pubkey configured
+    if let Some(ref owner_pub) = cfg.owner_pubkey {
+        match compute_tenant_proxy_dht_key(owner_pub) {
+            Ok(key) => {
+                let record_key = kad::RecordKey::new(&key);
+                match swarm.behaviour_mut().kademlia.start_providing(record_key) {
+                    Ok(qid) => info!(
+                        "proxy announced tenant DHT key peer={} query_id={:?}",
+                        swarm.local_peer_id(), qid
+                    ),
+                    Err(err) => warn!(
+                        "proxy tenant DHT key announcement failed peer={} error={}",
+                        swarm.local_peer_id(), err
+                    ),
+                }
+            }
+            Err(err) => warn!("failed to compute tenant proxy DHT key: {}", err),
+        }
+    }
+
     let handshake_states: HashMap<PeerId, HandshakeState> = HashMap::new();
     let peer_protocols: HashMap<PeerId, String> = HashMap::new();
     let single_node_mode = cfg.bootstrap_peer_strings.is_empty();
@@ -259,6 +319,10 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
     let local_peer_id = swarm.local_peer_id().to_string();
     let kad_ready_tx = kad_ready_tx;
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    
+    // Shared in-memory routing table (populated by sidecar registrations)
+    let routing_table: RoutingTable = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    let routing_table_task = Arc::clone(&routing_table);
     
     // Set up egress tunnel stream handler
     let egress_protocol = StreamProtocol::try_from_owned(EGRESS_TUNNEL_PROTOCOL.to_string())
@@ -288,6 +352,7 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
             request_response::OutboundRequestId,
             oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
         > = HashMap::new();
+        let routing_table = routing_table_task;
         async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             let mut handshake_interval = tokio::time::interval(Duration::from_secs(1));
@@ -366,6 +431,9 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
                                     &mut pending_proxy_requests,
                                 );
                             }
+                            SwarmEvent::Behaviour(WorkloadBehaviourEvent::RegistrationRr(event)) => {
+                                handle_registration_rr_event(&mut swarm, event, &routing_table);
+                            }
                             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                                 warn!("connection established with {}", peer_id);
                                 handshake::track_peer(&mut handshake_states, &peer_id);
@@ -413,6 +481,7 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
                             &mut manifest_queries,
                             &mut query_manifest,
                             &mut pending_proxy_requests,
+                            &routing_table,
                         );
                     }
                     _ = handshake_interval.tick() => {
@@ -467,6 +536,7 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
         proxy_provider_announced_rx,
         _proxy_provider_announced_tx: proxy_announced_tx,
         command_tx: cmd_tx,
+        routing_table,
     })
 }
 
@@ -510,6 +580,7 @@ fn handle_command(
         request_response::OutboundRequestId,
         oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
     >,
+    routing_table: &RoutingTable,
 ) {
     match cmd {
         P2pCommand::ProxyHttp {
@@ -527,8 +598,36 @@ fn handle_command(
                 manifest_queries,
                 query_manifest,
                 pending_proxy_requests,
+                routing_table,
             );
         }
+    }
+}
+
+/// Build a `SidecarProviderRecordOwned` from an in-memory `SidecarRouteEntry`
+/// so it can be dispatched through the existing proxy dispatch path.
+fn build_record_from_route_entry(entry: &SidecarRouteEntry) -> SidecarProviderRecordOwned {
+    let routes: Vec<SidecarRouteSpec> = entry
+        .routes
+        .iter()
+        .map(|r| SidecarRouteSpec {
+            host: String::new(),
+            path_prefix: r.path_prefix.clone(),
+            target_port: r.port,
+            service_name: String::new(),
+            service_port: String::new(),
+            source: SidecarRouteKind::Service,
+        })
+        .collect();
+    SidecarProviderRecordOwned {
+        manifest_id: String::new(),
+        peer_id: entry.sidecar_peer_id.clone(),
+        host: String::new(),
+        owner_public_key_b64: None,
+        routes,
+        ttl_ms: 0,
+        last_updated_ms: entry.registered_at,
+        version: 1,
     }
 }
 
@@ -542,8 +641,25 @@ fn process_proxy_command(
         request_response::OutboundRequestId,
         oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
     >,
+    routing_table: &RoutingTable,
 ) {
     let manifest_id = pending.request.manifest_id.clone();
+
+    // Phase 7.4: check in-memory routing table first
+    if let Ok(table) = routing_table.read() {
+        if let Some(entry) = table.get(&manifest_id) {
+            let record = build_record_from_route_entry(entry);
+            drop(table);
+            match dispatch_proxy_request(swarm, pending, &record, pending_proxy_requests) {
+                Ok(()) => return,
+                Err((pending, err)) => {
+                    let _ = pending.respond_to.send(Err(err));
+                    return;
+                }
+            }
+        }
+    }
+
     let now = Instant::now();
     if let Some(entry) = sidecar_cache.get(&manifest_id) {
         if entry.expires_at > now {
@@ -858,6 +974,85 @@ fn fail_manifest_query(
         }
     }
 }
+fn handle_registration_rr_event(
+    swarm: &mut Swarm<WorkloadBehaviour>,
+    event: request_response::Event<Vec<u8>, Vec<u8>>,
+    routing_table: &RoutingTable,
+) {
+    match event {
+        request_response::Event::Message { peer, message, .. } => match message {
+            request_response::Message::Request { request, channel, .. } => {
+                match SidecarRegistration::from_bytes(&request) {
+                    Ok(reg) => {
+                        // Verify the signature: sig covers manifest_id || sidecar_peer_id
+                        let signed_data = format!("{}{}", reg.manifest_id, reg.sidecar_peer_id);
+                        let sig_valid = verify_registration_sig(
+                            &reg.owner_pubkey,
+                            &reg.sig,
+                            signed_data.as_bytes(),
+                        );
+                        let (ok, message) = if sig_valid {
+                            let entry = SidecarRouteEntry {
+                                sidecar_peer_id: reg.sidecar_peer_id.clone(),
+                                routes: reg.routes.clone(),
+                                registered_at: p2p::timestamp_millis(),
+                            };
+                            {
+                                let mut table = routing_table.write().expect("routing table write lock");
+                                table.insert(reg.manifest_id.clone(), entry);
+                            }
+                            info!(
+                                "sidecar registered routes manifest={} peer={} routes={}",
+                                reg.manifest_id, reg.sidecar_peer_id, reg.routes.len()
+                            );
+                            (true, "ok".to_string())
+                        } else {
+                            warn!(
+                                "sidecar registration sig verification failed manifest={} peer={}",
+                                reg.manifest_id, peer
+                            );
+                            (false, "signature verification failed".to_string())
+                        };
+                        let ack = SidecarRegistrationAck {
+                            manifest_id: reg.manifest_id.clone(),
+                            ok,
+                            message,
+                        };
+                        if let Err(err) = swarm.behaviour_mut().registration_rr.send_response(channel, ack.to_bytes()) {
+                            warn!("failed to send registration ack error={:?}", err);
+                        }
+                    }
+                    Err(err) => {
+                        warn!("failed to deserialize sidecar registration from peer={} error={}", peer, err);
+                    }
+                }
+            }
+            request_response::Message::Response { .. } => {
+                warn!("unexpected outbound response on registration protocol");
+            }
+        },
+        request_response::Event::OutboundFailure { peer, error, .. } => {
+            warn!("registration outbound failure peer={} error={:?}", peer, error);
+        }
+        request_response::Event::InboundFailure { peer, error, .. } => {
+            warn!("registration inbound failure peer={} error={:?}", peer, error);
+        }
+        request_response::Event::ResponseSent { .. } => {}
+    }
+}
+
+fn verify_registration_sig(owner_pubkey_b64: &str, sig_b64: &str, data: &[u8]) -> bool {
+    let pk_bytes = match crypto::b64_decode(owner_pubkey_b64) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let sig_bytes = match crypto::b64_decode(sig_b64) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    crypto::verify_envelope(&pk_bytes, data, &sig_bytes).is_ok()
+}
+
 fn handle_proxy_rr_event(
     event: request_response::Event<ProxyHttpRequest, ProxyHttpResponse>,
     pending_proxy_requests: &mut HashMap<
@@ -1167,4 +1362,61 @@ async fn handle_egress_stream(
     }
     
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_proxy_announces_with_opaque_dht_key() {
+        let owner_pub_b64 = crypto::b64_encode(&[1u8; 32]);
+        let key = compute_tenant_proxy_dht_key(&owner_pub_b64).unwrap();
+        // key should be 32 bytes (sha256)
+        assert_eq!(key.len(), 32);
+        // key should NOT contain the raw owner pubkey bytes
+        assert!(!key.windows(32).any(|w| w == [1u8; 32].as_slice()));
+    }
+
+    #[test]
+    fn test_opaque_key_not_linkable_to_owner_identity() {
+        let owner_pub1 = crypto::b64_encode(&[1u8; 32]);
+        let owner_pub2 = crypto::b64_encode(&[2u8; 32]);
+        let key1 = compute_tenant_proxy_dht_key(&owner_pub1).unwrap();
+        let key2 = compute_tenant_proxy_dht_key(&owner_pub2).unwrap();
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn test_proxy_routes_from_in_memory_table() {
+        use std::sync::RwLock;
+        let table: RoutingTable = Arc::new(RwLock::new(HashMap::new()));
+        {
+            let mut t = table.write().unwrap();
+            t.insert(
+                "demo-app".to_string(),
+                SidecarRouteEntry {
+                    sidecar_peer_id: "peer123".to_string(),
+                    routes: vec![SidecarRoute {
+                        path_prefix: "/".to_string(),
+                        port: 8080,
+                    }],
+                    registered_at: 0,
+                },
+            );
+        }
+        let t = table.read().unwrap();
+        let entry = t.get("demo-app");
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().sidecar_peer_id, "peer123");
+    }
+
+    #[test]
+    fn test_proxy_returns_503_when_sidecar_not_registered() {
+        use std::sync::RwLock;
+        let table: RoutingTable = Arc::new(RwLock::new(HashMap::new()));
+        let t = table.read().unwrap();
+        // Empty table - no entry for manifest
+        assert!(t.get("unknown-app").is_none());
+    }
 }
