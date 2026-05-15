@@ -36,6 +36,9 @@ impl Workload {
         let peer_rx = node.peer_rx();
         let proxy_client = node.proxy_client();
         let peer_id = node.peer_id().to_string();
+        let cert_store = node.cert_store();
+        let cert_announce_tx = node.cert_announce_tx();
+        let handshake_cert_slot = node.handshake_cert_slot();
         let rest_handle = if self.cfg.disable_rest_api {
             info!(
                 "workload rest api disabled host={} port={}",
@@ -43,11 +46,15 @@ impl Workload {
             );
             None
         } else {
-            Some(restapi::spawn_rest_server(
-                self.cfg.rest_host.clone(),
-                self.cfg.rest_port,
+            Some(restapi::spawn_rest_server(restapi::RestServerOptions {
+                host: self.cfg.rest_host.clone(),
+                port: self.cfg.rest_port,
                 peer_rx,
-            )?)
+                local_peer_id: peer_id.clone(),
+                cert_store,
+                cert_announce_tx,
+                handshake_cert_slot,
+            })?)
         };
 
         self.rest_handle = rest_handle;
@@ -96,5 +103,28 @@ impl Workload {
 
     pub fn ingress_address(&self) -> Option<SocketAddr> {
         self.ingress.as_ref().map(|server| server.listen_addr())
+    }
+
+    /// Direct access to the cert store for in-process tests that bypass the REST API.
+    pub fn cert_store(&self) -> Option<crate::restapi::CertStore> {
+        self.p2p_node.as_ref().map(|n| n.cert_store())
+    }
+
+    /// Direct access to the cert announce channel for in-process tests.
+    pub fn cert_announce_tx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<crate::restapi::CertAnnouncement>> {
+        self.p2p_node.as_ref().map(|n| n.cert_announce_tx())
+    }
+
+    /// Direct access to the handshake cert slot.
+    pub fn handshake_cert_slot(&self) -> Option<p2p::handshake::ProxyCertProvider> {
+        self.p2p_node.as_ref().map(|n| n.handshake_cert_slot())
+    }
+
+    /// Direct access to the in-memory routing table populated by sidecar registrations.
+    /// Useful for integration tests asserting that a verified registration was stored.
+    pub fn routing_table_handle(&self) -> Option<p2p::RoutingTable> {
+        self.p2p_node.as_ref().map(|n| n.routing_table.clone())
     }
 }

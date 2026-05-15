@@ -101,7 +101,10 @@ pub fn check_and_insert_nonce_for_peer(
     Ok(())
 }
 
-#[cfg(test)]
+/// Clear the in-memory nonce store. Intended for tests only — exposed without
+/// `#[cfg(test)]` so that downstream crates' integration tests can call it
+/// (a `#[cfg(test)]` item in a library is not visible to tests in dependent
+/// crates).
 pub fn reset_nonce_store_for_test() {
     nonce_store()
         .lock()

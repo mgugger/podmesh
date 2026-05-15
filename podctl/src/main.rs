@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use podctl::{apply_file, delete_file, get_pods, get_pod, get_logs, format_workloads_table, format_workload_details};
+use podctl::{apply_file, cert, delete_file, get_pods, get_pod, get_logs, format_workloads_table, format_workload_details};
 use std::path::PathBuf;
 
 mod convert;
@@ -60,6 +60,11 @@ enum Commands {
     Convert {
         #[arg(short, long)]
         file: String,
+    },
+    /// NodeCert management (issue, show, verify, grant-proxy)
+    Cert {
+        #[command(subcommand)]
+        cmd: cert::CertCommands,
     },
 }
 
@@ -125,6 +130,9 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("{}", w);
             }
             print!("{}", output);
+        }
+        Commands::Cert { cmd } => {
+            cert::handle_cert_command(cmd)?;
         }
     }
 

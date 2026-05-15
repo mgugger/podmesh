@@ -13,10 +13,14 @@ pub struct SidecarRegistration {
     pub manifest_id: String,
     pub routes: Vec<SidecarRoute>,
     pub sidecar_peer_id: String,
-    /// Base64-encoded Ed25519 owner public key.
+    /// Base64-encoded Ed25519 owner public key (tenant key).
     pub owner_pubkey: String,
-    /// Ed25519 signature over `manifest_id || sidecar_peer_id` (base64-encoded).
+    /// Ed25519 signature over `manifest_id || sidecar_peer_id` (base64-encoded),
+    /// produced with the sidecar's own Ed25519 signing key (NOT the owner key).
     pub sig: String,
+    /// Base64-encoded Ed25519 public key of the sidecar (the key that produced `sig`).
+    /// Allows the proxy to verify the registration signature without trusting prior state.
+    pub sidecar_signing_pubkey: String,
 }
 
 impl SidecarRegistration {

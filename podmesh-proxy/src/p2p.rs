@@ -11,10 +11,11 @@ use libp2p::{
 use p2p::{
     CoreBehaviourAccess, NodeConfig, libp2p_stream,
     sidecar_manifest::verify_sidecar_manifest_envelope,
-    handshake::{self, HandshakeDriveConfig, HandshakeState},
     http_proxy::{ProxyCodec, ProxyHttpRequest, ProxyHttpResponse},
     request_response::{HandshakeCodec, ManifestFetchCodec, ByteCodec},
 };
+pub use p2p::handshake;
+use p2p::handshake::{HandshakeDriveConfig, HandshakeState, ProxyCertProvider, empty_proxy_cert_provider};
 use protocol::libp2p_constants::{
     SIDECAR_MANIFEST_PROTOCOL, INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX,
     WORKLOAD_CLUSTER_TOPIC, MANIFEST_RECORD_TTL_MS, MANIFEST_CACHE_TTL_RATIO,
@@ -28,6 +29,7 @@ use tokio::task::JoinHandle;
 use log::{debug, error, info, warn};
 
 use crate::config::Config;
+use crate::restapi::{CertAnnouncement, CertStore, new_cert_store};
 
 /// In-memory routing table entry for a registered sidecar.
 #[derive(Debug, Clone)]
@@ -48,15 +50,10 @@ const MAX_MANIFEST_FETCH_PEERS: usize = 4;
 
 /// Compute the opaque DHT key for a tenant proxy announcement.
 ///
-/// The key is `sha256(owner_pubkey_bytes || b"proxy")`, so it is unlinkable
-/// to the raw public key bytes while still being deterministic for a given owner.
+/// Re-exported from `protocol::compute_tenant_proxy_dht_key`. The key is
+/// `blake3(owner_pubkey_bytes)[..16]` — one-way and unlinkable to the raw key.
 pub fn compute_tenant_proxy_dht_key(owner_pubkey_b64: &str) -> anyhow::Result<Vec<u8>> {
-    use sha2::{Digest, Sha256};
-    let pk_bytes = crypto::b64_decode(owner_pubkey_b64)?;
-    let mut input = pk_bytes;
-    input.extend_from_slice(b"proxy");
-    let hash = Sha256::digest(&input);
-    Ok(hash.to_vec())
+    protocol::compute_tenant_proxy_dht_key(owner_pubkey_b64)
 }
 
 enum P2pCommand {
@@ -141,6 +138,14 @@ pub struct P2pNodeHandle {
     _proxy_provider_announced_tx: watch::Sender<bool>,
     command_tx: mpsc::UnboundedSender<P2pCommand>,
     pub routing_table: RoutingTable,
+    /// Shared store of tenant-issued NodeCerts. The REST API writes here when
+    /// `POST /api/v1/node_cert` is called; the p2p task reads it for SidecarRegistration verification.
+    pub cert_store: CertStore,
+    /// Channel that the REST API uses to notify the p2p task to begin announcing
+    /// a newly-stored tenant cert.
+    pub cert_announce_tx: mpsc::UnboundedSender<CertAnnouncement>,
+    /// Slot the handshake handler reads to embed `proxy_cert_b64` in responses.
+    pub handshake_cert_slot: ProxyCertProvider,
 }
 
 impl P2pNodeHandle {
@@ -164,6 +169,18 @@ impl P2pNodeHandle {
         ProxyClient {
             tx: self.command_tx.clone(),
         }
+    }
+
+    pub fn cert_store(&self) -> CertStore {
+        self.cert_store.clone()
+    }
+
+    pub fn cert_announce_tx(&self) -> mpsc::UnboundedSender<CertAnnouncement> {
+        self.cert_announce_tx.clone()
+    }
+
+    pub fn handshake_cert_slot(&self) -> ProxyCertProvider {
+        self.handshake_cert_slot.clone()
     }
 
     pub async fn shutdown(self) {
@@ -278,24 +295,15 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
         warn!("proxy provider announcement disabled peer={}", swarm.local_peer_id());
     }
 
-    // Phase 7.2: announce opaque tenant proxy DHT key if owner pubkey configured
+    // Tenant cert plumbing — shared between REST API and p2p loop
+    let cert_store: CertStore = new_cert_store();
+    let handshake_cert_slot: ProxyCertProvider = empty_proxy_cert_provider();
+    let (cert_announce_tx, mut cert_announce_rx) = mpsc::unbounded_channel::<CertAnnouncement>();
+
+    // Phase 7.2: announce opaque tenant proxy DHT key if owner pubkey configured statically.
+    // Operators may also provide certs at runtime via `POST /api/v1/node_cert`.
     if let Some(ref owner_pub) = cfg.owner_pubkey {
-        match compute_tenant_proxy_dht_key(owner_pub) {
-            Ok(key) => {
-                let record_key = kad::RecordKey::new(&key);
-                match swarm.behaviour_mut().kademlia.start_providing(record_key) {
-                    Ok(qid) => info!(
-                        "proxy announced tenant DHT key peer={} query_id={:?}",
-                        swarm.local_peer_id(), qid
-                    ),
-                    Err(err) => warn!(
-                        "proxy tenant DHT key announcement failed peer={} error={}",
-                        swarm.local_peer_id(), err
-                    ),
-                }
-            }
-            Err(err) => warn!("failed to compute tenant proxy DHT key: {}", err),
-        }
+        announce_tenant_dht_key(&mut swarm, owner_pub);
     }
 
     let handshake_states: HashMap<PeerId, HandshakeState> = HashMap::new();
@@ -323,6 +331,8 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
     // Shared in-memory routing table (populated by sidecar registrations)
     let routing_table: RoutingTable = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let routing_table_task = Arc::clone(&routing_table);
+    let cert_store_task = cert_store.clone();
+    let handshake_cert_slot_task = handshake_cert_slot.clone();
     
     // Set up egress tunnel stream handler
     let egress_protocol = StreamProtocol::try_from_owned(EGRESS_TUNNEL_PROTOCOL.to_string())
@@ -353,6 +363,8 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
             oneshot::Sender<anyhow::Result<ProxyHttpResponse>>,
         > = HashMap::new();
         let routing_table = routing_table_task;
+        let cert_store = cert_store_task;
+        let handshake_cert_slot = handshake_cert_slot_task;
         async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             let mut handshake_interval = tokio::time::interval(Duration::from_secs(1));
@@ -398,10 +410,11 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
                                 );
                             }
                             SwarmEvent::Behaviour(WorkloadBehaviourEvent::HandshakeRr(request_response::Event::Message { message, peer, connection_id: _ })) => {
-                                handshake::handle_request_response_message(
+                                handshake::handle_request_response_message_with_cert(
                                     message,
                                     peer,
                                     &mut handshake_states,
+                                    Some(&handshake_cert_slot),
                                     |resp, channel| {
                                         let _ = swarm.behaviour_mut().handshake_rr.send_response(channel, resp);
                                     },
@@ -432,7 +445,7 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
                                 );
                             }
                             SwarmEvent::Behaviour(WorkloadBehaviourEvent::RegistrationRr(event)) => {
-                                handle_registration_rr_event(&mut swarm, event, &routing_table);
+                                handle_registration_rr_event(&mut swarm, event, &routing_table, &cert_store);
                             }
                             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                                 warn!("connection established with {}", peer_id);
@@ -523,6 +536,13 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
                         publish_peer_snapshot(&swarm, &mut peer_tx);
                         prune_expired_cache_entries(&mut sidecar_cache);
                     }
+                    Some(notice) = cert_announce_rx.recv() => {
+                        info!(
+                            "received tenant cert announcement owner_pubkey={}",
+                            notice.owner_pubkey
+                        );
+                        announce_tenant_dht_key(&mut swarm, &notice.owner_pubkey);
+                    }
                 }
             }
         }
@@ -537,7 +557,38 @@ pub fn spawn(cfg: &Config) -> Result<P2pNodeHandle> {
         _proxy_provider_announced_tx: proxy_announced_tx,
         command_tx: cmd_tx,
         routing_table,
+        cert_store,
+        cert_announce_tx,
+        handshake_cert_slot,
     })
+}
+
+/// Start providing a tenant-derived DHT key for the given owner pubkey.
+///
+/// Idempotent in practice: libp2p's Kademlia accepts multiple `start_providing`
+/// calls for the same key. The key is `blake3(owner_pubkey_bytes)[..16]`, computed
+/// via [`compute_tenant_proxy_dht_key`].
+fn announce_tenant_dht_key(swarm: &mut Swarm<WorkloadBehaviour>, owner_pubkey_b64: &str) {
+    match compute_tenant_proxy_dht_key(owner_pubkey_b64) {
+        Ok(key) => {
+            let record_key = kad::RecordKey::new(&key);
+            match swarm.behaviour_mut().kademlia.start_providing(record_key) {
+                Ok(qid) => info!(
+                    "proxy announced tenant DHT key peer={} owner_pubkey={} dht_key_hex={} query_id={:?}",
+                    swarm.local_peer_id(),
+                    owner_pubkey_b64,
+                    hex::encode(&key),
+                    qid
+                ),
+                Err(err) => warn!(
+                    "proxy tenant DHT key announcement failed peer={} error={}",
+                    swarm.local_peer_id(),
+                    err
+                ),
+            }
+        }
+        Err(err) => warn!("failed to compute tenant proxy DHT key: {}", err),
+    }
 }
 
 /// Removes expired entries from the sidecar cache to prevent unbounded growth.
@@ -978,20 +1029,16 @@ fn handle_registration_rr_event(
     swarm: &mut Swarm<WorkloadBehaviour>,
     event: request_response::Event<Vec<u8>, Vec<u8>>,
     routing_table: &RoutingTable,
+    cert_store: &CertStore,
 ) {
     match event {
         request_response::Event::Message { peer, message, .. } => match message {
             request_response::Message::Request { request, channel, .. } => {
                 match SidecarRegistration::from_bytes(&request) {
                     Ok(reg) => {
-                        // Verify the signature: sig covers manifest_id || sidecar_peer_id
-                        let signed_data = format!("{}{}", reg.manifest_id, reg.sidecar_peer_id);
-                        let sig_valid = verify_registration_sig(
-                            &reg.owner_pubkey,
-                            &reg.sig,
-                            signed_data.as_bytes(),
-                        );
-                        let (ok, message) = if sig_valid {
+                        let (ok, message) =
+                            evaluate_sidecar_registration(&reg, &peer, cert_store);
+                        if ok {
                             let entry = SidecarRouteEntry {
                                 sidecar_peer_id: reg.sidecar_peer_id.clone(),
                                 routes: reg.routes.clone(),
@@ -1005,14 +1052,12 @@ fn handle_registration_rr_event(
                                 "sidecar registered routes manifest={} peer={} routes={}",
                                 reg.manifest_id, reg.sidecar_peer_id, reg.routes.len()
                             );
-                            (true, "ok".to_string())
                         } else {
                             warn!(
-                                "sidecar registration sig verification failed manifest={} peer={}",
-                                reg.manifest_id, peer
+                                "sidecar registration rejected manifest={} peer={} reason={}",
+                                reg.manifest_id, peer, message
                             );
-                            (false, "signature verification failed".to_string())
-                        };
+                        }
                         let ack = SidecarRegistrationAck {
                             manifest_id: reg.manifest_id.clone(),
                             ok,
@@ -1041,8 +1086,79 @@ fn handle_registration_rr_event(
     }
 }
 
-fn verify_registration_sig(owner_pubkey_b64: &str, sig_b64: &str, data: &[u8]) -> bool {
-    let pk_bytes = match crypto::b64_decode(owner_pubkey_b64) {
+/// Evaluate a sidecar registration against the proxy's stored tenant certs and the
+/// transport peer_id. Returns `(accepted, message)`.
+///
+/// Performs the four checks required by the sidecar-proxy-auth spec:
+///   1. `sig` is a valid Ed25519 signature over `manifest_id || sidecar_peer_id` using
+///      `sidecar_signing_pubkey`.
+///   2. `owner_pubkey` matches at least one stored NodeCert's `owner_pubkey` (same tenant).
+///   3. The transport peer_id of the connection equals `sidecar_peer_id`.
+///   4. The matched cert is not expired.
+pub fn evaluate_sidecar_registration(
+    reg: &SidecarRegistration,
+    transport_peer: &PeerId,
+    cert_store: &CertStore,
+) -> (bool, String) {
+    if reg.sidecar_signing_pubkey.is_empty() {
+        return (false, "missing sidecar_signing_pubkey".to_string());
+    }
+
+    let signed_data = format!("{}{}", reg.manifest_id, reg.sidecar_peer_id);
+    if !verify_registration_sig(
+        &reg.sidecar_signing_pubkey,
+        &reg.sig,
+        signed_data.as_bytes(),
+    ) {
+        return (false, "signature verification failed".to_string());
+    }
+
+    if transport_peer.to_string() != reg.sidecar_peer_id {
+        return (
+            false,
+            format!(
+                "transport peer_id {} does not match registration sidecar_peer_id {}",
+                transport_peer, reg.sidecar_peer_id
+            ),
+        );
+    }
+
+    let store = match cert_store.read() {
+        Ok(g) => g,
+        Err(_) => {
+            return (false, "cert store lock poisoned".to_string());
+        }
+    };
+
+    if store.is_empty() {
+        return (
+            false,
+            "proxy holds no tenant NodeCerts (run `podctl grant-proxy`)".to_string(),
+        );
+    }
+
+    let cert = match store.get(&reg.owner_pubkey) {
+        Some(c) => c,
+        None => {
+            return (
+                false,
+                format!(
+                    "no NodeCert held for owner_pubkey {} — cross-tenant registration rejected",
+                    reg.owner_pubkey
+                ),
+            );
+        }
+    };
+
+    if cert.is_expired() {
+        return (false, "tenant NodeCert is expired".to_string());
+    }
+
+    (true, "ok".to_string())
+}
+
+fn verify_registration_sig(signing_pubkey_b64: &str, sig_b64: &str, data: &[u8]) -> bool {
+    let pk_bytes = match crypto::b64_decode(signing_pubkey_b64) {
         Ok(b) => b,
         Err(_) => return false,
     };
@@ -1367,13 +1483,15 @@ async fn handle_egress_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::restapi::new_cert_store;
+    use protocol::{NodeCert, NodeRole};
 
     #[test]
     fn test_proxy_announces_with_opaque_dht_key() {
         let owner_pub_b64 = crypto::b64_encode(&[1u8; 32]);
         let key = compute_tenant_proxy_dht_key(&owner_pub_b64).unwrap();
-        // key should be 32 bytes (sha256)
-        assert_eq!(key.len(), 32);
+        // key should be 16 bytes (truncated blake3) per the spec
+        assert_eq!(key.len(), 16);
         // key should NOT contain the raw owner pubkey bytes
         assert!(!key.windows(32).any(|w| w == [1u8; 32].as_slice()));
     }
@@ -1418,5 +1536,173 @@ mod tests {
         let t = table.read().unwrap();
         // Empty table - no entry for manifest
         assert!(t.get("unknown-app").is_none());
+    }
+
+    /// Build a tenant-issued NodeCert + sidecar signing keys, then a valid
+    /// SidecarRegistration suitable for verification. Returns
+    /// `(reg, transport_peer, cert_store_with_owner_cert_inserted)`.
+    fn make_test_registration(
+        sidecar_peer: PeerId,
+        owner_b64: &str,
+        owner_sk: &[u8],
+        owner_pk: &[u8],
+        sidecar_sk: &[u8],
+        sidecar_pk: &[u8],
+    ) -> (SidecarRegistration, PeerId, CertStore) {
+        let manifest_id = "demo-manifest".to_string();
+        let signed = format!("{}{}", manifest_id, sidecar_peer);
+        let sig = crypto::sign_data_with_key(sidecar_sk, signed.as_bytes()).unwrap();
+
+        let reg = SidecarRegistration {
+            manifest_id,
+            routes: vec![],
+            sidecar_peer_id: sidecar_peer.to_string(),
+            owner_pubkey: owner_b64.to_string(),
+            sig: crypto::b64_encode(&sig),
+            sidecar_signing_pubkey: crypto::b64_encode(sidecar_pk),
+        };
+
+        // Build proxy NodeCert signed by owner key (irrelevant fields set to dummies)
+        let cert = NodeCert {
+            peer_id: "QmProxy".to_string(),
+            kem_pubkey: crypto::b64_encode(&[0u8; 32]),
+            signing_pubkey: crypto::b64_encode(&[0u8; 32]),
+            capabilities: vec!["proxy".to_string()],
+            role: NodeRole::Proxy,
+            valid_until: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600,
+            owner_pubkey: owner_b64.to_string(),
+            owner_sig: String::new(),
+            endorsements: vec![],
+        }
+        .sign(owner_sk, owner_pk)
+        .unwrap();
+
+        let store = new_cert_store();
+        store
+            .write()
+            .unwrap()
+            .insert(owner_b64.to_string(), cert);
+        (reg, sidecar_peer, store)
+    }
+
+    #[test]
+    fn registration_accepted_when_owner_matches_stored_cert() {
+        let (owner_pk, owner_sk) = crypto::ensure_keypair_ephemeral().unwrap();
+        let (side_pk, side_sk) = crypto::ensure_keypair_ephemeral().unwrap();
+        let owner_b64 = crypto::b64_encode(&owner_pk);
+        let sidecar_peer = PeerId::random();
+        let (reg, peer, store) =
+            make_test_registration(sidecar_peer, &owner_b64, &owner_sk, &owner_pk, &side_sk, &side_pk);
+        let (ok, msg) = evaluate_sidecar_registration(&reg, &peer, &store);
+        assert!(ok, "expected registration accepted: {}", msg);
+    }
+
+    #[test]
+    fn registration_rejected_when_signature_invalid() {
+        let (owner_pk, owner_sk) = crypto::ensure_keypair_ephemeral().unwrap();
+        let (side_pk, side_sk) = crypto::ensure_keypair_ephemeral().unwrap();
+        let owner_b64 = crypto::b64_encode(&owner_pk);
+        let sidecar_peer = PeerId::random();
+        let (mut reg, peer, store) =
+            make_test_registration(sidecar_peer, &owner_b64, &owner_sk, &owner_pk, &side_sk, &side_pk);
+        // Tamper with the manifest_id so signed data no longer matches
+        reg.manifest_id = "tampered".to_string();
+        let (ok, _msg) = evaluate_sidecar_registration(&reg, &peer, &store);
+        assert!(!ok);
+    }
+
+    #[test]
+    fn registration_rejected_when_transport_peer_id_differs() {
+        let (owner_pk, owner_sk) = crypto::ensure_keypair_ephemeral().unwrap();
+        let (side_pk, side_sk) = crypto::ensure_keypair_ephemeral().unwrap();
+        let owner_b64 = crypto::b64_encode(&owner_pk);
+        let sidecar_peer = PeerId::random();
+        let (reg, _peer, store) =
+            make_test_registration(sidecar_peer, &owner_b64, &owner_sk, &owner_pk, &side_sk, &side_pk);
+        // Use a different peer id as the transport peer
+        let other = PeerId::random();
+        let (ok, _msg) = evaluate_sidecar_registration(&reg, &other, &store);
+        assert!(!ok);
+    }
+
+    #[test]
+    fn registration_rejected_when_owner_not_in_store() {
+        let (owner_pk, owner_sk) = crypto::ensure_keypair_ephemeral().unwrap();
+        let (side_pk, side_sk) = crypto::ensure_keypair_ephemeral().unwrap();
+        let owner_b64 = crypto::b64_encode(&owner_pk);
+        let sidecar_peer = PeerId::random();
+        let (mut reg, peer, store) =
+            make_test_registration(sidecar_peer, &owner_b64, &owner_sk, &owner_pk, &side_sk, &side_pk);
+        // Switch the owner_pubkey to a different one that is not stored.
+        // Re-sign with the same sidecar key (so signature still valid) but using a fresh manifest
+        // to keep signed data intact: manifest_id || sidecar_peer_id is unchanged. We only swap owner_pubkey.
+        let (other_pk, _) = crypto::ensure_keypair_ephemeral().unwrap();
+        reg.owner_pubkey = crypto::b64_encode(&other_pk);
+        let (ok, msg) = evaluate_sidecar_registration(&reg, &peer, &store);
+        assert!(!ok, "expected reject: {}", msg);
+    }
+
+    #[test]
+    fn registration_rejected_when_no_certs_held() {
+        let (owner_pk, _owner_sk) = crypto::ensure_keypair_ephemeral().unwrap();
+        let (side_pk, side_sk) = crypto::ensure_keypair_ephemeral().unwrap();
+        let owner_b64 = crypto::b64_encode(&owner_pk);
+        let sidecar_peer = PeerId::random();
+        let manifest_id = "demo".to_string();
+        let signed = format!("{}{}", manifest_id, sidecar_peer);
+        let sig = crypto::sign_data_with_key(&side_sk, signed.as_bytes()).unwrap();
+        let reg = SidecarRegistration {
+            manifest_id,
+            routes: vec![],
+            sidecar_peer_id: sidecar_peer.to_string(),
+            owner_pubkey: owner_b64,
+            sig: crypto::b64_encode(&sig),
+            sidecar_signing_pubkey: crypto::b64_encode(&side_pk),
+        };
+        let store = new_cert_store();
+        let (ok, _msg) = evaluate_sidecar_registration(&reg, &sidecar_peer, &store);
+        assert!(!ok);
+    }
+
+    #[test]
+    fn registration_rejected_when_cert_expired() {
+        let (owner_pk, owner_sk) = crypto::ensure_keypair_ephemeral().unwrap();
+        let (side_pk, side_sk) = crypto::ensure_keypair_ephemeral().unwrap();
+        let owner_b64 = crypto::b64_encode(&owner_pk);
+        let sidecar_peer = PeerId::random();
+
+        let manifest_id = "demo".to_string();
+        let signed = format!("{}{}", manifest_id, sidecar_peer);
+        let sig = crypto::sign_data_with_key(&side_sk, signed.as_bytes()).unwrap();
+        let reg = SidecarRegistration {
+            manifest_id,
+            routes: vec![],
+            sidecar_peer_id: sidecar_peer.to_string(),
+            owner_pubkey: owner_b64.clone(),
+            sig: crypto::b64_encode(&sig),
+            sidecar_signing_pubkey: crypto::b64_encode(&side_pk),
+        };
+
+        let cert = NodeCert {
+            peer_id: "QmProxy".to_string(),
+            kem_pubkey: crypto::b64_encode(&[0u8; 32]),
+            signing_pubkey: crypto::b64_encode(&[0u8; 32]),
+            capabilities: vec!["proxy".to_string()],
+            role: NodeRole::Proxy,
+            valid_until: 1, // expired
+            owner_pubkey: owner_b64.clone(),
+            owner_sig: String::new(),
+            endorsements: vec![],
+        }
+        .sign(&owner_sk, &owner_pk)
+        .unwrap();
+        let store = new_cert_store();
+        store.write().unwrap().insert(owner_b64, cert);
+        let (ok, _msg) = evaluate_sidecar_registration(&reg, &sidecar_peer, &store);
+        assert!(!ok);
     }
 }

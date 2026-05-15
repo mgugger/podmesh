@@ -22,6 +22,7 @@ thiserror = { workspace = true }
 postcard = { workspace = true }
 sha2 = { workspace = true }
 crypto = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }

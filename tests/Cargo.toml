@@ -24,6 +24,8 @@ serde_yaml = { workspace = true }
 serde = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
 
 [features]
 default = []

@@ -6,6 +6,8 @@ pub enum NodeRole {
     Worker,
     Custodian,
     Both,
+    /// Tenant-bound podmesh-proxy node (provisioned by `podctl grant-proxy`).
+    Proxy,
 }
 
 impl Default for NodeRole {
@@ -18,6 +20,7 @@ impl std::fmt::Display for NodeRole {
             NodeRole::Worker => write!(f, "worker"),
             NodeRole::Custodian => write!(f, "custodian"),
             NodeRole::Both => write!(f, "both"),
+            NodeRole::Proxy => write!(f, "proxy"),
         }
     }
 }
@@ -29,6 +32,7 @@ impl std::str::FromStr for NodeRole {
             "worker" => Ok(NodeRole::Worker),
             "custodian" => Ok(NodeRole::Custodian),
             "both" => Ok(NodeRole::Both),
+            "proxy" => Ok(NodeRole::Proxy),
             _ => Err(anyhow::anyhow!("unknown role: {}", s)),
         }
     }
@@ -98,6 +102,7 @@ impl NodeCert {
             NodeRole::Worker => matches!(self.role, NodeRole::Worker | NodeRole::Both),
             NodeRole::Custodian => matches!(self.role, NodeRole::Custodian | NodeRole::Both),
             NodeRole::Both => matches!(self.role, NodeRole::Both),
+            NodeRole::Proxy => matches!(self.role, NodeRole::Proxy),
         }
     }
 

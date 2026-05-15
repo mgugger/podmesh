@@ -71,3 +71,48 @@ pub fn generate_test_node_cert(peer_id: &str, role: protocol::NodeRole) -> proto
     };
     cert.sign(&sk, &pk).unwrap()
 }
+
+/// A tenant owner keypair generated freshly per test.
+///
+/// Returns `(owner_pub_b64, owner_sk_bytes, owner_pub_bytes)`. Use this to
+/// drive the `podctl grant-proxy` flow in integration tests so the proxy
+/// holds a tenant-signed `NodeCert` and the sidecar can verify it.
+pub fn fresh_tenant_owner() -> (String, Vec<u8>, Vec<u8>) {
+    use rand::rngs::OsRng;
+    use ed25519_dalek::SigningKey;
+    let mut rng = OsRng;
+    let sk = SigningKey::generate(&mut rng);
+    let pk = sk.verifying_key();
+    let pk_bytes = pk.to_bytes().to_vec();
+    let sk_bytes = sk.to_bytes().to_vec();
+    let pk_b64 = crypto::b64_encode(&pk_bytes);
+    (pk_b64, sk_bytes, pk_bytes)
+}
+
+/// Wait until the proxy REST API at `http://127.0.0.1:{port}/healthz` becomes
+/// available, then issue a tenant-signed `NodeCert` to it via
+/// `podctl::cert::grant_proxy_async`. Returns the issued cert's owner pubkey
+/// (base64) on success.
+pub async fn provision_proxy_cert(
+    rest_port: u16,
+    owner_pk: &[u8],
+    owner_sk: &[u8],
+    timeout: std::time::Duration,
+) -> anyhow::Result<podctl::cert::GrantProxyResult> {
+    use std::time::Instant;
+    let url = format!("http://127.0.0.1:{}", rest_port);
+    let client = reqwest::Client::new();
+    let deadline = Instant::now() + timeout;
+    loop {
+        let healthz = format!("{}/healthz", url);
+        match client.get(&healthz).send().await {
+            Ok(resp) if resp.status().is_success() => break,
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("proxy REST API at {} did not become healthy", url);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    podctl::cert::grant_proxy_async(&url, owner_pk, owner_sk, 30).await
+}

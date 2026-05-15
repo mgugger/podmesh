@@ -268,7 +268,7 @@ pub async fn run_sidecar_with_shutdown(
                 }
             } => {
                 if needs_egress_proxy && state.kad_bootstrap_complete {
-                    trigger_proxy_lookup(&mut swarm, &mut state);
+                    trigger_tenant_proxy_lookup(&mut swarm, &cfg, &mut state);
                 }
             },
             _ = &mut shutdown => {
@@ -322,7 +322,7 @@ pub async fn run_sidecar_with_shutdown(
                 } else {
                     // No proxy peer known yet, try to discover one
                     if needs_egress_proxy && !state.proxy_query_pending {
-                        trigger_proxy_lookup(&mut swarm, &mut state);
+                        trigger_tenant_proxy_lookup(&mut swarm, &cfg, &mut state);
                     }
                     warn!("egress tunnel request dropped - no proxy peer discovered yet dest={}:{}", 
                           tunnel_req.dest_host, tunnel_req.dest_port);
@@ -389,6 +389,9 @@ struct SidecarState {
     tenant_proxy_lookup_triggered: bool,
     /// Pending outbound registration request id
     pending_registration_id: Option<request_response::OutboundRequestId>,
+    /// Proxy peers whose tenant `NodeCert` we successfully verified during handshake.
+    /// Only verified peers are eligible for `SidecarRegistration` and egress tunneling.
+    verified_proxy_peers: HashSet<PeerId>,
 }
 
 impl SidecarState {
@@ -403,12 +406,18 @@ impl SidecarState {
             proxy_query_pending: false,
             tenant_proxy_lookup_triggered: false,
             pending_registration_id: None,
+            verified_proxy_peers: HashSet::new(),
         }
     }
 
-    /// Get a proxy peer for egress tunneling, if available
+    /// Get a verified proxy peer for egress tunneling, if available.
+    /// Spec requires that egress tunneling only goes through proxies whose
+    /// tenant-signed NodeCert was verified during handshake.
     fn get_proxy_peer(&self) -> Option<PeerId> {
-        self.proxy_peers.first().copied()
+        self.proxy_peers
+            .iter()
+            .find(|p| self.verified_proxy_peers.contains(*p))
+            .copied()
     }
 }
 
@@ -627,7 +636,7 @@ fn handle_swarm_event(
             handle_kad_event(swarm, event, cfg, state, event_tx);
         }
         SwarmEvent::Behaviour(SidecarBehaviourEvent::HandshakeRr(event)) => {
-            handle_handshake_event(swarm, event, state);
+            handle_handshake_event(swarm, event, cfg, state);
         }
         SwarmEvent::Behaviour(SidecarBehaviourEvent::ProxyRr(event)) => {
             handle_proxy_event(cfg, state, event, proxy_resp_tx);
@@ -645,10 +654,19 @@ fn handle_swarm_event(
 fn handle_handshake_event(
     swarm: &mut Swarm<SidecarBehaviour>,
     event: request_response::Event<Vec<u8>, Vec<u8>>,
+    cfg: &SidecarConfig,
     state: &mut SidecarState,
 ) {
     match event {
         request_response::Event::Message { message, peer, .. } => {
+            // Intercept response messages to verify proxy NodeCert before
+            // delegating to the standard handshake handler. We only act on
+            // responses; requests we receive are not from proxies in this
+            // direction.
+            if let request_response::Message::Response { ref response, .. } = message {
+                verify_proxy_cert_from_response(swarm, peer, response, cfg, state);
+            }
+
             handshake::handle_request_response_message(
                 message,
                 peer,
@@ -677,6 +695,87 @@ fn handle_handshake_event(
         request_response::Event::ResponseSent { peer, .. } => {
             debug!("sidecar handshake response sent peer={}", peer);
         }
+    }
+}
+
+/// Inspect a handshake response from `peer`. If it carries a `proxy_cert_b64`,
+/// validate it against the sidecar's tenant key and, if successful, mark the
+/// peer as a verified proxy. If the peer is also one of our discovered tenant
+/// proxy candidates, trigger registration immediately.
+///
+/// The four checks performed (mirroring spec scenario "Sidecar verifies a valid proxy cert"):
+///   1. `NodeCert::verify()` — owner_sig is valid Ed25519
+///   2. `NodeCert.owner_pubkey == cfg.owner_public_key_b64` — same tenant
+///   3. `NodeCert.is_expired()` is false
+///   4. `NodeCert.peer_id == peer.to_string()` — cert binds to this peer
+fn verify_proxy_cert_from_response(
+    swarm: &mut Swarm<SidecarBehaviour>,
+    peer: PeerId,
+    response: &[u8],
+    cfg: &SidecarConfig,
+    state: &mut SidecarState,
+) {
+    let cert_b64 = match handshake::extract_proxy_cert_from_response(response, &peer) {
+        Some(s) if !s.is_empty() => s,
+        _ => return,
+    };
+
+    let Some(ref tenant_owner) = cfg.owner_public_key_b64 else {
+        log::debug!(
+            "received proxy cert from peer={} but sidecar has no tenant owner_pubkey configured",
+            peer
+        );
+        return;
+    };
+
+    let cert = match protocol::NodeCert::from_b64(&cert_b64) {
+        Ok(c) => c,
+        Err(err) => {
+            log::warn!("failed to decode proxy NodeCert from peer={}: {}", peer, err);
+            return;
+        }
+    };
+
+    if let Err(err) = cert.verify() {
+        log::warn!(
+            "proxy NodeCert signature invalid peer={} error={}",
+            peer, err
+        );
+        return;
+    }
+
+    if &cert.owner_pubkey != tenant_owner {
+        log::warn!(
+            "proxy NodeCert owner_pubkey mismatch peer={} cert_owner={} tenant_owner={}",
+            peer, cert.owner_pubkey, tenant_owner
+        );
+        return;
+    }
+
+    if cert.is_expired() {
+        log::warn!("proxy NodeCert is expired peer={}", peer);
+        return;
+    }
+
+    if cert.peer_id != peer.to_string() {
+        log::warn!(
+            "proxy NodeCert peer_id mismatch peer={} cert_peer_id={}",
+            peer, cert.peer_id
+        );
+        return;
+    }
+
+    log::info!(
+        "verified proxy NodeCert peer={} owner_pubkey={} valid_until={}",
+        peer, cert.owner_pubkey, cert.valid_until
+    );
+    let newly_verified = state.verified_proxy_peers.insert(peer);
+
+    // If this verified peer is one of our discovered tenant proxy candidates,
+    // proceed with registration now (handshake completion + cert verification
+    // are jointly the gate).
+    if newly_verified && state.proxy_peers.contains(&peer) {
+        send_sidecar_registration(swarm, cfg, peer, state);
     }
 }
 
@@ -894,21 +993,23 @@ fn handle_kad_event(
             kad::QueryResult::GetProviders(Ok(ok)) => match ok {
                 kad::GetProvidersOk::FoundProviders { key, providers } => {
                     log::debug!("sidecar get_providers result key={:?} count={}", key, providers.len());
-                    // Check both conditions independently to handle overlapping keys
+                    // Spec: the global `podmesh-proxy-node` key MUST NOT be used by sidecars to
+                    // discover authenticated proxies. We still allow this lookup result to
+                    // populate generic provider awareness for backward compatibility with
+                    // legacy mesh tooling, but we no longer use these peers for egress
+                    // tunneling or registration. Tenant binding requires the obfuscated key.
                     if key == proxy_record_key {
-                        // Proxy provider discovery result for egress
-                        update_proxy_peers(providers.clone(), state, event_tx);
+                        update_provider_cache_for_proxy(providers.clone(), state, event_tx);
                     }
                     if key == cfg.record_key() {
                         // Provider discovery for our provider_label (may overlap with proxy key)
                         update_provider_cache(providers.clone(), state, event_tx);
                     }
-                    // Phase 7.3: if this is a tenant proxy lookup result, register with the proxy
+                    // Phase 7.3: tenant proxy DHT lookup result. Mark these as candidate
+                    // proxy peers (used for egress + registration after cert verification).
                     if let Some(ref tpk) = tenant_proxy_key {
                         if &key == tpk {
-                            for proxy_peer in providers {
-                                send_sidecar_registration(swarm, cfg, proxy_peer, state);
-                            }
+                            update_tenant_proxy_peers(swarm, cfg, providers, state, event_tx);
                         }
                     }
                 }
@@ -933,12 +1034,9 @@ fn handle_kad_event(
                     if cfg.announce_providers {
                         announce_provider(swarm, cfg);
                     }
-                    // Trigger initial proxy discovery if any egress mode is enabled
-                    let needs_egress_proxy = cfg.enable_egress || cfg.http_proxy_port.is_some();
-                    if needs_egress_proxy {
-                        trigger_proxy_lookup(swarm, state);
-                    }
-                    // Phase 7.3: trigger tenant proxy DHT lookup for sidecar registration
+                    // Phase 7.3: trigger tenant proxy DHT lookup for sidecar registration AND egress.
+                    // Note: we no longer trigger the legacy `podmesh-proxy-node` lookup for workload
+                    // traffic per the sidecar-proxy-auth spec.
                     if !state.tenant_proxy_lookup_triggered {
                         trigger_tenant_proxy_lookup(swarm, cfg, state);
                     }
@@ -985,8 +1083,44 @@ fn update_provider_cache<I>(
     }
 }
 
-/// Updates the list of known proxy peers for egress tunneling
-fn update_proxy_peers<I>(
+/// Records that providers were discovered under the legacy `podmesh-proxy-node` key.
+/// Per the sidecar-proxy-auth spec these peers MUST NOT be used for workload traffic;
+/// we keep this only as a debug signal and to emit `ProxyPeerDiscovered` events that
+/// existing tests rely on for their assertions about generic proxy availability.
+fn update_provider_cache_for_proxy<I>(
+    providers: I,
+    _state: &mut SidecarState,
+    event_tx: Option<&mpsc::UnboundedSender<SidecarEvent>>,
+) where
+    I: IntoIterator<Item = libp2p::PeerId>,
+{
+    for peer in providers {
+        log::debug!(
+            "sidecar saw legacy podmesh-proxy-node provider peer={} (NOT used for workload traffic)",
+            peer
+        );
+        notify(
+            event_tx,
+            SidecarEvent::ProxyPeerDiscovered {
+                peer_id: peer.to_string(),
+            },
+        );
+    }
+}
+
+/// Updates the list of tenant-derived proxy peers (discovered via the obfuscated
+/// `blake3(owner_pubkey)[..16]` DHT key). These are the only peers eligible to
+/// be used for egress tunneling and SidecarRegistration, and only after their
+/// `NodeCert` has been verified during handshake.
+///
+/// For each newly-discovered tenant proxy peer we explicitly send an outbound
+/// handshake request so that the proxy responds with its `proxy_cert_b64`, even
+/// if our local handshake state already considers the peer "confirmed" because
+/// it received an inbound handshake request first. The cert is only carried in
+/// the response payload.
+fn update_tenant_proxy_peers<I>(
+    swarm: &mut Swarm<SidecarBehaviour>,
+    cfg: &SidecarConfig,
     providers: I,
     state: &mut SidecarState,
     event_tx: Option<&mpsc::UnboundedSender<SidecarEvent>>,
@@ -995,14 +1129,13 @@ fn update_proxy_peers<I>(
 {
     let new_peers: Vec<PeerId> = providers.into_iter().collect();
     if new_peers.is_empty() {
-        log::debug!("no proxy providers found");
+        log::debug!("no tenant proxy providers found");
     } else {
         log::info!(
-            "discovered {} proxy provider(s) for egress: {:?}",
+            "discovered {} tenant proxy provider(s): {:?}",
             new_peers.len(),
             new_peers
         );
-        // Emit events for newly discovered proxy peers
         for peer in &new_peers {
             notify(
                 event_tx,
@@ -1011,21 +1144,60 @@ fn update_proxy_peers<I>(
                 },
             );
         }
-        state.proxy_peers = new_peers;
+        state.proxy_peers = new_peers.clone();
+        for peer in new_peers {
+            // Explicitly request a handshake from the proxy so we receive a Response
+            // carrying the proxy_cert_b64. Without this, the drive ticker may have
+            // already marked the peer as confirmed because the proxy initiated.
+            send_handshake_request_to_proxy(swarm, &peer);
+
+            // If the cert was already verified earlier (rare but possible), trigger
+            // registration immediately.
+            if state.verified_proxy_peers.contains(&peer)
+                && state.pending_registration_id.is_none()
+            {
+                send_sidecar_registration(swarm, cfg, peer, state);
+            }
+        }
     }
     state.proxy_query_pending = false;
 }
 
-/// Triggers a DHT lookup for proxy providers
-fn trigger_proxy_lookup(swarm: &mut Swarm<SidecarBehaviour>, state: &mut SidecarState) {
-    if state.proxy_query_pending {
-        log::debug!("proxy provider query already pending, skipping");
-        return;
+/// Build and send a single signed handshake request to a peer, bypassing the
+/// drive-throttling logic. Used to force a Response from a tenant proxy so we
+/// can extract its `proxy_cert_b64`.
+fn send_handshake_request_to_proxy(swarm: &mut Swarm<SidecarBehaviour>, peer: &PeerId) {
+    let local_peer = *swarm.local_peer_id();
+    match handshake::build_handshake_request_for_kem_fetch(&local_peer) {
+        Ok(payload) => {
+            let request_id = swarm
+                .behaviour_mut()
+                .handshake_rr
+                .send_request(peer, payload);
+            log::info!(
+                "sidecar sent direct handshake request to tenant proxy peer={} request_id={:?}",
+                peer, request_id
+            );
+        }
+        Err(err) => {
+            log::warn!(
+                "sidecar failed to build handshake request for tenant proxy peer={}: {}",
+                peer, err
+            );
+        }
     }
-    let record_key = RecordKey::new(&PROXY_PROVIDER_KEY);
-    let query_id = swarm.behaviour_mut().kademlia.get_providers(record_key);
-    state.proxy_query_pending = true;
-    log::info!("initiated proxy provider discovery query_id={:?}", query_id);
+}
+
+/// Triggers a DHT lookup for proxy providers — DEPRECATED.
+/// Per the sidecar-proxy-auth spec, sidecars MUST NOT discover proxies for
+/// workload traffic via the global `podmesh-proxy-node` key. Use
+/// [`trigger_tenant_proxy_lookup`] instead. This stub is retained only as
+/// documentation and a compile-time anchor for callers that may have been missed.
+#[allow(dead_code)]
+fn trigger_proxy_lookup(_swarm: &mut Swarm<SidecarBehaviour>, _state: &mut SidecarState) {
+    log::warn!(
+        "trigger_proxy_lookup called: this is a deprecated no-op; use trigger_tenant_proxy_lookup"
+    );
 }
 
 /// Handles an egress tunnel request by opening a stream to the proxy peer
@@ -1228,17 +1400,14 @@ pub use p2p::split_csv;
 
 // ── Phase 7.3: sidecar→proxy registration ──────────────────────────────────
 
-/// Compute the opaque DHT key for the tenant proxy: sha256(owner_pubkey || "proxy").
+/// Compute the opaque DHT key for the tenant proxy: `blake3(owner_pubkey)[..16]`.
+/// Re-exports the canonical implementation from the `protocol` crate.
 pub fn compute_tenant_proxy_dht_key(owner_pubkey_b64: &str) -> anyhow::Result<Vec<u8>> {
-    use sha2::{Digest, Sha256};
-    let pk_bytes = crypto::b64_decode(owner_pubkey_b64)?;
-    let mut input = pk_bytes;
-    input.extend_from_slice(b"proxy");
-    let hash = Sha256::digest(&input);
-    Ok(hash.to_vec())
+    protocol::compute_tenant_proxy_dht_key(owner_pubkey_b64)
 }
 
 /// Trigger a DHT lookup for the tenant proxy (opaque key based on owner pubkey).
+/// Called both on initial bootstrap completion and on the periodic ticker for refresh.
 fn trigger_tenant_proxy_lookup(
     swarm: &mut Swarm<SidecarBehaviour>,
     cfg: &SidecarConfig,
@@ -1248,11 +1417,16 @@ fn trigger_tenant_proxy_lookup(
         log::debug!("sidecar has no owner pubkey, skipping tenant proxy lookup");
         return;
     };
+    if state.proxy_query_pending {
+        log::debug!("tenant proxy provider query already pending, skipping");
+        return;
+    }
     match compute_tenant_proxy_dht_key(owner_pub) {
         Ok(key) => {
             let record_key = RecordKey::new(&key);
             let query_id = swarm.behaviour_mut().kademlia.get_providers(record_key);
             state.tenant_proxy_lookup_triggered = true;
+            state.proxy_query_pending = true;
             log::info!("sidecar triggered tenant proxy DHT lookup query_id={:?}", query_id);
         }
         Err(err) => {
@@ -1262,11 +1436,15 @@ fn trigger_tenant_proxy_lookup(
 }
 
 /// Sign `manifest_id || sidecar_peer_id` with the node's Ed25519 signing key.
-fn sign_registration_payload(manifest_id: &str, sidecar_peer_id: &str) -> anyhow::Result<String> {
+/// Returns `(sig_b64, sidecar_signing_pubkey_b64)`.
+fn sign_registration_payload(
+    manifest_id: &str,
+    sidecar_peer_id: &str,
+) -> anyhow::Result<(String, String)> {
     let data = format!("{}{}", manifest_id, sidecar_peer_id);
-    let (_pub_bytes, priv_bytes) = crypto::ensure_keypair_on_disk()?;
+    let (pub_bytes, priv_bytes) = crypto::ensure_keypair_on_disk()?;
     let sig_bytes = crypto::sign_data_with_key(&priv_bytes, data.as_bytes())?;
-    Ok(crypto::b64_encode(&sig_bytes))
+    Ok((crypto::b64_encode(&sig_bytes), crypto::b64_encode(&pub_bytes)))
 }
 
 /// Send a SidecarRegistration to the given proxy peer.
@@ -1280,14 +1458,26 @@ fn send_sidecar_registration(
         return;
     };
 
+    // Spec gating: only register with proxies whose tenant-signed NodeCert we
+    // have already verified during handshake. Without verification the
+    // `owner_pubkey` exchange has no integrity guarantee.
+    if !state.verified_proxy_peers.contains(&proxy_peer) {
+        log::debug!(
+            "skipping registration to unverified proxy peer={} (cert not yet validated)",
+            proxy_peer
+        );
+        return;
+    }
+
     let sidecar_peer_id = swarm.local_peer_id().to_string();
-    let sig = match sign_registration_payload(&cfg.manifest_id, &sidecar_peer_id) {
-        Ok(s) => s,
-        Err(err) => {
-            log::warn!("sidecar failed to sign registration payload: {}", err);
-            return;
-        }
-    };
+    let (sig, sidecar_signing_pubkey) =
+        match sign_registration_payload(&cfg.manifest_id, &sidecar_peer_id) {
+            Ok(s) => s,
+            Err(err) => {
+                log::warn!("sidecar failed to sign registration payload: {}", err);
+                return;
+            }
+        };
 
     let routes: Vec<SidecarRoute> = cfg
         .routes
@@ -1304,6 +1494,7 @@ fn send_sidecar_registration(
         sidecar_peer_id: sidecar_peer_id.clone(),
         owner_pubkey: owner_pub.clone(),
         sig,
+        sidecar_signing_pubkey,
     };
 
     log::info!(

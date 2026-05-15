@@ -39,6 +39,26 @@ pub enum CertCommands {
         #[arg(long)]
         owner_pub: String,
     },
+    /// Provision a tenant-signed `NodeCert` to a proxy node so that sidecars
+    /// belonging to the same tenant can discover and trust it.
+    ///
+    /// Fetches the proxy's signing pubkey, KEM pubkey and PeerId from its
+    /// REST API, signs a `NodeRole::Proxy` `NodeCert` with the operator's
+    /// Ed25519 key, and POSTs the encoded cert to the proxy.
+    GrantProxy {
+        /// Base URL of the proxy REST API (e.g. http://10.0.0.5:7100).
+        #[arg(long)]
+        proxy_url: String,
+        /// Path to the operator's Ed25519 public key (raw 32 bytes).
+        #[arg(long)]
+        owner_pub: String,
+        /// Path to the operator's Ed25519 private key (raw 32 bytes).
+        #[arg(long)]
+        owner_sk: String,
+        /// Cert TTL in days.
+        #[arg(long, default_value = "365")]
+        ttl_days: u64,
+    },
 }
 
 pub fn handle_cert_command(cmd: CertCommands) -> anyhow::Result<()> {
@@ -137,8 +157,176 @@ pub fn handle_cert_command(cmd: CertCommands) -> anyhow::Result<()> {
             check_cert.verify()?;
             println!("NodeCert signature is valid.");
         }
+        CertCommands::GrantProxy {
+            proxy_url,
+            owner_pub,
+            owner_sk,
+            ttl_days,
+        } => {
+            let owner_pk_bytes = std::fs::read(&owner_pub)
+                .with_context(|| format!("reading owner_pub from {}", owner_pub))?;
+            let owner_sk_bytes = std::fs::read(&owner_sk)
+                .with_context(|| format!("reading owner_sk from {}", owner_sk))?;
+            let ack = grant_proxy(&proxy_url, &owner_pk_bytes, &owner_sk_bytes, ttl_days)?;
+            println!("NodeCert provisioned to proxy at {}", proxy_url);
+            println!("  owner_pubkey:        {}", ack.owner_pubkey);
+            println!("  tenant_dht_key_hex:  {}", ack.tenant_dht_key_hex);
+            println!("  valid_until:         {}", ack.valid_until);
+            println!("  message:             {}", ack.message);
+        }
     }
     Ok(())
+}
+
+/// Result returned by [`grant_proxy`].
+#[derive(Debug, Clone)]
+pub struct GrantProxyResult {
+    pub owner_pubkey: String,
+    pub tenant_dht_key_hex: String,
+    pub valid_until: u64,
+    pub message: String,
+}
+
+/// Programmatic implementation of `podctl grant-proxy`. Suitable for both the
+/// CLI and integration tests.
+///
+/// 1. Fetches the proxy's signing pubkey, KEM pubkey and PeerId from its REST API.
+/// 2. Builds a `NodeCert` with `role = NodeRole::Proxy` and signs it with the
+///    operator's Ed25519 key.
+/// 3. POSTs the base64-postcard encoded cert to `<proxy_url>/api/v1/node_cert`.
+pub fn grant_proxy(
+    proxy_url: &str,
+    owner_pub_bytes: &[u8],
+    owner_sk_bytes: &[u8],
+    ttl_days: u64,
+) -> anyhow::Result<GrantProxyResult> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(grant_proxy_async(
+        proxy_url,
+        owner_pub_bytes,
+        owner_sk_bytes,
+        ttl_days,
+    ))
+}
+
+/// Async variant of [`grant_proxy`]. Use this when calling from an existing
+/// tokio runtime (such as integration tests).
+pub async fn grant_proxy_async(
+    proxy_url: &str,
+    owner_pub_bytes: &[u8],
+    owner_sk_bytes: &[u8],
+    ttl_days: u64,
+) -> anyhow::Result<GrantProxyResult> {
+    let client = reqwest::Client::new();
+    let base = proxy_url.trim_end_matches('/');
+
+    let signing_pubkey_b64: String = client
+        .get(format!("{}/api/v1/signing_pubkey", base))
+        .send()
+        .await
+        .context("GET /api/v1/signing_pubkey failed")?
+        .error_for_status()
+        .context("proxy returned error for signing_pubkey")?
+        .json::<serde_json::Value>()
+        .await?
+        .get("pubkey_b64")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("signing_pubkey response missing pubkey_b64"))?;
+
+    let kem_pubkey_b64: String = client
+        .get(format!("{}/api/v1/kem_pubkey", base))
+        .send()
+        .await
+        .context("GET /api/v1/kem_pubkey failed")?
+        .error_for_status()
+        .context("proxy returned error for kem_pubkey")?
+        .json::<serde_json::Value>()
+        .await?
+        .get("pubkey_b64")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("kem_pubkey response missing pubkey_b64"))?;
+
+    let peer_id: String = client
+        .get(format!("{}/api/v1/peer_id", base))
+        .send()
+        .await
+        .context("GET /api/v1/peer_id failed")?
+        .error_for_status()
+        .context("proxy returned error for peer_id")?
+        .json::<serde_json::Value>()
+        .await?
+        .get("peer_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("peer_id response missing peer_id"))?;
+
+    let valid_until = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        + ttl_days * 86400;
+
+    let owner_pub_b64 = crypto::b64_encode(owner_pub_bytes);
+    let cert = NodeCert {
+        peer_id,
+        kem_pubkey: kem_pubkey_b64,
+        signing_pubkey: signing_pubkey_b64,
+        capabilities: vec!["proxy".to_string()],
+        role: NodeRole::Proxy,
+        valid_until,
+        owner_pubkey: owner_pub_b64.clone(),
+        owner_sig: String::new(),
+        endorsements: vec![],
+    };
+    let signed = cert.sign(owner_sk_bytes, owner_pub_bytes)?;
+
+    let body = serde_json::json!({
+        "cert_b64": signed.to_b64(),
+    });
+
+    let resp = client
+        .post(format!("{}/api/v1/node_cert", base))
+        .json(&body)
+        .send()
+        .await
+        .context("POST /api/v1/node_cert failed")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "proxy rejected NodeCert: status={} body={}",
+            status,
+            body_text
+        );
+    }
+
+    let ack: serde_json::Value = resp.json().await?;
+    Ok(GrantProxyResult {
+        owner_pubkey: ack
+            .get("owner_pubkey")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&owner_pub_b64)
+            .to_string(),
+        tenant_dht_key_hex: ack
+            .get("tenant_dht_key_hex")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        valid_until: ack
+            .get("valid_until")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(valid_until),
+        message: ack
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -181,5 +369,13 @@ mod cert_tests {
         let mut tampered = cert.clone();
         tampered.owner_pubkey = crypto::b64_encode(&wrong_pk);
         assert!(tampered.verify().is_err());
+    }
+
+    #[test]
+    fn test_proxy_role_is_distinct() {
+        let (cert, _sk, _pk) = make_signed_cert(NodeRole::Proxy);
+        assert!(cert.has_role(&NodeRole::Proxy));
+        assert!(!cert.has_role(&NodeRole::Worker));
+        assert!(!cert.has_role(&NodeRole::Custodian));
     }
 }

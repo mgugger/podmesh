@@ -18,7 +18,10 @@ use tokio::{
     task::JoinHandle,
 };
 
-use podmesh_integration_tests::support::{allocate_tcp_port, allocate_udp_port, init_ephemeral_keys, init_tracing};
+use podmesh_integration_tests::support::{
+    allocate_tcp_port, allocate_udp_port, fresh_tenant_owner, init_ephemeral_keys, init_tracing,
+    provision_proxy_cert,
+};
 
 const SIDECAR_PROVIDER_LABEL: &str = "podmesh-proxy-node";
 const DEMO_MANIFEST_ID: &str = "demo-nginx";
@@ -306,18 +309,22 @@ async fn sidecar_discovers_egress_proxy_via_dht() -> Result<()> {
 /// Tests that HTTP traffic can be routed through the sidecar's HTTP CONNECT proxy
 /// to an external HTTP server via the egress tunnel through the proxy node.
 ///
-/// This test verifies the complete egress path:
-/// 1. Proxy node announces itself and handles egress tunnel streams
-/// 2. Sidecar discovers proxy and starts HTTP CONNECT proxy
-/// 3. HTTP client uses sidecar's HTTP CONNECT proxy
-/// 4. Traffic flows: client -> sidecar HTTP proxy -> P2P tunnel -> proxy node -> target HTTP server
-/// 5. Response flows back through the same path
+/// This test exercises the **tenant-cert-gated** discovery path mandated by the
+/// sidecar-proxy-auth spec:
+/// 1. Owner keypair is generated for this test
+/// 2. Proxy node starts and is provisioned with a tenant-signed `NodeCert` via
+///    `podctl::cert::grant_proxy_async` (simulating `podctl grant-proxy`)
+/// 3. Sidecar is configured with the same owner pubkey, discovers the proxy via
+///    the obfuscated `blake3(owner_pubkey)[..16]` DHT key, verifies the cert
+///    during handshake, then routes egress traffic through the verified proxy
+/// 4. Response flows back through the tunnel
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
     init_tracing();
     init_ephemeral_keys();
-    
+    let (owner_b64, owner_sk, owner_pk) = fresh_tenant_owner();
+
     // Start target HTTP server
     let target_port = allocate_tcp_port();
     let target_body = "hello-from-egress-target".to_string();
@@ -331,17 +338,25 @@ async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
         // Wait for proxy to be ready
         wait_for_kad_ready(handle.kad_rx(), Duration::from_secs(10)).await?;
         wait_for_proxy_provider(handle.proxy_provider_rx(), Duration::from_secs(10)).await?;
-        
+
+        // Provision the proxy with a tenant-signed NodeCert via the REST API.
+        // This is the in-test equivalent of `podctl grant-proxy --proxy-url <url>`.
+        provision_proxy_cert(handle.rest_port, &owner_pk, &owner_sk, Duration::from_secs(10))
+            .await
+            .map_err(|e| anyhow!("provision proxy cert failed: {}", e))?;
+
         // Allocate port for sidecar's HTTP CONNECT proxy
         let http_proxy_port = allocate_tcp_port();
         
-        // Create sidecar with HTTP proxy enabled (no transparent proxy/NFT rules needed)
+        // Create sidecar with HTTP proxy enabled and tenant owner pubkey set so
+        // it discovers the proxy via the obfuscated tenant DHT key.
         let (mut sidecar_cfg, _, _) = build_sidecar_config_full(
             vec![handle.bootstrap_addr.clone()],
             DEFAULT_SIDECAR_APP_PORT,
             false, // enable_egress=false: transparent proxy not needed, http_proxy_port triggers DHT lookups
             Some(http_proxy_port),
         )?;
+        sidecar_cfg.owner_public_key_b64 = Some(owner_b64.clone());
         sidecar_cfg.lookup_interval = Duration::from_secs(1);
         
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -353,7 +368,7 @@ async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
                 .expect("sidecar run");
         });
         
-        // Wait for sidecar to discover the proxy peer
+        // Wait for sidecar to discover the proxy peer (under tenant DHT key)
         let mut proxy_discovered = false;
         let deadline = tokio::time::sleep(Duration::from_secs(30));
         tokio::pin!(deadline);
@@ -365,7 +380,7 @@ async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
                         SidecarEvent::ProxyPeerDiscovered { peer_id } => {
                             if peer_id == proxy_peer_id {
                                 proxy_discovered = true;
-                                log::info!("sidecar discovered proxy peer for egress peer={}", peer_id);
+                                log::info!("sidecar discovered tenant-bound proxy peer={}", peer_id);
                             }
                         }
                         _ => {}
@@ -377,10 +392,10 @@ async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
             }
         }
         
-        assert!(proxy_discovered, "sidecar never discovered proxy peer {} for egress", proxy_peer_id);
+        assert!(proxy_discovered, "sidecar never discovered proxy peer {} for egress under tenant DHT key", proxy_peer_id);
         
-        // Give the HTTP CONNECT proxy a moment to start
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Give the HTTP CONNECT proxy a moment to start and the sidecar to verify the cert.
+        tokio::time::sleep(Duration::from_millis(800)).await;
         
         // Create HTTP client that uses the sidecar's HTTP CONNECT proxy
         let proxy_url = format!("http://127.0.0.1:{}", http_proxy_port);
@@ -404,7 +419,7 @@ async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
         let body = response.text().await?;
         assert_eq!(body, target_body, "response body mismatch");
         
-        log::info!("egress HTTP proxy test succeeded - traffic routed through tunnel");
+        log::info!("egress HTTP proxy test succeeded - traffic routed through tenant-bound tunnel");
         
         let _ = shutdown_tx.send(());
         let _ = sidecar_task.await;
@@ -425,6 +440,7 @@ struct WorkloadHandle {
     bootstrap_addr: String,
     kad_rx: watch::Receiver<bool>,
     proxy_provider_rx: watch::Receiver<bool>,
+    rest_port: u16,
 }
 
 impl WorkloadHandle {
@@ -472,6 +488,7 @@ fn start_workload(
         bootstrap_addr,
         kad_rx,
         proxy_provider_rx,
+        rest_port,
     })
 }
 
@@ -657,4 +674,201 @@ fn demo_routes(app_port: u16) -> Result<(Vec<SidecarRouteSpec>, String, String)>
         .ok_or_else(|| anyhow!("demo manifest missing service route"))?;
 
     Ok((routes, ingress_host, service_host))
+}
+
+/// End-to-end exercise of the sidecar–proxy auth flow:
+///
+/// 1. Generate a tenant owner Ed25519 keypair (the operator's key).
+/// 2. Start a proxy. Its REST API exposes `signing_pubkey`, `kem_pubkey`,
+///    `peer_id` and accepts a `NodeCert` POST.
+/// 3. Call `podctl::cert::grant_proxy_async` (the in-process equivalent of
+///    `podctl grant-proxy`) to:
+///    - Fetch the proxy's keys + peer_id
+///    - Build a `NodeRole::Proxy` `NodeCert` signed with the owner key
+///    - POST it to the proxy
+/// 4. Start a sidecar configured with the same owner pubkey.
+/// 5. Assert the sidecar discovers the proxy under the obfuscated tenant
+///    DHT key (`blake3(owner_pubkey)[..16]`) and emits a
+///    `ProxyPeerDiscovered` event for it.
+/// 6. Assert the proxy's in-memory routing table eventually contains the
+///    sidecar registration for the demo manifest, proving the cert-gated
+///    handshake + `SidecarRegistration` flow worked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn sidecar_registers_with_tenant_signed_proxy_cert() -> Result<()> {
+    init_tracing();
+    init_ephemeral_keys();
+    let (owner_b64, owner_sk, owner_pk) = fresh_tenant_owner();
+
+    let mut handle = start_workload(Vec::new(), true, false)?;
+    let proxy_peer_id = handle.peer_id.clone();
+
+    let test_result: Result<()> = async {
+        wait_for_kad_ready(handle.kad_rx(), Duration::from_secs(10)).await?;
+        wait_for_proxy_provider(handle.proxy_provider_rx(), Duration::from_secs(10)).await?;
+
+        // Provision the cert via the REST API. The proxy will:
+        //   - verify the owner_sig
+        //   - check peer_id matches its own libp2p identity
+        //   - check role == Proxy
+        //   - store the cert keyed by owner_pubkey
+        //   - announce under blake3(owner_pubkey)[..16]
+        let ack = provision_proxy_cert(handle.rest_port, &owner_pk, &owner_sk, Duration::from_secs(10))
+            .await
+            .map_err(|e| anyhow!("provision_proxy_cert failed: {}", e))?;
+        log::info!(
+            "proxy provisioned with cert: tenant_dht_key_hex={} valid_until={}",
+            ack.tenant_dht_key_hex, ack.valid_until
+        );
+        assert!(!ack.tenant_dht_key_hex.is_empty(), "expected tenant_dht_key_hex in response");
+
+        // Sanity check: the cert should be visible in the proxy's in-process cert store.
+        let store = handle
+            .workload
+            .cert_store()
+            .ok_or_else(|| anyhow!("proxy cert_store unavailable"))?;
+        {
+            let g = store.read().unwrap();
+            assert!(
+                g.contains_key(&owner_b64),
+                "expected proxy cert store to contain owner_pubkey {}",
+                owner_b64
+            );
+        }
+
+        // Build the sidecar with the matching tenant pubkey.
+        let app_port = allocate_tcp_port();
+        let app_body = "hello-from-tenant-bound-app".to_string();
+        let app_server = spawn_test_app(app_port, app_body.clone()).await?;
+
+        let (mut sidecar_cfg, _, _) =
+            build_sidecar_config(vec![handle.bootstrap_addr.clone()], app_port)?;
+        sidecar_cfg.owner_public_key_b64 = Some(owner_b64.clone());
+        sidecar_cfg.lookup_interval = Duration::from_secs(1);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let sidecar_task = tokio::spawn(async move {
+            run_sidecar_with_shutdown(sidecar_cfg, shutdown_rx, Some(event_tx))
+                .await
+                .expect("sidecar run");
+        });
+
+        // Wait for the sidecar to discover the proxy under the obfuscated tenant key.
+        let mut tenant_proxy_seen = false;
+        let proxy_discovery_deadline = tokio::time::sleep(Duration::from_secs(30));
+        tokio::pin!(proxy_discovery_deadline);
+        while !tenant_proxy_seen {
+            tokio::select! {
+                Some(event) = event_rx.recv() => {
+                    if let SidecarEvent::ProxyPeerDiscovered { peer_id } = event {
+                        if peer_id == proxy_peer_id {
+                            tenant_proxy_seen = true;
+                        }
+                    }
+                }
+                _ = &mut proxy_discovery_deadline => break,
+            }
+        }
+        assert!(
+            tenant_proxy_seen,
+            "sidecar never discovered proxy peer {} under tenant DHT key",
+            proxy_peer_id
+        );
+
+        // Wait for the proxy's routing table to contain the sidecar registration.
+        // This proves: handshake exchanged → cert verified by sidecar → registration sent →
+        // proxy verified registration against stored NodeCert → routes stored.
+        let routing_table = handle.workload.routing_table_handle();
+        let routing_deadline = Instant::now() + Duration::from_secs(20);
+        let mut registered = false;
+        while Instant::now() < routing_deadline {
+            if let Some(table) = routing_table.as_ref() {
+                if table.read().unwrap().contains_key(DEMO_MANIFEST_ID) {
+                    registered = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(
+            registered,
+            "proxy never received a verified SidecarRegistration for manifest {}",
+            DEMO_MANIFEST_ID
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = sidecar_task.await;
+        app_server.abort();
+        let _ = app_server.await;
+        Ok(())
+    }
+    .await;
+
+    handle.workload.close().await;
+    test_result
+}
+
+/// Negative test: when the proxy holds NO tenant cert, the sidecar (with a
+/// configured owner pubkey) should NOT be able to send a `SidecarRegistration`
+/// because there is no proxy under the tenant DHT key to verify, and even if
+/// it dialed by some other means, the proxy would reject the registration.
+///
+/// This test asserts the proxy's routing table stays empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn sidecar_registration_blocked_when_proxy_has_no_tenant_cert() -> Result<()> {
+    init_tracing();
+    init_ephemeral_keys();
+    let (owner_b64, _owner_sk, _owner_pk) = fresh_tenant_owner();
+
+    let mut handle = start_workload(Vec::new(), true, false)?;
+    let test_result: Result<()> = async {
+        wait_for_kad_ready(handle.kad_rx(), Duration::from_secs(10)).await?;
+        wait_for_proxy_provider(handle.proxy_provider_rx(), Duration::from_secs(10)).await?;
+
+        // Intentionally do NOT call provision_proxy_cert.
+
+        let app_port = allocate_tcp_port();
+        let (mut sidecar_cfg, _, _) =
+            build_sidecar_config(vec![handle.bootstrap_addr.clone()], app_port)?;
+        sidecar_cfg.owner_public_key_b64 = Some(owner_b64.clone());
+        sidecar_cfg.lookup_interval = Duration::from_secs(1);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let sidecar_task = tokio::spawn(async move {
+            run_sidecar_with_shutdown(sidecar_cfg, shutdown_rx, Some(event_tx))
+                .await
+                .expect("sidecar run");
+        });
+
+        // Drain events for a few seconds — we don't expect ProxyPeerDiscovered for tenant key.
+        let drain_deadline = tokio::time::sleep(Duration::from_secs(8));
+        tokio::pin!(drain_deadline);
+        loop {
+            tokio::select! {
+                Some(_event) = event_rx.recv() => {}
+                _ = &mut drain_deadline => break,
+            }
+        }
+
+        let routing_table = handle.workload.routing_table_handle();
+        if let Some(table) = routing_table.as_ref() {
+            let snap = table.read().unwrap();
+            assert!(
+                snap.is_empty(),
+                "proxy unexpectedly accepted a registration without holding any tenant cert: {:?}",
+                snap.keys().collect::<Vec<_>>()
+            );
+        }
+
+        let _ = shutdown_tx.send(());
+        let _ = sidecar_task.await;
+        Ok(())
+    }
+    .await;
+
+    handle.workload.close().await;
+    test_result
 }

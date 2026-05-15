@@ -10,8 +10,13 @@ pub mod egress;
 pub mod podmesh_annotations;
 pub use podmesh_annotations::PodmeshAnnotations;
 pub mod sidecar_registration;
+pub mod tenant_dht;
 
 pub use sidecar_registration::{SidecarRegistration, SidecarRegistrationAck, SidecarRoute};
+pub use tenant_dht::{
+    compute_tenant_proxy_dht_key, compute_tenant_proxy_dht_key_from_bytes,
+    compute_tenant_proxy_dht_key_hex,
+};
 
 #[cfg(test)]
 mod tests {

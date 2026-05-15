@@ -381,6 +381,10 @@ pub struct Handshake {
     pub timestamp: u64,
     pub protocol_version: String,
     pub signature: String,
+    /// Optional base64-postcard `NodeCert` presented by a proxy node so the
+    /// peer (typically a sidecar) can verify it shares a tenant. Empty for
+    /// non-proxy nodes.
+    pub proxy_cert_b64: String,
 }
 
 impl Handshake {
@@ -398,6 +402,10 @@ impl Handshake {
 
     pub fn signature(&self) -> Option<&str> {
         opt_str(&self.signature)
+    }
+
+    pub fn proxy_cert_b64(&self) -> Option<&str> {
+        opt_str(&self.proxy_cert_b64)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {

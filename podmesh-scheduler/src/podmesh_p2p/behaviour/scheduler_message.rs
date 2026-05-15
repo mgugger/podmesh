@@ -751,6 +751,7 @@ impl LocalNodeRole {
             NodeRole::Worker => matches!(self.0, NodeRole::Worker | NodeRole::Both),
             NodeRole::Custodian => matches!(self.0, NodeRole::Custodian | NodeRole::Both),
             NodeRole::Both => matches!(self.0, NodeRole::Both),
+            NodeRole::Proxy => matches!(self.0, NodeRole::Proxy),
         }
     }
 }

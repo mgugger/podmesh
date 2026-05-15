@@ -241,8 +241,33 @@ pub fn build_handshake(
     version: impl Into<String>,
     sig: impl Into<String>,
 ) -> Vec<u8> {
-    Handshake { nonce, timestamp: ts, protocol_version: version.into(), signature: sig.into() }
-        .to_bytes()
+    Handshake {
+        nonce,
+        timestamp: ts,
+        protocol_version: version.into(),
+        signature: sig.into(),
+        proxy_cert_b64: String::new(),
+    }
+    .to_bytes()
+}
+
+/// Build a handshake payload that carries an optional `proxy_cert_b64`.
+/// When `proxy_cert_b64` is `None` the result is identical to [`build_handshake`].
+pub fn build_handshake_with_cert(
+    nonce: u32,
+    ts: u64,
+    version: impl Into<String>,
+    sig: impl Into<String>,
+    proxy_cert_b64: Option<&str>,
+) -> Vec<u8> {
+    Handshake {
+        nonce,
+        timestamp: ts,
+        protocol_version: version.into(),
+        signature: sig.into(),
+        proxy_cert_b64: proxy_cert_b64.unwrap_or("").to_string(),
+    }
+    .to_bytes()
 }
 
 pub fn root_as_handshake(bytes: &[u8]) -> Result<Handshake, postcard::Error> {
