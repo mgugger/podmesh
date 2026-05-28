@@ -1,16 +1,20 @@
 # podmesh-proxy
 
+> This component spec reflects current proxy behavior.
+> Sidecar/proxy tenant-auth requirements are defined in
+> `changes/sidecar-proxy-auth/specs/sidecar-proxy-auth/spec.md`.
+
 ## ADDED Requirements
 
-### Requirement: Proxy announces itself as provider in the DHT
+### Requirement: Proxy announces itself in the DHT
 
-The proxy MUST publish itself under a well-known DHT key so sidecars can discover it.
+The proxy MUST announce itself for workload-authenticated discovery using a tenant-derived DHT key.
 
-#### Scenario: Proxy provider announcement
-- Given the proxy starts with `--enable-proxy-provider`
-- When the libp2p node connects to the DHT
-- Then it announces itself as a Kademlia provider for the key `podmesh-proxy-node`
-- And sidecars performing a DHT provider lookup for `podmesh-proxy-node` can discover this peer
+#### Scenario: Tenant-derived provider announcement
+- Given the proxy is configured with owner pubkey material (or receives a tenant `NodeCert`)
+- When it computes the tenant key
+- Then it announces itself as a provider under `blake3(owner_pubkey_bytes)[..16]`
+- And sidecars use this key for workload-authenticated proxy discovery
 
 ### Requirement: Proxy accepts and stores sidecar route registrations
 
@@ -20,7 +24,9 @@ The proxy MUST accept `SidecarRegistration` messages from sidecars and store rou
 - Given a sidecar sends a `SidecarRegistration` via `/podmesh/sidecar-registration/1.0.0`
 - When the proxy processes it
 - Then it verifies `sig` is an Ed25519 signature over `manifest_id || sidecar_peer_id`
-  using `owner_pubkey` from the registration
+  using `sidecar_signing_pubkey`
+- And it verifies transport `peer_id == sidecar_peer_id`
+- And it verifies the registration `owner_pubkey` matches a stored tenant `NodeCert`
 - And it stores the mapping: manifest_id → sidecar_peer_id + routes
 
 ### Requirement: Proxy routes external HTTP requests to the correct sidecar
@@ -49,12 +55,6 @@ The proxy MUST accept egress tunnel streams and relay them to the requested dest
 
 ## OBSERVED Trust Gaps
 
-### Observation: SidecarRegistration owner_pubkey is self-asserted
-
-The proxy verifies the registration signature using `owner_pubkey` from the message itself.
-There is no check against a known owner pubkey or any trust anchor. Any peer can register
-arbitrary routes by generating a new keypair and signing with it.
-
 ### Observation: Egress tunneling has no destination allowlist
 
 The proxy connects to whatever `dest_host:dest_port` a sidecar requests. There is no observed
@@ -66,7 +66,7 @@ exist but enforcement is in the scheduler/sidecar layer).
 Sidecar registrations are stored but there is no observed TTL or expiry mechanism.
 A stale registration for a terminated workload could persist and misdirect traffic.
 
-### Observation: Proxy DHT discovery is unauthenticated
+### Observation: Proxy cert storage is in-memory
 
-Sidecars discover the proxy via DHT key `podmesh-proxy-node`. A compromised or malicious DHT
-record could redirect sidecar registrations and egress tunnels to an attacker-controlled peer.
+Tenant `NodeCert` entries are currently held in an in-memory map. Durable persistence
+across proxy restarts is not implemented yet.

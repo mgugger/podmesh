@@ -17,6 +17,13 @@ pub struct ShareRequest {
     /// Custodians reject requests where `now - assigned_at_secs > ASSIGNMENT_TOKEN_TTL_SECS`.
     #[serde(default)]
     pub assigned_at_secs: u64,
+    /// Optional 1-based share index expected by the requester.
+    /// Used for strict binding of request intent to a specific custodian shard.
+    #[serde(default)]
+    pub share_index: Option<u32>,
+    /// Optional base64url Biscuit authz token for share release / delegation flows.
+    #[serde(default)]
+    pub authz_token_b64: Option<String>,
     /// base64 X25519 pubkey — the share will be wrapped to this key
     pub worker_kem_pub: String,
     /// Random nonce for replay prevention
@@ -97,6 +104,8 @@ mod tests {
             node_cert_bytes: vec![],
             assignment_sig: "sig".to_string(),
             assigned_at_secs: 0,
+            share_index: None,
+            authz_token_b64: None,
             worker_kem_pub: "pub".to_string(),
             nonce: "nonce".to_string(),
             sig: "sig".to_string(),

@@ -177,7 +177,7 @@ pub async fn handle_deploy_dispatched_workload(
         local_peer_id, coordinator_peer_id, custodians
     );
 
-    for custodian_peer_id_str in &custodians {
+    for (custodian_idx, custodian_peer_id_str) in custodians.iter().enumerate() {
         if wrapped_cfrags.len() >= threshold {
             break;
         }
@@ -230,12 +230,44 @@ pub async fn handle_deploy_dispatched_workload(
         }
 
         let nonce = b64_encode(&utils::make_nonce(Some("sr")).as_bytes().to_vec());
+        let node_cert_bytes = load_local_node_cert_bytes_for_peer(&local_peer_id);
+        let tenant_owner_pubkey_b64 = protocol::NodeCert::from_bytes(&node_cert_bytes)
+            .map(|c| c.owner_pubkey)
+            .unwrap_or_default();
+        let now_unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let share_index = (custodian_idx as u32) + 1;
+        let authz_ctx = protocol::AuthzContext {
+            tenant_owner_pubkey_b64,
+            manifest_id: manifest_id.clone(),
+            transport_peer_id: local_peer_id.clone(),
+            operation: protocol::AuthzOperation::ReleaseShare,
+            http_path: None,
+            dest_host: None,
+            dest_port: None,
+            worker_peer_id: Some(local_peer_id.clone()),
+            share_index: Some(share_index),
+            delegate_peer_id: None,
+            now_unix_secs,
+        };
+        let authz_token_b64 = match protocol::mint_release_share_token_b64(&worker_signing_priv, &authz_ctx) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                warn!("deploy_dispatch: failed to mint release_share authz token: {}", e);
+                continue;
+            }
+        };
+
         let mut req = ShareRequest {
             manifest_id: manifest_id.clone(),
             worker_peer_id: local_peer_id.clone(),
-            node_cert_bytes: load_local_node_cert_bytes(),
+            node_cert_bytes,
             assignment_sig: assignment_token.clone(),
             assigned_at_secs,
+            share_index: Some(share_index),
+            authz_token_b64,
             worker_kem_pub: worker_kem_pub_b64.clone(),
             nonce,
             sig: String::new(),
@@ -404,15 +436,58 @@ async fn deploy_spec(manifest_id: &str, spec_json: &str, local_peer_id: &libp2p:
     }
 }
 
-pub(crate) fn load_local_node_cert_bytes() -> Vec<u8> {
+pub(crate) fn load_local_node_cert_bytes_for_peer(local_peer_id: &str) -> Vec<u8> {
     if let Ok(home) = std::env::var("HOME") {
         let key_dir = std::path::PathBuf::from(home).join(crypto::KEY_DIR);
         if let Ok(Some(cert)) = protocol::node_cert::load_node_cert(key_dir.to_str().unwrap_or(".podmesh")) {
             return cert.to_bytes();
         }
     }
-    vec![]
+
+    // Ephemeral mode fallback: construct an in-memory self-signed NodeCert from
+    // the currently configured signing/KEM keypairs so authz-bound ShareRequest
+    // validation still has a concrete worker identity.
+    let (signing_pub, signing_priv) = match crypto::ensure_keypair_on_disk() {
+        Ok(kp) => kp,
+        Err(e) => {
+            warn!("load_local_node_cert_bytes_for_peer: failed to load signing keypair: {}", e);
+            return vec![];
+        }
+    };
+    let (kem_pub, _kem_priv) = match crypto::ensure_kem_keypair_on_disk() {
+        Ok(kp) => kp,
+        Err(e) => {
+            warn!("load_local_node_cert_bytes_for_peer: failed to load KEM keypair: {}", e);
+            return vec![];
+        }
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let cert = protocol::NodeCert {
+        peer_id: local_peer_id.to_string(),
+        kem_pubkey: crypto::b64_encode(&kem_pub),
+        signing_pubkey: crypto::b64_encode(&signing_pub),
+        capabilities: vec!["default".to_string()],
+        role: protocol::NodeRole::Both,
+        valid_until: now.saturating_add(24 * 60 * 60),
+        owner_pubkey: crypto::b64_encode(&signing_pub),
+        owner_sig: String::new(),
+        endorsements: vec![],
+    };
+
+    match cert.sign(&signing_priv, &signing_pub) {
+        Ok(signed) => signed.to_bytes(),
+        Err(e) => {
+            warn!("load_local_node_cert_bytes_for_peer: failed to self-sign fallback NodeCert: {}", e);
+            vec![]
+        }
+    }
 }
+
 
 #[cfg(test)]
 mod tests {

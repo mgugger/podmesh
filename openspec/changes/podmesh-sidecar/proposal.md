@@ -60,14 +60,18 @@ The sidecar runs a libp2p node (QUIC transport, Noise handshake) with these prot
   The record is signed by the sidecar's Ed25519 key and includes route info.
 - Announces itself as a Kademlia provider for `manifest_id`.
 
-### Proxy Registration
+### Proxy Discovery and Registration
 
 Source: `src/lib.rs` (registration_rr)
 
-- After bootstrap completes, the sidecar sends a `SidecarRegistration` to the proxy peer.
+- After bootstrap completes, the sidecar performs tenant proxy discovery using a key derived
+  from `owner_public_key_b64`: `blake3(owner_pubkey_bytes)[..16]`.
+- The sidecar does not use the global `podmesh-proxy-node` key for workload traffic.
+- After discovering a candidate, the sidecar sends a handshake request and verifies
+  `proxy_cert_b64` from the response (owner match, expiry, peer binding).
+- Only after successful verification does the sidecar send `SidecarRegistration`.
 - `SidecarRegistration` contains: `manifest_id`, `routes` (Vec<SidecarRoute>), `sidecar_peer_id`,
-  `owner_pubkey`, `sig` = Ed25519 signature over `manifest_id || sidecar_peer_id`.
-- The proxy peer is discovered via DHT key `podmesh-proxy-node`.
+  `owner_pubkey`, `sig` (Ed25519 over `manifest_id || sidecar_peer_id`), and `sidecar_signing_pubkey`.
 
 ### Ingress Request Handling
 
@@ -103,8 +107,8 @@ Both modes:
   the proxy unless the proxy checks owner_pubkey consistency.
 - Ingress requests are forwarded to the local app without authentication — any peer that can
   reach the sidecar's libp2p QUIC address and knows the ingress-proxy protocol can inject requests.
-- Egress tunneling trusts the proxy peer to make outbound connections on the sidecar's behalf.
-  The sidecar does not verify the proxy peer's identity against a trust anchor.
+- Egress tunneling uses discovered proxy peers that have passed sidecar-side proxy cert verification.
+- Ingress request handling currently does not enforce that inbound request peers are previously verified proxies.
 
 ## Data Flow
 
@@ -114,7 +118,8 @@ Scheduler writes SidecarMetadata to /var/run/podmesh/sidecar/metadata.json
 podmesh-sidecar reads metadata, starts libp2p node
   │ dial bootstrap_peer, join DHT
   │ publish manifest record + announce as provider
-  │ discover proxy peer via DHT key "podmesh-proxy-node"
+  │ discover proxy peer via tenant-derived DHT key blake3(owner_pubkey)[..16]
+  │ verify proxy NodeCert from handshake response
   │ send SidecarRegistration (signed) to proxy
   ▼
 Ingress path:

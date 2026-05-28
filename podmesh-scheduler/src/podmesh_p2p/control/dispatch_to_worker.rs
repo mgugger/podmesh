@@ -331,7 +331,7 @@ pub fn handle_send_workload_dispatch(
 
     let mut remote_rxs: Vec<tokio::sync::mpsc::UnboundedReceiver<Option<crypto::ShareResponse>>> = vec![];
 
-    for custodian_peer_id_str in &all_custodian_peers {
+    for (custodian_idx, custodian_peer_id_str) in all_custodian_peers.iter().enumerate() {
         // Skip ourselves — already collected above.
         if custodian_peer_id_str == &local_peer_id {
             continue;
@@ -350,12 +350,44 @@ pub fn handle_send_workload_dispatch(
         };
 
         let nonce = crypto::b64_encode(&utils::make_nonce(Some("sr")).as_bytes().to_vec());
+        let node_cert_bytes = crate::podmesh_p2p::control::deploy_dispatch::load_local_node_cert_bytes_for_peer(&local_peer_id);
+        let tenant_owner_pubkey_b64 = protocol::NodeCert::from_bytes(&node_cert_bytes)
+            .map(|c| c.owner_pubkey)
+            .unwrap_or_default();
+        let now_unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let share_index = (custodian_idx as u32) + 1;
+        let authz_ctx = protocol::AuthzContext {
+            tenant_owner_pubkey_b64,
+            manifest_id: manifest_id.clone(),
+            transport_peer_id: worker_peer_id_str.clone(),
+            operation: protocol::AuthzOperation::ReleaseShare,
+            http_path: None,
+            dest_host: None,
+            dest_port: None,
+            worker_peer_id: Some(worker_peer_id_str.clone()),
+            share_index: Some(share_index),
+            delegate_peer_id: None,
+            now_unix_secs,
+        };
+        let authz_token_b64 = match protocol::mint_release_share_token_b64(&coordinator_signing_priv, &authz_ctx) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                warn!("dispatch_to_worker: failed to mint release_share authz token: {}", e);
+                continue;
+            }
+        };
+
         let mut req = crypto::ShareRequest {
             manifest_id: manifest_id.clone(),
             worker_peer_id: worker_peer_id_str.clone(),
-            node_cert_bytes: crate::podmesh_p2p::control::deploy_dispatch::load_local_node_cert_bytes(),
+            node_cert_bytes,
             assignment_sig: assignment_token.clone(),
             assigned_at_secs,
+            share_index: Some(share_index),
+            authz_token_b64,
             worker_kem_pub: worker_kem_pub_b64_enc.clone(),
             nonce,
             sig: String::new(),

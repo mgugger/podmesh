@@ -55,6 +55,7 @@ redb = "3.1"
 blake3 = "1"
 tempfile = "3"
 hex = "0.4"
+biscuit-auth = "6"
 vsss-rs = { version = "5.3", default-features = false, features = ["std", "zeroize"] }
 
 [profile.release]

@@ -38,11 +38,6 @@ podctl MUST load an existing keypair or generate a new one on first use.
 - Then it generates a new Ed25519 signing keypair
 - And writes `pubkey.bin` and `privkey.bin` to `~/.podmesh/` with mode 0o600
 
-#### Scenario: Ephemeral key mode
-- Given `--ephemeral` is set
-- When podctl runs
-- Then it generates in-memory keypairs and does not persist them to disk
-
 ### Requirement: podctl sends encrypted delete requests to each workload provider
 
 The delete command MUST route encrypted `DeleteRequest` messages per-provider.
@@ -53,7 +48,7 @@ The delete command MUST route encrypted `DeleteRequest` messages per-provider.
 - Then it computes the manifest_id from the spec file
 - And queries `POST {server}/tasks/{manifest_id}/providers` to discover holding peers
 - And for each provider, encrypts a `DeleteRequest` as an Envelope (ECIES + Ed25519 signed)
-- And sends it to `DELETE {server}/delete_direct/{peer_id}`
+- And sends it to `POST {server}/delete_direct/{peer_id}`
 
 ### Requirement: podctl queries workload status without authentication
 
@@ -74,16 +69,15 @@ uses that proxy is deployed.
 
 #### Scenario: Fetching proxy key material
 - Given a proxy node is reachable at a known address
-- When the operator runs `podctl grant-proxy --proxy-url <url>`
+- When the operator runs `podctl cert grant-proxy --proxy-url <url> --owner-pub <path> --owner-sk <path>`
 - Then podctl sends `GET <url>/api/v1/signing_pubkey` to retrieve the proxy's Ed25519 public key
 - And sends `GET <url>/api/v1/kem_pubkey` to retrieve the proxy's X25519 public key
-- And sends `GET <url>/api/v1/peer_id` (or derives it from the signing key) to retrieve the
-  proxy's libp2p PeerId
+- And sends `GET <url>/api/v1/peer_id` to retrieve the proxy's libp2p PeerId
 - And aborts with an error if any of these requests fail or return malformed data
 
 #### Scenario: Constructing and signing the proxy NodeCert
 - Given the proxy's `peer_id`, `signing_pubkey`, and `kem_pubkey` have been retrieved
-- And the operator's Ed25519 owner keypair is loaded from `~/.podmesh/`
+- And the operator's Ed25519 owner keypair bytes are loaded from the provided key files
 - When podctl builds the cert
 - Then it constructs a `NodeCert` with:
   - `peer_id` = proxy's libp2p PeerId
@@ -91,7 +85,7 @@ uses that proxy is deployed.
   - `kem_pubkey` = proxy's X25519 public key (base64)
   - `capabilities` = `["proxy"]`
   - `role` = `NodeRole::Proxy`
-  - `valid_until` = `now_unix_secs + ttl` (default TTL configurable, e.g. 90 days)
+  - `valid_until` = `now_unix_secs + ttl` (`--ttl-days`, default 365)
   - `owner_pubkey` = operator's Ed25519 public key (base64)
   - `owner_sig` = `Ed25519.sign(owner_sk, canonical_bytes(NodeCert))`
 - And the cert MUST NOT be signed until all fields are populated (no partial signing)
@@ -103,12 +97,6 @@ uses that proxy is deployed.
 - And the proxy responds with a success acknowledgement
 - And podctl prints the `proxy_dht_key = hex(blake3(owner_pubkey_bytes)[..16])` that the
   proxy will announce under, so the operator can verify discovery
-
-#### Scenario: Cert delivery is idempotent
-- Given a proxy already holds a valid cert for this owner
-- When podctl runs `grant-proxy` again for the same proxy
-- Then the proxy replaces the stored cert if the new cert's `valid_until` is later
-- And podctl does not error
 
 ## OBSERVED Trust Gaps
 
@@ -129,3 +117,8 @@ many workloads this may become an issue.
 `get pods`, `get pod`, and `logs` issue plain HTTP GETs with no signature or token.
 Anyone with network access to the scheduler REST API can enumerate running workloads and
 retrieve their logs.
+
+### Observation: podctl CLI currently has no `--ephemeral` flag
+
+Key operations use on-disk key helpers; ephemeral key mode is not currently exposed
+as a top-level CLI flag.

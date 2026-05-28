@@ -37,7 +37,7 @@ Custodians MUST periodically broadcast a signed heartbeat for liveness tracking.
 - Given a node is operating as a custodian
 - When the heartbeat timer fires
 - Then a `HeartbeatPing` is published on the `podmesh-machine` gossipsub topic
-- And the ping contains: peer_id, signing_pubkey, kem_pubkey, capabilities, timestamp_secs, Ed25519 sig
+- And the ping contains: `peer_id`, `timestamp_secs`, `custodian_manifest_ids`, `sig`
 
 ## OBSERVED Trust Gaps (not requirements — observations)
 
@@ -52,3 +52,8 @@ to a trusted scheduler node. Any peer can submit a crafted assignment.
 The `ShareRequest.worker_peer_id` field is accepted as provided in the request body.
 The custodian does not verify that the libp2p connection's remote peer ID matches
 the claimed `worker_peer_id`.
+
+### Observation: Heartbeat signatures are emitted but not verified on receipt
+
+Heartbeat messages are signed by senders, but current liveness tracking records
+incoming heartbeats without verifying `sig` against a trusted key.

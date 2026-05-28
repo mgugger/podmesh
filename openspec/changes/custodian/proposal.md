@@ -61,9 +61,10 @@ On receiving a `ShareRequest` from a worker:
 Source: `custodian/heartbeat.rs`
 
 - Custodians broadcast `HeartbeatPing` messages on the `podmesh-machine` gossipsub topic.
-- `HeartbeatPing` contains: `peer_id`, `signing_pubkey`, `kem_pubkey`, `capabilities`,
-  `timestamp_secs`, `sig` (Ed25519 over canonical bytes).
+- `HeartbeatPing` contains: `peer_id`, `timestamp_secs`, `custodian_manifest_ids`, `sig`
+  (Ed25519 over canonical bytes).
 - Other nodes use these heartbeats to maintain a liveness map of known custodians.
+- Current implementation records heartbeat liveness but does not verify heartbeat signatures on receipt.
 
 ### CustodianAnnounce / CustodianWithdraw
 

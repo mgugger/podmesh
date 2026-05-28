@@ -1,7 +1,7 @@
 # podmesh-proxy Tasks
 
-- Document proxy provider announcement in DHT
-- Document sidecar registration handling and verification
+- Document tenant-derived proxy provider announcement in DHT
+- Document sidecar registration handling and tenant verification
 - Document ingress hostname-to-manifest_id routing
 - Document egress tunnel relay behavior
-- Document current trust gaps (owner_pubkey not validated, DHT trust, no egress policy)
+- Document current trust gaps (in-memory cert store, no egress policy, registration TTL)

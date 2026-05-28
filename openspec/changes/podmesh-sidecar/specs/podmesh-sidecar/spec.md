@@ -1,5 +1,9 @@
 # podmesh-sidecar
 
+> This component spec reflects current sidecar behavior.
+> Sidecar/proxy tenant-auth requirements are defined in
+> `changes/sidecar-proxy-auth/specs/sidecar-proxy-auth/spec.md`.
+
 ## ADDED Requirements
 
 ### Requirement: Sidecar reads startup metadata from file or environment variable
@@ -27,16 +31,28 @@ The sidecar MUST publish its presence and manifest record in the Kademlia DHT.
 - And it publishes a signed manifest record to DHT key `podmesh/manifest/{manifest_id}`
 - And the record is periodically refreshed while the sidecar is running
 
-### Requirement: Sidecar registers its routes with the proxy
+### Requirement: Sidecar discovers proxy using tenant-derived DHT key
 
-The sidecar MUST send a signed `SidecarRegistration` to the proxy peer after bootstrap.
+The sidecar MUST use the tenant-derived proxy key for workload traffic.
+
+#### Scenario: Tenant proxy lookup
+- Given `owner_public_key_b64` is present in SidecarMetadata
+- When the sidecar seeks a proxy
+- Then it computes `blake3(owner_pubkey_bytes)[..16]`
+- And performs provider lookup using that key
+- And it does not use `podmesh-proxy-node` for workload registration/egress routing
+
+### Requirement: Sidecar registers routes with a verified proxy
+
+The sidecar MUST send `SidecarRegistration` only after proxy cert verification.
 
 #### Scenario: Sidecar registers with proxy
-- Given the proxy peer's libp2p address is resolved from DHT key `podmesh-proxy-node`
-- When the sidecar completes bootstrap
+- Given a proxy peer has been discovered from the tenant-derived DHT key
+- And the sidecar has verified the proxy NodeCert from handshake response
+- When the sidecar completes handshake validation
 - Then it sends a `SidecarRegistration` via `/podmesh/sidecar-registration/1.0.0`
 - And `SidecarRegistration.sig` is an Ed25519 signature over `manifest_id || sidecar_peer_id`
-- And it includes routes extracted from the manifest (path_prefix + port)
+- And it includes `sidecar_signing_pubkey` and routes extracted from the manifest
 
 ### Requirement: Sidecar forwards ingress requests to the local application
 
@@ -57,14 +73,14 @@ The sidecar MUST relay outbound TCP connections through a proxy peer via libp2p 
 - And nftables rules redirect outbound TCP to the sidecar's egress port
 - When the local app makes an outbound TCP connection
 - Then the sidecar intercepts it via `SO_ORIGINAL_DST`
-- And opens a `/podmesh/egress-tunnel/1.0.0` stream to the proxy peer
+- And opens a `/podmesh/egress-tunnel/1.0.0` stream to a verified proxy peer
 - And bidirectionally copies data between the local socket and the stream
 
 #### Scenario: HTTP CONNECT egress proxy mode
 - Given HTTP CONNECT mode is enabled
 - And the app uses `http_proxy=http://127.0.0.1:{port}`
 - When the app issues a CONNECT request
-- Then the sidecar resolves the target and opens a tunnel via the proxy peer as above
+- Then the sidecar resolves the target and opens a tunnel via a verified proxy peer as above
 
 ## OBSERVED Trust Gaps
 
@@ -77,8 +93,3 @@ Any process with write access to the path can inject arbitrary manifest_id, mani
 
 Any libp2p peer that connects to the sidecar and speaks `/podmesh/ingress-proxy/1.0.0`
 can send arbitrary HTTP requests to the local application. There is no token or allowlist check.
-
-### Observation: Proxy peer is trusted for egress without identity verification
-
-The sidecar discovers the proxy via DHT and opens tunnels without verifying the proxy's
-identity against a signature chain or owner key.

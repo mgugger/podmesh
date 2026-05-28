@@ -24,14 +24,14 @@ which is sufficient as the tenant anchor for both DHT key derivation and cert ve
 
 ### Requirement: podctl provisions a tenant-signed NodeCert to the proxy exactly once
 
-The operator MUST run `podctl grant-proxy` to sign and deliver a `NodeCert` to the proxy
+The operator MUST run `podctl cert grant-proxy` to sign and deliver a `NodeCert` to the proxy
 before any workload that uses that proxy is deployed. This is a one-time setup per
 tenant–proxy pair. The cert is delivered directly to the proxy's REST API; it is not
 embedded in any workload submission or `SidecarMetadata`.
 
 #### Scenario: podctl fetches proxy key material and signs a cert
-- Given the operator runs `podctl grant-proxy --proxy-url <url> [--ttl <days>]`
-- And the operator's Ed25519 owner keypair is loaded from `~/.podmesh/`
+- Given the operator runs `podctl cert grant-proxy --proxy-url <url> --owner-pub <path> --owner-sk <path> [--ttl-days <days>]`
+- And the operator's Ed25519 owner keypair bytes are loaded from those key files
 - When podctl executes
 - Then it retrieves the proxy's `signing_pubkey` from `GET <url>/api/v1/signing_pubkey`
 - And retrieves the proxy's `kem_pubkey` from `GET <url>/api/v1/kem_pubkey`

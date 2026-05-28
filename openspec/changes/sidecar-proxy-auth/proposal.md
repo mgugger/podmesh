@@ -49,9 +49,8 @@ and perform a Kademlia provider lookup for it.
 A proxy serving multiple tenants announces itself under multiple derived keys,
 one per tenant whose cert it holds.
 
-The existing `podmesh-proxy-node` key MAY continue to exist for mesh-internal use
-(e.g. bootstrap before tenant assignment) but MUST NOT be used by sidecars to
-discover an authenticated proxy for workload traffic.
+The global `podmesh-proxy-node` key MUST NOT be used for workload proxy discovery.
+Sidecars discover proxies only through the tenant-derived key.
 
 ### Proxy NodeCert (tenant-signed)
 
@@ -210,9 +209,8 @@ SidecarRegistration (sidecar → proxy):
 
 ## Remaining Open Questions
 
-- How does podctl provision the NodeCert to the proxy? Options: a `podctl grant-proxy` command
-  that POSTs the cert to the proxy REST API, a file at a configured path, or inclusion in the
-  proxy's startup config.
+- `podctl cert grant-proxy` currently POSTs the cert to the proxy REST API.
+  Should file-based provisioning at startup also be supported for offline/bootstrap workflows?
 - Should the proxy re-announce the derived DHT key periodically (like sidecar provider records)?
   What is the TTL?
 - If a proxy holds certs for multiple tenants, does it announce under all derived keys simultaneously?

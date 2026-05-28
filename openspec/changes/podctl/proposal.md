@@ -29,14 +29,15 @@ Source: `src/main.rs`
 | `get pod <id>` | Get workload detail |
 | `logs <id>` | Get workload logs |
 | `convert -f <file>` | Convert Kubernetes manifest to podmesh format |
+| `cert <subcommand>` | NodeCert tooling (`issue`, `show`, `verify`, `grant-proxy`) |
 
 ## Key Flags
 
-- `--server` / `--url` — scheduler REST API base URL (default `http://localhost:3000`)
-- `--shares` / `-n` — number of Shamir shares (N)
-- `--threshold` / `-k` — Shamir threshold (K)
-- `--capabilities` — required worker capabilities (CSV)
-- `--replicas` — number of workload replicas
+- `--api-url` — scheduler REST API base URL (default `http://127.0.0.1:3000`)
+- `--shares` — number of Shamir shares (N)
+- `--threshold` — Shamir threshold (K)
+- `--capability` (repeatable) — required worker capabilities
+- `--output` — output format for `get` (`table`/`json`)
 
 ## Observed Behavior
 
@@ -51,7 +52,7 @@ Full sequence:
 3. Load or generate Ed25519 signing keypair from `~/.podmesh/` (persistent).
 4. `GET {server}/api/v1/custodians?max=N` → `Vec<CustodianInfo { peer_id, kem_pubkey_b64 }>`.
    Aborts if fewer than N custodians are available.
-5. Call `seal_workload(spec_json, custodians, owner_pk, owner_sk, n, k, capabilities, replicas)`:
+5. Call `seal_workload(spec_json, custodians, owner_pk, owner_sk, n, k, capabilities)`:
 
    a. Validate `n >= k >= 1` and `custodians.len() >= n`.
 
@@ -65,6 +66,7 @@ Full sequence:
 
    d. Build `SealedSpec { manifest_id, owner_pubkey, ciphertext, nonce, kfrag_count=N,
       kfrag_threshold=K, sealed_at_secs, submission_version=1, replica_count }`.
+      (`replica_count` is parsed from the manifest, defaulting to 1)
 
    e. `submission_sig = Ed25519.sign(owner_sk, postcard(sealed_spec))`.
 
@@ -87,7 +89,7 @@ Source: `src/lib.rs:delete_file()`
    a. Load owner Ed25519 keypair.
    b. Build `DeleteRequest { manifest_id }`.
    c. Encrypt as an `Envelope` (ECIES to the peer's KEM pubkey + Ed25519 signed).
-   d. `DELETE {server}/delete_direct/{peer_id}` with the encrypted envelope body.
+   d. `POST {server}/delete_direct/{peer_id}` with the encrypted envelope body.
 
 ### `get` / `logs` — Status Queries
 
@@ -112,7 +114,7 @@ and converts it to a podmesh manifest format. Outputs JSON or YAML.
 - Ed25519 signing keypair: `~/.podmesh/pubkey.bin` + `~/.podmesh/privkey.bin`
 - X25519 KEM keypair: `~/.podmesh/kem_pub.bin` + `~/.podmesh/kem_priv.bin`
 - Keys are generated on first use and persisted with mode `0o600`.
-- `--ephemeral` flag uses in-memory keys only.
+- No top-level `--ephemeral` CLI flag is currently exposed.
 
 ## Trust Assumptions (as implemented)
 

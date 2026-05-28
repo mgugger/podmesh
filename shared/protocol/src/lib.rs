@@ -11,7 +11,13 @@ pub mod podmesh_annotations;
 pub use podmesh_annotations::PodmeshAnnotations;
 pub mod sidecar_registration;
 pub mod tenant_dht;
+pub mod authz;
 
+pub use authz::{
+    AUTHZ_TOKEN_SCHEMA_V1, AuthzContext, AuthzDecision, AuthzOperation, AuthzTokenVerifier,
+    BiscuitReleaseShareVerifier, UnimplementedBiscuitVerifier,
+    biscuit_public_key_from_ed25519_bytes, mint_release_share_token_b64, verify_authz_token,
+};
 pub use sidecar_registration::{SidecarRegistration, SidecarRegistrationAck, SidecarRoute};
 pub use tenant_dht::{
     compute_tenant_proxy_dht_key, compute_tenant_proxy_dht_key_from_bytes,

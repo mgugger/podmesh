@@ -32,7 +32,8 @@ Exposes operational endpoints for the proxy node.
 Source: `src/p2p.rs`
 
 Protocols:
-- Kademlia DHT (**server mode**): announces proxy as a provider under `podmesh-proxy-node`
+- Kademlia DHT (**server mode**): tenant-derived announcements under `blake3(owner_pubkey_bytes)[..16]`
+- `/podmesh/handshake/1.0.0` (inbound+outbound): handshake; proxy includes `proxy_cert_b64` in responses when tenant cert material is provisioned
 - `/podmesh/ingress-proxy/1.0.0` (outbound): sends `ProxyHttpRequest` to sidecar peers
 - `/podmesh/egress-tunnel/1.0.0` (inbound): accepts tunnel streams from sidecars
 - `/podmesh/sidecar-registration/1.0.0` (inbound): receives `SidecarRegistration` from sidecars
@@ -47,20 +48,21 @@ Listens for external HTTP requests. Enabled with `--enable-ingress`.
 
 ### Proxy Provider Announcement
 
-- When `--enable-proxy-provider` is set, the proxy announces itself in the DHT under
-  the key `podmesh-proxy-node`.
-- Sidecars discover the proxy by doing a DHT lookup for this key.
+- When owner pubkey / tenant cert material is available, the proxy announces itself
+  under tenant-derived key bytes `blake3(owner_pubkey_bytes)[..16]`.
+- Sidecars performing workload-authenticated traffic discovery use this tenant-derived key.
 
 ### Sidecar Registration Handling
 
 Source: `src/p2p.rs`
 
 - On receiving a `SidecarRegistration` via `/podmesh/sidecar-registration/1.0.0`:
-  1. Extracts `manifest_id`, `routes`, `sidecar_peer_id`, `owner_pubkey`, `sig`.
+  1. Extracts `manifest_id`, `routes`, `sidecar_peer_id`, `owner_pubkey`, `sig`, `sidecar_signing_pubkey`.
   2. Verifies `sig` = Ed25519 signature over `manifest_id || sidecar_peer_id`
-     using `owner_pubkey`. NOTE: There is no check that `owner_pubkey` matches a known
-     trusted owner — any key pair can sign a valid registration.
-  3. Stores the route mapping: hostname/path → sidecar peer_id.
+     using `sidecar_signing_pubkey`.
+  3. Verifies transport peer identity: connection `peer_id == sidecar_peer_id`.
+  4. Verifies `owner_pubkey` matches a stored tenant `NodeCert` and that cert is not expired.
+  5. Stores the route mapping: hostname/path → sidecar peer_id.
 
 ### Ingress Request Routing
 
@@ -84,17 +86,11 @@ Source: `src/p2p.rs`, `src/workload.rs`
 
 ## Trust Assumptions (as implemented)
 
-- The proxy verifies `SidecarRegistration.sig` (Ed25519 over `manifest_id || sidecar_peer_id`)
-  but only against `owner_pubkey` supplied in the registration message itself.
-  Any attacker who can reach the proxy via libp2p can register arbitrary routes with a
-  self-generated keypair.
 - Ingress requests are forwarded to whatever sidecar peer is registered for a hostname.
   There is no mutual authentication between the external HTTP client and the proxy.
 - Egress tunnel connections are made to whatever `dest_host:dest_port` the sidecar requests.
-  There is no egress allowlist or policy enforcement in the current implementation
-  (policy-enforcing manifests exist in test fixtures but enforcement is not confirmed in proxy).
-- The proxy trusts the DHT for discovering sidecars — a compromised DHT record could redirect
-  ingress traffic to a malicious peer.
+  There is no egress allowlist or policy enforcement in the current implementation.
+- Tenant `NodeCert` material used for registration checks is currently held in-memory (not durable across restarts).
 
 ## Data Flow
 

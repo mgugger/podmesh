@@ -18,3 +18,4 @@ log = { workspace = true }
 blake3 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+biscuit-auth = { workspace = true }

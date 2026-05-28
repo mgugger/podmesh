@@ -37,7 +37,7 @@ Key endpoints:
 - `GET /api/v1/custodians?max=N` — discovers custodian peers via libp2p; unauthenticated
 - `POST /api/v1/workloads/submit` — accepts `WorkloadSubmission` JSON; verifies `submission_sig`
 - `POST /apply_direct/{peer_id}` — forwards an encrypted `ApplyRequest` to a specific peer
-- `DELETE /delete_direct/{peer_id}` — forwards an encrypted `DeleteRequest` to a specific peer
+- `POST /delete_direct/{peer_id}` — forwards an encrypted `DeleteRequest` to a specific peer
 - `GET /runtime/workloads` — lists running workloads
 - `GET /runtime/workloads/{id}` — workload detail
 - `GET /runtime/workloads/{id}/logs` — workload logs
