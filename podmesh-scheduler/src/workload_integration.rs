@@ -333,24 +333,20 @@ pub async fn handle_apply_message_with_workload_manager(
                 ) {
                     Ok(parts) => (parts.payload, parts.pubkey),
                     Err(e) => {
-                        if crate::podmesh_p2p::security::require_signed_messages() {
-                            error!("Rejecting unsigned/invalid apply request: {:?}", e);
-                            let error_response = machine::build_apply_response(
-                                false,
-                                "unknown",
-                                "unsigned or invalid envelope",
-                            );
-                            let _ = swarm
-                                .behaviour_mut()
-                                .apply_rr
-                                .send_response(channel, error_response);
-                            return;
-                        }
-                        warn!(
-                            "Accepting unsigned apply request from peer={} due to relaxed policy",
-                            peer
+                        error!(
+                            "Rejecting unsigned/invalid apply request from peer={}: {:?}",
+                            peer, e
                         );
-                        (request.clone(), Vec::new())
+                        let error_response = machine::build_apply_response(
+                            false,
+                            "unknown",
+                            "unsigned or invalid envelope",
+                        );
+                        let _ = swarm
+                            .behaviour_mut()
+                            .apply_rr
+                            .send_response(channel, error_response);
+                        return;
                     }
                 };
 

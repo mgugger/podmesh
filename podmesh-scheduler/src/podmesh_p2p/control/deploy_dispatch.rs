@@ -1,9 +1,9 @@
-//! Worker-side cfrag collection, unsealing, and deployment (Umbral PRE only).
+//! Worker-side share collection, unsealing, and deployment (Shamir secret sharing).
 //!
 //! After the coordinator sends a `WorkloadDispatch`, this handler:
 //! 1. Sends a `ShareRequest` to each custodian over `scheduler_rr`.
-//! 2. Collects at least `threshold` `ShareResponse` replies (each containing a wrapped cfrag).
-//! 3. Calls `unseal_spec` (Umbral PRE decrypt) to recover the plaintext spec.
+//! 2. Collects at least `threshold` `ShareResponse` replies (each containing a wrapped DEK share).
+//! 3. Calls `unseal_spec` (Shamir reconstruct + decrypt) to recover the plaintext spec.
 //! 4. Applies the workload via the local runtime engine.
 
 use libp2p::Swarm;

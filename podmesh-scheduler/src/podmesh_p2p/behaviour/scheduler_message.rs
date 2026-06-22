@@ -409,9 +409,9 @@ fn handle_workload_assignment_v2(
     }
 }
 
-/// Handle a `ShareRequest` from a worker (Phase 5/8).
-/// Checks whether the manifest is v2 (Umbral PRE, KfragStore) or v1 (Shamir, CustodianStore)
-/// and dispatches to the appropriate oracle.
+/// Handle a `ShareRequest` from a worker.
+/// Looks up the custodian record for the manifest and releases the worker's
+/// wrapped DEK share via the `ShamirOracle`.
 fn handle_share_request(
     share_req: crypto::ShareRequest,
     channel: libp2p::request_response::ResponseChannel<Vec<u8>>,
@@ -457,7 +457,7 @@ fn handle_share_request(
             );
             let _ = swarm.behaviour_mut().scheduler_rr.send_response(channel, resp_bytes);
             info!(
-                "libp2p: released cfrag for manifest_id={} to worker={}",
+                "libp2p: released DEK share for manifest_id={} to worker={}",
                 share_req.manifest_id, peer
             );
         }

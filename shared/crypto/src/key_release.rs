@@ -69,8 +69,7 @@ impl ShareResponse {
 }
 
 /// Abstraction over key release mechanisms.
-/// v1: ShamirOracle — Shamir secret sharing
-/// v2: PreOracle — Umbral proxy re-encryption (Phase 8)
+/// Implemented by `ShamirOracle` — Shamir secret sharing with per-worker re-wrapping.
 #[async_trait]
 pub trait KeyReleaseOracle: Send + Sync {
     /// Release key material to an eligible worker.

@@ -5,7 +5,6 @@ use log::info;
 use uuid::Uuid;
 use std::env;
 
-use serde_json::Value as JsonValue;
 use std::path::PathBuf;
 
 mod api_client;
@@ -21,6 +20,9 @@ fn resolve_api_base(override_url: Option<&str>) -> String {
         .unwrap_or_else(|| "http://127.0.0.1:3000".to_string())
 }
 
+/// Extract the first `metadata.name` from a parsed manifest JSON document.
+/// Only used by unit tests that validate multi-document manifest parsing.
+#[cfg(test)]
 fn extract_manifest_name_from_json(manifest_json: &serde_json::Value) -> Option<String> {
     match manifest_json {
         serde_json::Value::Object(_) => manifest_json
@@ -34,31 +36,6 @@ fn extract_manifest_name_from_json(manifest_json: &serde_json::Value) -> Option<
             .next(),
         _ => None,
     }
-}
-
-fn compute_manifest_id_for_owner(
-    manifest_json: &JsonValue,
-    owner_pubkey: &[u8],
-) -> anyhow::Result<String> {
-    use sha2::{Digest, Sha256};
-
-    let manifest_name = extract_manifest_name_from_json(manifest_json).ok_or_else(|| {
-        anyhow::anyhow!("Manifest must have a name field in metadata for deployment")
-    })?;
-
-    // Use SHA-256 for cryptographically secure manifest ID generation.
-    // Hash format: SHA256(owner_pubkey || manifest_name)
-    let mut hasher = Sha256::new();
-    hasher.update(owner_pubkey);
-    hasher.update(manifest_name.as_bytes());
-    let result = hasher.finalize();
-    // Use first 16 bytes (128 bits) encoded as hex for the manifest ID
-    // Format as lowercase hex string manually to avoid hex dependency
-    let hex_chars: String = result[..16]
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect();
-    Ok(hex_chars)
 }
 
 

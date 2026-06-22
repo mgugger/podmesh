@@ -12,17 +12,17 @@ Workload specs are **encrypted client-side** before submission. No single node �
 
 ```
 podctl  ──────────────────────────────────────────────────────────────┐
-  │  seal spec client-side (Umbral PRE)                               │
-  │  encrypt under owner Umbral key                                   │
-  │  generate N kfrags, wrap each to a custodian's X25519 KEM pubkey  │
+  │  seal spec client-side (Shamir secret sharing)                    │
+  │  encrypt spec with a random DEK (XChaCha20-Poly1305)              │
+  │  split DEK into N shares, wrap each to a custodian's KEM          │
   │                                                                   │
   ▼                                                                   ▼
 podmesh-scheduler ◄──── libp2p gossipsub/kad/request-response ──► custodian nodes
   │  routes sealed WorkloadSubmission                                 │
-  │  never sees plaintext                                             │  hold kfrags
+  │  never sees plaintext                                             │  hold wrapped shares
   ▼                                                                   │
-worker nodes ◄──── collect threshold cfrags ────────────────────────┘
-  │  reconstruct via Umbral PRE, decrypt spec, deploy
+worker nodes ◄──── collect M-of-N wrapped shares ───────────────────┘
+  │  reconstruct DEK via Shamir, decrypt spec, deploy
   ▼
 container runtime (Podman / mock)
 ```
@@ -33,7 +33,7 @@ container runtime (Podman / mock)
 |---|---|
 | `podmesh-scheduler` | libp2p node: scheduler, worker, and custodian roles (co-located by default). Exposes a REST API on port 3000. |
 | `podctl` | CLI client: seals workload specs, submits to the scheduler, manages deployments. |
-| `shared/crypto` | Cryptographic primitives: X25519 KEM, Ed25519 signing, XChaCha20-Poly1305 AEAD, Umbral PRE (v2). |
+| `shared/crypto` | Cryptographic primitives: X25519 KEM, Ed25519 signing, XChaCha20-Poly1305 AEAD, Shamir secret sharing. |
 | `shared/protocol` | Shared message types: `SealedSpec`, `WorkloadSubmission`, `WorkloadDispatch`, `NodeCert`, etc. |
 | `shared/p2p` | libp2p swarm helpers. |
 | `podmesh-proxy` | Ingress/egress proxy node. |
@@ -44,7 +44,7 @@ container runtime (Podman / mock)
 ## Trust Model
 
 - **Sealing**: happens entirely in `podctl`. The plaintext spec never leaves the client.
-- **Umbral PRE**: The spec is encrypted under the owner's Umbral pubkey. The owner generates N key fragments (kfrags), each wrapped to a custodian's X25519 KEM pubkey. Custodians re-encrypt to the target worker's Umbral pubkey — the scheduler sees only capsule bytes and wrapped kfrags, never plaintext.
+- **Shamir secret sharing**: The spec is encrypted with a random per-workload DEK (XChaCha20-Poly1305). The owner splits the DEK into N Shamir shares with an M-of-N reconstruction threshold, wrapping each share to a custodian's X25519 KEM pubkey. On request, each custodian re-wraps its single share to the assigned worker's KEM pubkey — the scheduler sees only ciphertext and wrapped shares, and no single custodian ever holds the full DEK.
 - **NodeCerts**: Each node self-signs a certificate advertising its capabilities and KEM pubkey. Custodians and workers verify cert chains before accepting assignments.
 
 ---
@@ -67,8 +67,8 @@ cargo build -p podmesh-scheduler -p podctl
 ### Submit a workload
 
 ```bash
-./target/debug/podctl --api-url http://localhost:3000 submit -f deploy/demo_deployment.yml \
-  --worker-umbral-pk <hex-or-base64-worker-umbral-pk>
+./target/debug/podctl --api-url http://localhost:3000 apply -f deploy/demo_deployment.yml \
+  --shares 5 --threshold 3
 ```
 
 ### Verify peers / debug
@@ -119,7 +119,7 @@ cargo test --package podmesh-scheduler --features podman-tests
 podmesh-scheduler/      main node binary (scheduler + worker + custodian)
 podctl/                 CLI client
 shared/
-  crypto/               cryptographic primitives (KEM, Shamir, Umbral PRE)
+  crypto/               cryptographic primitives (KEM, Shamir secret sharing)
   protocol/             shared wire types
   p2p/                  libp2p helpers
 deploy/                 Podman deployment manifests and demo YAMLs
