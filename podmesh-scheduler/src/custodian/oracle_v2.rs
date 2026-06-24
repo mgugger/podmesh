@@ -313,6 +313,11 @@ mod tests {
 
     #[tokio::test]
     async fn release_share_allows_when_share_index_and_token_match() {
+        // Hold the shared keypair-config lock across both the seed (encrypt) and
+        // the release (decrypt) so a concurrent test cannot flip the global
+        // keypair mode in between and invalidate the stored DEK share.
+        let _kp_lock = crate::keypair_test_lock().lock().await;
+
         let manifest_id = "m-pos-share-idx-match";
         let local_peer_id = "local-custodian-c";
         seed_record(manifest_id, local_peer_id, 1);

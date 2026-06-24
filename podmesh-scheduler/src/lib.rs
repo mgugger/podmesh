@@ -29,6 +29,22 @@ pub use scheduler::{
     SchedulingPlan, SchedulingStrategy,
 };
 
+/// Process-wide serialization lock for tests that read or mutate the global
+/// `crypto` keypair configuration.
+///
+/// Several unit tests in this crate share one process and run in parallel.
+/// Some toggle the global keypair mode (e.g. Persistent ↔ Ephemeral) while
+/// others encrypt with one `ensure_kem_keypair_on_disk()` call and decrypt with
+/// a later one, assuming a stable keypair source in between. Without mutual
+/// exclusion, a mode flip from a concurrent test changes the keypair source
+/// mid-test and decryption fails. Any such test must hold this lock for the
+/// span that depends on a stable keypair configuration.
+#[cfg(test)]
+pub(crate) fn keypair_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Operating mode of a podmesh node.
 ///
 /// - `Worker`    — participates in workload scheduling and execution only.

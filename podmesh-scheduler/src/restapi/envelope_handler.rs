@@ -484,6 +484,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_envelope_roundtrip() {
+        // Serialize against other tests that depend on the global keypair config
+        // before mutating it process-wide.
+        let _kp_lock = crate::keypair_test_lock().lock().await;
+
         // Set ephemeral KEM mode for this test
         let _config_guard = KeypairConfigGuard::kem_ephemeral();
 

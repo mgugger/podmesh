@@ -7,7 +7,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use once_cell::sync::Lazy;
 use rand::RngCore;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
@@ -146,6 +146,17 @@ static EPHEMERAL_SIGNING: once_cell::sync::OnceCell<(Vec<u8>, Vec<u8>)> = once_c
 /// Cached ephemeral KEM keypair
 static EPHEMERAL_KEM: once_cell::sync::OnceCell<(Vec<u8>, Vec<u8>)> = once_cell::sync::OnceCell::new();
 
+/// Serializes persistent-mode keypair generation across threads.
+///
+/// Without this lock, concurrent callers that all observe the key files as
+/// missing would each generate a *different* keypair and clobber the files on
+/// disk (a TOCTOU race). A later caller could then read a keypair that no
+/// longer matches data already encrypted to a previously generated public key.
+/// Holding this lock for the whole read-or-generate critical section guarantees
+/// exactly one keypair is ever generated per file set and that reads never
+/// observe a partially written file.
+static KEYGEN_LOCK: Mutex<()> = Mutex::new(());
+
 pub fn ensure_keypair_on_disk() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let config = get_keypair_config();
 
@@ -168,6 +179,11 @@ pub fn ensure_keypair_on_disk() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
 
             let pub_path = key_dir.join(PUBKEY_FILE);
             let priv_path = key_dir.join(PRIVKEY_FILE);
+
+            // Serialize the read-or-generate section so concurrent callers do
+            // not each generate and clobber the on-disk keypair (TOCTOU race).
+            let _guard = KEYGEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
             if pub_path.exists() && priv_path.exists() {
                 let pubb = std::fs::read(&pub_path)?;
                 let privb = std::fs::read(&priv_path)?;
@@ -222,6 +238,11 @@ pub fn ensure_kem_keypair_on_disk() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
 
             let pub_path = key_dir.join(KEM_PUBFILE);
             let priv_path = key_dir.join(KEM_PRIVFILE);
+
+            // Serialize the read-or-generate section so concurrent callers do
+            // not each generate and clobber the on-disk keypair (TOCTOU race).
+            let _guard = KEYGEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
             if pub_path.exists() && priv_path.exists() {
                 let pubb = std::fs::read(&pub_path)?;
                 let privb = std::fs::read(&priv_path)?;
