@@ -58,11 +58,11 @@ impl Default for EgressProxyConfig {
 /// originally tried to connect to before nftables redirected the connection.
 #[cfg(target_os = "linux")]
 pub fn get_original_dst(stream: &TcpStream) -> Result<SocketAddr> {
-    use std::mem::{size_of, MaybeUninit};
+    use std::mem::{MaybeUninit, size_of};
     use std::os::unix::io::AsRawFd;
 
     let fd = stream.as_raw_fd();
-    
+
     // IPv4 original destination
     let mut addr: MaybeUninit<libc::sockaddr_in> = MaybeUninit::uninit();
     let mut len: libc::socklen_t = size_of::<libc::sockaddr_in>() as libc::socklen_t;
@@ -127,10 +127,7 @@ pub struct EgressProxy {
 
 impl EgressProxy {
     /// Creates a new egress proxy
-    pub fn new(
-        config: EgressProxyConfig,
-        tunnel_tx: mpsc::Sender<TunnelRequest>,
-    ) -> Self {
+    pub fn new(config: EgressProxyConfig, tunnel_tx: mpsc::Sender<TunnelRequest>) -> Self {
         Self { config, tunnel_tx }
     }
 
@@ -140,11 +137,11 @@ impl EgressProxy {
     /// and forwarding them to the tunnel channel for processing.
     pub async fn run(&self) -> Result<()> {
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.listen_port));
-        
+
         // Create the listener socket with transparent proxy options
-        let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
-            .context("Failed to create socket")?;
-        
+        let socket =
+            Socket::new(Domain::IPV4, Type::STREAM, None).context("Failed to create socket")?;
+
         // Enable IP_TRANSPARENT to accept redirected connections
         #[cfg(target_os = "linux")]
         {
@@ -160,18 +157,21 @@ impl EgressProxy {
             };
             if ret != 0 {
                 let err = std::io::Error::last_os_error();
-                log::warn!("Failed to set IP_TRANSPARENT (may not be required): {}", err);
+                log::warn!(
+                    "Failed to set IP_TRANSPARENT (may not be required): {}",
+                    err
+                );
                 // Don't fail - IP_TRANSPARENT may not be needed for REDIRECT
             }
         }
-        
+
         socket.set_reuse_address(true)?;
         socket.bind(&addr.into())?;
         socket.listen(128)?;
         socket.set_nonblocking(true)?;
 
-        let listener = TcpListener::from_std(socket.into())
-            .context("Failed to convert to TcpListener")?;
+        let listener =
+            TcpListener::from_std(socket.into()).context("Failed to convert to TcpListener")?;
 
         log::info!(
             "Egress proxy listening on {} for redirected connections",
@@ -182,10 +182,14 @@ impl EgressProxy {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
                     let tunnel_tx = self.tunnel_tx.clone();
-                    
+
                     tokio::spawn(async move {
                         if let Err(e) = handle_connection(stream, peer_addr, tunnel_tx).await {
-                            log::error!("Failed to handle egress connection from {}: {}", peer_addr, e);
+                            log::error!(
+                                "Failed to handle egress connection from {}: {}",
+                                peer_addr,
+                                e
+                            );
                         }
                     });
                 }
@@ -204,10 +208,9 @@ async fn handle_connection(
     tunnel_tx: mpsc::Sender<TunnelRequest>,
 ) -> Result<()> {
     // Get the original destination before the redirect
-    let orig_dst = get_original_dst(&stream)
-        .context("Failed to get original destination")?;
+    let orig_dst = get_original_dst(&stream).context("Failed to get original destination")?;
 
-    log::debug!(
+    log::info!(
         "Egress connection from {} -> original dest {}",
         peer_addr,
         orig_dst

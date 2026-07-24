@@ -5,10 +5,10 @@
 //!
 //! Test flow:
 //! 1. Deploy podmesh stack (scheduler + proxy)
-//! 2. Deploy test workload with curl client + sidecar (enable_egress=true, CAP_NET_ADMIN)
-//! 3. Execute curl to httpbin.org from within the app container
-//! 4. Verify sidecar logs contain "Egress proxy listening" and "egress tunnel established"
-//! 5. Verify proxy logs show handling of egress tunnel stream
+//! 2. Provision the proxy with the workload tenant's signed certificate
+//! 3. Deploy test workload with curl client + sidecar (enable_egress=true, CAP_NET_ADMIN)
+//! 4. Execute curl to the scheduler health endpoint from within the workload pod
+//! 5. Verify interception, tunnel establishment, proxy handling, and the HTTP 200 response
 
 #![cfg(feature = "podman-tests")]
 
@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use podctl::{apply_file, delete_file};
-use podmesh_integration_tests::support::{init_ephemeral_keys, init_tracing};
+use podmesh_agent::sidecar::workload_runtime_name;
+use podmesh_integration_tests::support::{init_ephemeral_keys, init_tracing, provision_proxy_cert};
 use reqwest::Client;
 use serde_json::Value;
 use serial_test::serial;
@@ -29,12 +30,13 @@ const MACHINE_API_URL: &str = "http://127.0.0.1:3000";
 const ROOTLESS_MANIFEST_PATH: &str = "deploy/podmesh_rootless.yml";
 const ROOTFUL_MANIFEST_PATH: &str = "deploy/podmesh_rootful.yml";
 const EGRESS_TEST_MANIFEST_PATH: &str = "tests/sample_manifests/transparent_egress_test.yml";
-const REQUIRED_MACHINE_PEERS: usize = 1;
+const EGRESS_TEST_URL: &str = "http://scheduler:3000/health";
 const PODMESH_NETWORK: &str = "podmesh";
 const ROOTLESS_PODMAN_SOCKET: &str = "/run/user/1000/podman/podman.sock";
 const ROOTFUL_PODMAN_SOCKET: &str = "/run/podman/podman.sock";
-const REQUIRED_IMAGES: [&str; 3] = [
+const REQUIRED_IMAGES: [&str; 4] = [
     "localhost/podmesh/scheduler:latest",
+    "localhost/podmesh/agent:latest",
     "localhost/podmesh/proxy:latest",
     "localhost/podmesh/sidecar:latest",
 ];
@@ -43,6 +45,7 @@ const REQUIRED_IMAGES: [&str; 3] = [
 const SIDECAR_EGRESS_LISTENING_PATTERN: &str = "Egress proxy listening";
 const SIDECAR_EGRESS_CONNECTION_PATTERN: &str = "Egress connection from";
 const SIDECAR_EGRESS_TUNNEL_ESTABLISHED_PATTERN: &str = "egress tunnel established";
+const SIDECAR_REGISTRATION_PATTERN: &str = "sidecar registration acknowledged";
 const PROXY_EGRESS_TUNNEL_PATTERN: &str = "egress tunnel";
 
 /// Integration test that validates transparent egress proxy through podman.
@@ -58,10 +61,10 @@ async fn transparent_egress_routes_through_sidecar_and_proxy() -> Result<()> {
     init_tracing();
     init_ephemeral_keys();
 
-    if !is_podman_available().await {
-        log::warn!("skipping transparent egress test because podman is unavailable");
-        return Ok(());
-    }
+    anyhow::ensure!(
+        is_podman_available().await,
+        "podman-tests requires the podman CLI"
+    );
 
     // Determine which podman socket and manifest to use
     let (socket_path, manifest_path, mode) = if is_socket_available(ROOTLESS_PODMAN_SOCKET) {
@@ -69,23 +72,15 @@ async fn transparent_egress_routes_through_sidecar_and_proxy() -> Result<()> {
     } else if is_socket_available(ROOTFUL_PODMAN_SOCKET) {
         (ROOTFUL_PODMAN_SOCKET, ROOTFUL_MANIFEST_PATH, "rootful")
     } else {
-        log::warn!(
-            "skipping transparent egress test because no podman socket is available. \
-             rootless: {} (start with `systemctl --user start podman.socket`), \
-             rootful: {} (start with `sudo systemctl start podman.socket`)",
+        anyhow::bail!(
+            "podman-tests requires a Podman socket; rootless: {} (start with `systemctl --user start podman.socket`), rootful: {}",
             ROOTLESS_PODMAN_SOCKET,
             ROOTFUL_PODMAN_SOCKET
         );
-        return Ok(());
     };
     log::info!("using {mode} podman socket: {socket_path}");
 
-    if let Err(err) = verify_required_images().await {
-        log::warn!(
-            "skipping transparent egress test because required container images are not available: {err:?}"
-        );
-        return Ok(());
-    }
+    verify_required_images().await?;
 
     let workspace = workspace_root();
     let stack_manifest = workspace.join(manifest_path);
@@ -102,7 +97,16 @@ async fn transparent_egress_routes_through_sidecar_and_proxy() -> Result<()> {
 
     // Wait for machine to be healthy and peers to register
     wait_for_machine_health(&client, Duration::from_secs(120)).await?;
-    wait_for_peer_registration(&client, REQUIRED_MACHINE_PEERS, Duration::from_secs(120)).await?;
+    wait_for_agent_registration(&client, Duration::from_secs(120)).await?;
+    let (owner_public, owner_private) = crypto::ensure_keypair_on_disk()?;
+    provision_proxy_cert(
+        3001,
+        &owner_public,
+        &owner_private,
+        Duration::from_secs(120),
+    )
+    .await
+    .context("failed to provision tenant proxy certificate")?;
 
     // Deploy the egress test workload
     let manifest_id = apply_file(egress_test_manifest.clone(), Some(MACHINE_API_URL))
@@ -113,14 +117,10 @@ async fn transparent_egress_routes_through_sidecar_and_proxy() -> Result<()> {
 
     // Wait for workload containers to be running
     wait_for_egress_test_containers(&manifest_id, Duration::from_secs(180)).await?;
+    wait_for_sidecar_registration(&manifest_id, Duration::from_secs(120)).await?;
 
-    // Give sidecar time to set up nftables rules and connect to proxy
-    sleep(Duration::from_secs(10)).await;
-
-    // Execute curl request from within the app container to httpbin.org
-    // This may fail if proxy peer discovery isn't complete yet, but we still
-    // want to verify that the nftables transparent proxy redirect is working
-    let curl_result = execute_egress_curl(&manifest_id).await;
+    let curl_output = execute_egress_curl(&manifest_id).await?;
+    log::info!("egress curl succeeded: {} bytes", curl_output.len());
 
     // Wait a moment for logs to be written
     sleep(Duration::from_secs(2)).await;
@@ -129,23 +129,11 @@ async fn transparent_egress_routes_through_sidecar_and_proxy() -> Result<()> {
     // This validates our rustables/netlink nftables implementation
     verify_sidecar_egress_logs(&manifest_id).await?;
 
-    // Only continue with full verification if curl succeeded
-    match curl_result {
-        Ok(curl_output) => {
-            log::info!("curl to httpbin.org succeeded: {} bytes", curl_output.len());
+    verify_proxy_egress_logs().await?;
 
-            // Verify proxy logs show egress tunnel handling
-            verify_proxy_egress_logs().await?;
-
-            log::info!("transparent egress proxy test passed - traffic successfully routed through sidecar and proxy");
-        }
-        Err(e) => {
-            // Curl failed but nftables redirect is working (verified above)
-            // This is likely due to proxy peer discovery timing
-            log::warn!("curl to external host failed, but nftables redirect is working: {}", e);
-            log::info!("transparent egress proxy test PARTIAL PASS - nftables redirect working, but end-to-end tunnel not established");
-        }
-    }
+    log::info!(
+        "transparent egress proxy test passed - traffic successfully routed through sidecar and proxy"
+    );
 
     // Cleanup
     delete_file(egress_test_manifest.clone(), true, Some(MACHINE_API_URL))
@@ -280,23 +268,23 @@ impl Drop for PodmanKubeGuard {
 
 #[derive(Default)]
 struct WorkloadGuard {
-    manifest_id: Option<String>,
+    workload_name: Option<String>,
 }
 
 impl WorkloadGuard {
-    fn set(&mut self, manifest_id: String) {
-        self.manifest_id = Some(manifest_id);
+    fn set(&mut self, workload_name: String) {
+        self.workload_name = Some(workload_name);
     }
 
     fn disarm(&mut self) {
-        self.manifest_id = None;
+        self.workload_name = None;
     }
 }
 
 impl Drop for WorkloadGuard {
     fn drop(&mut self) {
-        if let Some(id) = self.manifest_id.take() {
-            let pod_name = format!("podmesh-{}", id);
+        if let Some(workload_name) = self.workload_name.take() {
+            let pod_name = format!("{}-pod", workload_runtime_name(&workload_name));
             let _ = StdCommand::new("podman")
                 .arg("pod")
                 .arg("rm")
@@ -328,53 +316,31 @@ async fn wait_for_machine_health(client: &Client, timeout: Duration) -> Result<(
     Err(last_err.unwrap_or_else(|| anyhow!("machine REST API never became healthy")))
 }
 
-async fn wait_for_peer_registration(
-    client: &Client,
-    min_peers: usize,
-    timeout: Duration,
-) -> Result<()> {
-    let url = format!("{MACHINE_API_URL}/debug/peers");
+async fn wait_for_agent_registration(client: &Client, timeout: Duration) -> Result<()> {
+    let url = format!("{MACHINE_API_URL}/api/v1/agents/select");
     let deadline = Instant::now() + timeout;
     let mut last_err: Option<anyhow::Error> = None;
 
     while Instant::now() < deadline {
         match client.get(&url).send().await {
-            Ok(response) if response.status().is_success() => {
-                match response.json::<Value>().await {
-                    Ok(value) => {
-                        if value
-                            .get("count")
-                            .and_then(|c| c.as_u64())
-                            .map(|count| (count as usize) >= min_peers)
-                            .unwrap_or(false)
-                        {
-                            return Ok(());
-                        }
-                    }
-                    Err(err) => last_err = Some(err.into()),
-                }
-            }
-            Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
-                // debug-endpoints feature not enabled in container, skip peer check
-                log::warn!(
-                    "debug/peers endpoint not available (404), skipping peer registration check. \
-                     Build container with debug-endpoints feature to enable this check."
-                );
-                return Ok(());
-            }
+            Ok(response) if response.status().is_success() => return Ok(()),
             Ok(response) => {
-                last_err = Some(anyhow!("peer debug endpoint status {}", response.status()));
+                last_err = Some(anyhow!(
+                    "agent selection endpoint status {}",
+                    response.status()
+                ));
             }
             Err(err) => last_err = Some(err.into()),
         }
         sleep(Duration::from_millis(500)).await;
     }
 
-    Err(last_err.unwrap_or_else(|| anyhow!("machine never reported {min_peers} peers")))
+    Err(last_err.unwrap_or_else(|| anyhow!("scheduler never reported an available agent")))
 }
 
-async fn wait_for_egress_test_containers(manifest_id: &str, timeout: Duration) -> Result<()> {
+async fn wait_for_egress_test_containers(workload_name: &str, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
+    let runtime_name = workload_runtime_name(workload_name);
     let targets: HashSet<&str> = ["curl-client", "sidecar"].iter().copied().collect();
     let mut satisfied: HashSet<&str> = HashSet::new();
     let mut last_err: Option<anyhow::Error> = None;
@@ -384,14 +350,14 @@ async fn wait_for_egress_test_containers(manifest_id: &str, timeout: Duration) -
             Ok(containers) => {
                 satisfied.clear();
                 for target in &targets {
-                    if containers.iter().any(|c| c.matches(manifest_id, target)) {
+                    if containers.iter().any(|c| c.matches(&runtime_name, target)) {
                         satisfied.insert(target);
                     }
                 }
                 if satisfied.len() == targets.len() {
                     log::info!(
-                        "egress test workload containers are running for manifest {}",
-                        manifest_id
+                        "egress test workload containers are running for workload {}",
+                        workload_name
                     );
                     return Ok(());
                 }
@@ -403,22 +369,23 @@ async fn wait_for_egress_test_containers(manifest_id: &str, timeout: Duration) -
 
     Err(last_err.unwrap_or_else(|| {
         anyhow!(
-            "timed out waiting for containers {:?} belonging to manifest {}",
+            "timed out waiting for containers {:?} belonging to workload {}",
             ["curl-client", "sidecar"],
-            manifest_id
+            workload_name
         )
     }))
 }
 
-async fn wait_for_workload_teardown(manifest_id: &str, timeout: Duration) -> Result<()> {
+async fn wait_for_workload_teardown(workload_name: &str, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
+    let runtime_name = workload_runtime_name(workload_name);
 
     while Instant::now() < deadline {
         match capture_podman_containers().await {
             Ok(containers) => {
                 let active = containers
                     .iter()
-                    .any(|c| c.belongs_to_manifest(manifest_id));
+                    .any(|c| c.belongs_to_workload(&runtime_name));
                 if !active {
                     return Ok(());
                 }
@@ -431,21 +398,38 @@ async fn wait_for_workload_teardown(manifest_id: &str, timeout: Duration) -> Res
     }
 
     Err(anyhow!(
-        "workload containers for manifest {} never terminated after delete",
-        manifest_id
+        "workload containers for {} never terminated after delete",
+        workload_name
     ))
 }
 
-/// Execute a curl request from within the app container to httpbin.org
-/// Returns the output regardless of HTTP status - we just need to verify
-/// that network traffic flowed through the transparent proxy.
-/// Retries several times to allow proxy peer discovery to complete.
-async fn execute_egress_curl(manifest_id: &str) -> Result<String> {
-    let curl_container = find_container_by_pattern(manifest_id, "curl-client").await?;
+async fn wait_for_sidecar_registration(workload_name: &str, timeout: Duration) -> Result<()> {
+    let sidecar_container = find_container_by_pattern(workload_name, "sidecar").await?;
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        let logs = get_container_logs(&sidecar_container).await?;
+        if logs.contains(SIDECAR_REGISTRATION_PATTERN) {
+            log::info!("sidecar registered with an authenticated tenant proxy");
+            return Ok(());
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    Err(anyhow!(
+        "sidecar did not register with an authenticated tenant proxy"
+    ))
+}
+
+/// Execute an HTTP request from the workload pod to another pod in the mesh.
+/// The request must be intercepted and tunneled through the authenticated proxy.
+async fn execute_egress_curl(workload_name: &str) -> Result<String> {
+    let curl_container = find_container_by_pattern(workload_name, "curl-client").await?;
 
     log::info!(
-        "executing curl to httpbin.org from container {}",
-        curl_container
+        "executing curl to {} from container {}",
+        EGRESS_TEST_URL,
+        curl_container,
     );
 
     // Retry curl with increasing delays to allow proxy peer discovery
@@ -456,8 +440,6 @@ async fn execute_egress_curl(manifest_id: &str) -> Result<String> {
     for attempt in 1..=MAX_RETRIES {
         log::info!("curl attempt {}/{}", attempt, MAX_RETRIES);
 
-        // Execute curl to httpbin.org/get - this should be intercepted by nftables
-        // and routed through the transparent proxy
         let result = run_podman_command(&[
             "exec",
             &curl_container,
@@ -468,7 +450,7 @@ async fn execute_egress_curl(manifest_id: &str) -> Result<String> {
             "15", // 15 second timeout per attempt
             "-w",
             "\nHTTP_STATUS:%{http_code}\n",
-            "http://httpbin.org/get",
+            EGRESS_TEST_URL,
         ])
         .await;
 
@@ -476,18 +458,12 @@ async fn execute_egress_curl(manifest_id: &str) -> Result<String> {
             Ok(output) => {
                 log::info!("curl output: {}", output);
 
-                // Any response (even 5xx) means traffic went through the network stack
-                // The key verification is in the sidecar logs showing transparent proxy activity
-                if output.contains("HTTP_STATUS:") {
-                    log::info!("received HTTP response from httpbin.org (traffic flowed through network)");
-                    return Ok(output);
-                } else if output.contains("httpbin.org") || output.contains("origin") || output.contains("<html>") {
-                    // Got some response body
-                    log::info!("received response body from httpbin.org");
+                if output.contains("HTTP_STATUS:200") {
+                    log::info!("received successful HTTP response through egress tunnel");
                     return Ok(output);
                 } else {
                     last_error = Some(anyhow!(
-                        "no HTTP response received - curl may have failed entirely: {}",
+                        "egress destination did not return HTTP 200: {}",
                         output
                     ));
                 }
@@ -505,12 +481,12 @@ async fn execute_egress_curl(manifest_id: &str) -> Result<String> {
     }
 
     Err(last_error.unwrap_or_else(|| anyhow!("curl failed after {} attempts", MAX_RETRIES)))
-        .context("curl to httpbin.org failed - network may not be routed through proxy")
+        .context("egress request failed")
 }
 
 /// Verify sidecar logs contain evidence of transparent proxy activity
-async fn verify_sidecar_egress_logs(manifest_id: &str) -> Result<()> {
-    let sidecar_container = find_container_by_pattern(manifest_id, "sidecar").await?;
+async fn verify_sidecar_egress_logs(workload_name: &str) -> Result<()> {
+    let sidecar_container = find_container_by_pattern(workload_name, "sidecar").await?;
     let logs = get_container_logs(&sidecar_container).await?;
 
     log::debug!("sidecar logs:\n{}", logs);
@@ -545,59 +521,36 @@ async fn verify_sidecar_egress_logs(manifest_id: &str) -> Result<()> {
         missing_patterns
     );
 
-    // We require at least the egress proxy to be listening
-    if !found_patterns.contains(&SIDECAR_EGRESS_LISTENING_PATTERN) {
-        return Err(anyhow!(
-            "sidecar egress proxy not listening - transparent proxy may not be enabled. \
-             Found patterns: {:?}, Missing: {:?}",
-            found_patterns,
-            missing_patterns
-        ));
-    }
-
-    // For full verification, we want to see the tunnel established
-    if !found_patterns.contains(&SIDECAR_EGRESS_TUNNEL_ESTABLISHED_PATTERN) {
-        log::warn!(
-            "egress tunnel establishment not found in logs - traffic may not be flowing through proxy. \
-             This could indicate nftables rules didn't redirect traffic."
-        );
-    }
+    anyhow::ensure!(
+        missing_patterns.is_empty(),
+        "sidecar lacks required transparent egress evidence; found={found_patterns:?} missing={missing_patterns:?}"
+    );
 
     Ok(())
 }
 
 /// Verify proxy logs show egress tunnel handling
 async fn verify_proxy_egress_logs() -> Result<()> {
-    // Find the proxy container from the podmesh stack
     let containers = capture_podman_containers().await?;
-    let proxy_container = containers
+    let proxy_containers: Vec<String> = containers
         .iter()
-        .find(|c| {
-            c.names
-                .iter()
-                .any(|name| name.contains("proxy") && name.contains("podmesh"))
-        })
-        .map(|c| c.names.first().cloned())
-        .flatten();
+        .flat_map(|container| container.names.iter())
+        .filter(|name| name.starts_with("proxy-proxy"))
+        .cloned()
+        .collect();
+    anyhow::ensure!(!proxy_containers.is_empty(), "no proxy containers found");
 
-    if let Some(container_name) = proxy_container {
+    for container_name in proxy_containers {
         let logs = get_container_logs(&container_name).await?;
         log::debug!("proxy logs:\n{}", logs);
 
-        if logs.contains(PROXY_EGRESS_TUNNEL_PATTERN) || logs.contains("egress") {
+        if logs.contains(PROXY_EGRESS_TUNNEL_PATTERN) {
             log::info!("proxy logs show egress tunnel activity");
-        } else {
-            log::warn!(
-                "proxy logs do not show egress tunnel activity - \
-                 this may be expected if tunnel logging is at debug level"
-            );
+            return Ok(());
         }
-    } else {
-        log::warn!("could not find proxy container to verify egress logs");
     }
 
-    // Don't fail on missing proxy logs - the sidecar verification is sufficient
-    Ok(())
+    Err(anyhow!("proxy logs contain no egress tunnel activity"))
 }
 
 /// Get logs from a container
@@ -625,20 +578,21 @@ async fn get_container_logs(container_name: &str) -> Result<String> {
 }
 
 /// Find a container matching the manifest ID and name pattern
-async fn find_container_by_pattern(manifest_id: &str, pattern: &str) -> Result<String> {
+async fn find_container_by_pattern(workload_name: &str, pattern: &str) -> Result<String> {
+    let runtime_name = workload_runtime_name(workload_name);
     let containers = capture_podman_containers().await?;
 
     for container in &containers {
-        if container.matches(manifest_id, pattern) {
-            if let Some(name) = container.names.first() {
-                return Ok(name.clone());
-            }
+        if container.matches(&runtime_name, pattern)
+            && let Some(name) = container.names.first()
+        {
+            return Ok(name.clone());
         }
     }
 
     Err(anyhow!(
-        "could not find container matching manifest_id={} pattern={}",
-        manifest_id,
+        "could not find container matching workload={} pattern={}",
+        workload_name,
         pattern
     ))
 }
@@ -696,16 +650,16 @@ struct PodmanContainer {
 }
 
 impl PodmanContainer {
-    fn matches(&self, manifest_id: &str, token: &str) -> bool {
+    fn matches(&self, workload_name: &str, token: &str) -> bool {
         self.state == ContainerState::Running
             && self
                 .names
                 .iter()
-                .any(|name| name.contains(manifest_id) && name.contains(token))
+                .any(|name| name.contains(workload_name) && name.contains(token))
     }
 
-    fn belongs_to_manifest(&self, manifest_id: &str) -> bool {
-        self.names.iter().any(|name| name.contains(manifest_id))
+    fn belongs_to_workload(&self, workload_name: &str) -> bool {
+        self.names.iter().any(|name| name.contains(workload_name))
     }
 }
 
@@ -731,15 +685,15 @@ fn extract_container_names(value: &Value) -> Vec<String> {
             .iter()
             .filter_map(|entry| entry.as_str().map(|s| s.to_string()))
             .collect();
-        if names.is_empty() {
-            if let Some(name) = value.get("Names").and_then(|n| n.as_str()) {
-                names.push(name.to_string());
-            }
+        if names.is_empty()
+            && let Some(name) = value.get("Names").and_then(|n| n.as_str())
+        {
+            names.push(name.to_string());
         }
-        if names.is_empty() {
-            if let Some(name) = value.get("Name").and_then(|n| n.as_str()) {
-                names.push(name.to_string());
-            }
+        if names.is_empty()
+            && let Some(name) = value.get("Name").and_then(|n| n.as_str())
+        {
+            names.push(name.to_string());
         }
         names
     } else if let Some(name) = value.get("Names").and_then(|n| n.as_str()) {
@@ -757,10 +711,10 @@ fn extract_container_state(value: &Value) -> ContainerState {
     if let Some(state_value) = value.get("State") {
         if let Some(state_str) = state_value.as_str() {
             candidates.push(state_str.to_string());
-        } else if let Some(obj) = state_value.as_object() {
-            if let Some(status) = obj.get("Status").and_then(|s| s.as_str()) {
-                candidates.push(status.to_string());
-            }
+        } else if let Some(obj) = state_value.as_object()
+            && let Some(status) = obj.get("Status").and_then(|s| s.as_str())
+        {
+            candidates.push(status.to_string());
         }
     }
 

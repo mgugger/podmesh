@@ -75,27 +75,29 @@ impl Envelope {
     }
 }
 
-fn base_envelope(
-    payload: &[u8],
-    payload_type: &str,
-    nonce: &str,
-    ts: u64,
-    alg: &str,
-    peer_id: &str,
-    sig: &str,
-    pubkey: &str,
-    kem_pubkey: Option<&str>,
-) -> Envelope {
+struct EnvelopeParams<'a> {
+    payload: &'a [u8],
+    payload_type: &'a str,
+    nonce: &'a str,
+    timestamp: u64,
+    algorithm: &'a str,
+    peer_id: &'a str,
+    signature: &'a str,
+    public_key: &'a str,
+    kem_public_key: Option<&'a str>,
+}
+
+fn base_envelope(params: EnvelopeParams<'_>) -> Envelope {
     Envelope {
-        payload: payload.to_vec(),
-        payload_type: payload_type.to_string(),
-        nonce: nonce.to_string(),
-        ts,
-        alg: alg.to_string(),
-        sig: sig.to_string(),
-        pubkey: pubkey.to_string(),
-        peer_id: peer_id.to_string(),
-        kem_pubkey: kem_pubkey.unwrap_or_default().to_string(),
+        payload: params.payload.to_vec(),
+        payload_type: params.payload_type.to_string(),
+        nonce: params.nonce.to_string(),
+        ts: params.timestamp,
+        alg: params.algorithm.to_string(),
+        sig: params.signature.to_string(),
+        pubkey: params.public_key.to_string(),
+        peer_id: params.peer_id.to_string(),
+        kem_pubkey: params.kem_public_key.unwrap_or_default().to_string(),
     }
 }
 
@@ -107,42 +109,45 @@ pub fn build_envelope_canonical(
     alg: &str,
     kem_pub: Option<&str>,
 ) -> Vec<u8> {
-    serialize(&base_envelope(
+    serialize(&base_envelope(EnvelopeParams {
         payload,
         payload_type,
         nonce,
-        ts,
-        alg,
-        "",
-        "",
-        "",
-        kem_pub,
-    ))
+        timestamp: ts,
+        algorithm: alg,
+        peer_id: "",
+        signature: "",
+        public_key: "",
+        kem_public_key: kem_pub,
+    }))
 }
 
-pub fn build_envelope_signed(
-    payload: &[u8],
-    payload_type: &str,
-    nonce: &str,
-    ts: u64,
-    alg: &str,
-    sig_prefix: &str,
-    sig_b64: &str,
-    pubkey_b64: &str,
-    kem_pub_b64: Option<&str>,
-) -> Vec<u8> {
-    let sig_full = format!("{}:{}", sig_prefix, sig_b64);
-    serialize(&base_envelope(
-        payload,
-        payload_type,
-        nonce,
-        ts,
-        alg,
-        "",
-        &sig_full,
-        pubkey_b64,
-        kem_pub_b64,
-    ))
+pub struct SignedEnvelopeParams<'a> {
+    pub payload: &'a [u8],
+    pub payload_type: &'a str,
+    pub nonce: &'a str,
+    pub timestamp: u64,
+    pub algorithm: &'a str,
+    pub signature_prefix: &'a str,
+    pub signature_b64: &'a str,
+    pub public_key_b64: &'a str,
+    pub peer_id: Option<&'a str>,
+    pub kem_public_key_b64: Option<&'a str>,
+}
+
+pub fn build_envelope_signed(params: SignedEnvelopeParams<'_>) -> Vec<u8> {
+    let signature = format!("{}:{}", params.signature_prefix, params.signature_b64);
+    serialize(&base_envelope(EnvelopeParams {
+        payload: params.payload,
+        payload_type: params.payload_type,
+        nonce: params.nonce,
+        timestamp: params.timestamp,
+        algorithm: params.algorithm,
+        peer_id: params.peer_id.unwrap_or_default(),
+        signature: &signature,
+        public_key: params.public_key_b64,
+        kem_public_key: params.kem_public_key_b64,
+    }))
 }
 
 pub fn build_envelope_canonical_with_peer(
@@ -154,43 +159,17 @@ pub fn build_envelope_canonical_with_peer(
     peer_id: &str,
     kem_pub: Option<&str>,
 ) -> Vec<u8> {
-    serialize(&base_envelope(
+    serialize(&base_envelope(EnvelopeParams {
         payload,
         payload_type,
         nonce,
         timestamp,
         algorithm,
         peer_id,
-        "",
-        "",
-        kem_pub,
-    ))
-}
-
-pub fn build_envelope_signed_with_peer(
-    payload: &[u8],
-    payload_type: &str,
-    nonce: &str,
-    timestamp: u64,
-    algorithm: &str,
-    sig_prefix: &str,
-    sig_b64: &str,
-    pubkey_b64: &str,
-    peer_id: &str,
-    kem_pub_b64: Option<&str>,
-) -> Vec<u8> {
-    let sig_full = format!("{}:{}", sig_prefix, sig_b64);
-    serialize(&base_envelope(
-        payload,
-        payload_type,
-        nonce,
-        timestamp,
-        algorithm,
-        peer_id,
-        &sig_full,
-        pubkey_b64,
-        kem_pub_b64,
-    ))
+        signature: "",
+        public_key: "",
+        kem_public_key: kem_pub,
+    }))
 }
 
 pub fn root_as_envelope(bytes: &[u8]) -> Result<Envelope, postcard::Error> {
@@ -209,9 +188,9 @@ pub fn envelope_extract_sig_pub(envelope_bytes: &[u8]) -> Option<(Vec<u8>, Vec<u
     Some((sig_bytes, pub_bytes))
 }
 
-pub fn envelope_extract_sig_pub_legacy(
-    buf: &[u8],
-) -> anyhow::Result<(Vec<u8>, Vec<u8>, Vec<u8>, String, String)> {
+pub type LegacyEnvelopeParts = (Vec<u8>, Vec<u8>, Vec<u8>, String, String);
+
+pub fn envelope_extract_sig_pub_legacy(buf: &[u8]) -> anyhow::Result<LegacyEnvelopeParts> {
     let env =
         root_as_envelope(buf).map_err(|e| anyhow::anyhow!("failed to parse envelope: {e}"))?;
 
@@ -232,10 +211,8 @@ pub fn envelope_extract_sig_pub_legacy(
         .nth(if sig_field.contains(':') { 1 } else { 0 })
         .unwrap_or(&sig_field)
         .to_string();
-    let sig_bytes = crypto::b64_decode(&sig_b64)
-        .context("failed to base64-decode signature")?;
-    let pub_bytes = crypto::b64_decode(&pubkey_field)
-        .context("failed to base64-decode pubkey")?;
+    let sig_bytes = crypto::b64_decode(&sig_b64).context("failed to base64-decode signature")?;
+    let pub_bytes = crypto::b64_decode(&pubkey_field).context("failed to base64-decode pubkey")?;
 
     Ok((canonical, sig_bytes, pub_bytes, sig_field, pubkey_field))
 }
@@ -260,22 +237,23 @@ pub fn build_encrypted_envelope(
         None,
     );
 
-    let sender_pubkey_bytes = crypto::b64_decode(sender_pubkey)
-        .context("failed to decode sender public key")?;
+    let sender_pubkey_bytes =
+        crypto::b64_decode(sender_pubkey).context("failed to decode sender public key")?;
     let (sig_b64, pub_b64) =
         crypto::sign_envelope(sender_privkey, &sender_pubkey_bytes, &canonical)?;
 
-    Ok(build_envelope_signed(
-        &encrypted_payload,
+    Ok(build_envelope_signed(SignedEnvelopeParams {
+        payload: &encrypted_payload,
         payload_type,
-        &nonce,
-        ts,
-        "ed25519",
-        "ed25519",
-        &sig_b64,
-        &pub_b64,
-        None,
-    ))
+        nonce: &nonce,
+        timestamp: ts,
+        algorithm: "ed25519",
+        signature_prefix: "ed25519",
+        signature_b64: &sig_b64,
+        public_key_b64: &pub_b64,
+        peer_id: None,
+        kem_public_key_b64: None,
+    }))
 }
 
 pub fn build_encrypted_envelope_with_peer(
@@ -301,23 +279,23 @@ pub fn build_encrypted_envelope_with_peer(
         sender_kem_pub_b64,
     );
 
-    let sender_pubkey_bytes = crypto::b64_decode(sender_pubkey)
-        .context("failed to decode sender public key")?;
+    let sender_pubkey_bytes =
+        crypto::b64_decode(sender_pubkey).context("failed to decode sender public key")?;
     let (sig_b64, pub_b64) =
         crypto::sign_envelope(sender_privkey, &sender_pubkey_bytes, &canonical)?;
 
-    Ok(build_envelope_signed_with_peer(
-        &encrypted_payload,
+    Ok(build_envelope_signed(SignedEnvelopeParams {
+        payload: &encrypted_payload,
         payload_type,
-        &nonce,
-        ts,
-        "ed25519",
-        "ed25519",
-        &sig_b64,
-        &pub_b64,
-        peer_id,
-        sender_kem_pub_b64,
-    ))
+        nonce: &nonce,
+        timestamp: ts,
+        algorithm: "ed25519",
+        signature_prefix: "ed25519",
+        signature_b64: &sig_b64,
+        public_key_b64: &pub_b64,
+        peer_id: Some(peer_id),
+        kem_public_key_b64: sender_kem_pub_b64,
+    }))
 }
 
 fn envelope_nonce_and_timestamp() -> (String, u64) {

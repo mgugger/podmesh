@@ -9,9 +9,9 @@ use podmesh_sidecar::{
     split_csv,
 };
 use protocol::{
-    sidecar_metadata::{DEFAULT_SIDECAR_BOOTSTRAP_MULTIADDR, SidecarMetadata},
     libp2p_constants::MESH_DOMAIN_SUFFIX,
     machine::{SidecarRouteKind, SidecarRouteSpec},
+    sidecar_metadata::{DEFAULT_SIDECAR_BOOTSTRAP_MULTIADDR, SidecarMetadata},
 };
 
 #[derive(Parser, Debug)]
@@ -52,10 +52,18 @@ struct Args {
     #[arg(long = "metadata-b64", env = "PODMESH_SIDECAR_METADATA_B64")]
     metadata_b64: Option<String>,
     /// Enable transparent egress proxy (requires CAP_NET_ADMIN for nftables)
-    #[arg(long = "enable-egress", env = "PODMESH_ENABLE_EGRESS", default_value_t = false)]
+    #[arg(
+        long = "enable-egress",
+        env = "PODMESH_ENABLE_EGRESS",
+        default_value_t = false
+    )]
     enable_egress: bool,
     /// Skip nftables programming even when egress is enabled (useful for tests or restricted hosts)
-    #[arg(long = "skip-egress-nft", env = "PODMESH_SKIP_EGRESS_NFT", default_value_t = false)]
+    #[arg(
+        long = "skip-egress-nft",
+        env = "PODMESH_SKIP_EGRESS_NFT",
+        default_value_t = false
+    )]
     skip_egress_nft: bool,
     /// Port for HTTP CONNECT proxy (explicit proxy mode, 0 to use default port)
     /// If not specified, HTTP CONNECT proxy is disabled.
@@ -107,8 +115,7 @@ impl TryFrom<Args> for SidecarConfig {
         if !derived_from_ingress {
             warn!(
                 "no ingress host detected; using fallback manifest id metadata_manifest={} manifest={}",
-                metadata.manifest_id,
-                manifest_id
+                metadata.manifest_id, manifest_id
             );
         }
         update_service_route_hosts(&mut routes, &manifest_id);
@@ -158,8 +165,8 @@ fn decode_inline_metadata(blob: &str) -> Result<SidecarMetadata> {
         return Err(anyhow::anyhow!("inline sidecar metadata blob is empty"));
     }
 
-    let decoded = crypto::b64_decode(trimmed)
-        .context("failed to decode inline sidecar metadata blob")?;
+    let decoded =
+        crypto::b64_decode(trimmed).context("failed to decode inline sidecar metadata blob")?;
 
     let metadata: SidecarMetadata =
         serde_json::from_slice(&decoded).context("failed to parse inline sidecar metadata blob")?;

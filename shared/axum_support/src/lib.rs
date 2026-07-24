@@ -10,7 +10,7 @@ use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 
 pub mod rate_limiter;
-pub use rate_limiter::{create_rate_limiter, rate_limit_middleware, RateLimiterState};
+pub use rate_limiter::{RateLimiterState, create_rate_limiter, rate_limit_middleware};
 
 /// Spawn a TCP axum server by binding to the provided address inside the task.
 /// This version supports ConnectInfo<SocketAddr> for rate limiting middleware.

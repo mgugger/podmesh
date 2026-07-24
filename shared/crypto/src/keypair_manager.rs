@@ -28,8 +28,11 @@ pub enum KeypairError {
 pub type KeypairResult<T> = Result<T, KeypairError>;
 
 /// Cached ephemeral keypairs for testing and development
-static EPHEMERAL_SIGNING_KEYPAIR: OnceCell<Mutex<Option<(Vec<u8>, Vec<u8>)>>> = OnceCell::new();
-static EPHEMERAL_KEM_KEYPAIR: OnceCell<Mutex<Option<(Vec<u8>, Vec<u8>)>>> = OnceCell::new();
+type EncodedKeypair = (Vec<u8>, Vec<u8>);
+type KeypairCache = OnceCell<Mutex<Option<EncodedKeypair>>>;
+
+static EPHEMERAL_SIGNING_KEYPAIR: KeypairCache = OnceCell::new();
+static EPHEMERAL_KEM_KEYPAIR: KeypairCache = OnceCell::new();
 
 /// Keypair types supported by the system
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,7 +81,7 @@ impl KeypairManager {
     pub fn get_persistent_signing_keypair() -> KeypairResult<(Vec<u8>, Vec<u8>)> {
         crate::ensure_keypair_on_disk()
             .map_err(|e| KeypairError::LoadingFailed(format!("signing keypair: {}", e)))
-            .and_then(|(pub_bytes, priv_bytes)| {
+            .map(|(pub_bytes, priv_bytes)| {
                 CryptoLogger::log_crypto_operation(
                     "load_signing_keypair",
                     true,
@@ -89,7 +92,7 @@ impl KeypairManager {
                     pub_bytes.len(),
                     priv_bytes.len()
                 );
-                Ok((pub_bytes, priv_bytes))
+                (pub_bytes, priv_bytes)
             })
     }
 
@@ -97,7 +100,7 @@ impl KeypairManager {
     pub fn get_persistent_kem_keypair() -> KeypairResult<(Vec<u8>, Vec<u8>)> {
         crate::ensure_kem_keypair_on_disk()
             .map_err(|e| KeypairError::LoadingFailed(format!("KEM keypair: {}", e)))
-            .and_then(|(pub_bytes, priv_bytes)| {
+            .map(|(pub_bytes, priv_bytes)| {
                 CryptoLogger::log_crypto_operation(
                     "load_kem_keypair",
                     true,
@@ -108,7 +111,7 @@ impl KeypairManager {
                     pub_bytes.len(),
                     priv_bytes.len()
                 );
-                Ok((pub_bytes, priv_bytes))
+                (pub_bytes, priv_bytes)
             })
     }
 
@@ -155,8 +158,8 @@ impl KeypairManager {
         }
 
         // Generate new ephemeral X25519 keypair
-        let mut rng = rand::rngs::OsRng;
-        let secret = StaticSecret::random_from_rng(&mut rng);
+        let rng = rand::rngs::OsRng;
+        let secret = StaticSecret::random_from_rng(rng);
         let public = X25519PublicKey::from(&secret);
 
         let pub_bytes = public.as_bytes().to_vec();
@@ -196,8 +199,8 @@ impl KeypairManager {
                 Ok((pub_bytes, priv_bytes))
             }
             KeypairType::Kem => {
-                let mut rng = rand::rngs::OsRng;
-                let secret = StaticSecret::random_from_rng(&mut rng);
+                let rng = rand::rngs::OsRng;
+                let secret = StaticSecret::random_from_rng(rng);
                 let public = X25519PublicKey::from(&secret);
 
                 let pub_bytes = public.as_bytes().to_vec();
@@ -219,9 +222,9 @@ impl KeypairManager {
 
         crate::sign_envelope(&priv_bytes, &pub_bytes, data)
             .map_err(|e| KeypairError::GenerationFailed(format!("signing operation: {}", e)))
-            .and_then(|(sig_b64, pub_b64)| {
+            .map(|(sig_b64, pub_b64)| {
                 CryptoLogger::log_crypto_operation("sign_data", true, Some("envelope signing"));
-                Ok((sig_b64, pub_b64))
+                (sig_b64, pub_b64)
             })
     }
 
@@ -248,9 +251,9 @@ impl KeypairManager {
     pub fn encapsulate_to_pubkey(pub_bytes: &[u8]) -> KeypairResult<(Vec<u8>, Vec<u8>)> {
         crate::encapsulate_to_pubkey(pub_bytes)
             .map_err(|e| KeypairError::GenerationFailed(format!("KEM encapsulation: {}", e)))
-            .and_then(|(ciphertext, shared_secret)| {
+            .map(|(ciphertext, shared_secret)| {
                 CryptoLogger::log_crypto_operation("kem_encapsulate", true, None);
-                Ok((ciphertext, shared_secret))
+                (ciphertext, shared_secret)
             })
     }
 
@@ -263,9 +266,8 @@ impl KeypairManager {
 
         crate::decapsulate_share(&priv_bytes, ciphertext)
             .map_err(|e| KeypairError::GenerationFailed(format!("KEM decapsulation: {}", e)))
-            .and_then(|shared_secret| {
+            .inspect(|_| {
                 CryptoLogger::log_crypto_operation("kem_decapsulate", true, None);
-                Ok(shared_secret)
             })
     }
 
@@ -411,8 +413,7 @@ mod tests {
     fn test_keypair_info() {
         let info = KeypairManager::get_keypair_info(KeypairType::Signing, StorageMode::Ephemeral);
 
-        if info.is_ok() {
-            let info = info.unwrap();
+        if let Ok(info) = info {
             assert_eq!(info.keypair_type, KeypairType::Signing);
             assert_eq!(info.storage_mode, StorageMode::Ephemeral);
             assert!(info.public_key_len > 0);

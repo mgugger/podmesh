@@ -1,40 +1,21 @@
-# =====================
-# 1. Build the gateway binary
-# =====================
 FROM rust:latest AS builder
-
 WORKDIR /app
-
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends musl-tools pkg-config clang llvm libclang-dev \
+    && apt-get install -y --no-install-recommends ca-certificates clang libclang-dev llvm musl-tools \
     && rm -rf /var/lib/apt/lists/*
-
-RUN rustup target add x86_64-unknown-linux-musl
-
 COPY . .
+RUN set -eu; \
+    case "$(uname -m)" in \
+      x86_64) rust_target=x86_64-unknown-linux-musl ;; \
+      aarch64|arm64) rust_target=aarch64-unknown-linux-musl ;; \
+      *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    rustup target add "$rust_target"; \
+    cargo build --release --locked -p podmesh-sidecar --target "$rust_target"; \
+    install -Dm0755 "target/$rust_target/release/podmesh-sidecar" /out/podmesh-sidecar
 
-RUN cargo build --release --locked -p podmesh-sidecar --target x86_64-unknown-linux-musl
-
-# =====================
-# 2. Minimal runtime image
-# =====================
 FROM scratch
-
-# Provide a minimal BusyBox for basic tooling (optional)
-#COPY --from=busybox:musl /bin/busybox /bin/busybox
-#RUN ["/bin/busybox", "ln", "-s", "/bin/busybox", "/bin/sh"]
-
-# Basic /etc data needed by glibc-compatible binaries
-COPY --from=alpine:latest /etc/passwd /etc/passwd
-COPY --from=alpine:latest /etc/group /etc/group
-COPY --from=alpine:latest /etc/hosts /etc/hosts
-COPY --from=alpine:latest /etc/nsswitch.conf /etc/nsswitch.conf
-COPY --from=alpine:latest /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-
-# Sidecar binary
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/podmesh-sidecar /usr/local/bin/podmesh-sidecar
-
-ENV PATH=/usr/local/bin:/bin
-
-ENTRYPOINT ["podmesh-sidecar"]
-
+ENV HOME=/var/lib/podmesh-sidecar
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /out/podmesh-sidecar /usr/local/bin/podmesh-sidecar
+ENTRYPOINT ["/usr/local/bin/podmesh-sidecar"]

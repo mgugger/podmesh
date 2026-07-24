@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use podctl::{apply_file, delete_file};
+use podmesh_agent::sidecar::workload_runtime_name;
 use podmesh_integration_tests::support::{init_ephemeral_keys, init_tracing};
 use protocol::libp2p_constants::MESH_DOMAIN_SUFFIX;
 use reqwest::Client;
@@ -20,13 +21,13 @@ const ROOTFUL_MANIFEST_PATH: &str = "deploy/podmesh_rootful.yml";
 const SAMPLE_MANIFEST_PATH: &str = "tests/sample_manifests/demo_deployment_without_sidecar.yml";
 const PODMESH_PROXY_URL: &str = "http://127.0.0.1:8080/";
 const EXPECTED_BODY_SUBSTRING: &str = "Welcome to Podmesh";
-const REQUIRED_MACHINE_PEERS: usize = 1;
 const EXPECTED_CONTAINERS: [&str; 2] = ["my-nginx", "sidecar"];
 const PODMESH_NETWORK: &str = "podmesh";
 const ROOTLESS_PODMAN_SOCKET: &str = "/run/user/1000/podman/podman.sock";
 const ROOTFUL_PODMAN_SOCKET: &str = "/run/podman/podman.sock";
-const REQUIRED_IMAGES: [&str; 3] = [
+const REQUIRED_IMAGES: [&str; 4] = [
     "localhost/podmesh/scheduler:latest",
+    "localhost/podmesh/agent:latest",
     "localhost/podmesh/proxy:latest",
     "localhost/podmesh/sidecar:latest",
 ];
@@ -37,10 +38,10 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
     init_tracing();
     init_ephemeral_keys();
 
-    if !is_podman_available().await {
-        log::warn!("skipping end-to-end test because podman is unavailable");
-        return Ok(());
-    }
+    anyhow::ensure!(
+        is_podman_available().await,
+        "podman-tests requires the podman CLI"
+    );
 
     // Determine which podman socket and manifest to use
     let (socket_path, manifest_path, mode) = if is_socket_available(ROOTLESS_PODMAN_SOCKET) {
@@ -48,23 +49,15 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
     } else if is_socket_available(ROOTFUL_PODMAN_SOCKET) {
         (ROOTFUL_PODMAN_SOCKET, ROOTFUL_MANIFEST_PATH, "rootful")
     } else {
-        log::warn!(
-            "skipping end-to-end test because no podman socket is available. \
-             rootless: {} (start with `systemctl --user start podman.socket`), \
-             rootful: {} (start with `sudo systemctl start podman.socket`)",
+        anyhow::bail!(
+            "podman-tests requires a Podman socket; rootless: {} (start with `systemctl --user start podman.socket`), rootful: {}",
             ROOTLESS_PODMAN_SOCKET,
             ROOTFUL_PODMAN_SOCKET
         );
-        return Ok(());
     };
     log::info!("using {mode} podman socket: {socket_path}");
 
-    if let Err(err) = verify_required_images().await {
-        log::warn!(
-            "skipping end-to-end test because required container images are not available: {err:?}"
-        );
-        return Ok(());
-    }
+    verify_required_images().await?;
 
     let workspace = workspace_root();
     let stack_manifest = workspace.join(manifest_path);
@@ -79,7 +72,7 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
         .context("failed to build HTTP client")?;
 
     wait_for_machine_health(&client, Duration::from_secs(120)).await?;
-    wait_for_peer_registration(&client, REQUIRED_MACHINE_PEERS, Duration::from_secs(120)).await?;
+    wait_for_agent_registration(&client, Duration::from_secs(120)).await?;
 
     let manifest_id = apply_file(sample_manifest.clone(), Some(MACHINE_API_URL))
         .await
@@ -142,7 +135,7 @@ fn is_unix_socket(metadata: &std::fs::Metadata) -> bool {
 async fn verify_required_images() -> Result<()> {
     let output = run_podman_command(["images", "--format", "json"]).await?;
     let images: Value = serde_json::from_str(&output).context("invalid podman images json")?;
-    
+
     let available_images: HashSet<String> = images
         .as_array()
         .ok_or_else(|| anyhow!("podman images output was not an array"))?
@@ -221,23 +214,23 @@ impl Drop for PodmanKubeGuard {
 
 #[derive(Default)]
 struct WorkloadGuard {
-    manifest_id: Option<String>,
+    workload_name: Option<String>,
 }
 
 impl WorkloadGuard {
-    fn set(&mut self, manifest_id: String) {
-        self.manifest_id = Some(manifest_id);
+    fn set(&mut self, workload_name: String) {
+        self.workload_name = Some(workload_name);
     }
 
     fn disarm(&mut self) {
-        self.manifest_id = None;
+        self.workload_name = None;
     }
 }
 
 impl Drop for WorkloadGuard {
     fn drop(&mut self) {
-        if let Some(id) = self.manifest_id.take() {
-            let pod_name = format!("podmesh-{}", id);
+        if let Some(workload_name) = self.workload_name.take() {
+            let pod_name = format!("{}-pod", workload_runtime_name(&workload_name));
             let _ = StdCommand::new("podman")
                 .arg("pod")
                 .arg("rm")
@@ -269,53 +262,31 @@ async fn wait_for_machine_health(client: &Client, timeout: Duration) -> Result<(
     Err(last_err.unwrap_or_else(|| anyhow!("machine REST API never became healthy")))
 }
 
-async fn wait_for_peer_registration(
-    client: &Client,
-    min_peers: usize,
-    timeout: Duration,
-) -> Result<()> {
-    let url = format!("{MACHINE_API_URL}/debug/peers");
+async fn wait_for_agent_registration(client: &Client, timeout: Duration) -> Result<()> {
+    let url = format!("{MACHINE_API_URL}/api/v1/agents/select");
     let deadline = Instant::now() + timeout;
     let mut last_err: Option<anyhow::Error> = None;
 
     while Instant::now() < deadline {
         match client.get(&url).send().await {
-            Ok(response) if response.status().is_success() => {
-                match response.json::<Value>().await {
-                    Ok(value) => {
-                        if value
-                            .get("count")
-                            .and_then(|c| c.as_u64())
-                            .map(|count| (count as usize) >= min_peers)
-                            .unwrap_or(false)
-                        {
-                            return Ok(());
-                        }
-                    }
-                    Err(err) => last_err = Some(err.into()),
-                }
-            }
-            Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
-                // debug-endpoints feature not enabled in container, skip peer check
-                log::warn!(
-                    "debug/peers endpoint not available (404), skipping peer registration check. \
-                     Build container with debug-endpoints feature to enable this check."
-                );
-                return Ok(());
-            }
+            Ok(response) if response.status().is_success() => return Ok(()),
             Ok(response) => {
-                last_err = Some(anyhow!("peer debug endpoint status {}", response.status()));
+                last_err = Some(anyhow!(
+                    "agent selection endpoint status {}",
+                    response.status()
+                ));
             }
             Err(err) => last_err = Some(err.into()),
         }
         sleep(Duration::from_millis(500)).await;
     }
 
-    Err(last_err.unwrap_or_else(|| anyhow!("machine never reported {min_peers} peers")))
+    Err(last_err.unwrap_or_else(|| anyhow!("scheduler never reported an available agent")))
 }
 
-async fn wait_for_workload_containers(manifest_id: &str, timeout: Duration) -> Result<()> {
+async fn wait_for_workload_containers(workload_name: &str, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
+    let runtime_name = workload_runtime_name(workload_name);
     let targets: HashSet<&str> = EXPECTED_CONTAINERS.iter().copied().collect();
     let mut satisfied: HashSet<&str> = HashSet::new();
     let mut last_err: Option<anyhow::Error> = None;
@@ -325,14 +296,14 @@ async fn wait_for_workload_containers(manifest_id: &str, timeout: Duration) -> R
             Ok(containers) => {
                 satisfied.clear();
                 for target in &targets {
-                    if containers.iter().any(|c| c.matches(manifest_id, target)) {
+                    if containers.iter().any(|c| c.matches(&runtime_name, target)) {
                         satisfied.insert(target);
                     }
                 }
                 if satisfied.len() == targets.len() {
                     log::info!(
-                        "nginx workload containers are running for manifest {}",
-                        manifest_id
+                        "nginx workload containers are running for workload {}",
+                        workload_name
                     );
                     return Ok(());
                 }
@@ -344,22 +315,23 @@ async fn wait_for_workload_containers(manifest_id: &str, timeout: Duration) -> R
 
     Err(last_err.unwrap_or_else(|| {
         anyhow!(
-            "timed out waiting for containers {:?} belonging to manifest {}",
+            "timed out waiting for containers {:?} belonging to workload {}",
             EXPECTED_CONTAINERS,
-            manifest_id
+            workload_name
         )
     }))
 }
 
-async fn wait_for_workload_teardown(manifest_id: &str, timeout: Duration) -> Result<()> {
+async fn wait_for_workload_teardown(workload_name: &str, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
+    let runtime_name = workload_runtime_name(workload_name);
 
     while Instant::now() < deadline {
         match capture_podman_containers().await {
             Ok(containers) => {
                 let active = containers
                     .iter()
-                    .any(|c| c.belongs_to_manifest(manifest_id));
+                    .any(|c| c.belongs_to_workload(&runtime_name));
                 if !active {
                     return Ok(());
                 }
@@ -372,8 +344,8 @@ async fn wait_for_workload_teardown(manifest_id: &str, timeout: Duration) -> Res
     }
 
     Err(anyhow!(
-        "workload containers for manifest {} never terminated after delete",
-        manifest_id
+        "workload containers for {} never terminated after delete",
+        workload_name
     ))
 }
 
@@ -465,16 +437,16 @@ struct PodmanContainer {
 }
 
 impl PodmanContainer {
-    fn matches(&self, manifest_id: &str, token: &str) -> bool {
+    fn matches(&self, workload_name: &str, token: &str) -> bool {
         self.state == ContainerState::Running
             && self
                 .names
                 .iter()
-                .any(|name| name.contains(manifest_id) && name.contains(token))
+                .any(|name| name.contains(workload_name) && name.contains(token))
     }
 
-    fn belongs_to_manifest(&self, manifest_id: &str) -> bool {
-        self.names.iter().any(|name| name.contains(manifest_id))
+    fn belongs_to_workload(&self, workload_name: &str) -> bool {
+        self.names.iter().any(|name| name.contains(workload_name))
     }
 }
 
@@ -500,15 +472,15 @@ fn extract_container_names(value: &Value) -> Vec<String> {
             .iter()
             .filter_map(|entry| entry.as_str().map(|s| s.to_string()))
             .collect();
-        if names.is_empty() {
-            if let Some(name) = value.get("Names").and_then(|n| n.as_str()) {
-                names.push(name.to_string());
-            }
+        if names.is_empty()
+            && let Some(name) = value.get("Names").and_then(|n| n.as_str())
+        {
+            names.push(name.to_string());
         }
-        if names.is_empty() {
-            if let Some(name) = value.get("Name").and_then(|n| n.as_str()) {
-                names.push(name.to_string());
-            }
+        if names.is_empty()
+            && let Some(name) = value.get("Name").and_then(|n| n.as_str())
+        {
+            names.push(name.to_string());
         }
         names
     } else if let Some(name) = value.get("Names").and_then(|n| n.as_str()) {
@@ -526,10 +498,10 @@ fn extract_container_state(value: &Value) -> ContainerState {
     if let Some(state_value) = value.get("State") {
         if let Some(state_str) = state_value.as_str() {
             candidates.push(state_str.to_string());
-        } else if let Some(obj) = state_value.as_object() {
-            if let Some(status) = obj.get("Status").and_then(|s| s.as_str()) {
-                candidates.push(status.to_string());
-            }
+        } else if let Some(obj) = state_value.as_object()
+            && let Some(status) = obj.get("Status").and_then(|s| s.as_str())
+        {
+            candidates.push(status.to_string());
         }
     }
 

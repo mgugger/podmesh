@@ -6,9 +6,7 @@ static INIT_EPHEMERAL_KEYS: Once = Once::new();
 
 pub fn init_tracing() {
     INIT_LOGGING.call_once(|| {
-        let _ = env_logger::builder()
-            .is_test(true)
-            .try_init();
+        let _ = env_logger::builder().is_test(true).try_init();
     });
 }
 
@@ -78,8 +76,8 @@ pub fn generate_test_node_cert(peer_id: &str, role: protocol::NodeRole) -> proto
 /// drive the `podctl grant-proxy` flow in integration tests so the proxy
 /// holds a tenant-signed `NodeCert` and the sidecar can verify it.
 pub fn fresh_tenant_owner() -> (String, Vec<u8>, Vec<u8>) {
-    use rand::rngs::OsRng;
     use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
     let mut rng = OsRng;
     let sk = SigningKey::generate(&mut rng);
     let pk = sk.verifying_key();

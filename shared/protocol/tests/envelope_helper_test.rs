@@ -1,5 +1,5 @@
 use crypto::{ensure_keypair_ephemeral, sign_envelope};
-use protocol::machine::build_envelope_signed;
+use protocol::machine::{SignedEnvelopeParams, build_envelope_signed};
 
 #[test]
 fn envelope_helper_roundtrip() {
@@ -17,17 +17,18 @@ fn envelope_helper_roundtrip() {
     let (sig_b64, pub_b64) = sign_envelope(&privb, &pubb, &canonical).expect("sign");
 
     // Build a signed postcard envelope using the same format
-    let envelope = build_envelope_signed(
-        &payload,
+    let envelope = build_envelope_signed(SignedEnvelopeParams {
+        payload: &payload,
         payload_type,
         nonce,
-        ts,
-        alg,
-        "ed25519",
-        &sig_b64,
-        &pub_b64,
-        None,
-    );
+        timestamp: ts,
+        algorithm: alg,
+        signature_prefix: "ed25519",
+        signature_b64: &sig_b64,
+        public_key_b64: &pub_b64,
+        peer_id: None,
+        kem_public_key_b64: None,
+    });
 
     // Use helper to extract and verify fields
     let (canon2, sig_bytes, pub_bytes, sig_field, pub_field) =

@@ -1,5 +1,7 @@
 use crypto::{b64_decode, ensure_keypair_ephemeral, sign_envelope, verify_envelope};
-use protocol::machine::{build_envelope_canonical, build_envelope_signed, root_as_envelope};
+use protocol::machine::{
+    SignedEnvelopeParams, build_envelope_canonical, build_envelope_signed, root_as_envelope,
+};
 
 #[test]
 fn postcard_envelope_sign_and_verify() -> anyhow::Result<()> {
@@ -17,17 +19,18 @@ fn postcard_envelope_sign_and_verify() -> anyhow::Result<()> {
 
     let (sig_b64, pub_b64) = sign_envelope(&priv_bytes, &pub_bytes, &canonical_bytes)?;
 
-    let signed_bytes = build_envelope_signed(
-        payload_bytes,
-        "test.payload.v1",
-        "nonce-abc-123",
-        123_456_789,
-        "ed25519",
-        "ed25519",
-        &sig_b64,
-        &pub_b64,
-        None,
-    );
+    let signed_bytes = build_envelope_signed(SignedEnvelopeParams {
+        payload: payload_bytes,
+        payload_type: "test.payload.v1",
+        nonce: "nonce-abc-123",
+        timestamp: 123_456_789,
+        algorithm: "ed25519",
+        signature_prefix: "ed25519",
+        signature_b64: &sig_b64,
+        public_key_b64: &pub_b64,
+        peer_id: None,
+        kem_public_key_b64: None,
+    });
 
     let sig_bytes = b64_decode(&sig_b64)?;
 

@@ -2,23 +2,39 @@
 
 ## ADDED Requirements
 
-### Requirement: Encrypted workload execution
+### Requirement: Workload execution is encrypted end to end
 
-The system MUST allow execution of encrypted workloads without exposing plaintext to schedulers.
+The complete execution specification MUST be encrypted between the namespace client and selected
+agent. The scheduler and unrelated agents MUST NOT receive plaintext or the DEK.
 
-#### Scenario: Worker executes encrypted workload
-- Given a workload is submitted in encrypted form
-- And a worker is assigned the workload
-- When the worker retrieves it
-- Then only the worker can decrypt and execute it
+#### Scenario: Selected agent receives a workload
+- **WHEN** podctl deploys an admitted workload
+- **THEN** only the selected agent can unwrap the DEK and decrypt the complete specification
 
-## ADDED Requirements
+### Requirement: Agent validates admission and deployment independently
 
-### Requirement: Scheduler cannot access workload secrets
+The selected agent MUST verify owner identity, request expiry, replay nonce, aggregate resources,
+reservation binding, target node, workload identity, revision identity, and grant signature before
+execution.
 
-Schedulers MUST NOT access plaintext workloads or decryption keys.
+#### Scenario: Agent validates a deployment
+- **WHEN** the agent receives an encrypted grant
+- **THEN** it verifies owner, expiry, replay nonce, resources, reservation, target, workload identity, revision, and signature before execution
 
-#### Scenario: Scheduler routes workload without decryption
-- Given a workload is submitted
-- When the scheduler processes it
-- Then it forwards it without decrypting or inspecting payload
+### Requirement: Agent isolates workload lifecycle state
+
+Each workload MUST have an independently encrypted persistent record and independently authorized
+status, logs, and delete commands. Deleting one workload MUST NOT modify another.
+
+#### Scenario: One workload is deleted
+- **WHEN** an owner deletes one of several workloads on an agent
+- **THEN** only that workload runtime and encrypted record are removed
+
+### Requirement: Scheduler is not in the lifecycle path
+
+Running workloads, restart reconciliation, status, logs, and deletion MUST remain functional without
+scheduler persistence.
+
+#### Scenario: Scheduler is unavailable
+- **WHEN** an owner requests status, logs, or deletion using a receipt
+- **THEN** the operation is handled directly by the agent without scheduler state

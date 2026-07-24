@@ -2,10 +2,9 @@
 
 ## Context
 
-This spec addresses the trust gap between `podmesh-sidecar` and `podmesh-proxy`:
-both sides currently communicate over an encrypted libp2p transport but do not
-verify that the other party belongs to the same tenant, and the DHT key used for
-proxy discovery (`podmesh-proxy-node`) is global and tenant-agnostic.
+This spec addressed the original trust gap between `podmesh-sidecar` and `podmesh-proxy`:
+authenticated libp2p QUIC/TLS transport did not prove tenant membership, and the original global
+proxy discovery key was tenant-agnostic.
 
 The trust anchor for workload ownership in podmesh is the operator's Ed25519 keypair
 (managed by podctl). This spec extends that anchor to proxy identity by:
@@ -22,11 +21,12 @@ which is sufficient as the tenant anchor for both DHT key derivation and cert ve
 
 ## ADDED Requirements
 
-### Requirement: podctl provisions a tenant-signed NodeCert to the proxy exactly once
+### Requirement: podctl provisions a tenant-signed NodeCert before proxy use
 
 The operator MUST run `podctl cert grant-proxy` to sign and deliver a `NodeCert` to the proxy
-before any workload that uses that proxy is deployed. This is a one-time setup per
-tenant–proxy pair. The cert is delivered directly to the proxy's REST API; it is not
+before any workload that uses that proxy is deployed. Re-provisioning renews or replaces the
+in-memory certificate for the tenant–proxy pair and is required after proxy restart until durable
+certificate storage exists. The cert is delivered directly to the proxy's REST API; it is not
 embedded in any workload submission or `SidecarMetadata`.
 
 #### Scenario: podctl fetches proxy key material and signs a cert

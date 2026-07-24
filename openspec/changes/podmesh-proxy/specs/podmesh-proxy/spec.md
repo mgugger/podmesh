@@ -59,7 +59,7 @@ The proxy MUST accept egress tunnel streams and relay them to the requested dest
 
 The proxy connects to whatever `dest_host:dest_port` a sidecar requests. There is no observed
 per-manifest egress policy enforcement in the proxy binary at this time (policy test fixtures
-exist but enforcement is in the scheduler/sidecar layer).
+exist, but destination policy is not currently enforced on this path).
 
 ### Observation: Ingress routing trusts the registration map without TTL
 

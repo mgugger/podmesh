@@ -12,9 +12,9 @@ use axum::{
     routing::any,
 };
 use axum_support::{parse_socket_addr, spawn_tcp_listener};
+use log::{error, info, warn};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use log::{error, info, warn};
 
 use crate::p2p::ProxyClient;
 use p2p::http_proxy::ProxyHttpRequest;
@@ -83,16 +83,25 @@ async fn ingress_entry(
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| request.uri().path().to_string());
-    info!("ingress proxy forwarding request via sidecar host={} manifest={} method={} path={}", host, app_id, method, path);
+    info!(
+        "ingress proxy forwarding request via sidecar host={} manifest={} method={} path={}",
+        host, app_id, method, path
+    );
 
     match state.sidecar.forward(&app_id, request).await {
         Ok(response) => {
             let status = response.status().as_u16();
-            info!("ingress proxy received response from sidecar host={} manifest={} method={} path={} status={}", host, app_id, method, path, status);
+            info!(
+                "ingress proxy received response from sidecar host={} manifest={} method={} path={} status={}",
+                host, app_id, method, path, status
+            );
             response
         }
         Err(err) => {
-            error!("sidecar forward failed host={} manifest={} error={}", host, app_id, err);
+            error!(
+                "sidecar forward failed host={} manifest={} error={}",
+                host, app_id, err
+            );
             status_response(StatusCode::BAD_GATEWAY, "sidecar forwarding failed")
         }
     }
@@ -172,7 +181,7 @@ impl SidecarForwarder for NoopSidecarForwarder {
 }
 
 pub fn noop_sidecar_client() -> SidecarClient {
-    Arc::new(NoopSidecarForwarder::default())
+    Arc::new(NoopSidecarForwarder)
 }
 
 #[derive(Clone)]

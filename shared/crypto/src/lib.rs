@@ -14,13 +14,9 @@ use zeroize::Zeroizing;
 use dirs::home_dir;
 
 pub mod envelope_validator;
-pub mod nonce_helper;
 pub mod keypair_manager;
 pub mod logging;
-pub mod key_release;
-pub mod shamir;
-pub use key_release::{KeyReleaseOracle, ShareRequest, ShareResponse};
-pub use shamir::{seal_shamir, unseal_shamir, ShamirSealOutput, WrappedShare};
+pub mod nonce_helper;
 
 pub const KEY_DIR: &str = ".podmesh";
 pub const PUBKEY_FILE: &str = "pubkey.bin";
@@ -141,10 +137,12 @@ fn ensure_key_dir(path: &Path) -> anyhow::Result<()> {
 }
 
 /// Cached ephemeral signing keypair
-static EPHEMERAL_SIGNING: once_cell::sync::OnceCell<(Vec<u8>, Vec<u8>)> = once_cell::sync::OnceCell::new();
+static EPHEMERAL_SIGNING: once_cell::sync::OnceCell<(Vec<u8>, Vec<u8>)> =
+    once_cell::sync::OnceCell::new();
 
 /// Cached ephemeral KEM keypair
-static EPHEMERAL_KEM: once_cell::sync::OnceCell<(Vec<u8>, Vec<u8>)> = once_cell::sync::OnceCell::new();
+static EPHEMERAL_KEM: once_cell::sync::OnceCell<(Vec<u8>, Vec<u8>)> =
+    once_cell::sync::OnceCell::new();
 
 /// Serializes persistent-mode keypair generation across threads.
 ///
@@ -168,7 +166,9 @@ pub fn ensure_keypair_on_disk() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
                 let verifying_key = signing_key.verifying_key();
                 let pubb = verifying_key.to_bytes().to_vec();
                 let privb = signing_key.to_bytes().to_vec();
-                log::warn!("ensure_keypair_on_disk: using ephemeral signing keypair (no disk writes)");
+                log::warn!(
+                    "ensure_keypair_on_disk: using ephemeral signing keypair (no disk writes)"
+                );
                 Ok::<_, anyhow::Error>((pubb, privb))
             })?;
             Ok((keypair.0.clone(), keypair.1.clone()))
@@ -189,10 +189,18 @@ pub fn ensure_keypair_on_disk() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
                 let privb = std::fs::read(&priv_path)?;
                 // Validate key sizes
                 if pubb.len() != ED25519_PUBLIC_KEY_SIZE {
-                    anyhow::bail!("Invalid public key size: expected {}, got {}", ED25519_PUBLIC_KEY_SIZE, pubb.len());
+                    anyhow::bail!(
+                        "Invalid public key size: expected {}, got {}",
+                        ED25519_PUBLIC_KEY_SIZE,
+                        pubb.len()
+                    );
                 }
                 if privb.len() != ED25519_PRIVATE_KEY_SIZE {
-                    anyhow::bail!("Invalid private key size: expected {}, got {}", ED25519_PRIVATE_KEY_SIZE, privb.len());
+                    anyhow::bail!(
+                        "Invalid private key size: expected {}, got {}",
+                        ED25519_PRIVATE_KEY_SIZE,
+                        privb.len()
+                    );
                 }
                 return Ok((pubb, privb));
             }
@@ -222,12 +230,14 @@ pub fn ensure_kem_keypair_on_disk() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     match config.kem_mode {
         KeypairMode::Ephemeral => {
             let keypair = EPHEMERAL_KEM.get_or_try_init(|| {
-                let mut rng = rand::rngs::OsRng;
-                let secret = StaticSecret::random_from_rng(&mut rng);
+                let rng = rand::rngs::OsRng;
+                let secret = StaticSecret::random_from_rng(rng);
                 let public = X25519PublicKey::from(&secret);
                 let pubb = public.as_bytes().to_vec();
                 let privb = secret.as_bytes().to_vec();
-                log::warn!("ensure_kem_keypair_on_disk: using ephemeral KEM keypair (no disk writes)");
+                log::warn!(
+                    "ensure_kem_keypair_on_disk: using ephemeral KEM keypair (no disk writes)"
+                );
                 Ok::<_, anyhow::Error>((pubb, privb))
             })?;
             Ok((keypair.0.clone(), keypair.1.clone()))
@@ -248,16 +258,24 @@ pub fn ensure_kem_keypair_on_disk() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
                 let privb = std::fs::read(&priv_path)?;
                 // Validate key sizes
                 if pubb.len() != X25519_PUBLIC_KEY_SIZE {
-                    anyhow::bail!("Invalid X25519 public key size: expected {}, got {}", X25519_PUBLIC_KEY_SIZE, pubb.len());
+                    anyhow::bail!(
+                        "Invalid X25519 public key size: expected {}, got {}",
+                        X25519_PUBLIC_KEY_SIZE,
+                        pubb.len()
+                    );
                 }
                 if privb.len() != X25519_PRIVATE_KEY_SIZE {
-                    anyhow::bail!("Invalid X25519 private key size: expected {}, got {}", X25519_PRIVATE_KEY_SIZE, privb.len());
+                    anyhow::bail!(
+                        "Invalid X25519 private key size: expected {}, got {}",
+                        X25519_PRIVATE_KEY_SIZE,
+                        privb.len()
+                    );
                 }
                 return Ok((pubb, privb));
             }
 
-            let mut rng = rand::rngs::OsRng;
-            let secret = StaticSecret::random_from_rng(&mut rng);
+            let rng = rand::rngs::OsRng;
+            let secret = StaticSecret::random_from_rng(rng);
             let public = X25519PublicKey::from(&secret);
             let pubb = public.as_bytes().to_vec();
             let privb = secret.as_bytes().to_vec();
@@ -277,7 +295,11 @@ pub fn ensure_kem_keypair_on_disk() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
 /// Validate an X25519 public key by checking its size.
 pub fn validate_kem_pubkey(pub_bytes: &[u8]) -> anyhow::Result<()> {
     if pub_bytes.len() != X25519_PUBLIC_KEY_SIZE {
-        anyhow::bail!("Invalid X25519 public key: expected {} bytes, got {}", X25519_PUBLIC_KEY_SIZE, pub_bytes.len());
+        anyhow::bail!(
+            "Invalid X25519 public key: expected {} bytes, got {}",
+            X25519_PUBLIC_KEY_SIZE,
+            pub_bytes.len()
+        );
     }
     Ok(())
 }
@@ -289,19 +311,23 @@ pub fn encapsulate_to_pubkey(pub_bytes: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u
     if pub_bytes.len() != X25519_PUBLIC_KEY_SIZE {
         anyhow::bail!("Invalid recipient public key size");
     }
-    
-    let recipient_pub: [u8; 32] = pub_bytes.try_into()
+
+    let recipient_pub: [u8; 32] = pub_bytes
+        .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid recipient public key"))?;
     let recipient_public = X25519PublicKey::from(recipient_pub);
-    
+
     // Generate ephemeral keypair for this encryption
     let ephemeral_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
     let ephemeral_public = X25519PublicKey::from(&ephemeral_secret);
-    
+
     // Perform X25519 key agreement
     let shared_secret = ephemeral_secret.diffie_hellman(&recipient_public);
-    
-    Ok((ephemeral_public.as_bytes().to_vec(), shared_secret.as_bytes().to_vec()))
+
+    Ok((
+        ephemeral_public.as_bytes().to_vec(),
+        shared_secret.as_bytes().to_vec(),
+    ))
 }
 
 /// Decapsulate: perform X25519 key agreement using our static private key and the sender's ephemeral public key.
@@ -316,17 +342,19 @@ pub fn decapsulate_share(
     if ephemeral_pub_bytes.len() != X25519_PUBLIC_KEY_SIZE {
         anyhow::bail!("Invalid ephemeral public key size");
     }
-    
-    let priv_arr: [u8; 32] = priv_bytes.try_into()
+
+    let priv_arr: [u8; 32] = priv_bytes
+        .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid private key"))?;
-    let ephemeral_pub_arr: [u8; 32] = ephemeral_pub_bytes.try_into()
+    let ephemeral_pub_arr: [u8; 32] = ephemeral_pub_bytes
+        .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid ephemeral public key"))?;
-    
+
     let our_secret = StaticSecret::from(priv_arr);
     let their_public = X25519PublicKey::from(ephemeral_pub_arr);
-    
+
     let shared_secret = our_secret.diffie_hellman(&their_public);
-    
+
     Ok(Zeroizing::new(shared_secret.as_bytes().to_vec()))
 }
 
@@ -334,7 +362,10 @@ pub fn ensure_keypair_ephemeral() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let mut rng = rand::rngs::OsRng;
     let signing_key = SigningKey::generate(&mut rng);
     let verifying_key = signing_key.verifying_key();
-    Ok((verifying_key.to_bytes().to_vec(), signing_key.to_bytes().to_vec()))
+    Ok((
+        verifying_key.to_bytes().to_vec(),
+        signing_key.to_bytes().to_vec(),
+    ))
 }
 
 /// Get cached ephemeral keypair (same instance across calls) - useful for tests
@@ -348,21 +379,46 @@ pub fn clear_ephemeral_keypair_cache() {
     keypair_manager::KeypairManager::clear_ephemeral_caches();
 }
 
-pub fn encrypt_manifest(
-    manifest_json: &serde_json::Value,
-) -> anyhow::Result<(Vec<u8>, Vec<u8>, [u8; 32], [u8; 24])> {
+pub type EncryptedManifest = (Vec<u8>, Vec<u8>, [u8; 32], [u8; 24]);
+
+pub fn encrypt_manifest(manifest_json: &serde_json::Value) -> anyhow::Result<EncryptedManifest> {
     let mut sym = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut sym);
-    let cipher = XChaCha20Poly1305::new_from_slice(&sym)
+    let plaintext = serde_json::to_vec(manifest_json)?;
+    let (ciphertext, nonce_bytes) = encrypt_payload_with_key(&sym, &plaintext)?;
+    Ok((ciphertext, nonce_bytes.to_vec(), sym, nonce_bytes))
+}
+
+/// Encrypt arbitrary bytes with a caller-owned 256-bit DEK and a fresh nonce.
+pub fn encrypt_payload_with_key(
+    key: &[u8; 32],
+    payload: &[u8],
+) -> anyhow::Result<(Vec<u8>, [u8; 24])> {
+    let cipher = XChaCha20Poly1305::new_from_slice(key)
         .map_err(|e| anyhow::anyhow!("invalid key length for XChaCha20-Poly1305: {}", e))?;
     let mut nonce_bytes = [0u8; 24];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = XNonce::from(nonce_bytes);
-    let plaintext = serde_json::to_vec(manifest_json)?;
     let ciphertext = cipher
-        .encrypt(&nonce, plaintext.as_ref())
+        .encrypt(&nonce, payload)
         .map_err(|e| anyhow::anyhow!("XChaCha20-Poly1305 encrypt error: {}", e))?;
-    Ok((ciphertext, nonce_bytes.to_vec(), sym, nonce_bytes))
+    Ok((ciphertext, nonce_bytes))
+}
+
+/// Decrypt bytes produced by [`encrypt_payload_with_key`].
+pub fn decrypt_payload_with_key(
+    key: &[u8; 32],
+    nonce_bytes: &[u8],
+    ciphertext: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let cipher = XChaCha20Poly1305::new_from_slice(key)
+        .map_err(|e| anyhow::anyhow!("invalid key length for XChaCha20-Poly1305: {}", e))?;
+    let nonce_array: [u8; 24] = nonce_bytes.try_into().map_err(|_| {
+        anyhow::anyhow!("invalid nonce length: {} (expected 24)", nonce_bytes.len())
+    })?;
+    cipher
+        .decrypt(&XNonce::from(nonce_array), ciphertext)
+        .map_err(|e| anyhow::anyhow!("XChaCha20-Poly1305 decrypt error: {}", e))
 }
 
 /// Encrypt an arbitrary payload to a recipient's X25519 public key.
@@ -374,7 +430,7 @@ pub fn encrypt_payload_for_recipient(
 ) -> anyhow::Result<Vec<u8>> {
     // Perform X25519 key agreement with ephemeral keypair
     let (ephemeral_pub, shared_secret) = encapsulate_to_pubkey(recipient_pub)?;
-    
+
     let cipher = XChaCha20Poly1305::new_from_slice(&shared_secret)
         .map_err(|e| anyhow::anyhow!("invalid key length for XChaCha20-Poly1305: {}", e))?;
     let mut nonce_bytes = [0u8; 24];
@@ -388,7 +444,7 @@ pub fn encrypt_payload_for_recipient(
     let mut blob = Vec::with_capacity(1 + 32 + 24 + 4 + ciphertext.len());
     blob.push(0x03u8);
     blob.extend_from_slice(&ephemeral_pub); // 32 bytes
-    blob.extend_from_slice(&nonce_bytes);   // 24 bytes
+    blob.extend_from_slice(&nonce_bytes); // 24 bytes
     let clen = ciphertext.len() as u32;
     blob.extend_from_slice(&clen.to_be_bytes());
     blob.extend_from_slice(&ciphertext);
@@ -403,22 +459,22 @@ pub fn decrypt_payload_from_recipient_blob(
     if blob.is_empty() {
         anyhow::bail!("empty blob");
     }
-    
+
     let version = blob[0];
     if version != 0x03 {
         anyhow::bail!("unsupported recipient-blob version: {}", version);
     }
-    
+
     // Parse version 0x03 format: [version 1][ephemeral_pub 32][nonce 24][ctlen 4][ciphertext]
     let min_len = 1 + 32 + 24 + 4;
     if blob.len() < min_len {
         anyhow::bail!("blob too short");
     }
-    
+
     let ephemeral_pub = &blob[1..33];
     let nonce_bytes = &blob[33..57];
     let clen = u32::from_be_bytes([blob[57], blob[58], blob[59], blob[60]]) as usize;
-    
+
     if blob.len() < min_len + clen {
         anyhow::bail!("blob too short for ciphertext");
     }
@@ -426,15 +482,15 @@ pub fn decrypt_payload_from_recipient_blob(
 
     // Perform X25519 key agreement
     let shared = decapsulate_share(priv_kem_bytes, ephemeral_pub)?;
-    
+
     let cipher = XChaCha20Poly1305::new_from_slice(&shared[..])
         .map_err(|e| anyhow::anyhow!("key error: {}", e))?;
-    
+
     let nonce_array: [u8; 24] = nonce_bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("invalid nonce length"))?;
     let nonce = XNonce::from(nonce_array);
-    
+
     let plain = cipher
         .decrypt(&nonce, ciphertext)
         .map_err(|e| anyhow::anyhow!("XChaCha20-Poly1305 decrypt error: {}", e))?;
@@ -447,19 +503,7 @@ pub fn decrypt_manifest(
     nonce_bytes: &[u8],
     ciphertext: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
-    let cipher = XChaCha20Poly1305::new_from_slice(&sym[..])
-        .map_err(|e| anyhow::anyhow!("invalid key length for XChaCha20-Poly1305: {}", e))?;
-    if nonce_bytes.len() != 24 {
-        anyhow::bail!("invalid nonce length: {} (expected 24)", nonce_bytes.len());
-    }
-    let nonce_array: [u8; 24] = nonce_bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("nonce length mismatch"))?;
-    let nonce = XNonce::from(nonce_array);
-    let plain = cipher
-        .decrypt(&nonce, ciphertext.as_ref())
-        .map_err(|e| anyhow::anyhow!("XChaCha20-Poly1305 decrypt error: {}", e))?;
-    Ok(plain)
+    decrypt_payload_with_key(sym, nonce_bytes, ciphertext)
 }
 
 pub fn sign_envelope(
@@ -468,20 +512,29 @@ pub fn sign_envelope(
     envelope_bytes: &[u8],
 ) -> anyhow::Result<(String, String)> {
     if sk_bytes.len() != ED25519_PRIVATE_KEY_SIZE {
-        anyhow::bail!("Invalid private key size: expected {}, got {}", ED25519_PRIVATE_KEY_SIZE, sk_bytes.len());
+        anyhow::bail!(
+            "Invalid private key size: expected {}, got {}",
+            ED25519_PRIVATE_KEY_SIZE,
+            sk_bytes.len()
+        );
     }
     if pk_bytes.len() != ED25519_PUBLIC_KEY_SIZE {
-        anyhow::bail!("Invalid public key size: expected {}, got {}", ED25519_PUBLIC_KEY_SIZE, pk_bytes.len());
+        anyhow::bail!(
+            "Invalid public key size: expected {}, got {}",
+            ED25519_PUBLIC_KEY_SIZE,
+            pk_bytes.len()
+        );
     }
-    
-    let sk_arr: [u8; 32] = sk_bytes.try_into()
+
+    let sk_arr: [u8; 32] = sk_bytes
+        .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid private key"))?;
     let signing_key = SigningKey::from_bytes(&sk_arr);
-    
+
     let signature = signing_key.sign(envelope_bytes);
     let sig_b64 = general_purpose::STANDARD.encode(signature.to_bytes());
     let pub_b64 = general_purpose::STANDARD.encode(pk_bytes);
-    
+
     Ok((sig_b64, pub_b64))
 }
 
@@ -491,24 +544,35 @@ pub fn verify_envelope(
     sig_bytes: &[u8],
 ) -> anyhow::Result<()> {
     if pub_bytes.len() != ED25519_PUBLIC_KEY_SIZE {
-        anyhow::bail!("Invalid public key size: expected {}, got {}", ED25519_PUBLIC_KEY_SIZE, pub_bytes.len());
+        anyhow::bail!(
+            "Invalid public key size: expected {}, got {}",
+            ED25519_PUBLIC_KEY_SIZE,
+            pub_bytes.len()
+        );
     }
     if sig_bytes.len() != ED25519_SIGNATURE_SIZE {
-        anyhow::bail!("Invalid signature size: expected {}, got {}", ED25519_SIGNATURE_SIZE, sig_bytes.len());
+        anyhow::bail!(
+            "Invalid signature size: expected {}, got {}",
+            ED25519_SIGNATURE_SIZE,
+            sig_bytes.len()
+        );
     }
-    
-    let pub_arr: [u8; 32] = pub_bytes.try_into()
+
+    let pub_arr: [u8; 32] = pub_bytes
+        .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid public key"))?;
-    let sig_arr: [u8; 64] = sig_bytes.try_into()
+    let sig_arr: [u8; 64] = sig_bytes
+        .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid signature"))?;
-    
+
     let verifying_key = VerifyingKey::from_bytes(&pub_arr)
         .map_err(|e| anyhow::anyhow!("Invalid public key: {}", e))?;
     let signature = Signature::from_bytes(&sig_arr);
-    
-    verifying_key.verify(envelope_bytes, &signature)
+
+    verifying_key
+        .verify(envelope_bytes, &signature)
         .map_err(|e| anyhow::anyhow!("signature verification failed: {}", e))?;
-    
+
     Ok(())
 }
 
@@ -516,9 +580,14 @@ pub fn verify_envelope(
 /// Returns the raw signature bytes (64 bytes).
 pub fn sign_data_with_key(sk_bytes: &[u8], data: &[u8]) -> anyhow::Result<Vec<u8>> {
     if sk_bytes.len() != ED25519_PRIVATE_KEY_SIZE {
-        anyhow::bail!("Invalid private key size: expected {}, got {}", ED25519_PRIVATE_KEY_SIZE, sk_bytes.len());
+        anyhow::bail!(
+            "Invalid private key size: expected {}, got {}",
+            ED25519_PRIVATE_KEY_SIZE,
+            sk_bytes.len()
+        );
     }
-    let sk_arr: [u8; 32] = sk_bytes.try_into()
+    let sk_arr: [u8; 32] = sk_bytes
+        .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid private key"))?;
     let signing_key = SigningKey::from_bytes(&sk_arr);
     let signature = signing_key.sign(data);
@@ -528,6 +597,19 @@ pub fn sign_data_with_key(sk_bytes: &[u8], data: &[u8]) -> anyhow::Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payload_key_roundtrip_and_tamper_rejection() {
+        let key = [42u8; 32];
+        let (mut ciphertext, nonce) =
+            encrypt_payload_with_key(&key, b"encrypted workload").unwrap();
+        assert_eq!(
+            decrypt_payload_with_key(&key, &nonce, &ciphertext).unwrap(),
+            b"encrypted workload"
+        );
+        ciphertext[0] ^= 1;
+        assert!(decrypt_payload_with_key(&key, &nonce, &ciphertext).is_err());
+    }
 
     #[test]
     fn test_sign_and_verify_envelope() {
@@ -564,8 +646,8 @@ mod tests {
     #[test]
     fn test_kem_encapsulate_decapsulate_roundtrip() {
         // Generate a static X25519 keypair
-        let mut rng = rand::rngs::OsRng;
-        let secret = StaticSecret::random_from_rng(&mut rng);
+        let rng = rand::rngs::OsRng;
+        let secret = StaticSecret::random_from_rng(rng);
         let public = X25519PublicKey::from(&secret);
         let pubb = public.as_bytes().to_vec();
         let privb = secret.as_bytes().to_vec();
@@ -579,8 +661,8 @@ mod tests {
 
     #[test]
     fn test_recipient_blob_roundtrip() {
-        let mut rng = rand::rngs::OsRng;
-        let secret = StaticSecret::random_from_rng(&mut rng);
+        let rng = rand::rngs::OsRng;
+        let secret = StaticSecret::random_from_rng(rng);
         let public = X25519PublicKey::from(&secret);
         let pubb = public.as_bytes().to_vec();
         let privb = secret.as_bytes().to_vec();
@@ -591,16 +673,17 @@ mod tests {
             decrypt_payload_from_recipient_blob(&blob, &privb).expect("decrypt recipient blob");
         assert_eq!(recovered, payload);
     }
-    
+
     #[test]
     fn test_encrypt_manifest_roundtrip() {
         let manifest = serde_json::json!({"name": "test", "version": "1.0"});
-        let (ciphertext, nonce_vec, sym, _nonce_arr) = encrypt_manifest(&manifest).expect("encrypt");
+        let (ciphertext, nonce_vec, sym, _nonce_arr) =
+            encrypt_manifest(&manifest).expect("encrypt");
         let decrypted = decrypt_manifest(&sym, &nonce_vec, &ciphertext).expect("decrypt");
         let recovered: serde_json::Value = serde_json::from_slice(&decrypted).expect("parse json");
         assert_eq!(recovered, manifest);
     }
-    
+
     #[test]
     fn test_key_sizes() {
         let (pub_bytes, priv_bytes) = ensure_keypair_ephemeral().expect("keygen");

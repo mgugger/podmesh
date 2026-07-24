@@ -4,16 +4,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use futures::{StreamExt, future};
 use libp2p::{
-    Multiaddr, PeerId, Swarm, StreamProtocol,
+    Multiaddr, PeerId, StreamProtocol, Swarm,
     kad::{self, Quorum, Record, RecordKey},
     multiaddr::Protocol,
     request_response,
     swarm::{NetworkBehaviour, SwarmEvent},
 };
+use log::{debug, info, warn};
 use p2p::http_proxy::{ProxyCodec, ProxyHttpRequest, ProxyHttpResponse};
 use p2p::libp2p_stream;
 use p2p::{
-    build_quic_multiaddr, sidecar_manifest::sign_sidecar_manifest_record, parse_bootstrap_peer,
+    build_quic_multiaddr, parse_bootstrap_peer, sidecar_manifest::sign_sidecar_manifest_record,
     timestamp_millis,
 };
 use p2p::{
@@ -21,9 +22,8 @@ use p2p::{
     request_response::{HandshakeCodec, ManifestFetchCodec},
 };
 use protocol::libp2p_constants::{
-    SIDECAR_MANIFEST_PROTOCOL, INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX,
-    MANIFEST_RECORD_TTL_MS, EGRESS_TUNNEL_PROTOCOL, PROXY_PROVIDER_KEY,
-    SIDECAR_REGISTRATION_PROTOCOL,
+    EGRESS_TUNNEL_PROTOCOL, INGRESS_PROXY_PROTOCOL, MANIFEST_RECORD_PREFIX, MANIFEST_RECORD_TTL_MS,
+    PROXY_PROVIDER_KEY, SIDECAR_MANIFEST_PROTOCOL, SIDECAR_REGISTRATION_PROTOCOL,
 };
 use protocol::machine::{
     SidecarRouteSpec, build_sidecar_provider_record, root_as_sidecar_manifest_request,
@@ -35,7 +35,6 @@ use reqwest::{
 };
 use tokio::signal;
 use tokio::sync::{mpsc, oneshot};
-use log::{debug, info, warn};
 
 pub mod egress_nft;
 pub mod egress_proxy;
@@ -73,14 +72,27 @@ pub struct SidecarConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidecarEvent {
-    Connected { peer_id: String },
-    ProviderDiscovered { peer_id: String },
+    Connected {
+        peer_id: String,
+    },
+    ProviderDiscovered {
+        peer_id: String,
+    },
     /// Proxy peer discovered for egress tunneling
-    ProxyPeerDiscovered { peer_id: String },
+    ProxyPeerDiscovered {
+        peer_id: String,
+    },
     /// Egress tunnel established to destination
-    EgressTunnelEstablished { dest_host: String, dest_port: u16 },
+    EgressTunnelEstablished {
+        dest_host: String,
+        dest_port: u16,
+    },
     /// Egress tunnel failed
-    EgressTunnelFailed { dest_host: String, dest_port: u16, error: String },
+    EgressTunnelFailed {
+        dest_host: String,
+        dest_port: u16,
+        error: String,
+    },
 }
 
 pub async fn run_sidecar(cfg: SidecarConfig) -> Result<()> {
@@ -159,7 +171,10 @@ pub async fn run_sidecar_with_shutdown(
                     true
                 }
                 Err(err) => {
-                    warn!("failed to setup egress nftables rules (requires CAP_NET_ADMIN): {}", err);
+                    warn!(
+                        "failed to setup egress nftables rules (requires CAP_NET_ADMIN): {}",
+                        err
+                    );
                     false
                 }
             }
@@ -190,7 +205,11 @@ pub async fn run_sidecar_with_shutdown(
     // Start HTTP CONNECT proxy if configured
     let _http_proxy_handle = if let Some(port) = cfg.http_proxy_port {
         let http_config = http_connect_proxy::HttpConnectProxyConfig {
-            listen_port: if port == 0 { http_connect_proxy::HTTP_CONNECT_PROXY_PORT } else { port },
+            listen_port: if port == 0 {
+                http_connect_proxy::HTTP_CONNECT_PROXY_PORT
+            } else {
+                port
+            },
             listen_host: "127.0.0.1".to_string(),
         };
         let proxy = http_connect_proxy::HttpConnectProxy::new(http_config, tunnel_tx.clone());
@@ -276,7 +295,7 @@ pub async fn run_sidecar_with_shutdown(
                 break;
             }
             _ = handshake_ticker.tick() => {
-                let local_peer = swarm.local_peer_id().clone();
+                let local_peer = *swarm.local_peer_id();
                 match handshake::collect_handshake_actions(
                     &mut state.handshake_states,
                     &local_peer,
@@ -324,7 +343,7 @@ pub async fn run_sidecar_with_shutdown(
                     if needs_egress_proxy && !state.proxy_query_pending {
                         trigger_tenant_proxy_lookup(&mut swarm, &cfg, &mut state);
                     }
-                    warn!("egress tunnel request dropped - no proxy peer discovered yet dest={}:{}", 
+                    warn!("egress tunnel request dropped - no proxy peer discovered yet dest={}:{}",
                           tunnel_req.dest_host, tunnel_req.dest_port);
                 }
             }
@@ -485,7 +504,10 @@ fn build_swarm(_cfg: &SidecarConfig) -> Result<Swarm<SidecarBehaviour>> {
         .iter()
         .map(|p| p.to_string())
         .collect();
-    debug!("sidecar kad protocols configured kad_protocols={:?}", kad_protocols);
+    debug!(
+        "sidecar kad protocols configured kad_protocols={:?}",
+        kad_protocols
+    );
 
     Ok(swarm)
 }
@@ -509,17 +531,26 @@ fn dial_bootstrap(swarm: &mut Swarm<SidecarBehaviour>, cfg: &SidecarConfig) {
 fn trigger_lookup(swarm: &mut Swarm<SidecarBehaviour>, cfg: &SidecarConfig) {
     let key = cfg.record_key();
     let query_id = swarm.behaviour_mut().kademlia.get_providers(key);
-    debug!("sidecar started provider lookup query_id={:?} provider={}", query_id, cfg.provider_label);
+    debug!(
+        "sidecar started provider lookup query_id={:?} provider={}",
+        query_id, cfg.provider_label
+    );
 }
 
 fn announce_provider(swarm: &mut Swarm<SidecarBehaviour>, cfg: &SidecarConfig) {
     let key = cfg.record_key();
     match swarm.behaviour_mut().kademlia.start_providing(key) {
         Ok(query_id) => {
-            debug!("sidecar announced provider query_id={:?} provider={}", query_id, cfg.provider_label)
+            debug!(
+                "sidecar announced provider query_id={:?} provider={}",
+                query_id, cfg.provider_label
+            )
         }
         Err(err) => {
-            warn!("sidecar provider announce failed provider={} error={}", cfg.provider_label, err)
+            warn!(
+                "sidecar provider announce failed provider={} error={}",
+                cfg.provider_label, err
+            )
         }
     }
 }
@@ -530,9 +561,7 @@ fn publish_manifest_record(swarm: &mut Swarm<SidecarBehaviour>, cfg: &SidecarCon
     let record_key = cfg.manifest_record_key();
     info!(
         "sidecar publishing ingress manifest to dht manifest={} ingress_host={} record_key={:?}",
-        cfg.manifest_id,
-        cfg.ingress_host,
-        record_key
+        cfg.manifest_id, cfg.ingress_host, record_key
     );
 
     let record = Record {
@@ -548,19 +577,31 @@ fn publish_manifest_record(swarm: &mut Swarm<SidecarBehaviour>, cfg: &SidecarCon
         .put_record(record, Quorum::One)
     {
         Ok(query_id) => {
-            debug!("sidecar published manifest record query_id={:?} manifest={}", query_id, cfg.manifest_id)
+            debug!(
+                "sidecar published manifest record query_id={:?} manifest={}",
+                query_id, cfg.manifest_id
+            )
         }
         Err(err) => {
-            warn!("sidecar failed to publish manifest record manifest={} error={}", cfg.manifest_id, err)
+            warn!(
+                "sidecar failed to publish manifest record manifest={} error={}",
+                cfg.manifest_id, err
+            )
         }
     }
 
     match swarm.behaviour_mut().kademlia.start_providing(record_key) {
         Ok(query_id) => {
-            debug!("sidecar announced manifest provider query_id={:?} manifest={}", query_id, cfg.manifest_id)
+            debug!(
+                "sidecar announced manifest provider query_id={:?} manifest={}",
+                query_id, cfg.manifest_id
+            )
         }
         Err(err) => {
-            warn!("sidecar manifest provider announce failed manifest={} error={}", cfg.manifest_id, err)
+            warn!(
+                "sidecar manifest provider announce failed manifest={} error={}",
+                cfg.manifest_id, err
+            )
         }
     }
 }
@@ -570,16 +611,17 @@ fn build_manifest_record_payload(
     cfg: &SidecarConfig,
     timestamp_ms: u64,
 ) -> Vec<u8> {
-    build_sidecar_provider_record(
-        &cfg.manifest_id,
-        &peer_id.to_string(),
-        &cfg.ingress_host,
-        cfg.owner_public_key_b64.as_deref(),
-        &cfg.routes,
-        MANIFEST_RECORD_TTL_MS,
-        timestamp_ms,
-        MANIFEST_RECORD_VERSION,
-    )
+    let peer_id = peer_id.to_string();
+    build_sidecar_provider_record(protocol::machine::SidecarProviderRecordParams {
+        manifest_id: &cfg.manifest_id,
+        peer_id: &peer_id,
+        host: &cfg.ingress_host,
+        owner_public_key_b64: cfg.owner_public_key_b64.as_deref(),
+        routes: &cfg.routes,
+        ttl_ms: MANIFEST_RECORD_TTL_MS,
+        last_updated_ms: timestamp_ms,
+        version: MANIFEST_RECORD_VERSION,
+    })
 }
 
 fn handle_swarm_event(
@@ -680,17 +722,26 @@ fn handle_handshake_event(
             );
         }
         request_response::Event::OutboundFailure { peer, error, .. } => {
-            warn!("sidecar handshake outbound failure peer={} error={:?}", peer, error);
+            warn!(
+                "sidecar handshake outbound failure peer={} error={:?}",
+                peer, error
+            );
             if matches!(
                 error,
                 request_response::OutboundFailure::UnsupportedProtocols
             ) {
                 handshake::track_peer(&mut state.handshake_states, &peer).confirmed = true;
-                debug!("sidecar treating peer as handshake-confirmed due to unsupported protocol peer={}", peer);
+                debug!(
+                    "sidecar treating peer as handshake-confirmed due to unsupported protocol peer={}",
+                    peer
+                );
             }
         }
         request_response::Event::InboundFailure { peer, error, .. } => {
-            warn!("sidecar handshake inbound failure peer={} error={:?}", peer, error);
+            warn!(
+                "sidecar handshake inbound failure peer={} error={:?}",
+                peer, error
+            );
         }
         request_response::Event::ResponseSent { peer, .. } => {
             debug!("sidecar handshake response sent peer={}", peer);
@@ -731,7 +782,11 @@ fn verify_proxy_cert_from_response(
     let cert = match protocol::NodeCert::from_b64(&cert_b64) {
         Ok(c) => c,
         Err(err) => {
-            log::warn!("failed to decode proxy NodeCert from peer={}: {}", peer, err);
+            log::warn!(
+                "failed to decode proxy NodeCert from peer={}: {}",
+                peer,
+                err
+            );
             return;
         }
     };
@@ -739,7 +794,8 @@ fn verify_proxy_cert_from_response(
     if let Err(err) = cert.verify() {
         log::warn!(
             "proxy NodeCert signature invalid peer={} error={}",
-            peer, err
+            peer,
+            err
         );
         return;
     }
@@ -747,7 +803,9 @@ fn verify_proxy_cert_from_response(
     if &cert.owner_pubkey != tenant_owner {
         log::warn!(
             "proxy NodeCert owner_pubkey mismatch peer={} cert_owner={} tenant_owner={}",
-            peer, cert.owner_pubkey, tenant_owner
+            peer,
+            cert.owner_pubkey,
+            tenant_owner
         );
         return;
     }
@@ -760,14 +818,17 @@ fn verify_proxy_cert_from_response(
     if cert.peer_id != peer.to_string() {
         log::warn!(
             "proxy NodeCert peer_id mismatch peer={} cert_peer_id={}",
-            peer, cert.peer_id
+            peer,
+            cert.peer_id
         );
         return;
     }
 
     log::info!(
         "verified proxy NodeCert peer={} owner_pubkey={} valid_until={}",
-        peer, cert.owner_pubkey, cert.valid_until
+        peer,
+        cert.owner_pubkey,
+        cert.valid_until
     );
     let newly_verified = state.verified_proxy_peers.insert(peer);
 
@@ -815,14 +876,23 @@ fn handle_proxy_event(
                 );
             }
             request_response::Message::Response { response, .. } => {
-                debug!("sidecar received proxy response acknowledgement peer={} status={}", peer, response.status_code);
+                debug!(
+                    "sidecar received proxy response acknowledgement peer={} status={}",
+                    peer, response.status_code
+                );
             }
         },
         request_response::Event::OutboundFailure { peer, error, .. } => {
-            warn!("sidecar proxy outbound failure peer={} error={:?}", peer, error);
+            warn!(
+                "sidecar proxy outbound failure peer={} error={:?}",
+                peer, error
+            );
         }
         request_response::Event::InboundFailure { peer, error, .. } => {
-            warn!("sidecar proxy inbound failure peer={} error={:?}", peer, error);
+            warn!(
+                "sidecar proxy inbound failure peer={} error={:?}",
+                peer, error
+            );
         }
         request_response::Event::ResponseSent { peer, .. } => {
             debug!("sidecar proxy response sent peer={}", peer);
@@ -844,7 +914,11 @@ fn handle_manifest_fetch_event(
                     match build_manifest_response_bytes(swarm.local_peer_id(), cfg, &request) {
                         Ok(bytes) => bytes,
                         Err(err) => {
-                            log::warn!("sidecar failed to build manifest response peer={} error={}", peer, err);
+                            log::warn!(
+                                "sidecar failed to build manifest response peer={} error={}",
+                                peer,
+                                err
+                            );
                             Vec::new()
                         }
                     };
@@ -853,18 +927,33 @@ fn handle_manifest_fetch_event(
                     .manifest_rr
                     .send_response(channel, response)
                 {
-                    log::warn!("sidecar failed to send manifest response peer={} error={:?}", peer, err);
+                    log::warn!(
+                        "sidecar failed to send manifest response peer={} error={:?}",
+                        peer,
+                        err
+                    );
                 }
             }
             request_response::Message::Response { .. } => {
-                log::debug!("sidecar received unexpected manifest response peer={}", peer);
+                log::debug!(
+                    "sidecar received unexpected manifest response peer={}",
+                    peer
+                );
             }
         },
         request_response::Event::OutboundFailure { peer, error, .. } => {
-            log::warn!("sidecar manifest outbound failure peer={} error={:?}", peer, error);
+            log::warn!(
+                "sidecar manifest outbound failure peer={} error={:?}",
+                peer,
+                error
+            );
         }
         request_response::Event::InboundFailure { peer, error, .. } => {
-            log::warn!("sidecar manifest inbound failure peer={} error={:?}", peer, error);
+            log::warn!(
+                "sidecar manifest inbound failure peer={} error={:?}",
+                peer,
+                error
+            );
         }
         request_response::Event::ResponseSent { peer, .. } => {
             log::debug!("sidecar manifest response sent peer={}", peer);
@@ -911,14 +1000,22 @@ fn spawn_local_http_request(
             Ok(resp) => {
                 log::info!(
                     "sidecar forwarded request to application manifest={} method={} path={} target_port={} status={}",
-                    manifest_id, method, path, target_port, resp.status_code
+                    manifest_id,
+                    method,
+                    path,
+                    target_port,
+                    resp.status_code
                 );
                 resp
             }
             Err(err) => {
                 log::warn!(
                     "sidecar local http request failed manifest={} method={} path={} target_port={} error={:?}",
-                    manifest_id, method, path, target_port, err
+                    manifest_id,
+                    method,
+                    path,
+                    target_port,
+                    err
                 );
                 ProxyHttpResponse {
                     status_code: 502,
@@ -985,14 +1082,20 @@ fn handle_kad_event(
 ) {
     let proxy_record_key = RecordKey::new(&PROXY_PROVIDER_KEY);
     // Compute the tenant-specific proxy DHT key if owner pubkey is available
-    let tenant_proxy_key: Option<RecordKey> = cfg.owner_public_key_b64.as_deref()
+    let tenant_proxy_key: Option<RecordKey> = cfg
+        .owner_public_key_b64
+        .as_deref()
         .and_then(|pk| compute_tenant_proxy_dht_key(pk).ok())
         .map(|k| RecordKey::new(&k));
     match event {
         kad::Event::OutboundQueryProgressed { result, .. } => match result {
             kad::QueryResult::GetProviders(Ok(ok)) => match ok {
                 kad::GetProvidersOk::FoundProviders { key, providers } => {
-                    log::debug!("sidecar get_providers result key={:?} count={}", key, providers.len());
+                    log::debug!(
+                        "sidecar get_providers result key={:?} count={}",
+                        key,
+                        providers.len()
+                    );
                     // Spec: the global `podmesh-proxy-node` key MUST NOT be used by sidecars to
                     // discover authenticated proxies. We still allow this lookup result to
                     // populate generic provider awareness for backward compatibility with
@@ -1007,23 +1110,28 @@ fn handle_kad_event(
                     }
                     // Phase 7.3: tenant proxy DHT lookup result. Mark these as candidate
                     // proxy peers (used for egress + registration after cert verification).
-                    if let Some(ref tpk) = tenant_proxy_key {
-                        if &key == tpk {
-                            update_tenant_proxy_peers(swarm, cfg, providers, state, event_tx);
-                        }
+                    if let Some(ref tpk) = tenant_proxy_key
+                        && &key == tpk
+                    {
+                        update_tenant_proxy_peers(swarm, cfg, providers, state, event_tx);
                     }
                 }
                 kad::GetProvidersOk::FinishedWithNoAdditionalRecord { closest_peers } => {
                     log::debug!(
                         "sidecar provider lookup finished without providers provider={} closest={}",
-                        cfg.provider_label, closest_peers.len()
+                        cfg.provider_label,
+                        closest_peers.len()
                     );
                     // Mark proxy query as complete if this was a proxy query
                     state.proxy_query_pending = false;
                 }
             },
             kad::QueryResult::GetProviders(Err(err)) => {
-                log::warn!("sidecar provider lookup failed provider={} error={}", cfg.provider_label, err);
+                log::warn!(
+                    "sidecar provider lookup failed provider={} error={}",
+                    cfg.provider_label,
+                    err
+                );
                 state.proxy_query_pending = false;
             }
             kad::QueryResult::Bootstrap(Ok(_)) => {
@@ -1153,8 +1261,7 @@ fn update_tenant_proxy_peers<I>(
 
             // If the cert was already verified earlier (rare but possible), trigger
             // registration immediately.
-            if state.verified_proxy_peers.contains(&peer)
-                && state.pending_registration_id.is_none()
+            if state.verified_proxy_peers.contains(&peer) && state.pending_registration_id.is_none()
             {
                 send_sidecar_registration(swarm, cfg, peer, state);
             }
@@ -1176,13 +1283,15 @@ fn send_handshake_request_to_proxy(swarm: &mut Swarm<SidecarBehaviour>, peer: &P
                 .send_request(peer, payload);
             log::info!(
                 "sidecar sent direct handshake request to tenant proxy peer={} request_id={:?}",
-                peer, request_id
+                peer,
+                request_id
             );
         }
         Err(err) => {
             log::warn!(
                 "sidecar failed to build handshake request for tenant proxy peer={}: {}",
-                peer, err
+                peer,
+                err
             );
         }
     }
@@ -1303,7 +1412,7 @@ async fn handle_egress_tunnel(
     // Now pipe data bidirectionally between client_stream and p2p_stream
     // Use tokio's bidirectional copy which works with the Stream type
     let mut client_stream = tunnel_req.client_stream;
-    
+
     // Send HTTP 200 response if this is an HTTP CONNECT proxy request
     if tunnel_req.send_http_200 {
         use tokio::io::AsyncWriteExt;
@@ -1313,11 +1422,11 @@ async fn handle_egress_tunnel(
             return;
         }
     }
-    
+
     // Convert libp2p Stream to tokio-compatible using compat layer
     let p2p_compat = tokio_util::compat::FuturesAsyncReadCompatExt::compat(p2p_stream);
     let (mut p2p_read, mut p2p_write) = tokio::io::split(p2p_compat);
-    
+
     // If there's initial data (for plain HTTP proxy), send it to the destination first
     if let Some(initial_data) = tunnel_req.initial_data {
         use tokio::io::AsyncWriteExt;
@@ -1326,7 +1435,7 @@ async fn handle_egress_tunnel(
             return;
         }
     }
-    
+
     let (mut client_read, mut client_write) = client_stream.into_split();
 
     // Wait for either direction to complete (or error)
@@ -1364,17 +1473,21 @@ fn dial_multiaddr_str(swarm: &mut Swarm<SidecarBehaviour>, addr: &str) {
 
 fn dial_multiaddr(swarm: &mut Swarm<SidecarBehaviour>, addr: &Multiaddr) {
     if let Err(err) = swarm.dial(addr.clone()) {
-        log::warn!("sidecar failed to dial bootstrap peer addr={} error={}", addr, err);
+        log::warn!(
+            "sidecar failed to dial bootstrap peer addr={} error={}",
+            addr,
+            err
+        );
     } else {
         log::debug!("sidecar dialing bootstrap peer addr={}", addr);
     }
 }
 
 fn notify(event_tx: Option<&mpsc::UnboundedSender<SidecarEvent>>, event: SidecarEvent) {
-    if let Some(tx) = event_tx {
-        if let Err(err) = tx.send(event) {
-            log::warn!("sidecar failed to emit event error={}", err);
-        }
+    if let Some(tx) = event_tx
+        && let Err(err) = tx.send(event)
+    {
+        log::warn!("sidecar failed to emit event error={}", err);
     }
 }
 
@@ -1427,7 +1540,10 @@ fn trigger_tenant_proxy_lookup(
             let query_id = swarm.behaviour_mut().kademlia.get_providers(record_key);
             state.tenant_proxy_lookup_triggered = true;
             state.proxy_query_pending = true;
-            log::info!("sidecar triggered tenant proxy DHT lookup query_id={:?}", query_id);
+            log::info!(
+                "sidecar triggered tenant proxy DHT lookup query_id={:?}",
+                query_id
+            );
         }
         Err(err) => {
             log::warn!("failed to compute tenant proxy DHT key: {}", err);
@@ -1444,7 +1560,10 @@ fn sign_registration_payload(
     let data = format!("{}{}", manifest_id, sidecar_peer_id);
     let (pub_bytes, priv_bytes) = crypto::ensure_keypair_on_disk()?;
     let sig_bytes = crypto::sign_data_with_key(&priv_bytes, data.as_bytes())?;
-    Ok((crypto::b64_encode(&sig_bytes), crypto::b64_encode(&pub_bytes)))
+    Ok((
+        crypto::b64_encode(&sig_bytes),
+        crypto::b64_encode(&pub_bytes),
+    ))
 }
 
 /// Send a SidecarRegistration to the given proxy peer.
@@ -1499,7 +1618,9 @@ fn send_sidecar_registration(
 
     log::info!(
         "sidecar sending registration to proxy peer={} manifest={} routes={}",
-        proxy_peer, cfg.manifest_id, cfg.routes.len()
+        proxy_peer,
+        cfg.manifest_id,
+        cfg.routes.len()
     );
     let request_id = swarm
         .behaviour_mut()
@@ -1515,7 +1636,11 @@ fn handle_registration_rr_event(
 ) {
     match event {
         request_response::Event::Message { peer, message, .. } => match message {
-            request_response::Message::Response { request_id, response, .. } => {
+            request_response::Message::Response {
+                request_id,
+                response,
+                ..
+            } => {
                 if Some(request_id) == state.pending_registration_id {
                     state.pending_registration_id = None;
                 }
@@ -1524,17 +1649,24 @@ fn handle_registration_rr_event(
                         if ack.ok {
                             log::info!(
                                 "sidecar registration acknowledged by proxy peer={} manifest={}",
-                                peer, ack.manifest_id
+                                peer,
+                                ack.manifest_id
                             );
                         } else {
                             log::warn!(
                                 "sidecar registration rejected by proxy peer={} manifest={} reason={}",
-                                peer, ack.manifest_id, ack.message
+                                peer,
+                                ack.manifest_id,
+                                ack.message
                             );
                         }
                     }
                     Err(err) => {
-                        log::warn!("failed to deserialize registration ack from peer={}: {}", peer, err);
+                        log::warn!(
+                            "failed to deserialize registration ack from peer={}: {}",
+                            peer,
+                            err
+                        );
                     }
                 }
             }
@@ -1543,11 +1675,19 @@ fn handle_registration_rr_event(
             }
         },
         request_response::Event::OutboundFailure { peer, error, .. } => {
-            log::warn!("sidecar registration outbound failure peer={} error={:?}", peer, error);
+            log::warn!(
+                "sidecar registration outbound failure peer={} error={:?}",
+                peer,
+                error
+            );
             state.pending_registration_id = None;
         }
         request_response::Event::InboundFailure { peer, error, .. } => {
-            log::warn!("sidecar registration inbound failure peer={} error={:?}", peer, error);
+            log::warn!(
+                "sidecar registration inbound failure peer={} error={:?}",
+                peer,
+                error
+            );
         }
         request_response::Event::ResponseSent { .. } => {}
     }

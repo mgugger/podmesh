@@ -7,7 +7,7 @@
 //! - Injects default resource limits when missing
 
 use anyhow::{Context, Result};
-use protocol::manifest_policy::{validate_manifest, validate_and_mutate_manifest};
+use protocol::manifest_policy::{validate_and_mutate_manifest, validate_manifest};
 use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
@@ -29,11 +29,14 @@ fn load_manifest(name: &str) -> Result<String> {
 fn test_privileged_container_rejected() {
     let manifest = load_manifest("privileged_container.yml").unwrap();
     let result = validate_manifest(&manifest).expect("validation should succeed");
-    
+
     assert!(!result.allowed, "privileged container should be rejected");
     assert!(!result.violations.is_empty(), "should have violations");
     assert!(
-        result.violations.iter().any(|v| v.to_lowercase().contains("privileged")),
+        result
+            .violations
+            .iter()
+            .any(|v| v.to_lowercase().contains("privileged")),
         "should mention 'privileged' in violations: {:?}",
         result.violations
     );
@@ -43,10 +46,13 @@ fn test_privileged_container_rejected() {
 fn test_unauthorized_net_admin_rejected() {
     let manifest = load_manifest("unauthorized_net_admin.yml").unwrap();
     let result = validate_manifest(&manifest).expect("validation should succeed");
-    
+
     assert!(!result.allowed, "unauthorized NET_ADMIN should be rejected");
     assert!(
-        result.violations.iter().any(|v| v.contains("NET_ADMIN") || v.contains("net_admin")),
+        result
+            .violations
+            .iter()
+            .any(|v| v.contains("NET_ADMIN") || v.contains("net_admin")),
         "should mention NET_ADMIN in violations: {:?}",
         result.violations
     );
@@ -56,7 +62,7 @@ fn test_unauthorized_net_admin_rejected() {
 fn test_authorized_sidecar_net_admin_allowed() {
     let manifest = load_manifest("authorized_sidecar_net_admin.yml").unwrap();
     let result = validate_manifest(&manifest).expect("validation should succeed");
-    
+
     assert!(
         result.allowed,
         "sidecar container with NET_ADMIN should be allowed: {:?}",
@@ -68,7 +74,7 @@ fn test_authorized_sidecar_net_admin_allowed() {
 fn test_valid_deployment_allowed() {
     let manifest = load_manifest("demo_deployment_without_sidecar.yml").unwrap();
     let result = validate_manifest(&manifest).expect("validation should succeed");
-    
+
     assert!(
         result.allowed,
         "valid deployment should be allowed: {:?}",
@@ -80,19 +86,20 @@ fn test_valid_deployment_allowed() {
 fn test_resource_defaults_injected() {
     let manifest = load_manifest("deployment_no_resources.yml").unwrap();
     let result = validate_and_mutate_manifest(&manifest);
-    
+
     assert!(result.is_ok(), "should succeed: {:?}", result.err());
     let mutated = result.unwrap();
-    
+
     // Parse the mutated manifest to verify resources were injected
     let mut docs: Vec<serde_yaml::Value> = Vec::new();
     for document in serde_yaml::Deserializer::from_str(&mutated) {
         let value: serde_yaml::Value = Deserialize::deserialize(document).unwrap();
         docs.push(value);
     }
-    
+
     // Find the Deployment document
-    let deployment = docs.iter()
+    let deployment = docs
+        .iter()
         .find(|doc| {
             doc.get("kind")
                 .and_then(|k| k.as_str())
@@ -100,7 +107,7 @@ fn test_resource_defaults_injected() {
                 .unwrap_or(false)
         })
         .expect("should have a Deployment");
-    
+
     // Navigate to container resources
     let containers = deployment
         .get("spec")
@@ -109,16 +116,17 @@ fn test_resource_defaults_injected() {
         .and_then(|s| s.get("containers"))
         .and_then(|c| c.as_sequence())
         .expect("should have containers");
-    
+
     assert!(!containers.is_empty(), "should have at least one container");
-    
+
     let container = &containers[0];
-    let resources = container.get("resources")
+    let resources = container
+        .get("resources")
         .expect("resources should be injected");
-    
+
     let limits = resources.get("limits").expect("limits should exist");
     let requests = resources.get("requests").expect("requests should exist");
-    
+
     // Verify default values
     assert_eq!(
         limits.get("cpu").and_then(|v| v.as_str()),
@@ -162,25 +170,25 @@ spec:
           cpu: "250m"
           memory: "256Mi"
 "#;
-    
+
     let result = validate_and_mutate_manifest(manifest);
     assert!(result.is_ok(), "should succeed: {:?}", result.err());
-    
+
     let mutated = result.unwrap();
     let doc: serde_yaml::Value = serde_yaml::from_str(&mutated).unwrap();
-    
+
     let container = doc
         .get("spec")
         .and_then(|s| s.get("containers"))
         .and_then(|c| c.as_sequence())
         .and_then(|c| c.first())
         .expect("should have container");
-    
+
     let limits = container
         .get("resources")
         .and_then(|r| r.get("limits"))
         .expect("should have limits");
-    
+
     // Verify existing values are preserved
     assert_eq!(
         limits.get("cpu").and_then(|v| v.as_str()),

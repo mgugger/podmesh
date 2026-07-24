@@ -11,24 +11,19 @@ pub const EGRESS_PROXY_PORT: u16 = 15001;
 /// Networks to exclude from egress interception (pod-local traffic).
 /// These are CIDR ranges that should not be redirected through the tunnel.
 pub const EGRESS_EXCLUDE_NETWORKS: &[&str] = &[
-    "127.0.0.0/8",   // Loopback
-    "10.0.2.0/24",   // Pasta/slirp4netns default network
+    "127.0.0.0/8",    // Loopback
+    "10.0.2.0/24",    // Pasta/slirp4netns default network
     "169.254.0.0/16", // Link-local
 ];
 
 /// Protocol type for egress tunneling.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum EgressProtocol {
     /// TCP protocol
+    #[default]
     Tcp,
     /// UDP protocol (future support)
     Udp,
-}
-
-impl Default for EgressProtocol {
-    fn default() -> Self {
-        Self::Tcp
-    }
 }
 
 impl std::fmt::Display for EgressProtocol {

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
-use tokio::signal;
 use log::{error, info};
+use tokio::signal;
 
 use podmesh_proxy::{Config, Workload};
 

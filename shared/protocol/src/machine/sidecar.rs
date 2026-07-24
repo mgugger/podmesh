@@ -9,17 +9,12 @@ fn deserialize<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, postcard
     postcard::from_bytes(bytes)
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SidecarRouteKind {
+    #[default]
     Service = 0,
     Ingress = 1,
-}
-
-impl Default for SidecarRouteKind {
-    fn default() -> Self {
-        SidecarRouteKind::Service
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,16 +75,28 @@ impl SidecarManifestRequest {
     }
 }
 
-pub fn build_sidecar_provider_record(
-    manifest_id: &str,
-    peer_id: &str,
-    host: &str,
-    owner_public_key_b64: Option<&str>,
-    routes: &[SidecarRouteSpec],
-    ttl_ms: u32,
-    last_updated_ms: u64,
-    version: u16,
-) -> Vec<u8> {
+pub struct SidecarProviderRecordParams<'a> {
+    pub manifest_id: &'a str,
+    pub peer_id: &'a str,
+    pub host: &'a str,
+    pub owner_public_key_b64: Option<&'a str>,
+    pub routes: &'a [SidecarRouteSpec],
+    pub ttl_ms: u32,
+    pub last_updated_ms: u64,
+    pub version: u16,
+}
+
+pub fn build_sidecar_provider_record(params: SidecarProviderRecordParams<'_>) -> Vec<u8> {
+    let SidecarProviderRecordParams {
+        manifest_id,
+        peer_id,
+        host,
+        owner_public_key_b64,
+        routes,
+        ttl_ms,
+        last_updated_ms,
+        version,
+    } = params;
     let wire = SidecarProviderRecordWire {
         manifest_id: manifest_id.to_string(),
         peer_id: peer_id.to_string(),

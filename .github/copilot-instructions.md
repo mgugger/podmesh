@@ -1,11 +1,22 @@
 # Podmesh
 
-Podmesh is a decentralized, lock-free orchestration system that turns any device into an interchangeable compute resource through a decentralized scheduler. The workload plane is strictly focusing on scheduling and running workloads, it does not contain any service mesh like behavior.
+Podmesh is a decentralized, zero-trust workload system. The scheduler is a stateless selector over
+signed, expiring agent advertisements. Selected agents admit, decrypt, execute, persist, and manage
+many independent workloads within configured aggregate limits. Proxy and sidecar crates form a
+separate workload traffic plane.
 
 ## Principles
 
-* The solution prioritizes decentralization through libp2p and zero-trust by encrypting and signing all communication and encrypting with the receivers kem public key through functions in the crypto crate.
-* The scheduler listen should check for node failure and restart crashed containers and reschedule workloads on failed nodes, but does not handle any workload communication as this is handled by the scheduler plane (strict segregation and zero trust, the workload plane does not trust the scheduler plane).
+* Treat every non-selected node as untrusted. Complete workload specifications and lifecycle
+  commands are signed by the namespace owner and encrypted to the selected agent's KEM key.
+* The scheduler MUST remain stateless: no Podman access, workload ciphertext, keys, lifecycle state,
+  status, logs, deletion, sidecar injection, or durable agent records.
+* `podmesh-agent` owns workload admission, aggregate resource accounting, Podman, sidecar injection,
+  encrypted per-workload persistence, local restart reconciliation, status, logs, and deletion.
+* An agent can host many workloads, bounded by `max_workloads`, CPU, memory, storage, reservation,
+  payload, and replay limits. Deleting or restoring one workload must not affect another.
+* Remote recovery after loss of an agent and its durable keys is not implemented. Do not imply that
+  single-replica workloads recover offline.
 * Always use `log::info!`, `log::error!`, `log::warn!`, or `log::debug!` — never `println!`
 * No backward compatibility guarantees / implementations required for changes
 
@@ -15,56 +26,41 @@ The project consists of the following crates:
 
 | Crate | Description |
 |-------|-------------|
-| `podctl` | CLI tool (similar to kubectl) for interacting with podmesh |
+| `podctl` | Namespace client: encrypted deployment, direct lifecycle commands, local receipts |
 | `shared/crypto` | Cryptographic primitives: signing, encryption, envelope validation |
-| `shared/protocol` | Postcard-serialized message types and libp2p constants |
+| `shared/protocol` | Bounded signed/encrypted records and workload-plane libp2p constants |
 | `shared/p2p` | Common libp2p utilities shared across components |
 | `shared/axum_support` | Axum middleware and REST API helpers |
-| `podmesh-scheduler` | Core scheduler node: workload lifecycle, P2P networking, REST API |
+| `podmesh-scheduler` | Stateless HTTP registry and deterministic agent selector |
+| `podmesh-agent` | Multi-workload admission, encrypted persistence, Podman, sidecar injection |
 | `podmesh-proxy` | Ingress/egress gateway: routes external traffic to sidecars |
 | `podmesh-sidecar` | In-pod companion: publishes to DHT, forwards traffic to app container |
 
 ## Architecture
 
-```
-┌─────────────────┐     ┌─────────────────────────────────────────────┐
-│   podctl CLI    │────▶│  Bootstrap Scheduler (podmesh-scheduler)    │
-│   (apply/delete)│     │  - REST API on port 3000                    │
-└─────────────────┘     │  - Gossipsub capacity queries               │
-                        │  - Coordinates workload placement           │
-                        └───────────────┬─────────────────────────────┘
-                                        │ libp2p (QUIC)
-                        ┌───────────────▼─────────────────────────────┐
-                        │  Worker Scheduler (podmesh-scheduler)       │
-                        │  - Deploys pods via Podman                  │
-                        │  - Announces as provider in Kademlia DHT    │
-                        │  - Injects sidecar into each pod            │
-                        └───────────────┬─────────────────────────────┘
-                                        │
-              ┌─────────────────────────┼─────────────────────────────┐
-              │                         │                             │
-              ▼                         ▼                             ▼
-┌─────────────────────┐   ┌─────────────────────┐   ┌─────────────────────┐
-│  Proxy              │   │  Pod                │   │  Pod                │
-│  (podmesh-proxy)    │   │  ┌───────────────┐  │   │  ┌───────────────┐  │
-│  - Ingress gateway  │◀──│  │ Sidecar       │  │   │  │ Sidecar       │  │
-│  - DHT lookup for   │   │  │ - DHT publish │  │   │  │ - DHT publish │  │
-│    manifest routes  │   │  │ - Route match │  │   │  │ - Route match │  │
-│  - P2P to sidecars  │   │  └───────┬───────┘  │   │  └───────┬───────┘  │
-└─────────────────────┘   │          │          │   │          │          │
-                          │  ┌───────▼───────┐  │   │  ┌───────▼───────┐  │
-                          │  │ App Container │  │   │  │ App Container │  │
-                          │  └───────────────┘  │   │  └───────────────┘  │
-                          └─────────────────────┘   └─────────────────────┘
+```text
+podmesh-agent --signed, expiring advertisement--> podmesh-scheduler
+podctl -------candidate selection---------------> podmesh-scheduler
+podctl ==encrypted admission/deployment=========> selected podmesh-agent
+podmesh-agent --Podman + sidecar injection------> many workloads
+podctl ==encrypted status/log/delete============> receipt agent
+
+external client --> podmesh-proxy ==libp2p QUIC==> podmesh-sidecar --> application
+application --> podmesh-sidecar ==egress stream==> podmesh-proxy --> destination
 ```
 
 ### Component Details
 
 #### Scheduler (`podmesh-scheduler`)
-- **Bootstrap Mode**: Receives apply/delete requests from CLI, broadcasts capacity queries via gossipsub, selects worker nodes, forwards encrypted manifests
-- **Worker Mode**: Responds to capacity queries, deploys pods via Podman runtime, injects sidecars, announces as provider in Kademlia DHT
-- **REST API**: Exposes endpoints for CLI interaction (apply, delete, status)
-- **Failure Recovery**: Monitors pod health, restarts crashed containers, reschedules on node failure
+- **Registration**: Validates signed, short-lived `AgentAdvertisement` records in memory
+- **Selection**: Deterministically returns one available non-excluded agent by coarse load and node ID
+- **No workload ownership**: Never receives workload requirements, ciphertext, DEKs, status, or logs
+
+#### Agent (`podmesh-agent`)
+- **Admission**: Verifies encrypted owner requests and reserves aggregate CPU, memory, and storage
+- **Execution**: Decrypts target-bound grants, injects sidecars, and deploys through Podman
+- **Persistence**: Stores one encrypted redb row per full workload ID and reconciles all rows on restart
+- **Lifecycle**: Handles owner-signed encrypted status, logs, and delete commands independently per workload
 
 #### Proxy (`podmesh-proxy`)
 - **Ingress Gateway**: Accepts external HTTP traffic on configured ports
@@ -80,7 +76,9 @@ The project consists of the following crates:
 
 ## Message Security
 
-**All inter-node communication MUST be encrypted and signed.** The system uses proven cryptographic primitives.
+**All workload-bearing and lifecycle communication MUST be encrypted and signed.** Public agent
+advertisements are intentionally not encrypted because they contain no workload or tenant data, but
+they MUST be self-signed, bounded, short-lived, and replay-resistant.
 
 ### Envelope Structure
 
@@ -119,63 +117,41 @@ Envelope {
 ### Key Management
 
 Keys are managed via `shared/crypto/src/keypair_manager.rs`:
-- **Persistent Mode**: Keys stored in `~/.podmesh/` or `/etc/podmesh/machine/`
+- **Persistent Mode**: Client keys live under `~/.podmesh/`; agent keys use the configured agent key
+  directory (default `/etc/podmesh/agent`)
 - **Ephemeral Mode**: Keys generated in-memory for testing
 - Key files: `pubkey.bin`, `privkey.bin` (signing), `kem_pub.bin`, `kem_priv.bin` (encryption)
 
-## P2P Protocols
+## Network Protocols
 
-The system uses libp2p with QUIC transport. All protocols are defined in `shared/protocol/src/libp2p_constants.rs`.
+### Scheduler And Agent HTTP
 
-### Request-Response Protocols
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v1/agents` | Register a signed, expiring agent advertisement |
+| `GET /api/v1/agents/select` | Select an available agent without workload data |
+| `POST agent:/api/v1/admission` | Encrypted owner-signed resource admission |
+| `POST agent:/api/v1/deploy` | Encrypted target-bound deployment grant |
+| `POST agent:/api/v1/command` | Encrypted status, logs, or delete command |
 
-| Protocol | Purpose | Used By |
-|----------|---------|---------|
-| `/podmesh/apply/1.0.0` | Deploy workload manifests | Scheduler ⟷ Scheduler |
-| `/podmesh/delete/1.0.0` | Delete workloads | Scheduler ⟷ Scheduler |
-| `/podmesh/handshake/1.0.0` | Peer authentication, key exchange | All nodes |
-| `/podmesh/scheduler-tasks/1.0.0` | Scheduler coordination tasks | Scheduler ⟷ Scheduler |
-| `/podmesh/ingress-proxy/1.0.0` | HTTP request forwarding | Proxy ⟷ Sidecar |
-| `/podmesh/sidecar-manifest/1.0.0` | Manifest fetch RPCs | Proxy ⟷ Sidecar |
+HTTP is the initial transport. Records in `shared/protocol/src/agent.rs` must remain transport-neutral
+for a future Iroh endpoint implementation.
 
-### Gossipsub Topics
+### Proxy And Sidecar libp2p
 
-| Topic | Purpose |
-|-------|---------|
-| `podmesh-machine` | Scheduler plane: capacity queries, proposals |
-| `podmesh-workload` | Workload plane: proxy/sidecar coordination |
+The workload traffic plane uses libp2p QUIC. Active protocol IDs are defined in
+`shared/protocol/src/libp2p_constants.rs`.
 
-### Gossipsub Message Prefixes
+| Protocol | Purpose |
+|---|---|
+| `/podmesh/handshake/1.0.0` | Peer handshake and tenant proxy certificate exchange |
+| `/podmesh/ingress-proxy/1.0.0` | Proxy-to-sidecar HTTP forwarding |
+| `/podmesh/sidecar-manifest/1.0.0` | Signed sidecar manifest fetch |
+| `/podmesh/egress-tunnel/1.0.0` | Sidecar-to-proxy TCP tunnel |
+| `/podmesh/sidecar-registration/1.0.0` | Authenticated route registration |
 
-| Prefix | Purpose |
-|--------|---------|
-| `podmesh-handshake` | Peer handshake messages |
-| `podmesh-free-capacity` | Capacity request broadcasts |
-| `podmesh-free-capacity-reply` | Capacity response messages |
-
-### Kademlia DHT
-
-- **Provider Records**: Schedulers announce as providers for deployed manifests
-- **Manifest Records**: Key format `podmesh/manifest/{manifest_id}` maps to sidecar endpoints
-- **Mode**: All nodes run in Server mode to store/serve records
-
-### Behaviour Composition
-
-The scheduler's libp2p behaviour (`podmesh-scheduler/src/podmesh_p2p/behaviour/mod.rs`):
-
-```rust
-pub struct MyBehaviour {
-    pub gossipsub: gossipsub::Behaviour,      // PubSub messaging
-    pub apply_rr: request_response::Behaviour, // Apply protocol
-    pub handshake_rr: request_response::Behaviour, // Handshake protocol
-    pub scheduler_rr: request_response::Behaviour, // Scheduler tasks
-    pub delete_rr: request_response::Behaviour,    // Delete protocol
-    pub kademlia: kad::Behaviour,              // DHT for discovery
-    pub relay: relay::Behaviour,               // NAT traversal
-    pub autonat: autonat::Behaviour,           // NAT detection
-    pub identify: identify::Behaviour,         // Peer identification
-}
-```
+Kademlia and gossipsub are workload-plane discovery mechanisms for proxy and sidecar. The scheduler
+does not participate in libp2p or DHT storage.
 
 ## Rust Idioms
 

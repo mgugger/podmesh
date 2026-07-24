@@ -7,11 +7,12 @@ publish = false
 
 [dependencies]
 anyhow = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
 podmesh-proxy = { workspace = true }
 podmesh-sidecar = { workspace = true }
+podmesh-agent = { workspace = true }
 protocol = { workspace = true }
-podmesh-scheduler = { workspace = true, features = ["debug-endpoints"] }
+podmesh-scheduler = { workspace = true }
 podctl = { workspace = true }
 crypto = { workspace = true }
 axum = { workspace = true }

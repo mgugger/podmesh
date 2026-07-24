@@ -9,7 +9,7 @@ pub struct Config {
     pub enable_proxy_provider: bool,
     pub enable_ingress: bool,
     /// Base64-encoded Ed25519 owner public key. When set, the proxy announces
-    /// itself under the opaque DHT key `sha256(owner_pubkey_bytes || "proxy")`.
+    /// itself under the opaque DHT key `blake3(owner_pubkey_bytes)[..16]`.
     pub owner_pubkey: Option<String>,
 }
 

@@ -69,7 +69,11 @@ impl HttpConnectProxy {
                     let tunnel_tx = self.tunnel_tx.clone();
                     tokio::spawn(async move {
                         if let Err(err) = handle_connection(stream, peer_addr, tunnel_tx).await {
-                            log::debug!("HTTP CONNECT connection error peer={}: {}", peer_addr, err);
+                            log::debug!(
+                                "HTTP CONNECT connection error peer={}: {}",
+                                peer_addr,
+                                err
+                            );
                         }
                     });
                 }
@@ -174,7 +178,7 @@ async fn handle_connect(
 }
 
 /// Handle plain HTTP proxy request (GET, POST, etc.)
-/// 
+///
 /// For plain HTTP, we open a tunnel to the target host:port and forward
 /// the original request through it.
 async fn handle_http_proxy(
@@ -189,24 +193,24 @@ async fn handle_http_proxy(
     if parts.len() < 3 {
         return Err(anyhow::anyhow!("invalid request line"));
     }
-    
+
     let method = parts[0];
     let url = parts[1];
     let version = parts[2];
-    
+
     // Parse the URL to extract host, port, and path
     let (host, port, path) = parse_proxy_url(url)?;
-    
+
     log::info!("HTTP proxy request {} {}:{}{}", method, host, port, path);
-    
+
     // Reunite the stream
     let reader = buf_reader.into_inner();
     let stream = reader.reunite(writer).context("failed to reunite stream")?;
-    
+
     // Build the modified request to send through tunnel
     // Convert absolute URL to relative path for the origin server
     let modified_request_line = format!("{} {} {}\r\n", method, path, version);
-    
+
     // Prepare the full request to write after tunnel is established
     let mut request_bytes = modified_request_line.into_bytes();
     for header in headers {
@@ -216,7 +220,7 @@ async fn handle_http_proxy(
         }
     }
     request_bytes.extend_from_slice(b"\r\n");
-    
+
     // Create tunnel request with initial data to send to destination
     let tunnel_req = TunnelRequest {
         dest_host: host,
@@ -226,33 +230,34 @@ async fn handle_http_proxy(
         send_http_200: false, // Plain HTTP proxy doesn't need 200 response
         initial_data: Some(request_bytes), // Forward the HTTP request through tunnel
     };
-    
+
     // Send to tunnel handler
     tunnel_tx
         .send(tunnel_req)
         .await
         .map_err(|_| anyhow::anyhow!("tunnel channel closed"))?;
-    
+
     Ok(())
 }
 
 /// Parse a proxy URL like "http://host:port/path" into (host, port, path)
 fn parse_proxy_url(url: &str) -> Result<(String, u16, String)> {
     // Remove http:// or https:// prefix
-    let url = url.strip_prefix("http://")
+    let url = url
+        .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
         .unwrap_or(url);
-    
+
     // Split into host:port and path
     let (host_port, path) = if let Some(slash_pos) = url.find('/') {
         (&url[..slash_pos], &url[slash_pos..])
     } else {
         (url, "/")
     };
-    
+
     // Parse host and port
     let (host, port) = parse_host_port(host_port)?;
-    
+
     Ok((host, port, path.to_string()))
 }
 
@@ -263,8 +268,8 @@ fn parse_host_port(target: &str) -> Result<(String, u16)> {
         if let Some(bracket_end) = target.find(']') {
             let host = &target[1..bracket_end];
             let port_part = &target[bracket_end + 1..];
-            if port_part.starts_with(':') {
-                let port: u16 = port_part[1..]
+            if let Some(port_part) = port_part.strip_prefix(':') {
+                let port: u16 = port_part
                     .parse()
                     .context("invalid port in CONNECT target")?;
                 return Ok((host.to_string(), port));

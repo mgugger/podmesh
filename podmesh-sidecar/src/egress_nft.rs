@@ -8,12 +8,12 @@
 
 use anyhow::{Context, Result};
 use ipnetwork::IpNetwork;
-use std::fs;
 use rustables::{
-    expr::{Cmp, CmpOp, Immediate, Meta, MetaType, Nat, NatType, Register, VerdictKind},
     Batch, Chain, ChainPolicy, ChainType, Hook, HookClass, MsgType, Protocol, ProtocolFamily, Rule,
     Table,
+    expr::{Cmp, CmpOp, Immediate, Meta, MetaType, Nat, NatType, Register, VerdictKind},
 };
+use std::fs;
 
 /// Table name for podmesh egress rules
 const TABLE_NAME: &str = "podmesh_egress";
@@ -23,10 +23,6 @@ const OUTPUT_CHAIN: &str = "output";
 
 /// Transparent proxy port where sidecar listens
 const PROXY_PORT: u16 = 15001;
-
-/// Sidecar UID used to exclude our own traffic from redirection
-/// This must match the UID the sidecar runs as inside the container
-const SIDECAR_UID: u32 = 1337;
 
 /// Networks to exclude from egress interception
 const EXCLUDED_NETWORKS: &[&str] = &[
@@ -59,7 +55,7 @@ impl Default for EgressNftConfig {
         }
         Self {
             proxy_port: PROXY_PORT,
-            sidecar_uid: SIDECAR_UID,
+            sidecar_uid: unsafe { libc::geteuid() },
             excluded_networks: excluded,
         }
     }
@@ -208,7 +204,10 @@ pub fn has_net_admin_capability() -> bool {
             false
         }
         Err(err) => {
-            log::debug!("failed to read /proc/self/status to check capabilities: {}", err);
+            log::debug!(
+                "failed to read /proc/self/status to check capabilities: {}",
+                err
+            );
             false
         }
     }
@@ -236,7 +235,7 @@ mod tests {
     fn test_default_config() {
         let config = EgressNftConfig::default();
         assert_eq!(config.proxy_port, PROXY_PORT);
-        assert_eq!(config.sidecar_uid, SIDECAR_UID);
+        assert_eq!(config.sidecar_uid, unsafe { libc::geteuid() });
         assert!(!config.excluded_networks.is_empty());
     }
 

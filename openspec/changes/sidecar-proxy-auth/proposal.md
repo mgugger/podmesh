@@ -2,9 +2,8 @@
 
 ## Problem
 
-Currently, the sidecar and proxy exchange traffic that is encrypted at the libp2p
-transport layer (QUIC + Noise) but neither side authenticates the other beyond
-transport-layer identity. Specifically:
+Before this change, sidecar and proxy traffic used authenticated libp2p QUIC/TLS transport but had
+no tenant binding beyond transport identity. The implementation addressed these gaps:
 
 - The sidecar discovers a proxy via DHT under the global key `podmesh-proxy-node` and
   connects to it without any way to determine whether the proxy belongs to the same tenant.
@@ -64,7 +63,7 @@ NodeCert {
     kem_pubkey: String,        // base64 X25519 — proxy's KEM key
     signing_pubkey: String,    // base64 Ed25519 — proxy's own signing key
     capabilities: ["proxy"],   // capability marker
-    role: NodeRole::Proxy,     // new role variant
+    role: NodeRole::Proxy,
     valid_until: u64,          // unix timestamp secs (configurable TTL)
     owner_pubkey: String,      // base64 Ed25519 — tenant's owner key (issuer)
     owner_sig: String,         // Ed25519 sig over canonical_bytes(NodeCert)
@@ -113,7 +112,8 @@ public key) to make verification self-contained without relying on prior state.
 - **podmesh-proxy** — holds the tenant-signed cert; announces under obfuscated tenant DHT key;
   presents cert in handshake; verifies sidecar registration owner
 - **podmesh-sidecar** — discovers proxy via derived DHT key; verifies cert on connect
-- **podmesh-scheduler** — no change to `SidecarMetadata`; `owner_public_key_b64` already present
+- **podmesh-agent** — derives `SidecarMetadata` from the verified encrypted deployment grant;
+  `owner_public_key_b64` is already present
 
 ## Data Structure Changes
 
@@ -121,10 +121,7 @@ public key) to make verification self-contained without relying on prior state.
 
 ```rust
 pub enum NodeRole {
-    Worker,
-    Custodian,
-    Both,
-    Proxy,   // NEW
+  Proxy,
 }
 ```
 
@@ -137,7 +134,7 @@ pub struct SidecarRegistration {
     pub sidecar_peer_id: String,
     pub owner_pubkey: String,           // unchanged
     pub sig: String,                    // unchanged: sig over manifest_id || sidecar_peer_id
-    pub sidecar_signing_pubkey: String, // NEW: sidecar's own Ed25519 pubkey
+    pub sidecar_signing_pubkey: String, // sidecar's own Ed25519 pubkey
 }
 ```
 
@@ -220,6 +217,6 @@ SidecarRegistration (sidecar → proxy):
 
 - CA hierarchy — the owner keypair is the sole trust anchor.
 - Revoking a proxy cert before expiry — not addressed in this change.
-- Encrypting the cert in transit — the handshake channel is already encrypted by libp2p Noise.
+- Encrypting the cert separately in transit — libp2p QUIC/TLS already encrypts the transport.
 - Protecting the owner pubkey against a peer who has already established a connection —
   obfuscation applies to passive DHT observers only.

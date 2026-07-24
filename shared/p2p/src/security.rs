@@ -21,9 +21,7 @@ pub fn require_signed_messages() -> bool {
 
 /// Verify a postcard envelope and check nonce for replay protection.
 /// Returns the verified envelope on successful verification.
-pub fn verify_envelope_and_check_nonce(
-    envelope_bytes: &[u8],
-) -> anyhow::Result<VerifiedEnvelope> {
+pub fn verify_envelope_and_check_nonce(envelope_bytes: &[u8]) -> anyhow::Result<VerifiedEnvelope> {
     verify_envelope_and_check_nonce_for_peer(envelope_bytes, "global")
 }
 
@@ -33,11 +31,7 @@ pub fn verify_envelope_and_check_nonce_for_peer(
     envelope_bytes: &[u8],
     peer_id: &str,
 ) -> anyhow::Result<VerifiedEnvelope> {
-    envelope::verify_envelope_for_peer(
-        envelope_bytes,
-        std::time::Duration::from_secs(300),
-        peer_id,
-    )
+    envelope::verify_envelope_for_peer(envelope_bytes, std::time::Duration::from_secs(300), peer_id)
 }
 
 /// Verify the supplied bytes as a signed envelope originating from `peer`.

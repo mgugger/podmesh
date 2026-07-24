@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 
 use anyhow::Result;
-use tokio::{sync::watch, task::JoinHandle};
 use log::info;
+use tokio::{sync::watch, task::JoinHandle};
 
 use crate::{config::Config, ingress, p2p, restapi};
 

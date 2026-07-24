@@ -16,21 +16,13 @@ anyhow = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
-p2p = { workspace = true }
 crypto = { workspace = true }
 protocol = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 uuid = { workspace = true }
-sha2 = { workspace = true }
-zeroize = { workspace = true }
-chacha20poly1305 = { workspace = true }
-x25519-dalek = { workspace = true }
-ed25519-dalek = { workspace = true }
-blake3 = { workspace = true }
 postcard = { workspace = true }
 rand = { workspace = true }
-hex = { workspace = true }
 dirs = { workspace = true }
 
 [[bin]]

@@ -1,25 +1,15 @@
-use serde::{Deserialize, Serialize};
 use crypto::{b64_decode, b64_encode, sign_envelope, verify_envelope};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum NodeRole {
-    Worker,
-    Custodian,
-    Both,
-    /// Tenant-bound podmesh-proxy node (provisioned by `podctl grant-proxy`).
+    #[default]
     Proxy,
-}
-
-impl Default for NodeRole {
-    fn default() -> Self { NodeRole::Both }
 }
 
 impl std::fmt::Display for NodeRole {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NodeRole::Worker => write!(f, "worker"),
-            NodeRole::Custodian => write!(f, "custodian"),
-            NodeRole::Both => write!(f, "both"),
             NodeRole::Proxy => write!(f, "proxy"),
         }
     }
@@ -29,9 +19,6 @@ impl std::str::FromStr for NodeRole {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "worker" => Ok(NodeRole::Worker),
-            "custodian" => Ok(NodeRole::Custodian),
-            "both" => Ok(NodeRole::Both),
             "proxy" => Ok(NodeRole::Proxy),
             _ => Err(anyhow::anyhow!("unknown role: {}", s)),
         }
@@ -41,19 +28,19 @@ impl std::str::FromStr for NodeRole {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Endorsement {
     pub endorser_peer_id: String,
-    pub endorser_sig: String,  // base64 Ed25519 sig over NodeCert canonical bytes
+    pub endorser_sig: String, // base64 Ed25519 sig over NodeCert canonical bytes
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeCert {
     pub peer_id: String,
-    pub kem_pubkey: String,        // base64 X25519
-    pub signing_pubkey: String,    // base64 Ed25519
-    pub capabilities: Vec<String>, // ["gpu", "region:eu", "custodian"]
+    pub kem_pubkey: String,     // base64 X25519
+    pub signing_pubkey: String, // base64 Ed25519
+    pub capabilities: Vec<String>,
     pub role: NodeRole,
-    pub valid_until: u64,          // unix timestamp seconds
-    pub owner_pubkey: String,      // base64 Ed25519 — who issued this cert
-    pub owner_sig: String,         // base64 Ed25519 sig over canonical bytes
+    pub valid_until: u64,     // unix timestamp seconds
+    pub owner_pubkey: String, // base64 Ed25519 — who issued this cert
+    pub owner_sig: String,    // base64 Ed25519 sig over canonical bytes
     pub endorsements: Vec<Endorsement>,
 }
 
@@ -98,12 +85,7 @@ impl NodeCert {
 
     /// Returns true if the cert satisfies a role requirement.
     pub fn has_role(&self, role: &NodeRole) -> bool {
-        match role {
-            NodeRole::Worker => matches!(self.role, NodeRole::Worker | NodeRole::Both),
-            NodeRole::Custodian => matches!(self.role, NodeRole::Custodian | NodeRole::Both),
-            NodeRole::Both => matches!(self.role, NodeRole::Both),
-            NodeRole::Proxy => matches!(self.role, NodeRole::Proxy),
-        }
+        self.role == *role
     }
 
     /// Serialize to bytes (postcard)
@@ -167,7 +149,8 @@ mod tests {
             valid_until: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_secs() + 86400,
+                .as_secs()
+                + 86400,
             owner_pubkey: b64_encode(&pk),
             owner_sig: String::new(),
             endorsements: vec![],
@@ -177,14 +160,14 @@ mod tests {
 
     #[test]
     fn test_node_cert_sign_verify_roundtrip() {
-        let (cert, sk, pk) = make_test_cert(NodeRole::Both);
+        let (cert, sk, pk) = make_test_cert(NodeRole::Proxy);
         let signed = cert.sign(&sk, &pk).unwrap();
         assert!(signed.verify().is_ok());
     }
 
     #[test]
     fn test_node_cert_rejects_tampered_capabilities() {
-        let (cert, sk, pk) = make_test_cert(NodeRole::Worker);
+        let (cert, sk, pk) = make_test_cert(NodeRole::Proxy);
         let mut signed = cert.sign(&sk, &pk).unwrap();
         signed.capabilities.push("extra".to_string());
         assert!(signed.verify().is_err());
@@ -192,7 +175,7 @@ mod tests {
 
     #[test]
     fn test_node_cert_is_expired() {
-        let (mut cert, sk, pk) = make_test_cert(NodeRole::Worker);
+        let (mut cert, sk, pk) = make_test_cert(NodeRole::Proxy);
         cert.valid_until = 1; // far in the past
         let signed = cert.sign(&sk, &pk).unwrap();
         assert!(signed.is_expired());
@@ -200,40 +183,36 @@ mod tests {
 
     #[test]
     fn test_node_cert_not_expired() {
-        let (cert, sk, pk) = make_test_cert(NodeRole::Worker);
+        let (cert, sk, pk) = make_test_cert(NodeRole::Proxy);
         let signed = cert.sign(&sk, &pk).unwrap();
         assert!(!signed.is_expired());
     }
 
     #[test]
     fn test_node_cert_role_serialization() {
-        for role in [NodeRole::Worker, NodeRole::Custodian, NodeRole::Both] {
-            let s = role.to_string();
-            let parsed: NodeRole = s.parse().unwrap();
-            assert_eq!(parsed.to_string(), s);
-        }
+        let role = NodeRole::Proxy;
+        let serialized = role.to_string();
+        let parsed: NodeRole = serialized.parse().unwrap();
+        assert_eq!(parsed.to_string(), serialized);
     }
 
     #[test]
     fn test_node_cert_has_role() {
-        let (cert, sk, pk) = make_test_cert(NodeRole::Both);
+        let (cert, sk, pk) = make_test_cert(NodeRole::Proxy);
         let signed = cert.sign(&sk, &pk).unwrap();
-        assert!(signed.has_role(&NodeRole::Worker));
-        assert!(signed.has_role(&NodeRole::Custodian));
-        assert!(signed.has_role(&NodeRole::Both));
+        assert!(signed.has_role(&NodeRole::Proxy));
     }
 
     #[test]
-    fn test_node_cert_worker_role_not_custodian() {
-        let (cert, sk, pk) = make_test_cert(NodeRole::Worker);
+    fn test_node_cert_proxy_role() {
+        let (cert, sk, pk) = make_test_cert(NodeRole::Proxy);
         let signed = cert.sign(&sk, &pk).unwrap();
-        assert!(signed.has_role(&NodeRole::Worker));
-        assert!(!signed.has_role(&NodeRole::Custodian));
+        assert!(signed.has_role(&NodeRole::Proxy));
     }
 
     #[test]
     fn test_node_cert_bytes_roundtrip() {
-        let (cert, sk, pk) = make_test_cert(NodeRole::Custodian);
+        let (cert, sk, pk) = make_test_cert(NodeRole::Proxy);
         let signed = cert.sign(&sk, &pk).unwrap();
         let bytes = signed.to_bytes();
         let recovered = NodeCert::from_bytes(&bytes).unwrap();
@@ -242,7 +221,7 @@ mod tests {
 
     #[test]
     fn test_node_cert_b64_roundtrip() {
-        let (cert, sk, pk) = make_test_cert(NodeRole::Both);
+        let (cert, sk, pk) = make_test_cert(NodeRole::Proxy);
         let signed = cert.sign(&sk, &pk).unwrap();
         let b64 = signed.to_b64();
         let recovered = NodeCert::from_b64(&b64).unwrap();

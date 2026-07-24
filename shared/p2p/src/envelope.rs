@@ -117,32 +117,18 @@ fn sign_internal(
 
     let (sig_b64, pub_b64) = crypto::sign_envelope(sk_bytes, pub_bytes, &canonical)?;
 
-    let bytes = if let Some(peer) = peer_id {
-        protocol::machine::build_envelope_signed_with_peer(
-            payload,
-            payload_type,
-            &nonce_owned,
-            timestamp,
-            algorithm,
-            signature_prefix,
-            &sig_b64,
-            &pub_b64,
-            peer,
-            kem_pub_b64,
-        )
-    } else {
-        protocol::machine::build_envelope_signed(
-            payload,
-            payload_type,
-            &nonce_owned,
-            timestamp,
-            algorithm,
-            signature_prefix,
-            &sig_b64,
-            &pub_b64,
-            kem_pub_b64,
-        )
-    };
+    let bytes = protocol::machine::build_envelope_signed(protocol::machine::SignedEnvelopeParams {
+        payload,
+        payload_type,
+        nonce: &nonce_owned,
+        timestamp,
+        algorithm,
+        signature_prefix,
+        signature_b64: &sig_b64,
+        public_key_b64: &pub_b64,
+        peer_id,
+        kem_public_key_b64: kem_pub_b64,
+    });
 
     Ok(SignedEnvelope {
         bytes,
@@ -159,8 +145,8 @@ pub fn create_signed_envelope(
     peer_id: Option<&str>,
     kem_pub_b64: Option<&str>,
 ) -> anyhow::Result<Vec<u8>> {
-    let public_key_bytes = crypto::b64_decode(public_key_b64)
-        .context("failed to decode public key")?;
+    let public_key_bytes =
+        crypto::b64_decode(public_key_b64).context("failed to decode public key")?;
 
     let config = SignEnvelopeConfig {
         peer_id,
@@ -190,8 +176,8 @@ pub fn create_encrypted_signed_envelope(
 ) -> anyhow::Result<Vec<u8>> {
     let encrypted_payload = crypto::encrypt_payload_for_recipient(recipient_kem_pubkey, payload)?;
 
-    let public_key_bytes = crypto::b64_decode(public_key_b64)
-        .context("failed to decode public key")?;
+    let public_key_bytes =
+        crypto::b64_decode(public_key_b64).context("failed to decode public key")?;
 
     let config = SignEnvelopeConfig {
         peer_id,
@@ -253,8 +239,7 @@ pub fn verify_envelope_for_peer(
     let pub_str = env.pubkey().unwrap_or("");
 
     let sig_bytes = normalize_and_decode_signature(Some(sig_str))?;
-    let pub_bytes = crypto::b64_decode(pub_str)
-        .context("failed to base64-decode pubkey")?;
+    let pub_bytes = crypto::b64_decode(pub_str).context("failed to base64-decode pubkey")?;
 
     // Reconstruct canonical bytes using the same method as signing
     let payload_vec = env.payload().map(|b| b.to_vec()).unwrap_or_default();
@@ -269,7 +254,7 @@ pub fn verify_envelope_for_peer(
     let now_ms = timestamp_millis();
     // If ts is much smaller than now_ms (by factor of 1000), it's likely in seconds
     let ts_ms = if ts < now_ms / 100 { ts * 1000 } else { ts };
-    let drift_ms = if ts_ms > now_ms { ts_ms - now_ms } else { now_ms - ts_ms };
+    let drift_ms = ts_ms.abs_diff(now_ms);
     if drift_ms > MAX_TIMESTAMP_DRIFT_MS {
         bail!(
             "envelope timestamp drift {} ms exceeds maximum {} ms",
@@ -332,9 +317,7 @@ pub fn verify_envelope_for_peer(
 /// This is used when extracting tokens for re-signing, where the same envelope
 /// may be processed multiple times legitimately.
 /// Returns verified envelope.
-pub fn verify_envelope_skip_nonce_check(
-    envelope_bytes: &[u8],
-) -> anyhow::Result<VerifiedEnvelope> {
+pub fn verify_envelope_skip_nonce_check(envelope_bytes: &[u8]) -> anyhow::Result<VerifiedEnvelope> {
     let env = protocol::machine::root_as_envelope(envelope_bytes)
         .context("failed to parse postcard envelope")?;
 
@@ -342,8 +325,7 @@ pub fn verify_envelope_skip_nonce_check(
     let pub_str = env.pubkey().unwrap_or("");
 
     let sig_bytes = normalize_and_decode_signature(Some(sig_str))?;
-    let pub_bytes = crypto::b64_decode(pub_str)
-        .context("failed to base64-decode pubkey")?;
+    let pub_bytes = crypto::b64_decode(pub_str).context("failed to base64-decode pubkey")?;
 
     let payload_vec = env.payload().map(|b| b.to_vec()).unwrap_or_default();
     let payload_type = env.payload_type().unwrap_or("");
@@ -424,21 +406,22 @@ mod tests {
         let (sig_b64, pub_b64) = sign_envelope(&privb, &pubb, &canonical).expect("sign");
 
         // Build the final signed postcard envelope using the original payload
-        let signed_envelope = protocol::machine::build_envelope_signed(
-            payload,
-            payload_type,
-            &nonce,
-            timestamp,
-            alg,
-            "ed25519",
-            &sig_b64,
-            &pub_b64,
-            None,
-        );
+        let signed_envelope =
+            protocol::machine::build_envelope_signed(protocol::machine::SignedEnvelopeParams {
+                payload,
+                payload_type,
+                nonce: &nonce,
+                timestamp,
+                algorithm: alg,
+                signature_prefix: "ed25519",
+                signature_b64: &sig_b64,
+                public_key_b64: &pub_b64,
+                peer_id: None,
+                kem_public_key_b64: None,
+            });
 
         // Verify the envelope and ensure the extracted payload matches
-        let parts =
-            verify_envelope(&signed_envelope, Duration::from_secs(300)).expect("verify");
+        let parts = verify_envelope(&signed_envelope, Duration::from_secs(300)).expect("verify");
 
         assert_eq!(parts.payload, payload);
 

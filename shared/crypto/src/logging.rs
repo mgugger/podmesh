@@ -72,12 +72,7 @@ impl ProtocolLogger {
     }
 
     /// Log a failure event with structured format
-    pub fn log_failure<E: std::fmt::Debug>(
-        protocol: &str,
-        direction: &str,
-        peer: &str,
-        error: E,
-    ) {
+    pub fn log_failure<E: std::fmt::Debug>(protocol: &str, direction: &str, peer: &str, error: E) {
         log::warn!(
             "libp2p: [{}] {} failure with peer {}: {:?}",
             protocol,

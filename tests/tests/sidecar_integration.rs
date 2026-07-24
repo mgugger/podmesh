@@ -102,7 +102,7 @@ async fn sidecar_discovers_workload_provider() -> Result<()> {
         let deadline = tokio::time::sleep(Duration::from_secs(30));
         tokio::pin!(deadline);
 
-        while !(connected_peers.len() >= 1 && provider_seen) {
+        while !(!connected_peers.is_empty() && provider_seen) {
             tokio::select! {
                 Some(event) = event_rx.recv() => {
                     match event {
@@ -116,7 +116,7 @@ async fn sidecar_discovers_workload_provider() -> Result<()> {
                                 provider_seen = true;
                             }
                         }
-                        SidecarEvent::ProxyPeerDiscovered { .. } 
+                        SidecarEvent::ProxyPeerDiscovered { .. }
                         | SidecarEvent::EgressTunnelEstablished { .. }
                         | SidecarEvent::EgressTunnelFailed { .. } => {
                             // Ignored in this test
@@ -231,16 +231,16 @@ async fn ingress_proxies_requests_via_sidecar() -> Result<()> {
 async fn sidecar_discovers_egress_proxy_via_dht() -> Result<()> {
     init_tracing();
     init_ephemeral_keys();
-    
+
     // Start a workload node that acts as the proxy provider
     let mut handle = start_workload(Vec::new(), true, false)?;
     let proxy_peer_id = handle.peer_id.clone();
-    
+
     let test_result: Result<()> = async {
         // Wait for proxy to be ready and announce itself
         wait_for_kad_ready(handle.kad_rx(), Duration::from_secs(10)).await?;
         wait_for_proxy_provider(handle.proxy_provider_rx(), Duration::from_secs(10)).await?;
-        
+
         // Create sidecar with egress enabled
         let (mut sidecar_cfg, _, _) = build_sidecar_config_with_egress(
             vec![handle.bootstrap_addr.clone()],
@@ -251,22 +251,22 @@ async fn sidecar_discovers_egress_proxy_via_dht() -> Result<()> {
         sidecar_cfg.skip_egress_nft = true;
         // Use a faster lookup interval for testing
         sidecar_cfg.lookup_interval = Duration::from_secs(1);
-        
+
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        
+
         let sidecar_task = tokio::spawn(async move {
             run_sidecar_with_shutdown(sidecar_cfg, shutdown_rx, Some(event_tx))
                 .await
                 .expect("sidecar run");
         });
-        
+
         // Wait for sidecar to discover the proxy peer
         let mut connected = false;
         let mut proxy_discovered = false;
         let deadline = tokio::time::sleep(Duration::from_secs(30));
         tokio::pin!(deadline);
-        
+
         while !(connected && proxy_discovered) {
             tokio::select! {
                 Some(event) = event_rx.recv() => {
@@ -277,11 +277,10 @@ async fn sidecar_discovers_egress_proxy_via_dht() -> Result<()> {
                                 log::info!("sidecar connected to proxy peer={}", peer_id);
                             }
                         }
-                        SidecarEvent::ProxyPeerDiscovered { peer_id } => {
-                            if peer_id == proxy_peer_id {
-                                proxy_discovered = true;
-                                log::info!("sidecar discovered proxy peer for egress peer={}", peer_id);
-                            }
+                        SidecarEvent::ProxyPeerDiscovered { peer_id }
+                            if peer_id == proxy_peer_id => {
+                            proxy_discovered = true;
+                            log::info!("sidecar discovered proxy peer for egress peer={}", peer_id);
                         }
                         _ => {}
                     }
@@ -291,17 +290,21 @@ async fn sidecar_discovers_egress_proxy_via_dht() -> Result<()> {
                 }
             }
         }
-        
+
         assert!(connected, "sidecar never connected to proxy node");
-        assert!(proxy_discovered, "sidecar never discovered proxy peer {} for egress", proxy_peer_id);
-        
+        assert!(
+            proxy_discovered,
+            "sidecar never discovered proxy peer {} for egress",
+            proxy_peer_id
+        );
+
         let _ = shutdown_tx.send(());
         let _ = sidecar_task.await;
-        
+
         Ok(())
     }
     .await;
-    
+
     handle.workload.close().await;
     test_result
 }
@@ -329,11 +332,11 @@ async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
     let target_port = allocate_tcp_port();
     let target_body = "hello-from-egress-target".to_string();
     let target_server = spawn_test_app(target_port, target_body.clone()).await?;
-    
+
     // Start proxy node that will handle egress tunnel streams
     let mut handle = start_workload(Vec::new(), true, false)?;
     let proxy_peer_id = handle.peer_id.clone();
-    
+
     let test_result: Result<()> = async {
         // Wait for proxy to be ready
         wait_for_kad_ready(handle.kad_rx(), Duration::from_secs(10)).await?;
@@ -341,13 +344,18 @@ async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
 
         // Provision the proxy with a tenant-signed NodeCert via the REST API.
         // This is the in-test equivalent of `podctl grant-proxy --proxy-url <url>`.
-        provision_proxy_cert(handle.rest_port, &owner_pk, &owner_sk, Duration::from_secs(10))
-            .await
-            .map_err(|e| anyhow!("provision proxy cert failed: {}", e))?;
+        provision_proxy_cert(
+            handle.rest_port,
+            &owner_pk,
+            &owner_sk,
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(|e| anyhow!("provision proxy cert failed: {}", e))?;
 
         // Allocate port for sidecar's HTTP CONNECT proxy
         let http_proxy_port = allocate_tcp_port();
-        
+
         // Create sidecar with HTTP proxy enabled and tenant owner pubkey set so
         // it discovers the proxy via the obfuscated tenant DHT key.
         let (mut sidecar_cfg, _, _) = build_sidecar_config_full(
@@ -358,32 +366,29 @@ async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
         )?;
         sidecar_cfg.owner_public_key_b64 = Some(owner_b64.clone());
         sidecar_cfg.lookup_interval = Duration::from_secs(1);
-        
+
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        
+
         let sidecar_task = tokio::spawn(async move {
             run_sidecar_with_shutdown(sidecar_cfg, shutdown_rx, Some(event_tx))
                 .await
                 .expect("sidecar run");
         });
-        
+
         // Wait for sidecar to discover the proxy peer (under tenant DHT key)
         let mut proxy_discovered = false;
         let deadline = tokio::time::sleep(Duration::from_secs(30));
         tokio::pin!(deadline);
-        
+
         while !proxy_discovered {
             tokio::select! {
                 Some(event) = event_rx.recv() => {
-                    match event {
-                        SidecarEvent::ProxyPeerDiscovered { peer_id } => {
-                            if peer_id == proxy_peer_id {
-                                proxy_discovered = true;
-                                log::info!("sidecar discovered tenant-bound proxy peer={}", peer_id);
-                            }
-                        }
-                        _ => {}
+                    if let SidecarEvent::ProxyPeerDiscovered { peer_id } = event
+                        && peer_id == proxy_peer_id
+                    {
+                        proxy_discovered = true;
+                        log::info!("sidecar discovered tenant-bound proxy peer={}", peer_id);
                     }
                 }
                 _ = &mut deadline => {
@@ -391,43 +396,49 @@ async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
                 }
             }
         }
-        
-        assert!(proxy_discovered, "sidecar never discovered proxy peer {} for egress under tenant DHT key", proxy_peer_id);
-        
+
+        assert!(
+            proxy_discovered,
+            "sidecar never discovered proxy peer {} for egress under tenant DHT key",
+            proxy_peer_id
+        );
+
         // Give the HTTP CONNECT proxy a moment to start and the sidecar to verify the cert.
         tokio::time::sleep(Duration::from_millis(800)).await;
-        
+
         // Create HTTP client that uses the sidecar's HTTP CONNECT proxy
         let proxy_url = format!("http://127.0.0.1:{}", http_proxy_port);
         let client = Client::builder()
             .proxy(reqwest::Proxy::all(&proxy_url).expect("valid proxy URL"))
             .build()
             .expect("build http client with proxy");
-        
+
         // Make HTTP request through the proxy tunnel
         let target_url = format!("http://127.0.0.1:{}/hello", target_port);
-        let response = tokio::time::timeout(
-            Duration::from_secs(15),
-            client.get(&target_url).send()
-        )
-        .await
-        .map_err(|_| anyhow!("HTTP request through egress proxy timed out"))?
-        .map_err(|e| anyhow!("HTTP request through egress proxy failed: {}", e))?;
-        
-        assert!(response.status().is_success(), "expected success status, got {}", response.status());
-        
+        let response =
+            tokio::time::timeout(Duration::from_secs(15), client.get(&target_url).send())
+                .await
+                .map_err(|_| anyhow!("HTTP request through egress proxy timed out"))?
+                .map_err(|e| anyhow!("HTTP request through egress proxy failed: {}", e))?;
+
+        assert!(
+            response.status().is_success(),
+            "expected success status, got {}",
+            response.status()
+        );
+
         let body = response.text().await?;
         assert_eq!(body, target_body, "response body mismatch");
-        
+
         log::info!("egress HTTP proxy test succeeded - traffic routed through tenant-bound tunnel");
-        
+
         let _ = shutdown_tx.send(());
         let _ = sidecar_task.await;
-        
+
         Ok(())
     }
     .await;
-    
+
     target_server.abort();
     let _ = target_server.await;
     handle.workload.close().await;
@@ -557,10 +568,10 @@ async fn wait_for_ingress_response(
 ) -> Result<String> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(response) = client.get(url).header("host", host).send().await {
-            if response.status().is_success() {
-                return Ok(response.text().await?);
-            }
+        if let Ok(response) = client.get(url).header("host", host).send().await
+            && response.status().is_success()
+        {
+            return Ok(response.text().await?);
         }
         if Instant::now() >= deadline {
             return Err(anyhow!("ingress proxy response timed out"));
@@ -713,14 +724,23 @@ async fn sidecar_registers_with_tenant_signed_proxy_cert() -> Result<()> {
         //   - check role == Proxy
         //   - store the cert keyed by owner_pubkey
         //   - announce under blake3(owner_pubkey)[..16]
-        let ack = provision_proxy_cert(handle.rest_port, &owner_pk, &owner_sk, Duration::from_secs(10))
-            .await
-            .map_err(|e| anyhow!("provision_proxy_cert failed: {}", e))?;
+        let ack = provision_proxy_cert(
+            handle.rest_port,
+            &owner_pk,
+            &owner_sk,
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(|e| anyhow!("provision_proxy_cert failed: {}", e))?;
         log::info!(
             "proxy provisioned with cert: tenant_dht_key_hex={} valid_until={}",
-            ack.tenant_dht_key_hex, ack.valid_until
+            ack.tenant_dht_key_hex,
+            ack.valid_until
         );
-        assert!(!ack.tenant_dht_key_hex.is_empty(), "expected tenant_dht_key_hex in response");
+        assert!(
+            !ack.tenant_dht_key_hex.is_empty(),
+            "expected tenant_dht_key_hex in response"
+        );
 
         // Sanity check: the cert should be visible in the proxy's in-process cert store.
         let store = handle
@@ -761,10 +781,10 @@ async fn sidecar_registers_with_tenant_signed_proxy_cert() -> Result<()> {
         while !tenant_proxy_seen {
             tokio::select! {
                 Some(event) = event_rx.recv() => {
-                    if let SidecarEvent::ProxyPeerDiscovered { peer_id } = event {
-                        if peer_id == proxy_peer_id {
-                            tenant_proxy_seen = true;
-                        }
+                    if let SidecarEvent::ProxyPeerDiscovered { peer_id } = event
+                        && peer_id == proxy_peer_id
+                    {
+                        tenant_proxy_seen = true;
                     }
                 }
                 _ = &mut proxy_discovery_deadline => break,
@@ -783,11 +803,11 @@ async fn sidecar_registers_with_tenant_signed_proxy_cert() -> Result<()> {
         let routing_deadline = Instant::now() + Duration::from_secs(20);
         let mut registered = false;
         while Instant::now() < routing_deadline {
-            if let Some(table) = routing_table.as_ref() {
-                if table.read().unwrap().contains_key(DEMO_MANIFEST_ID) {
-                    registered = true;
-                    break;
-                }
+            if let Some(table) = routing_table.as_ref()
+                && table.read().unwrap().contains_key(DEMO_MANIFEST_ID)
+            {
+                registered = true;
+                break;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }

@@ -1,126 +1,92 @@
 # Podmesh
 
-A decentralized, zero-trust, multi-tenant compute mesh built on [libp2p](https://libp2p.io/).
-
-Workload specs are **encrypted client-side** before submission. No single node — including the scheduler — ever sees plaintext workload specs or raw decryption keys.
-
-**License**: GPL-3.0-only
-
----
+Podmesh is a zero-trust, multi-tenant workload mesh. A namespace is currently identified by its
+Ed25519 public key. Complete workload specifications are encrypted by `podctl` and sent directly to
+the selected execution agent; the scheduler never receives workload plaintext or key material.
 
 ## Architecture
 
-```
-podctl  ──────────────────────────────────────────────────────────────┐
-  │  seal spec client-side (Shamir secret sharing)                    │
-  │  encrypt spec with a random DEK (XChaCha20-Poly1305)              │
-  │  split DEK into N shares, wrap each to a custodian's KEM          │
-  │                                                                   │
-  ▼                                                                   ▼
-podmesh-scheduler ◄──── libp2p gossipsub/kad/request-response ──► custodian nodes
-  │  routes sealed WorkloadSubmission                                 │
-  │  never sees plaintext                                             │  hold wrapped shares
-  ▼                                                                   │
-worker nodes ◄──── collect M-of-N wrapped shares ───────────────────┘
-  │  reconstruct DEK via Shamir, decrypt spec, deploy
-  ▼
-container runtime (Podman / mock)
+```text
+podmesh-agent --signed, expiring availability--> podmesh-scheduler
+podctl -------candidate selection-------------> podmesh-scheduler
+podctl ==encrypted admission and grant========> podmesh-agent
+podmesh-agent --Podman + sidecar--------------> workload
+podctl ==encrypted status/log/delete==========> podmesh-agent
 ```
 
-### Components
+- `podmesh-scheduler` stores only expiring agent advertisements in memory and deterministically
+  selects an available candidate. Restarting it does not affect running workloads.
+- `podmesh-agent` admits and runs many workloads up to configured count and aggregate resource
+  limits. It owns Podman, sidecar injection, local status/log/delete commands, persistent node
+  keys, and one encrypted record per workload.
+- `podctl` owns the namespace signing key, encrypts the complete execution specification with a
+  random DEK, wraps the DEK to the selected agent, and stores the signed deployment receipt locally.
+- `podmesh-proxy` and `podmesh-sidecar` remain the workload traffic plane.
 
-| Crate | Description |
-|---|---|
-| `podmesh-scheduler` | libp2p node: scheduler, worker, and custodian roles (co-located by default). Exposes a REST API on port 3000. |
-| `podctl` | CLI client: seals workload specs, submits to the scheduler, manages deployments. |
-| `shared/crypto` | Cryptographic primitives: X25519 KEM, Ed25519 signing, XChaCha20-Poly1305 AEAD, Shamir secret sharing. |
-| `shared/protocol` | Shared message types: `SealedSpec`, `WorkloadSubmission`, `WorkloadDispatch`, `NodeCert`, etc. |
-| `shared/p2p` | libp2p swarm helpers. |
-| `podmesh-proxy` | Ingress/egress proxy node. |
-| `podmesh-sidecar` | In-pod sidecar that connects to the proxy. |
+## Availability Contract
 
----
+Automatic recovery is intentionally not implemented yet. A container or agent restart can recover
+from the agent's encrypted local record as long as its persistent node keys remain available. Loss
+of the only agent and its durable state requires the namespace owner to deploy again. Workloads that
+cannot accept this must use multiple replicas once replica handoff is implemented.
 
 ## Trust Model
 
-- **Sealing**: happens entirely in `podctl`. The plaintext spec never leaves the client.
-- **Shamir secret sharing**: The spec is encrypted with a random per-workload DEK (XChaCha20-Poly1305). The owner splits the DEK into N Shamir shares with an M-of-N reconstruction threshold, wrapping each share to a custodian's X25519 KEM pubkey. On request, each custodian re-wraps its single share to the assigned worker's KEM pubkey — the scheduler sees only ciphertext and wrapped shares, and no single custodian ever holds the full DEK.
-- **NodeCerts**: Each node self-signs a certificate advertising its capabilities and KEM pubkey. Custodians and workers verify cert chains before accepting assignments.
+- Agent advertisements are public, signed, bounded, and short-lived.
+- Admission requests, deployment grants, receipts, status, logs, and deletion are encrypted between
+  `podctl` and the selected agent.
+- Owner signatures bind namespace, full 256-bit workload/revision IDs, target node, reservation,
+  ciphertext, wrapped DEK, expiry, and nonce.
+- Client and agent use the same strict Kubernetes quantity parser. The agent validates post-sidecar
+  CPU, memory, and ephemeral storage limits against the signed reservation before execution.
+- The selected agent necessarily sees plaintext while executing the workload. Other agents, the
+  scheduler, and proxies do not receive the execution specification.
+- Proxy traffic confidentiality requires TLS or another end-to-end protocol terminating in the
+  workload/sidecar; proxies are not trusted with workload plaintext.
 
----
-
-## Quick Start
-
-### Build
-
-```bash
-# Build everything (excludes podmesh-sidecar which requires libclang)
-cargo build -p podmesh-scheduler -p podctl
-```
-
-### Run a local node (co-located scheduler + worker + custodian)
+## Build And Run
 
 ```bash
-./target/debug/podmesh-scheduler --mode both --api-port 3000
+cargo build --workspace
+
+./target/debug/podmesh-scheduler --listen 127.0.0.1:3000
+./target/debug/podmesh-agent \
+  --listen 127.0.0.1:3100 \
+  --advertise-url http://127.0.0.1:3100 \
+  --scheduler-url http://127.0.0.1:3000 \
+  --max-workloads 100 \
+  --runtime mock
+
+./target/debug/podctl --api-url http://127.0.0.1:3000 apply -f deploy/demo_deployment.yml
 ```
 
-### Submit a workload
+Use `--runtime podman` for real execution. The agent expects a working `podman` command and may use
+`PODMAN_HOST` to target a mounted Podman socket.
+
+## Test
 
 ```bash
-./target/debug/podctl --api-url http://localhost:3000 apply -f deploy/demo_deployment.yml \
-  --shares 5 --threshold 3
+cargo test --workspace
 ```
 
-### Verify peers / debug
+Podman-dependent tests remain behind the integration test crate's `podman-tests` feature and require
+a working Podman CLI, a rootless or rootful Podman socket, and all images from
+`deploy/build_containers.sh`. They fail explicitly rather than reporting a skipped test as passing.
+The build script creates scratch images for both `linux/amd64` and `linux/arm64` by default.
 
 ```bash
-curl localhost:3000/debug/dht/peers
-curl localhost:3000/api/v1/custodians
+cargo test -p podmesh-integration-tests --features podman-tests
 ```
 
----
+## Crates
 
-## Local Podman Deployment
-
-See [deploy/README.md](deploy/README.md) for running the full stack with Podman.
-
----
-
-## Testing
-
-Run all tests (excluding Podman-dependent tests):
-
-```bash
-cargo test -p podmesh-scheduler -p protocol -p crypto -p podctl
-```
-
-Run integration tests (no Podman required):
-
-```bash
-cargo test -p podmesh-scheduler --test '*'
-```
-
-Run Podman-dependent tests (requires running Podman socket and pre-built images):
-
-```bash
-cargo test --package podmesh-scheduler --features podman-tests
-```
-
-**Prerequisites for Podman tests:**
-- Podman installed and available in `PATH`
-- Rootless Podman socket running: `systemctl --user start podman.socket`
-- Container images built: `./deploy/build_containers.sh`
-
----
-
-## Key Files
-
-```
-podmesh-scheduler/      main node binary (scheduler + worker + custodian)
-podctl/                 CLI client
-shared/
-  crypto/               cryptographic primitives (KEM, Shamir secret sharing)
-  protocol/             shared wire types
-  p2p/                  libp2p helpers
-deploy/                 Podman deployment manifests and demo YAMLs
-```
+| Crate | Responsibility |
+|---|---|
+| `podctl` | Namespace keys, encrypted deployment, local receipt catalog |
+| `podmesh-scheduler` | Stateless in-memory agent selection |
+| `podmesh-agent` | Admission, encrypted persistence, Podman, sidecar injection |
+| `podmesh-proxy` | Ingress/egress workload traffic gateway |
+| `podmesh-sidecar` | Workload-local traffic endpoint |
+| `shared/crypto` | Ed25519, X25519, XChaCha20-Poly1305 |
+| `shared/protocol` | Bounded signed/encrypted wire records |
+| `shared/p2p` | Proxy/sidecar libp2p transport helpers |

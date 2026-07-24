@@ -29,9 +29,7 @@ pub enum CertCommands {
         output: Option<String>,
     },
     /// Show the contents of a NodeCert
-    Show {
-        path: String,
-    },
+    Show { path: String },
     /// Verify a NodeCert's owner signature
     Verify {
         cert_path: String,
@@ -61,7 +59,7 @@ pub enum CertCommands {
     },
 }
 
-pub fn handle_cert_command(cmd: CertCommands) -> anyhow::Result<()> {
+pub async fn handle_cert_command(cmd: CertCommands) -> anyhow::Result<()> {
     match cmd {
         CertCommands::Issue {
             peer_id,
@@ -127,10 +125,9 @@ pub fn handle_cert_command(cmd: CertCommands) -> anyhow::Result<()> {
             println!("  caps:       {:?}", signed.capabilities);
         }
         CertCommands::Show { path } => {
-            let bytes = std::fs::read(&path)
-                .with_context(|| format!("reading cert from {}", path))?;
-            let cert = NodeCert::from_bytes(&bytes)
-                .with_context(|| "deserializing NodeCert")?;
+            let bytes =
+                std::fs::read(&path).with_context(|| format!("reading cert from {}", path))?;
+            let cert = NodeCert::from_bytes(&bytes).with_context(|| "deserializing NodeCert")?;
             println!("NodeCert:");
             println!("  peer_id:       {}", cert.peer_id);
             println!("  role:          {}", cert.role);
@@ -143,11 +140,13 @@ pub fn handle_cert_command(cmd: CertCommands) -> anyhow::Result<()> {
             println!("  owner_sig:     {}", cert.owner_sig);
             println!("  endorsements:  {}", cert.endorsements.len());
         }
-        CertCommands::Verify { cert_path, owner_pub } => {
+        CertCommands::Verify {
+            cert_path,
+            owner_pub,
+        } => {
             let bytes = std::fs::read(&cert_path)
                 .with_context(|| format!("reading cert from {}", cert_path))?;
-            let cert = NodeCert::from_bytes(&bytes)
-                .with_context(|| "deserializing NodeCert")?;
+            let cert = NodeCert::from_bytes(&bytes).with_context(|| "deserializing NodeCert")?;
 
             // Override owner_pubkey from file for verification
             let owner_pk_bytes = std::fs::read(&owner_pub)
@@ -167,7 +166,8 @@ pub fn handle_cert_command(cmd: CertCommands) -> anyhow::Result<()> {
                 .with_context(|| format!("reading owner_pub from {}", owner_pub))?;
             let owner_sk_bytes = std::fs::read(&owner_sk)
                 .with_context(|| format!("reading owner_sk from {}", owner_sk))?;
-            let ack = grant_proxy(&proxy_url, &owner_pk_bytes, &owner_sk_bytes, ttl_days)?;
+            let ack =
+                grant_proxy_async(&proxy_url, &owner_pk_bytes, &owner_sk_bytes, ttl_days).await?;
             println!("NodeCert provisioned to proxy at {}", proxy_url);
             println!("  owner_pubkey:        {}", ack.owner_pubkey);
             println!("  tenant_dht_key_hex:  {}", ack.tenant_dht_key_hex);
@@ -358,13 +358,13 @@ mod cert_tests {
 
     #[test]
     fn test_cert_issue_and_verify() {
-        let (cert, _sk, _pk) = make_signed_cert(NodeRole::Both);
+        let (cert, _sk, _pk) = make_signed_cert(NodeRole::Proxy);
         assert!(cert.verify().is_ok());
     }
 
     #[test]
     fn test_cert_rejects_wrong_owner_key() {
-        let (cert, _sk, _pk) = make_signed_cert(NodeRole::Worker);
+        let (cert, _sk, _pk) = make_signed_cert(NodeRole::Proxy);
         let (wrong_pk, _) = ensure_keypair_ephemeral().unwrap();
         let mut tampered = cert.clone();
         tampered.owner_pubkey = crypto::b64_encode(&wrong_pk);
@@ -375,7 +375,5 @@ mod cert_tests {
     fn test_proxy_role_is_distinct() {
         let (cert, _sk, _pk) = make_signed_cert(NodeRole::Proxy);
         assert!(cert.has_role(&NodeRole::Proxy));
-        assert!(!cert.has_role(&NodeRole::Worker));
-        assert!(!cert.has_role(&NodeRole::Custodian));
     }
 }

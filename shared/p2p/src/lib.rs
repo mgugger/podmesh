@@ -1,11 +1,11 @@
 pub mod envelope;
-pub mod sidecar_manifest;
 pub mod handshake;
 pub mod http_proxy;
 pub mod message_verifier;
 pub mod multiaddr;
 pub mod request_response;
 pub mod security;
+pub mod sidecar_manifest;
 pub mod util;
 
 pub use libp2p_stream;
@@ -51,16 +51,15 @@ impl NodeConfig {
     }
 }
 
-/// Construct a libp2p swarm with caller-provided behaviour factory.
-pub fn setup_swarm<B, F>(
-    config: NodeConfig,
-    behaviour_builder: F,
-) -> Result<(
+pub type SwarmSetup<B> = (
     Swarm<B>,
     gossipsub::IdentTopic,
     watch::Receiver<Vec<String>>,
     watch::Sender<Vec<String>>,
-)>
+);
+
+/// Construct a libp2p swarm with caller-provided behaviour factory.
+pub fn setup_swarm<B, F>(config: NodeConfig, behaviour_builder: F) -> Result<SwarmSetup<B>>
 where
     B: NetworkBehaviour + CoreBehaviourAccess,
     F: FnOnce(&libp2p::identity::Keypair) -> B,
@@ -82,7 +81,7 @@ where
 
     debug!("Subscribing to topic: {}", topic.hash());
     swarm.behaviour_mut().gossipsub_mut().subscribe(&topic)?;
-    let local_peer = swarm.local_peer_id().clone();
+    let local_peer = *swarm.local_peer_id();
     swarm
         .behaviour_mut()
         .gossipsub_mut()
@@ -107,9 +106,8 @@ pub fn default_kademlia_config() -> kad::Config {
         NonZeroUsize::new(KADEMLIA_REPLICATION_FACTOR).expect("replication factor is non-zero"),
     );
     config.set_max_packet_size(KADEMLIA_MAX_PACKET_SIZE);
-    config.set_parallelism(
-        NonZeroUsize::new(KADEMLIA_PARALLELISM).expect("parallelism is non-zero"),
-    );
+    config
+        .set_parallelism(NonZeroUsize::new(KADEMLIA_PARALLELISM).expect("parallelism is non-zero"));
     config.set_query_timeout(Duration::from_secs(KADEMLIA_QUERY_TIMEOUT_SECS));
     config.set_provider_record_ttl(Some(Duration::from_secs(KADEMLIA_PROVIDER_TTL_SECS)));
     config.set_provider_publication_interval(Some(Duration::from_secs(
@@ -164,8 +162,8 @@ pub fn dial_multiaddr_str<B: NetworkBehaviour>(
     swarm: &mut Swarm<B>,
     addr: &str,
 ) -> std::result::Result<(), String> {
-    let ma: Multiaddr = addr.parse().map_err(|e| format!("invalid multiaddr: {}", e))?;
-    swarm
-        .dial(ma)
-        .map_err(|e| format!("dial failed: {}", e))
+    let ma: Multiaddr = addr
+        .parse()
+        .map_err(|e| format!("invalid multiaddr: {}", e))?;
+    swarm.dial(ma).map_err(|e| format!("dial failed: {}", e))
 }

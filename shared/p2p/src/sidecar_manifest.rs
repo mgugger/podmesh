@@ -52,7 +52,10 @@ pub fn verify_sidecar_manifest_envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::machine::{SidecarRouteKind, SidecarRouteSpec, build_sidecar_provider_record};
+    use protocol::machine::{
+        SidecarProviderRecordParams, SidecarRouteKind, SidecarRouteSpec,
+        build_sidecar_provider_record,
+    };
 
     #[test]
     fn manifest_envelope_roundtrip() {
@@ -70,16 +73,16 @@ mod tests {
             service_port: "http".to_string(),
             source: SidecarRouteKind::Service,
         }];
-        let payload = build_sidecar_provider_record(
-            "demo",
-            "peer-id",
-            "demo.mesh.local",
-            None,
-            &routes,
-            30_000,
-            1234,
-            1,
-        );
+        let payload = build_sidecar_provider_record(SidecarProviderRecordParams {
+            manifest_id: "demo",
+            peer_id: "peer-id",
+            host: "demo.mesh.local",
+            owner_public_key_b64: None,
+            routes: &routes,
+            ttl_ms: 30_000,
+            last_updated_ms: 1234,
+            version: 1,
+        });
 
         let envelope = sign_sidecar_manifest_record(&payload).expect("sign envelope");
         let verified = verify_sidecar_manifest_envelope(&envelope).expect("verify envelope");

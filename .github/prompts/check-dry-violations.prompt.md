@@ -7,7 +7,10 @@ tools: ['runCommands', 'edit', 'runTasks', 'search', 'usages', 'problems', 'chan
 # 🔍 Check DRY violations
 
 ## 🎯 Objective
-Analyze the codebase for the main crates podmesh-scheduler (the orchestrator deploying podman pods), podmesh-proxy (the ingress DHT that the sidecar connects to), and podmesh-sidecar (the container being added to every pod to form a service mesh). Also look at podctl and the shared crates.
+Analyze the codebase for the main crates: podmesh-scheduler (stateless signed-agent registry and
+selector), podmesh-agent (bounded multi-workload admission, encrypted persistence, Podman, and
+sidecar injection), podmesh-proxy (ingress/egress workload gateway), and podmesh-sidecar (the
+workload traffic companion). Also inspect podctl and the shared crates.
 
 Your goals:
 

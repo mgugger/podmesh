@@ -10,32 +10,22 @@ fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, postcard::Error> 
     postcard::from_bytes(bytes)
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SignatureScheme {
+    #[default]
     None = 0,
     Ed25519 = 1,
     RsaPss = 2,
 }
 
-impl Default for SignatureScheme {
-    fn default() -> Self {
-        SignatureScheme::None
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[repr(u8)]
 pub enum OperationType {
+    #[default]
     Apply = 0,
     Update = 1,
     Delete = 2,
-}
-
-impl Default for OperationType {
-    fn default() -> Self {
-        OperationType::Apply
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

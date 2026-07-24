@@ -16,10 +16,14 @@ use serde_json::Value as JsonValue;
 pub const DEFAULT_CPU_LIMIT: &str = "100m";
 /// Default memory limit to inject when manifest omits resources.limits.memory
 pub const DEFAULT_MEMORY_LIMIT: &str = "128Mi";
+/// Default ephemeral storage limit to inject when omitted.
+pub const DEFAULT_STORAGE_LIMIT: &str = "1Gi";
 /// Default CPU request to inject when manifest omits resources.requests.cpu
 pub const DEFAULT_CPU_REQUEST: &str = "50m";
 /// Default memory request to inject when manifest omits resources.requests.memory
 pub const DEFAULT_MEMORY_REQUEST: &str = "64Mi";
+/// Default ephemeral storage request to inject when omitted.
+pub const DEFAULT_STORAGE_REQUEST: &str = "512Mi";
 
 /// Built-in Rego policy that enforces podmesh security constraints.
 const BUILTIN_POLICY: &str = r#"
@@ -110,11 +114,11 @@ impl PolicyEngine {
     /// Create a new policy engine with built-in rules.
     pub fn new() -> Result<Self> {
         let mut engine = regorus::Engine::new();
-        
+
         engine
             .add_policy(String::from("builtin.rego"), String::from(BUILTIN_POLICY))
             .context("failed to add built-in policy")?;
-        
+
         debug!("PolicyEngine initialized with built-in rules");
         Ok(Self { engine })
     }
@@ -153,18 +157,22 @@ impl PolicyEngine {
             self.engine.set_input(input);
 
             // Evaluate allow rule
-            let allow_result = self.engine.eval_rule(String::from("data.podmesh.policy.allow"))
+            let allow_result = self
+                .engine
+                .eval_rule(String::from("data.podmesh.policy.allow"))
                 .context("failed to evaluate allow rule")?;
-            
+
             let allowed = matches!(allow_result, regorus::Value::Bool(true));
             if !allowed {
                 all_allowed = false;
             }
 
             // Get violations
-            let violations_result = self.engine.eval_rule(String::from("data.podmesh.policy.violations"))
+            let violations_result = self
+                .engine
+                .eval_rule(String::from("data.podmesh.policy.violations"))
                 .context("failed to evaluate violations rule")?;
-            
+
             if let regorus::Value::Set(violations) = violations_result {
                 for v in violations.iter() {
                     if let regorus::Value::String(msg) = v {
@@ -196,17 +204,21 @@ impl PolicyEngine {
     /// Validate and return the mutated manifest, or error with violations.
     pub fn validate_and_mutate(&mut self, manifest_yaml: &str) -> Result<String> {
         let result = self.validate(manifest_yaml)?;
-        
+
         if !result.allowed {
             let msg = if result.violations.is_empty() {
                 "manifest rejected by policy".to_string()
             } else {
-                format!("manifest rejected by policy: {}", result.violations.join("; "))
+                format!(
+                    "manifest rejected by policy: {}",
+                    result.violations.join("; ")
+                )
             };
             return Err(anyhow!(msg));
         }
 
-        result.mutated_manifest
+        result
+            .mutated_manifest
             .ok_or_else(|| anyhow!("internal error: allowed manifest has no mutation result"))
     }
 }
@@ -244,15 +256,13 @@ fn mutate_document_defaults(doc: &mut serde_yaml::Value) {
 fn get_containers_mut(doc: &mut serde_yaml::Value) -> Option<&mut Vec<serde_yaml::Value>> {
     let kind = doc
         .as_mapping()
-        .and_then(|m| m.get(&serde_yaml::Value::String("kind".to_string())))
+        .and_then(|m| m.get(serde_yaml::Value::String("kind".to_string())))
         .and_then(|v| v.as_str())?;
 
     let spec = match kind {
         "Pod" => doc.get_mut("spec")?,
         "Deployment" | "ReplicaSet" | "DaemonSet" | "StatefulSet" => {
-            doc.get_mut("spec")?
-                .get_mut("template")?
-                .get_mut("spec")?
+            doc.get_mut("spec")?.get_mut("template")?.get_mut("spec")?
         }
         _ => return None,
     };
@@ -277,10 +287,16 @@ fn inject_resource_defaults(container: &mut serde_yaml::Value) {
     // Ensure resources key exists
     let resources_key = serde_yaml::Value::String("resources".to_string());
     if !container_map.contains_key(&resources_key) {
-        container_map.insert(resources_key.clone(), serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+        container_map.insert(
+            resources_key.clone(),
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        );
     }
 
-    let resources = match container_map.get_mut(&resources_key).and_then(|v| v.as_mapping_mut()) {
+    let resources = match container_map
+        .get_mut(&resources_key)
+        .and_then(|v| v.as_mapping_mut())
+    {
         Some(r) => r,
         None => return,
     };
@@ -288,36 +304,80 @@ fn inject_resource_defaults(container: &mut serde_yaml::Value) {
     // Inject limits
     let limits_key = serde_yaml::Value::String("limits".to_string());
     if !resources.contains_key(&limits_key) {
-        resources.insert(limits_key.clone(), serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+        resources.insert(
+            limits_key.clone(),
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        );
     }
-    if let Some(limits) = resources.get_mut(&limits_key).and_then(|v| v.as_mapping_mut()) {
+    if let Some(limits) = resources
+        .get_mut(&limits_key)
+        .and_then(|v| v.as_mapping_mut())
+    {
         let cpu_key = serde_yaml::Value::String("cpu".to_string());
         let memory_key = serde_yaml::Value::String("memory".to_string());
-        
+        let storage_key = serde_yaml::Value::String("ephemeral-storage".to_string());
+
         if !limits.contains_key(&cpu_key) {
-            limits.insert(cpu_key, serde_yaml::Value::String(DEFAULT_CPU_LIMIT.to_string()));
-            debug!("Injected default CPU limit for container '{}'", container_name);
+            limits.insert(
+                cpu_key,
+                serde_yaml::Value::String(DEFAULT_CPU_LIMIT.to_string()),
+            );
+            debug!(
+                "Injected default CPU limit for container '{}'",
+                container_name
+            );
         }
         if !limits.contains_key(&memory_key) {
-            limits.insert(memory_key, serde_yaml::Value::String(DEFAULT_MEMORY_LIMIT.to_string()));
-            debug!("Injected default memory limit for container '{}'", container_name);
+            limits.insert(
+                memory_key,
+                serde_yaml::Value::String(DEFAULT_MEMORY_LIMIT.to_string()),
+            );
+            debug!(
+                "Injected default memory limit for container '{}'",
+                container_name
+            );
+        }
+        if !limits.contains_key(&storage_key) {
+            limits.insert(
+                storage_key,
+                serde_yaml::Value::String(DEFAULT_STORAGE_LIMIT.to_string()),
+            );
         }
     }
 
     // Inject requests
     let requests_key = serde_yaml::Value::String("requests".to_string());
     if !resources.contains_key(&requests_key) {
-        resources.insert(requests_key.clone(), serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+        resources.insert(
+            requests_key.clone(),
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        );
     }
-    if let Some(requests) = resources.get_mut(&requests_key).and_then(|v| v.as_mapping_mut()) {
+    if let Some(requests) = resources
+        .get_mut(&requests_key)
+        .and_then(|v| v.as_mapping_mut())
+    {
         let cpu_key = serde_yaml::Value::String("cpu".to_string());
         let memory_key = serde_yaml::Value::String("memory".to_string());
-        
+        let storage_key = serde_yaml::Value::String("ephemeral-storage".to_string());
+
         if !requests.contains_key(&cpu_key) {
-            requests.insert(cpu_key, serde_yaml::Value::String(DEFAULT_CPU_REQUEST.to_string()));
+            requests.insert(
+                cpu_key,
+                serde_yaml::Value::String(DEFAULT_CPU_REQUEST.to_string()),
+            );
         }
         if !requests.contains_key(&memory_key) {
-            requests.insert(memory_key, serde_yaml::Value::String(DEFAULT_MEMORY_REQUEST.to_string()));
+            requests.insert(
+                memory_key,
+                serde_yaml::Value::String(DEFAULT_MEMORY_REQUEST.to_string()),
+            );
+        }
+        if !requests.contains_key(&storage_key) {
+            requests.insert(
+                storage_key,
+                serde_yaml::Value::String(DEFAULT_STORAGE_REQUEST.to_string()),
+            );
         }
     }
 }
@@ -401,7 +461,10 @@ spec:
         let result = validate_manifest(VALID_POD).expect("validation should succeed");
         assert!(result.allowed, "valid pod should be allowed");
         assert!(result.violations.is_empty(), "should have no violations");
-        assert!(result.mutated_manifest.is_some(), "should have mutated manifest");
+        assert!(
+            result.mutated_manifest.is_some(),
+            "should have mutated manifest"
+        );
     }
 
     #[test]
@@ -420,14 +483,18 @@ spec:
         let result = validate_manifest(UNAUTHORIZED_NET_ADMIN).expect("validation should succeed");
         assert!(!result.allowed, "unauthorized NET_ADMIN should be rejected");
         assert!(
-            result.violations.iter().any(|v| v.contains("CAP_NET_ADMIN") || v.contains("NET_ADMIN")),
+            result
+                .violations
+                .iter()
+                .any(|v| v.contains("CAP_NET_ADMIN") || v.contains("NET_ADMIN")),
             "should mention NET_ADMIN in violations"
         );
     }
 
     #[test]
     fn test_authorized_sidecar_net_admin_allowed() {
-        let result = validate_manifest(AUTHORIZED_SIDECAR_NET_ADMIN).expect("validation should succeed");
+        let result =
+            validate_manifest(AUTHORIZED_SIDECAR_NET_ADMIN).expect("validation should succeed");
         assert!(result.allowed, "sidecar with NET_ADMIN should be allowed");
         assert!(result.violations.is_empty(), "should have no violations");
     }
@@ -435,19 +502,34 @@ spec:
     #[test]
     fn test_resource_defaults_injected() {
         let result = validate_manifest(VALID_POD).expect("validation should succeed");
-        let mutated = result.mutated_manifest.expect("should have mutated manifest");
-        
+        let mutated = result
+            .mutated_manifest
+            .expect("should have mutated manifest");
+
         // Check that defaults were injected
         assert!(mutated.contains("cpu:"), "should inject CPU");
         assert!(mutated.contains("memory:"), "should inject memory");
-        assert!(mutated.contains(DEFAULT_CPU_LIMIT) || mutated.contains("100m"), "should have default CPU limit");
-        assert!(mutated.contains(DEFAULT_MEMORY_LIMIT) || mutated.contains("128Mi"), "should have default memory limit");
+        assert!(
+            mutated.contains("ephemeral-storage:"),
+            "should inject ephemeral storage"
+        );
+        assert!(
+            mutated.contains(DEFAULT_CPU_LIMIT) || mutated.contains("100m"),
+            "should have default CPU limit"
+        );
+        assert!(
+            mutated.contains(DEFAULT_MEMORY_LIMIT) || mutated.contains("128Mi"),
+            "should have default memory limit"
+        );
     }
 
     #[test]
     fn test_validate_and_mutate_success() {
         let mutated = validate_and_mutate_manifest(VALID_POD).expect("should succeed");
-        assert!(mutated.contains("resources"), "should have resources section");
+        assert!(
+            mutated.contains("resources"),
+            "should have resources section"
+        );
     }
 
     #[test]

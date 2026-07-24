@@ -279,9 +279,7 @@ async fn wait_for_proxy_provider(node: &NodeHandle, timeout: Duration) -> Result
 
 fn init_tracing() {
     INIT_TRACING.call_once(|| {
-        let _ = env_logger::builder()
-            .is_test(true)
-            .try_init();
+        let _ = env_logger::builder().is_test(true).try_init();
     });
 }
 

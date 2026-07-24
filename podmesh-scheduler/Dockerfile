@@ -1,60 +1,20 @@
-# =====================
-# 1. Build Rust binary
-# =====================
 FROM rust:latest AS builder
-
 WORKDIR /app
-
-# Install musl toolchain
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl musl-tools pkg-config \
+    && apt-get install -y --no-install-recommends ca-certificates musl-tools \
     && rm -rf /var/lib/apt/lists/*
-
-RUN rustup target add x86_64-unknown-linux-musl
-
 COPY . .
+RUN set -eu; \
+    case "$(uname -m)" in \
+      x86_64) rust_target=x86_64-unknown-linux-musl ;; \
+      aarch64|arm64) rust_target=aarch64-unknown-linux-musl ;; \
+      *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    rustup target add "$rust_target"; \
+    cargo build --release --locked -p podmesh-scheduler --target "$rust_target"; \
+    install -Dm0755 "target/$rust_target/release/podmesh-scheduler" /out/podmesh-scheduler
 
-RUN cargo build --release --locked -p podmesh-scheduler --target x86_64-unknown-linux-musl
-
-# ===============================
-# 2. Fetch static Podman client
-# ===============================
-ARG PODMAN_REMOTE_VERSION=5.6.2
-
-RUN curl -sSL "https://github.com/containers/podman/releases/download/v${PODMAN_REMOTE_VERSION}/podman-remote-static-linux_amd64.tar.gz" -o /tmp/podman.tar.gz \
-    && mkdir -p /out/podman \
-    && tar -xzf /tmp/podman.tar.gz -C /tmp \
-    && install -m 0755 /tmp/bin/podman-remote-static-linux_amd64 /out/podman/podman \
-    && strip /out/podman/podman \
-    && rm -rf /tmp/podman.tar.gz /tmp/bin
-
-# =====================
-# 3. Minimal scratch image
-# =====================
 FROM scratch
-
-# Add BusyBox binary for df
-COPY --from=busybox:musl /bin/busybox /bin/busybox
-
-# Symlink df explicitly
-RUN ["/bin/busybox", "ln", "-s", "/bin/busybox", "/bin/df"]
-
-# Minimal passwd/group for Podman
-COPY --from=alpine:latest /etc/passwd /etc/passwd
-COPY --from=alpine:latest /etc/group /etc/group
-
-# CA certificates for HTTPS
-COPY --from=alpine:latest /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-# DNS config
-#COPY --from=alpine:latest /etc/resolv.conf /etc/resolv.conf
-COPY --from=alpine:latest /etc/nsswitch.conf /etc/nsswitch.conf
-COPY --from=alpine:latest /etc/hosts /etc/hosts
-
-# Copy binaries into /usr/local/bin
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/podmesh-scheduler /usr/local/bin/podmesh-scheduler
-COPY --from=builder /out/podman/podman /usr/local/bin/podman
-
-# Set PATH so /bin and /usr/local/bin are both available
-ENV PATH=/usr/local/bin:/bin
-
-ENTRYPOINT ["podmesh-scheduler"]
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /out/podmesh-scheduler /usr/local/bin/podmesh-scheduler
+ENTRYPOINT ["/usr/local/bin/podmesh-scheduler"]

@@ -74,9 +74,7 @@ pub fn track_peer<'a>(
     states: &'a mut HashMap<PeerId, HandshakeState>,
     peer: &PeerId,
 ) -> &'a mut HandshakeState {
-    states
-        .entry(peer.clone())
-        .or_insert_with(HandshakeState::default)
+    states.entry(*peer).or_default()
 }
 
 /// Remove bookkeeping for the given peer.
@@ -91,13 +89,9 @@ pub fn handle_request_response_message(
     handshake_states: &mut HashMap<PeerId, HandshakeState>,
     mut send_response: impl FnMut(Vec<u8>, request_response::ResponseChannel<Vec<u8>>),
 ) {
-    handle_request_response_message_with_cert(
-        message,
-        peer,
-        handshake_states,
-        None,
-        |resp, ch| send_response(resp, ch),
-    );
+    handle_request_response_message_with_cert(message, peer, handshake_states, None, |resp, ch| {
+        send_response(resp, ch)
+    });
 }
 
 /// Variant of [`handle_request_response_message`] that allows supplying a
@@ -140,8 +134,7 @@ fn handle_request(
         Ok(_) => {
             track_peer(handshake_states, peer).confirmed = true;
 
-            let cert_b64 = proxy_cert
-                .and_then(|p| p.read().ok().and_then(|guard| guard.clone()));
+            let cert_b64 = proxy_cert.and_then(|p| p.read().ok().and_then(|guard| guard.clone()));
 
             if let Ok(response) = build_signed_handshake_response(peer, cert_b64.as_deref()) {
                 response
@@ -186,15 +179,15 @@ fn build_signed_handshake_response(peer: &PeerId, proxy_cert_b64: Option<&str>) 
         rand::random::<u32>(),
         timestamp,
         "podmesh/1.0",
-        &peer.to_string(),
+        peer.to_string(),
         proxy_cert_b64,
     );
-    
+
     // Include our KEM public key in the handshake response so peers can encrypt messages to us
     let kem_pub_b64 = crypto::ensure_kem_keypair_on_disk()
         .ok()
         .map(|(pub_bytes, _)| crypto::b64_encode(&pub_bytes));
-    
+
     let cfg = SignEnvelopeConfig {
         nonce: Some(&nonce),
         timestamp: Some(timestamp),
@@ -214,15 +207,15 @@ fn build_signed_handshake_request(
         nonce,
         timestamp,
         cfg.protocol_version,
-        &local_peer.to_string(),
+        local_peer.to_string(),
     );
     let envelope_nonce = format!("handshake_req_{nonce}");
-    
+
     // Include our KEM public key in the handshake request so peers can encrypt messages to us
     let kem_pub_b64 = crypto::ensure_kem_keypair_on_disk()
         .ok()
         .map(|(pub_bytes, _)| crypto::b64_encode(&pub_bytes));
-    
+
     let sign_cfg = SignEnvelopeConfig {
         nonce: Some(&envelope_nonce),
         timestamp: Some(timestamp),
@@ -241,14 +234,14 @@ pub fn build_handshake_request_for_kem_fetch(local_peer: &PeerId) -> Result<Vec<
 
 /// Extract KEM public key from a verified handshake response.
 /// Returns the KEM pubkey as base64 string if present.
-pub fn extract_kem_pubkey_from_response(
-    response: &[u8],
-    peer: &PeerId,
-) -> Option<String> {
+pub fn extract_kem_pubkey_from_response(response: &[u8], peer: &PeerId) -> Option<String> {
     let verified = verify_signed_message(peer, response, |err| {
-        warn!("Failed to verify handshake response for KEM extraction: {}", err);
+        warn!(
+            "Failed to verify handshake response for KEM extraction: {}",
+            err
+        );
     })?;
-    
+
     verified.kem_pubkey.map(|bytes| crypto::b64_encode(&bytes))
 }
 
@@ -258,14 +251,14 @@ pub fn extract_kem_pubkey_from_response(
 /// Uses `verify_envelope_skip_nonce_check` so this can be called alongside the
 /// standard handshake verification path without triggering nonce replay errors.
 /// Signature integrity is still enforced.
-pub fn extract_proxy_cert_from_response(
-    response: &[u8],
-    _peer: &PeerId,
-) -> Option<String> {
+pub fn extract_proxy_cert_from_response(response: &[u8], _peer: &PeerId) -> Option<String> {
     let verified = match crate::envelope::verify_envelope_skip_nonce_check(response) {
         Ok(v) => v,
         Err(err) => {
-            warn!("Failed to verify handshake response for proxy_cert extraction: {}", err);
+            warn!(
+                "Failed to verify handshake response for proxy_cert extraction: {}",
+                err
+            );
             return None;
         }
     };
@@ -296,7 +289,7 @@ where
         if state.attempts >= cfg.max_attempts {
             warn!("removing non-responsive peer {peer}");
             on_unresponsive(peer);
-            to_remove.push(peer.clone());
+            to_remove.push(*peer);
             continue;
         }
 
@@ -331,10 +324,10 @@ pub fn collect_handshake_actions(
         local_peer,
         cfg,
         |peer, payload| {
-            actions.requests.push((peer.clone(), payload));
+            actions.requests.push((*peer, payload));
             true
         },
-        |peer| actions.drops.push(peer.clone()),
+        |peer| actions.drops.push(*peer),
     )?;
     Ok(actions)
 }

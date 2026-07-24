@@ -1,0 +1,29 @@
+[package]
+name = "podmesh-agent"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+blake3 = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+crypto = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+postcard = { workspace = true }
+protocol = { workspace = true }
+redb = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+uuid = { workspace = true }
+
+[dev-dependencies]
+podmesh-scheduler = { workspace = true }
+rand = { workspace = true }
+serial_test = { workspace = true }

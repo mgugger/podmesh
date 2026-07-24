@@ -1,7 +1,8 @@
-# podctl Tasks
+# Tasks
 
-- Document apply command: sealing pipeline, manifest_id derivation, submission
-- Document delete command: provider discovery, encrypted delete request
-- Document get/logs commands: unauthenticated status queries
-- Document key material management (~/.podmesh/, cert grant-proxy owner key files)
-- Document current trust gaps (custodian list trust, unauthenticated status endpoints, manifest_id truncation)
+- [x] Replace share-based sealing with direct agent DEK wrapping
+- [x] Add encrypted admission and deployment flows
+- [x] Add local signed receipt catalog
+- [x] Route status, logs, and delete directly to the agent
+- [x] Preserve deterministic multi-document manifests
+- [x] Remove provider discovery and legacy scheduler runtime APIs

@@ -300,12 +300,9 @@ async fn post_node_cert(
         *slot = Some(cert_b64);
     }
 
-    if let Err(err) = state
-        .cert_announce_tx
-        .send(CertAnnouncement {
-            owner_pubkey: owner_pubkey.clone(),
-        })
-    {
+    if let Err(err) = state.cert_announce_tx.send(CertAnnouncement {
+        owner_pubkey: owner_pubkey.clone(),
+    }) {
         log::warn!("failed to notify p2p task of new cert: {}", err);
     }
 

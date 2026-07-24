@@ -1,561 +1,360 @@
-use anyhow::Context;
-use log::debug;
-use log::error;
-use log::info;
-use uuid::Uuid;
-use std::env;
-
-use std::path::PathBuf;
-
-mod api_client;
-use api_client::ApiClient;
+use anyhow::{Context, Result, anyhow};
+use protocol::{
+    AGENT_PROTOCOL_VERSION, AdmissionRequest, AgentAdvertisement, DeploymentGrant,
+    DeploymentReceipt, EncryptedWorkloadCapsule, ExecutionSpec, Reservation, WorkloadCommand,
+    WorkloadCommandResponse, WorkloadOperation,
+};
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use std::{
+    fs::OpenOptions,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 pub mod cert;
-pub mod seal;
+
+const REQUEST_TTL_SECS: u64 = 30;
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 fn resolve_api_base(override_url: Option<&str>) -> String {
     override_url
         .map(str::to_string)
-        .or_else(|| env::var("PODMESH_API").ok())
+        .or_else(|| std::env::var("PODMESH_API").ok())
         .unwrap_or_else(|| "http://127.0.0.1:3000".to_string())
 }
 
-/// Extract the first `metadata.name` from a parsed manifest JSON document.
-/// Only used by unit tests that validate multi-document manifest parsing.
-#[cfg(test)]
-fn extract_manifest_name_from_json(manifest_json: &serde_json::Value) -> Option<String> {
-    match manifest_json {
-        serde_json::Value::Object(_) => manifest_json
-            .get("metadata")?
-            .get("name")?
-            .as_str()
-            .map(|s| s.to_string()),
-        serde_json::Value::Array(items) => items
-            .iter()
-            .filter_map(extract_manifest_name_from_json)
-            .next(),
-        _ => None,
-    }
+fn http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .map_err(Into::into)
 }
 
+fn canonical_manifest(path: &Path) -> Result<(String, Vec<u8>)> {
+    let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let documents = protocol::manifest_yaml::parse_yaml_documents_from_slice(&raw)
+        .context("parse workload YAML documents")?;
+    anyhow::ensure!(!documents.is_empty(), "workload manifest is empty");
+    let name = documents
+        .iter()
+        .find(|document| {
+            document.get("kind").and_then(serde_yaml::Value::as_str) == Some("Pod")
+                || document
+                    .get("spec")
+                    .and_then(|spec| spec.get("template"))
+                    .and_then(|template| template.get("spec"))
+                    .is_some()
+        })
+        .and_then(|document| document.get("metadata"))
+        .and_then(|metadata| metadata.get("name"))
+        .and_then(serde_yaml::Value::as_str)
+        .filter(|name| !name.is_empty() && name.len() <= 253)
+        .ok_or_else(|| anyhow!("metadata.name is required"))?
+        .to_string();
+    let canonical = protocol::manifest_yaml::serialize_yaml_documents(&documents)?;
+    Ok((name, canonical.into_bytes()))
+}
 
-pub async fn apply_file(
-    path: PathBuf,
-    shares: u8,
-    threshold: u8,
-    required_capabilities: Vec<String>,
-    api_base: Option<&str>,
-) -> anyhow::Result<protocol::machine::WorkloadSubmissionResponse> {
-    debug!("apply_file called for path: {:?}", path);
-
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {:?}", path))?;
-
-    // Parse YAML → JSON string
-    let spec_json = {
-        let value: serde_json::Value = serde_yaml::from_str(&raw)
-            .or_else(|_| serde_json::from_str::<serde_json::Value>(&raw))
-            .with_context(|| "failed to parse spec as YAML or JSON")?;
-        serde_json::to_string(&value)?
-    };
-
-    // Load owner keypair
-    let (owner_pk, owner_sk) = crypto::ensure_keypair_on_disk()
-        .context("loading owner signing keypair")?;
-
-    // Discover custodians
-    let custodians = get_custodians(api_base, shares as usize).await
-        .context("discovering custodians")?;
-
-    anyhow::ensure!(
-        custodians.len() >= shares as usize,
-        "need {} custodians, scheduler returned {}",
-        shares,
-        custodians.len()
+async fn select_agent(scheduler_url: &str) -> Result<AgentAdvertisement> {
+    let url = format!(
+        "{}/api/v1/agents/select",
+        scheduler_url.trim_end_matches('/')
     );
-
-    let (submission, _) = seal::seal_workload(
-        &spec_json,
-        &custodians,
-        &owner_pk,
-        &owner_sk,
-        shares,
-        threshold,
-        required_capabilities,
-    )?;
-
-    let manifest_id = submission.sealed_spec.manifest_id.clone();
-    info!("apply_file: sealed manifest_id={}", manifest_id);
-
-    let base = resolve_api_base(api_base);
-    let url = format!("{}/api/v1/workloads/submit", base);
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .json(&submission)
+    let advertisement = http_client()?
+        .get(url)
         .send()
         .await?
-        .error_for_status()?;
-    let result: protocol::machine::WorkloadSubmissionResponse = resp.json().await?;
-    Ok(result)
-}
-
-
-pub async fn delete_file(
-    path: PathBuf,
-    force: bool,
-    api_base: Option<&str>,
-) -> anyhow::Result<String> {
-    debug!("delete_file called for path: {:?}, force: {}", path, force);
-
-    if !path.exists() {
-        error!("delete_file: file not found: {}", path.display());
-        anyhow::bail!("file not found: {}", path.display());
-    }
-
-    let contents = tokio::fs::read_to_string(&path).await?;
-    debug!(
-        "delete_file: file contents read successfully, length: {}",
-        contents.len()
-    );
-    info!(
-        "File contents read successfully, length: {}",
-        contents.len()
-    );
-
-    // Parse manifest to JSON — same normalization as apply_file uses before sealing
-    let spec_json = {
-        let value: serde_json::Value = serde_yaml::from_str(&contents)
-            .or_else(|_| serde_json::from_str::<serde_json::Value>(&contents))
-            .with_context(|| "failed to parse spec as YAML or JSON")?;
-        serde_json::to_string(&value)?
-    };
-    debug!("delete_file: manifest parsed successfully");
-
-    // Compute manifest_id using the same scheme as apply_file/seal_workload:
-    // blake3(spec_json)[..8] encoded as lowercase hex (16 hex chars).
-    let manifest_id = {
-        let hash = blake3::hash(spec_json.as_bytes());
-        hash.as_bytes()[..8]
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>()
-    };
-    debug!("CLI: Computed manifest_id for deletion: {}", manifest_id);
-
-    // API base URL can be overridden with PODMESH_API env var
-    let base = api_base
-        .map(|s| s.to_string())
-        .or_else(|| env::var("PODMESH_API").ok())
-        .unwrap_or_else(|| "http://127.0.0.1:3000".to_string());
-    debug!("Creating ApiClient with base URL: {}", base);
-    let mut api_client = ApiClient::new(base)?;
-
-    // Fetch machine's public key for encrypted communication
-    debug!("Fetching machine's public key...");
-    api_client.fetch_machine_public_key().await?;
-    debug!("Successfully fetched machine's public key");
-
-    // Step 1: Discover which nodes are providing this manifest via DHT
-    debug!("Discovering providers for manifest_id: {}", manifest_id);
-    let providers = discover_manifest_providers(&api_client, &manifest_id).await?;
-
-    if providers.is_empty() {
-        info!("No providers found for manifest_id: {}", manifest_id);
-        return Ok(manifest_id);
-    }
-
-    info!(
-        "Found {} providers for manifest_id {}: {:?}",
-        providers.len(),
-        manifest_id,
-        providers.iter().map(|(id, _)| id).collect::<Vec<_>>()
-    );
-
-    // Step 2: Send delete requests directly to each provider node (end-to-end encryption)
-    let operation_id = Uuid::new_v4().to_string();
-    let mut succeeded_nodes = Vec::new();
-    let mut failed_nodes: Vec<(String, String)> = Vec::new();
-
-    for (node_id, node_pubkey_b64) in &providers {
-        match send_delete_to_node(
-            &api_client,
-            node_id,
-            node_pubkey_b64,
-            &manifest_id,
-            &operation_id,
-            force,
-        )
-        .await
-        {
-            Ok(_) => {
-                succeeded_nodes.push(node_id.clone());
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            }
-            Err(err) => {
-                let err_msg = err.to_string();
-                log::error!("Direct delete failed for node {}: {}", node_id, err_msg);
-                failed_nodes.push((node_id.clone(), err_msg));
-            }
-        }
-    }
-
-    if failed_nodes.is_empty() {
-        info!(
-            "Delete completed for manifest_id {} on {} nodes",
-            manifest_id,
-            succeeded_nodes.len()
-        );
-        return Ok(manifest_id);
-    }
-
-    if !succeeded_nodes.is_empty() {
-        log::warn!(
-            "Delete partially succeeded for manifest {} ({} ok / {} failed)",
-            manifest_id,
-            succeeded_nodes.len(),
-            failed_nodes.len()
-        );
-    }
-
-    let failure_count = failed_nodes.len();
-    let failure_summary = failed_nodes
-        .into_iter()
-        .map(|(node, err)| format!("{node}: {err}"))
-        .collect::<Vec<_>>()
-        .join("; ");
-
-    anyhow::bail!(
-        "Delete failed for {} of {} provider nodes: {}",
-        failure_count,
-        providers.len(),
-        failure_summary
-    );
-}
-
-async fn discover_manifest_providers(
-    api_client: &ApiClient,
-    manifest_id: &str,
-) -> anyhow::Result<Vec<(String, String)>> {
-    let url = format!(
-        "{}/tasks/{}/providers",
-        api_client.base_url.trim_end_matches('/'),
-        manifest_id
-    );
-
-    debug!("Discovering providers at: {}", url);
-
-    // Use encrypted request to discover providers
-    let response_bytes = api_client
-        .send_encrypted_request(&url, &[], "providers_request")
+        .error_for_status()?
+        .json::<AgentAdvertisement>()
         .await?;
-
-    debug!("Received provider discovery response: {} bytes", response_bytes.len());
-
-    // Parse response - binary postcard format (same as CandidatesResponse)
-    let providers_response = protocol::machine::root_as_candidates_response(&response_bytes)
-        .map_err(|e| anyhow::anyhow!("Failed to parse providers response: {}", e))?;
-
-    if !providers_response.ok() {
-        debug!("Providers response indicates no providers found");
-        return Ok(Vec::new());
-    }
-
-    let result: Vec<(String, String)> = providers_response
-        .candidates()
-        .iter()
-        .map(|c| (c.peer_id.clone(), c.public_key.clone()))
-        .collect();
-
-    debug!("Parsed {} providers from response", result.len());
-    Ok(result)
+    advertisement.verify(now_secs())?;
+    Ok(advertisement)
 }
 
-async fn send_delete_to_node(
-    api_client: &ApiClient,
-    node_id: &str,
-    node_pubkey_b64: &str,
-    manifest_id: &str,
-    operation_id: &str,
-    force: bool,
-) -> anyhow::Result<()> {
-    debug!("Sending delete request to node: {}", node_id);
-
-    let node_pubkey_bytes = crypto::b64_decode(node_pubkey_b64)
-        .map_err(|e| anyhow::anyhow!("Failed to decode node public key for {}: {}", node_id, e))?;
-
-    let delete_request_bytes = protocol::machine::build_delete_request(
-        manifest_id,
-        operation_id,
-        "", // origin_peer (CLI doesn't have peer ID)
-        force,
-    );
-
-    let url = format!(
-        "{}/delete_direct/{}",
-        api_client.base_url.trim_end_matches('/'),
-        node_id
-    );
-
-    debug!(
-        "Sending DeleteRequest directly to node {} for manifest_id {}",
-        node_id, manifest_id
-    );
-
-    // Encrypt and sign the DeleteRequest for the target worker node (end-to-end encryption)
-    let response_bytes = api_client
-        .send_encrypted_request_to_node(&url, &delete_request_bytes, "delete_request", &node_pubkey_bytes)
+async fn post_encrypted(agent_url: &str, endpoint: &str, payload: Vec<u8>) -> Result<Vec<u8>> {
+    let url = format!("{}/api/v1/{endpoint}", agent_url.trim_end_matches('/'));
+    let response = http_client()?
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body(payload)
+        .send()
         .await?;
-
-    let delete_response = protocol::machine::root_as_delete_response(&response_bytes)
-        .map_err(|e| anyhow::anyhow!("Failed to parse DeleteResponse: {}", e))?;
-
-    if !delete_response.ok() {
-        anyhow::bail!(
-            "Direct delete failed for node {}: {}",
-            node_id,
-            delete_response.message().unwrap_or("unknown error")
-        );
+    let status = response.status();
+    let body = response.bytes().await?;
+    if !status.is_success() {
+        return Err(anyhow!("agent request failed with status {status}"));
     }
+    Ok(body.to_vec())
+}
 
-    debug!("Direct delete successful for node {}", node_id);
+fn encrypt_for<T: Serialize>(value: &T, recipient_kem_b64: &str) -> Result<Vec<u8>> {
+    let recipient = crypto::b64_decode(recipient_kem_b64)?;
+    let plaintext = postcard::to_allocvec(value)?;
+    crypto::encrypt_payload_for_recipient(&recipient, &plaintext)
+}
+
+fn decrypt_from<T: for<'de> Deserialize<'de>>(body: &[u8], kem_private: &[u8]) -> Result<T> {
+    let plaintext = crypto::decrypt_payload_from_recipient_blob(body, kem_private)?;
+    postcard::from_bytes(&plaintext).map_err(Into::into)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalReceipt {
+    receipt: DeploymentReceipt,
+    agent_url: String,
+    agent_kem_pubkey: String,
+}
+
+fn catalog_dir() -> Result<PathBuf> {
+    let path = dirs::home_dir()
+        .ok_or_else(|| anyhow!("home directory unavailable"))?
+        .join(".podmesh")
+        .join("workloads");
+    std::fs::create_dir_all(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(path)
+}
+
+fn receipt_path(workload_id: &str) -> Result<PathBuf> {
+    anyhow::ensure!(
+        workload_id.len() == 64 && workload_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid workload id"
+    );
+    Ok(catalog_dir()?.join(format!("{workload_id}.json")))
+}
+
+fn save_receipt(receipt: &LocalReceipt) -> Result<()> {
+    let path = receipt_path(&receipt.receipt.workload_id)?;
+    let bytes = serde_json::to_vec(receipt)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    std::io::Write::write_all(&mut file, &bytes)?;
     Ok(())
 }
 
-/// List all workloads from the scheduler.
-/// Returns a JSON array of workload information.
-pub async fn get_pods(api_base: Option<&str>) -> anyhow::Result<String> {
-    let base = resolve_api_base(api_base);
-    let url = format!("{}/runtime/workloads", base);
-    
-    debug!("Fetching workloads from {}", url);
-    
-    let client = reqwest::Client::new();
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to scheduler: {}", e))?;
-    
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Failed to get workloads: {} - {}", status, body);
-    }
-    
-    let body = response.text().await
-        .map_err(|e| anyhow::anyhow!("Failed to read response: {}", e))?;
-    
-    Ok(body)
+fn load_receipt(workload_id: &str) -> Result<LocalReceipt> {
+    let path = receipt_path(workload_id)?;
+    serde_json::from_slice(&std::fs::read(path).context("workload receipt not found")?)
+        .map_err(Into::into)
 }
 
-/// Get details of a specific workload by ID.
-pub async fn get_pod(workload_id: &str, api_base: Option<&str>) -> anyhow::Result<String> {
-    let base = resolve_api_base(api_base);
-    let url = format!("{}/runtime/workloads/{}", base, workload_id);
-    
-    debug!("Fetching workload {} from {}", workload_id, url);
-    
-    let client = reqwest::Client::new();
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to scheduler: {}", e))?;
-    
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        anyhow::bail!("Workload '{}' not found", workload_id);
-    }
-    
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Failed to get workload: {} - {}", status, body);
-    }
-    
-    let body = response.text().await
-        .map_err(|e| anyhow::anyhow!("Failed to read response: {}", e))?;
-    
-    Ok(body)
-}
+pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> Result<String> {
+    let (workload_name, manifest) = canonical_manifest(&path)?;
+    let (manifest, resources) = protocol::validate_and_measure_manifest(&manifest)?;
+    let resources = resources.with_default_sidecar()?;
+    let (owner_public, owner_private) =
+        crypto::ensure_keypair_on_disk().context("load namespace signing key")?;
+    let (response_kem_public, response_kem_private) =
+        crypto::ensure_kem_keypair_on_disk().context("load namespace response key")?;
+    let namespace_id = crypto::b64_encode(&owner_public);
+    let workload_id = protocol::workload_id(&owner_public, &workload_name);
+    let revision_id = protocol::revision_id(&manifest);
+    let agent = select_agent(&resolve_api_base(api_base)).await?;
 
-/// Get logs for a specific workload.
-pub async fn get_logs(workload_id: &str, tail: Option<usize>, api_base: Option<&str>) -> anyhow::Result<String> {
-    let base = resolve_api_base(api_base);
-    let url = if let Some(n) = tail {
-        format!("{}/runtime/workloads/{}/logs?tail={}", base, workload_id, n)
-    } else {
-        format!("{}/runtime/workloads/{}/logs", base, workload_id)
+    let admission = AdmissionRequest {
+        version: AGENT_PROTOCOL_VERSION,
+        request_id: uuid::Uuid::new_v4().to_string(),
+        namespace_id: namespace_id.clone(),
+        workload_id: workload_id.clone(),
+        response_kem_pubkey: crypto::b64_encode(&response_kem_public),
+        cpu_milli: resources.cpu_milli,
+        memory_bytes: resources.memory_bytes,
+        storage_bytes: resources.storage_bytes,
+        expires_at_secs: now_secs() + REQUEST_TTL_SECS,
+        nonce: uuid::Uuid::new_v4().to_string(),
+        owner_signature: String::new(),
+    }
+    .sign(&owner_private)?;
+    let reservation_body = post_encrypted(
+        &agent.relay_url,
+        "admission",
+        encrypt_for(&admission, &agent.kem_pubkey)?,
+    )
+    .await?;
+    let reservation: Reservation = decrypt_from(&reservation_body, &response_kem_private)?;
+    reservation.verify(now_secs())?;
+    anyhow::ensure!(
+        reservation.accepted,
+        "agent rejected workload: {}",
+        reservation.reason
+    );
+    anyhow::ensure!(
+        reservation.agent_node_id == agent.node_id
+            && reservation.request_id == admission.request_id
+            && reservation.namespace_id == namespace_id
+            && reservation.workload_id == workload_id
+            && reservation.cpu_milli == admission.cpu_milli
+            && reservation.memory_bytes == admission.memory_bytes
+            && reservation.storage_bytes == admission.storage_bytes,
+        "reservation response binding mismatch"
+    );
+
+    let execution = ExecutionSpec {
+        workload_name,
+        manifest,
     };
-    
-    debug!("Fetching logs for workload {} from {}", workload_id, url);
-    
-    let client = reqwest::Client::new();
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to scheduler: {}", e))?;
-    
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        anyhow::bail!("Workload '{}' not found", workload_id);
+    let execution_bytes = postcard::to_allocvec(&execution)?;
+    let mut dek = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut dek);
+    let (ciphertext, nonce) = crypto::encrypt_payload_with_key(&dek, &execution_bytes)?;
+    let agent_kem = crypto::b64_decode(&agent.kem_pubkey)?;
+    let grant = DeploymentGrant {
+        version: AGENT_PROTOCOL_VERSION,
+        namespace_id,
+        workload_id: workload_id.clone(),
+        revision_id,
+        target_node_id: agent.node_id.clone(),
+        response_kem_pubkey: crypto::b64_encode(&response_kem_public),
+        reservation_id: reservation.reservation_id,
+        capsule: EncryptedWorkloadCapsule {
+            ciphertext,
+            nonce: nonce.to_vec(),
+            wrapped_dek: crypto::encrypt_payload_for_recipient(&agent_kem, &dek)?,
+        },
+        issued_at_secs: now_secs(),
+        expires_at_secs: now_secs() + REQUEST_TTL_SECS,
+        nonce: uuid::Uuid::new_v4().to_string(),
+        owner_signature: String::new(),
     }
-    
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Failed to get logs: {} - {}", status, body);
-    }
-    
-    let body = response.text().await
-        .map_err(|e| anyhow::anyhow!("Failed to read response: {}", e))?;
-    
-    Ok(body)
+    .sign(&owner_private)?;
+    let receipt_body = post_encrypted(
+        &agent.relay_url,
+        "deploy",
+        encrypt_for(&grant, &agent.kem_pubkey)?,
+    )
+    .await?;
+    let receipt: DeploymentReceipt = decrypt_from(&receipt_body, &response_kem_private)?;
+    receipt.verify()?;
+    anyhow::ensure!(
+        receipt.workload_id == workload_id && receipt.agent_node_id == agent.node_id,
+        "deployment receipt binding mismatch"
+    );
+    save_receipt(&LocalReceipt {
+        receipt,
+        agent_url: agent.relay_url,
+        agent_kem_pubkey: agent.kem_pubkey,
+    })?;
+    Ok(workload_id)
 }
 
-/// Format workload list for human-readable output.
-pub fn format_workloads_table(json_response: &str) -> String {
-    let workloads: Result<Vec<serde_json::Value>, _> = serde_json::from_str(json_response);
-    
-    match workloads {
-        Ok(list) if list.is_empty() => "No workloads found.".to_string(),
-        Ok(list) => {
-            let mut output = String::new();
-            output.push_str(&format!(
-                "{:<40} {:<15} {:<20} {:<10}\n",
-                "NAME", "STATUS", "RUNTIME", "AGE"
-            ));
-            output.push_str(&"-".repeat(85));
-            output.push('\n');
-            
-            for workload in list {
-                let name = workload.get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let status = workload.get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let runtime = workload.get("runtime_engine")
-                    .or_else(|| workload.get("runtime"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let created = workload.get("created_at")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("-");
-                
-                output.push_str(&format!(
-                    "{:<40} {:<15} {:<20} {:<10}\n",
-                    truncate_str(name, 38),
-                    status,
-                    runtime,
-                    created
-                ));
-            }
-            output
-        }
-        Err(_) => {
-            // If we can't parse as array, just return raw JSON
-            json_response.to_string()
-        }
+async fn command(
+    workload_id: &str,
+    operation: WorkloadOperation,
+    tail: Option<usize>,
+) -> Result<WorkloadCommandResponse> {
+    let local = load_receipt(workload_id)?;
+    let (owner_public, owner_private) = crypto::ensure_keypair_on_disk()?;
+    let (response_kem_public, response_kem_private) = crypto::ensure_kem_keypair_on_disk()?;
+    let command = WorkloadCommand {
+        version: AGENT_PROTOCOL_VERSION,
+        request_id: uuid::Uuid::new_v4().to_string(),
+        namespace_id: crypto::b64_encode(&owner_public),
+        workload_id: workload_id.to_string(),
+        operation,
+        log_tail: tail.map(|value| value.min(10_000) as u32),
+        response_kem_pubkey: crypto::b64_encode(&response_kem_public),
+        expires_at_secs: now_secs() + REQUEST_TTL_SECS,
+        nonce: uuid::Uuid::new_v4().to_string(),
+        owner_signature: String::new(),
     }
+    .sign(&owner_private)?;
+    let body = post_encrypted(
+        &local.agent_url,
+        "command",
+        encrypt_for(&command, &local.agent_kem_pubkey)?,
+    )
+    .await?;
+    let response: WorkloadCommandResponse = decrypt_from(&body, &response_kem_private)?;
+    response.verify()?;
+    anyhow::ensure!(
+        response.request_id == command.request_id && response.workload_id == workload_id,
+        "workload response binding mismatch"
+    );
+    Ok(response)
 }
 
-/// Format single workload for human-readable output.
-pub fn format_workload_details(json_response: &str) -> String {
-    let workload: Result<serde_json::Value, _> = serde_json::from_str(json_response);
-    
-    match workload {
-        Ok(w) => {
-            let mut output = String::new();
-            output.push_str("Workload Details:\n");
-            output.push_str(&"-".repeat(40));
-            output.push('\n');
-            
-            if let Some(id) = w.get("id").and_then(|v| v.as_str()) {
-                output.push_str(&format!("ID:       {}\n", id));
-            }
-            if let Some(status) = w.get("status").and_then(|v| v.as_str()) {
-                output.push_str(&format!("Status:   {}\n", status));
-            }
-            if let Some(runtime) = w.get("runtime_engine").or_else(|| w.get("runtime")).and_then(|v| v.as_str()) {
-                output.push_str(&format!("Runtime:  {}\n", runtime));
-            }
-            if let Some(manifest) = w.get("manifest_id").and_then(|v| v.as_str()) {
-                output.push_str(&format!("Manifest: {}\n", manifest));
-            }
-            if let Some(created) = w.get("created_at").and_then(|v| v.as_str()) {
-                output.push_str(&format!("Created:  {}\n", created));
-            }
-            
-            output
-        }
-        Err(_) => json_response.to_string(),
-    }
+pub async fn delete_file(path: PathBuf, _force: bool, _api_base: Option<&str>) -> Result<String> {
+    let (workload_name, _) = canonical_manifest(&path)?;
+    let (owner_public, _) = crypto::ensure_keypair_on_disk()?;
+    let workload_id = protocol::workload_id(&owner_public, &workload_name);
+    let response = command(&workload_id, WorkloadOperation::Delete, None).await?;
+    anyhow::ensure!(response.ok, "delete failed: {}", response.payload);
+    std::fs::remove_file(receipt_path(&workload_id)?)?;
+    Ok(workload_id)
 }
 
-fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len - 3])
+pub async fn get_pod(workload_id: &str, _api_base: Option<&str>) -> Result<String> {
+    let response = command(workload_id, WorkloadOperation::Status, None).await?;
+    anyhow::ensure!(response.ok, "status failed: {}", response.payload);
+    Ok(response.payload)
+}
+
+pub async fn get_logs(
+    workload_id: &str,
+    tail: Option<usize>,
+    _api_base: Option<&str>,
+) -> Result<String> {
+    let response = command(workload_id, WorkloadOperation::Logs, tail).await?;
+    anyhow::ensure!(response.ok, "logs failed: {}", response.payload);
+    Ok(response.payload)
+}
+
+pub async fn get_pods(_api_base: Option<&str>) -> Result<String> {
+    let mut receipts = Vec::new();
+    for entry in std::fs::read_dir(catalog_dir()?)? {
+        let entry = entry?;
+        if entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+            && let Ok(receipt) =
+                serde_json::from_slice::<LocalReceipt>(&std::fs::read(entry.path())?)
+        {
+            receipts.push(receipt.receipt);
+        }
     }
+    serde_json::to_string_pretty(&receipts).map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::manifest_yaml::parse_manifest_to_json;
 
     #[test]
-    fn test_extract_manifest_name_multi_doc_first_manifest() {
-        let manifest = r#"---
-apiVersion: v1
-kind: ConfigMap
-metadata:
-    name: first
----
-apiVersion: v1
-kind: Pod
-metadata:
-    name: second
-"#;
-
-        let value = parse_manifest_to_json(manifest).expect("parse yaml");
-        let name = extract_manifest_name_from_json(&value);
-        assert_eq!(name.as_deref(), Some("first"));
+    fn canonical_manifest_requires_name_and_is_stable() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            temp.path(),
+            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: demo\n",
+        )
+        .unwrap();
+        let first = canonical_manifest(temp.path()).unwrap();
+        let second = canonical_manifest(temp.path()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.0, "demo");
     }
 
     #[test]
-    fn test_extract_manifest_name_multi_doc_skips_missing_metadata() {
-        let manifest = r#"---
-kind: List
----
-apiVersion: v1
-kind: Pod
-metadata:
-    name: actual
-"#;
-
-        let value = parse_manifest_to_json(manifest).expect("parse yaml");
-        let name = extract_manifest_name_from_json(&value);
-        assert_eq!(name.as_deref(), Some("actual"));
+    fn canonical_manifest_preserves_multiple_documents() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), "kind: ConfigMap\nmetadata:\n  name: config\n---\nkind: Pod\nmetadata:\n  name: demo\nspec:\n  containers: []\n").unwrap();
+        let (name, manifest) = canonical_manifest(temp.path()).unwrap();
+        assert_eq!(name, "demo");
+        assert_eq!(
+            protocol::manifest_yaml::parse_yaml_documents_from_slice(&manifest)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }
-
-// ---------------------------------------------------------------------------
-// Workload submission (client-side sealing)
-// ---------------------------------------------------------------------------
-
-/// Discover available custodian nodes from the scheduler.
-pub async fn get_custodians(
-    api_base: Option<&str>,
-    max: usize,
-) -> anyhow::Result<Vec<protocol::machine::CustodianInfo>> {
-    let base = resolve_api_base(api_base);
-    let url = format!("{}/api/v1/custodians?max={}", base, max);
-    let client = reqwest::Client::new();
-    let resp = client.get(&url).send().await?.error_for_status()?;
-    let body: protocol::machine::CustodiansResponse = resp.json().await?;
-    Ok(body.custodians)
-}
-

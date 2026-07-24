@@ -20,8 +20,8 @@ use axum::{Router, routing::get};
 use axum_support::spawn_tcp_listener;
 use podmesh_proxy::{Config as ProxyConfig, Workload as ProxyWorkload};
 use podmesh_sidecar::{
-    DEFAULT_SIDECAR_APP_PORT, SidecarConfig, SidecarEvent,
-    manifest_routes::extract_sidecar_routes, run_sidecar_with_shutdown,
+    DEFAULT_SIDECAR_APP_PORT, SidecarConfig, SidecarEvent, manifest_routes::extract_sidecar_routes,
+    run_sidecar_with_shutdown,
 };
 use protocol::machine::{SidecarRouteKind, SidecarRouteSpec};
 use reqwest::Client;
@@ -188,10 +188,10 @@ async fn wait_for_ingress_response(
 ) -> Result<String> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(response) = client.get(url).header("host", host).send().await {
-            if response.status().is_success() {
-                return Ok(response.text().await?);
-            }
+        if let Ok(response) = client.get(url).header("host", host).send().await
+            && response.status().is_success()
+        {
+            return Ok(response.text().await?);
         }
         if Instant::now() >= deadline {
             return Err(anyhow!("ingress proxy response timed out"));
@@ -330,7 +330,11 @@ async fn process_based_stack_with_multiple_nodes() -> Result<()> {
 
         // Start third proxy node
         log::info!("Starting third proxy node");
-        let third = start_proxy(vec![first_bootstrap.clone(), second_bootstrap.clone()], true, false)?;
+        let third = start_proxy(
+            vec![first_bootstrap.clone(), second_bootstrap.clone()],
+            true,
+            false,
+        )?;
         proxies.push(third);
 
         // Wait for all nodes to have their Kademlia tables ready
@@ -361,10 +365,8 @@ async fn process_based_stack_with_multiple_nodes() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Collect bootstrap peers for the sidecar
-        let sidecar_bootstrap_peers: Vec<String> = proxies
-            .iter()
-            .map(|p| p.bootstrap_addr.clone())
-            .collect();
+        let sidecar_bootstrap_peers: Vec<String> =
+            proxies.iter().map(|p| p.bootstrap_addr.clone()).collect();
 
         // Build sidecar configuration
         let (sidecar_cfg, ingress_host, service_host) =
@@ -381,7 +383,9 @@ async fn process_based_stack_with_multiple_nodes() -> Result<()> {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
         sidecar_task = Some(tokio::spawn(async move {
-            if let Err(e) = run_sidecar_with_shutdown(sidecar_cfg, shutdown_rx, Some(event_tx)).await {
+            if let Err(e) =
+                run_sidecar_with_shutdown(sidecar_cfg, shutdown_rx, Some(event_tx)).await
+            {
                 log::error!("Sidecar exited with error: {:?}", e);
             }
         }));
@@ -414,10 +418,7 @@ async fn process_based_stack_with_multiple_nodes() -> Result<()> {
         let body = wait_for_ingress_response(&client, &url, &ingress_host, Duration::from_secs(20))
             .await
             .context("ingress response with ingress host")?;
-        assert_eq!(
-            body, app_body,
-            "Response body mismatch for ingress host"
-        );
+        assert_eq!(body, app_body, "Response body mismatch for ingress host");
         log::info!("Ingress test passed for ingress host");
 
         // Test with service host header
@@ -425,10 +426,7 @@ async fn process_based_stack_with_multiple_nodes() -> Result<()> {
         let body = wait_for_ingress_response(&client, &url, &service_host, Duration::from_secs(20))
             .await
             .context("ingress response with service host")?;
-        assert_eq!(
-            body, app_body,
-            "Response body mismatch for service host"
-        );
+        assert_eq!(body, app_body, "Response body mismatch for service host");
         log::info!("Ingress test passed for service host");
 
         log::info!("All process-based stack tests passed!");
@@ -526,7 +524,7 @@ async fn sidecar_discovers_provider_in_process_mesh() -> Result<()> {
         let deadline = tokio::time::sleep(Duration::from_secs(30));
         tokio::pin!(deadline);
 
-        while !(connected_peers.len() >= 1 && provider_seen) {
+        while !(!connected_peers.is_empty() && provider_seen) {
             tokio::select! {
                 Some(event) = event_rx.recv() => {
                     match event {

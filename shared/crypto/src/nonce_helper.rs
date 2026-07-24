@@ -25,8 +25,7 @@ pub fn normalize_and_decode_signature(sig_opt: Option<&str>) -> anyhow::Result<V
     } else {
         sig_str
     };
-    crate::b64_decode(b64_part)
-        .context("failed to base64-decode signature")
+    crate::b64_decode(b64_part).context("failed to base64-decode signature")
 }
 
 /// Check replay protection: ensure nonce is not seen in `nonce_window` and insert it.
@@ -57,7 +56,10 @@ pub fn check_and_insert_nonce_for_peer(
         if let Some(oldest_peer) = store
             .iter()
             .filter_map(|(k, inner)| {
-                inner.values().min().map(|oldest_time| (k.clone(), *oldest_time))
+                inner
+                    .values()
+                    .min()
+                    .map(|oldest_time| (k.clone(), *oldest_time))
             })
             .min_by_key(|(_, time)| *time)
             .map(|(k, _)| k)
@@ -71,9 +73,7 @@ pub fn check_and_insert_nonce_for_peer(
     }
 
     // Get or create peer-specific nonce store
-    let peer_store = store
-        .entry(peer_id.to_string())
-        .or_insert_with(HashMap::new);
+    let peer_store = store.entry(peer_id.to_string()).or_default();
 
     // prune old nonces for this peer
     peer_store.retain(|_, &mut t| now.duration_since(t) <= nonce_window);
