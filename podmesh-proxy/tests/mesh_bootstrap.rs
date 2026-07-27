@@ -30,14 +30,7 @@ async fn workload_mesh_bootstraps_three_nodes() -> Result<()> {
 
     let mut nodes = Vec::new();
     let test_result: Result<()> = async {
-        let node1 = start_node(
-            allocate_udp_port(),
-            allocate_tcp_port(),
-            Vec::new(),
-            false,
-            false,
-        )
-        .await?;
+        let node1 = start_node(allocate_udp_port(), allocate_tcp_port(), Vec::new(), false).await?;
         let bootstrap1 = node1.bootstrap_multiaddr();
         nodes.push(node1);
 
@@ -45,7 +38,6 @@ async fn workload_mesh_bootstraps_three_nodes() -> Result<()> {
             allocate_udp_port(),
             allocate_tcp_port(),
             vec![bootstrap1.clone()],
-            false,
             false,
         )
         .await?;
@@ -57,14 +49,12 @@ async fn workload_mesh_bootstraps_three_nodes() -> Result<()> {
             allocate_tcp_port(),
             vec![bootstrap1, bootstrap2],
             true,
-            true,
         )
         .await?;
         nodes.push(node3);
 
         wait_for_mesh(&nodes, 2, Duration::from_secs(30)).await?;
-        wait_for_kademlia(&nodes, Duration::from_secs(30)).await?;
-        wait_for_proxy_provider(&nodes[2], Duration::from_secs(30)).await?;
+        wait_for_network(&nodes, Duration::from_secs(30)).await?;
         Ok(())
     }
     .await;
@@ -82,21 +72,14 @@ async fn workload_mesh_single_node_reports_zero_peers() -> Result<()> {
     init_tracing();
     init_ephemeral_keys();
 
-    let mut node = start_node(
-        allocate_udp_port(),
-        allocate_tcp_port(),
-        Vec::new(),
-        false,
-        false,
-    )
-    .await?;
+    let mut node = start_node(allocate_udp_port(), allocate_tcp_port(), Vec::new(), false).await?;
 
     let client = reqwest::Client::new();
     wait_for_peer_count(&node, 0, Duration::from_secs(10), &client).await?;
     let observed = fetch_peer_count(&node, &client).await?;
     assert_eq!(observed, 0, "single node workload should see no mesh peers");
 
-    wait_for_kad_ready(node.kad_rx(), Duration::from_secs(5)).await?;
+    wait_for_network_ready(node.network_ready_rx(), Duration::from_secs(5)).await?;
 
     node.workload.close().await;
     Ok(())
@@ -106,17 +89,16 @@ async fn start_node(
     libp2p_port: u16,
     rest_port: u16,
     bootstrap_peers: Vec<String>,
-    enable_proxy_provider: bool,
     enable_ingress: bool,
 ) -> Result<NodeHandle> {
     let cfg = Config {
-        bootstrap_peer_strings: bootstrap_peers,
+        proxy_peer_multiaddrs: bootstrap_peers,
+        identity: podmesh_proxy::IdentitySource::ephemeral(),
         libp2p_quic_port: libp2p_port,
         libp2p_host: "127.0.0.1".to_string(),
         rest_host: "127.0.0.1".to_string(),
         rest_port,
         disable_rest_api: false,
-        enable_proxy_provider,
         enable_ingress,
         owner_pubkey: None,
     };
@@ -127,20 +109,16 @@ async fn start_node(
         .peer_id()
         .map(|p| p.to_string())
         .ok_or_else(|| anyhow!("workload peer id unavailable"))?;
-    let kad_rx = workload
-        .kad_bootstrap_rx()
-        .ok_or_else(|| anyhow!("kad bootstrap channel missing"))?;
-    let proxy_provider_rx = workload
-        .proxy_provider_announced_rx()
-        .ok_or_else(|| anyhow!("proxy provider channel missing"))?;
+    let network_ready_rx = workload
+        .network_ready_rx()
+        .ok_or_else(|| anyhow!("network readiness channel missing"))?;
 
     Ok(NodeHandle {
         workload,
         rest_port,
         libp2p_port,
         peer_id,
-        kad_rx,
-        proxy_provider_rx,
+        network_ready_rx,
     })
 }
 
@@ -149,8 +127,7 @@ struct NodeHandle {
     rest_port: u16,
     libp2p_port: u16,
     peer_id: String,
-    kad_rx: Receiver<bool>,
-    proxy_provider_rx: Receiver<bool>,
+    network_ready_rx: Receiver<bool>,
 }
 
 impl NodeHandle {
@@ -165,12 +142,8 @@ impl NodeHandle {
         format!("http://127.0.0.1:{}/healthz", self.rest_port)
     }
 
-    fn kad_rx(&self) -> Receiver<bool> {
-        self.kad_rx.clone()
-    }
-
-    fn proxy_provider_rx(&self) -> Receiver<bool> {
-        self.proxy_provider_rx.clone()
+    fn network_ready_rx(&self) -> Receiver<bool> {
+        self.network_ready_rx.clone()
     }
 }
 
@@ -229,14 +202,14 @@ async fn fetch_peer_count(node: &NodeHandle, client: &reqwest::Client) -> Result
     Ok(resp.peer_count)
 }
 
-async fn wait_for_kademlia(nodes: &[NodeHandle], timeout: Duration) -> Result<()> {
+async fn wait_for_network(nodes: &[NodeHandle], timeout: Duration) -> Result<()> {
     for node in nodes {
-        wait_for_kad_ready(node.kad_rx(), timeout).await?;
+        wait_for_network_ready(node.network_ready_rx(), timeout).await?;
     }
     Ok(())
 }
 
-async fn wait_for_kad_ready(mut rx: Receiver<bool>, timeout: Duration) -> Result<()> {
+async fn wait_for_network_ready(mut rx: Receiver<bool>, timeout: Duration) -> Result<()> {
     if *rx.borrow() {
         return Ok(());
     }
@@ -245,35 +218,14 @@ async fn wait_for_kad_ready(mut rx: Receiver<bool>, timeout: Duration) -> Result
         loop {
             rx.changed()
                 .await
-                .map_err(|_| anyhow!("kad channel closed before readiness"))?;
+                .map_err(|_| anyhow!("network readiness channel closed"))?;
             if *rx.borrow() {
                 return Ok::<(), anyhow::Error>(());
             }
         }
     })
     .await
-    .map_err(|_| anyhow!("kademlia routing table never updated"))??;
-    Ok(())
-}
-
-async fn wait_for_proxy_provider(node: &NodeHandle, timeout: Duration) -> Result<()> {
-    let mut rx = node.proxy_provider_rx();
-    if *rx.borrow() {
-        return Ok(());
-    }
-
-    tokio::time::timeout(timeout, async {
-        loop {
-            rx.changed()
-                .await
-                .map_err(|_| anyhow!("proxy provider channel closed before announcement"))?;
-            if *rx.borrow() {
-                return Ok::<(), anyhow::Error>(());
-            }
-        }
-    })
-    .await
-    .map_err(|_| anyhow!("proxy provider announcement never observed"))??;
+    .map_err(|_| anyhow!("proxy listener never became ready"))??;
     Ok(())
 }
 

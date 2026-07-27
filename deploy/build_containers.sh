@@ -18,18 +18,20 @@ fi
 
 build_image() {
 	image=$1
-	dockerfile=$2
+	target=$2
 
 	podman manifest rm "$image" >/dev/null 2>&1 || true
 	podman image rm --force "$image" >/dev/null 2>&1 || true
 	podman build \
 		--platform "$PLATFORM" \
-		--manifest "$image" \
-		-f "$dockerfile" \
+		--layers \
+		--tag "$image" \
+		--target "$target" \
+		-f deploy/Containerfile \
 		.
 }
 
-build_image podmesh/scheduler:latest podmesh-scheduler/Dockerfile
-build_image podmesh/agent:latest podmesh-agent/Dockerfile
-build_image podmesh/proxy:latest podmesh-proxy/Dockerfile
-build_image podmesh/sidecar:latest podmesh-sidecar/Dockerfile
+build_image podmesh/scheduler:latest scheduler
+build_image podmesh/agent:latest agent
+build_image podmesh/proxy:latest proxy
+build_image podmesh/sidecar:latest sidecar

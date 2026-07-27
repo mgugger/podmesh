@@ -18,16 +18,6 @@ pub fn timestamp_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Split a comma-separated string into a vector of trimmed, non-empty strings.
-pub fn split_csv(input: Option<String>) -> Vec<String> {
-    input
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -36,29 +26,5 @@ mod tests {
     fn test_timestamp_millis() {
         let ts = timestamp_millis();
         assert!(ts > 0);
-    }
-
-    #[test]
-    fn test_split_csv_basic() {
-        let result = split_csv(Some("a,b,c".to_string()));
-        assert_eq!(result, vec!["a", "b", "c"]);
-    }
-
-    #[test]
-    fn test_split_csv_with_whitespace() {
-        let result = split_csv(Some(" a , b , c ".to_string()));
-        assert_eq!(result, vec!["a", "b", "c"]);
-    }
-
-    #[test]
-    fn test_split_csv_empty() {
-        let result = split_csv(None);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_split_csv_filters_empty() {
-        let result = split_csv(Some("a,,b,  ,c".to_string()));
-        assert_eq!(result, vec!["a", "b", "c"]);
     }
 }

@@ -370,7 +370,7 @@ mod tests {
 
     #[test]
     fn extracts_routes_from_sample_manifest() {
-        let manifest = include_bytes!("../../podmesh-proxy/tests/sample_manifests/nginx.yml");
+        let manifest = include_bytes!("../tests/sample_manifests/nginx.yml");
         let extraction =
             extract_sidecar_routes(manifest, "my-nginx").expect("route extraction succeeds");
         assert!(

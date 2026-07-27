@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::{ProxyPeer, validate_proxy_peers};
+
 /// Metadata file written by the machine-plane for sidecars.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SidecarMetadata {
@@ -9,12 +11,15 @@ pub struct SidecarMetadata {
     pub manifest_b64: String,
     /// Optional owner public key encoded as base64 (may be empty if unknown).
     pub owner_public_key_b64: Option<String>,
-    /// Bootstrap peer multiaddr for the workload DHT.
-    pub bootstrap_peer: String,
+    /// Initial tenant proxy identities and dialable addresses.
+    pub proxy_peers: Vec<ProxyPeer>,
 }
 
-/// Default workload-plane bootstrap peer multiaddr used by sidecars.
-pub const DEFAULT_SIDECAR_BOOTSTRAP_MULTIADDR: &str = "/dns4/proxy/udp/4002/quic-v1";
+impl SidecarMetadata {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_proxy_peers(&self.proxy_peers, false)
+    }
+}
 
 /// Default mount path inside the workload pod where sidecar metadata is exposed.
 pub const DEFAULT_METADATA_MOUNT_PATH: &str = "/var/run/podmesh/sidecar";
@@ -26,5 +31,3 @@ pub const DEFAULT_METADATA_FILE: &str = "/var/run/podmesh/sidecar/metadata.json"
 pub const METADATA_PATH_ENV_VAR: &str = "PODMESH_SIDECAR_METADATA_PATH";
 /// Environment variable that conveys an inline base64-encoded metadata blob to the sidecar.
 pub const METADATA_BLOB_ENV_VAR: &str = "PODMESH_SIDECAR_METADATA_B64";
-/// Environment variable that optionally overrides the bootstrap peer from metadata.
-pub const BOOTSTRAP_ENV_VAR: &str = "PODMESH_SIDECAR_BOOTSTRAP_PEER";

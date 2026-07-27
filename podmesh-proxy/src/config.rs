@@ -1,15 +1,14 @@
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub bootstrap_peer_strings: Vec<String>,
+    pub proxy_peer_multiaddrs: Vec<String>,
+    pub identity: p2p::identity::IdentitySource,
     pub libp2p_quic_port: u16,
     pub libp2p_host: String,
     pub rest_host: String,
     pub rest_port: u16,
     pub disable_rest_api: bool,
-    pub enable_proxy_provider: bool,
     pub enable_ingress: bool,
-    /// Base64-encoded Ed25519 owner public key. When set, the proxy announces
-    /// itself under the opaque DHT key `blake3(owner_pubkey_bytes)[..16]`.
+    /// Base64-encoded Ed25519 owner public key used for static tenant authorization.
     pub owner_pubkey: Option<String>,
 }
 

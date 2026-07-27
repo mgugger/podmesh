@@ -1,8 +1,15 @@
 use std::net::{TcpListener, UdpSocket};
+use std::process::Stdio;
 use std::sync::Once;
+
+use anyhow::{Context, Result, anyhow};
+use tokio::process::Command;
 
 static INIT_LOGGING: Once = Once::new();
 static INIT_EPHEMERAL_KEYS: Once = Once::new();
+const PROXY_STATE_VOLUME: &str = "podmesh-proxy-state";
+const PROXY_TOPOLOGY_SECRET: &str = "podmesh-proxy-topology";
+const PROXY_IMAGE: &str = "localhost/podmesh/proxy:latest";
 
 pub fn init_tracing() {
     INIT_LOGGING.call_once(|| {
@@ -41,6 +48,80 @@ pub fn allocate_tcp_port() -> u16 {
         .local_addr()
         .expect("tcp local addr")
         .port()
+}
+
+pub async fn prepare_podman_proxy_topology() -> Result<String> {
+    if !podman_status(&["volume", "exists", PROXY_STATE_VOLUME]).await? {
+        podman_output(&["volume", "create", PROXY_STATE_VOLUME]).await?;
+    }
+
+    let identity_output = podman_output(&[
+        "run",
+        "--rm",
+        "--env",
+        "RUST_LOG=info",
+        "--volume",
+        "podmesh-proxy-state:/var/lib/podmesh-proxy",
+        PROXY_IMAGE,
+        "--init-identity",
+        "--key-dir",
+        "/var/lib/podmesh-proxy/proxy-bootstrap",
+    ])
+    .await?;
+    let peer_id = identity_output
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("peer_id="))
+        .ok_or_else(|| {
+            anyhow!("proxy identity output did not contain peer_id: {identity_output}")
+        })?;
+    let proxy_multiaddr = format!("/dns4/proxy/udp/4002/quic-v1/p2p/{peer_id}");
+
+    let secret_path =
+        std::env::temp_dir().join(format!("podmesh-proxy-topology-{}", std::process::id()));
+    let secret_yaml = format!(
+        "apiVersion: v1\nkind: Secret\nmetadata:\n  name: {PROXY_TOPOLOGY_SECRET}\nstringData:\n  bootstrap-peer: {proxy_multiaddr}\n"
+    );
+    std::fs::write(&secret_path, secret_yaml)
+        .with_context(|| format!("write topology secret {}", secret_path.display()))?;
+    let secret_path_arg = secret_path.to_string_lossy().to_string();
+    let create_result = podman_output(&[
+        "secret",
+        "create",
+        "--replace",
+        PROXY_TOPOLOGY_SECRET,
+        &secret_path_arg,
+    ])
+    .await;
+    let _ = std::fs::remove_file(&secret_path);
+    create_result?;
+    Ok(peer_id.to_string())
+}
+
+async fn podman_status(args: &[&str]) -> Result<bool> {
+    Command::new("podman")
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .context("run podman command")
+        .map(|status| status.success())
+}
+
+async fn podman_output(args: &[&str]) -> Result<String> {
+    let output = Command::new("podman")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("run podman command")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(anyhow!("podman {args:?} failed: {stderr}"));
+    }
+    Ok(format!("{stdout}\n{stderr}"))
 }
 
 /// Generate a NodeCert for testing, signed by the ephemeral owner key.

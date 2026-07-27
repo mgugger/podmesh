@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.dependencies]
-libp2p = { version = "0.56", features = [ "tokio", "gossipsub", "macros", "quic", "request-response", "kad", "dns" ] }
+libp2p = { version = "0.56", features = [ "tokio", "gossipsub", "macros", "quic", "request-response", "dns" ] }
 tokio = { version = "1" }
 reqwest = { version = "0.12",  default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }

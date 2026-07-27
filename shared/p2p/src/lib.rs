@@ -1,36 +1,32 @@
 pub mod envelope;
 pub mod handshake;
 pub mod http_proxy;
+pub mod identity;
 pub mod message_verifier;
 pub mod multiaddr;
 pub mod request_response;
 pub mod security;
-pub mod sidecar_manifest;
 pub mod util;
 
 pub use libp2p_stream;
-pub use multiaddr::{build_quic_multiaddr, parse_bootstrap_peer};
-pub use util::{split_csv, timestamp_millis, timestamp_secs};
+pub use multiaddr::build_quic_multiaddr;
+pub use util::{timestamp_millis, timestamp_secs};
 
 use anyhow::Result;
-use libp2p::{Multiaddr, Swarm, gossipsub, kad, swarm::NetworkBehaviour};
+use libp2p::{Multiaddr, Swarm, gossipsub, swarm::NetworkBehaviour};
 use log::debug;
 use protocol::libp2p_constants::{
     GOSSIPSUB_HEARTBEAT_INTERVAL_SECS, GOSSIPSUB_MESH_N, GOSSIPSUB_MESH_N_HIGH,
-    GOSSIPSUB_MESH_N_LOW, GOSSIPSUB_MESH_OUTBOUND_MIN, KADEMLIA_MAX_PACKET_SIZE,
-    KADEMLIA_PARALLELISM, KADEMLIA_PROVIDER_PUBLICATION_INTERVAL_SECS, KADEMLIA_PROVIDER_TTL_SECS,
-    KADEMLIA_QUERY_TIMEOUT_SECS, KADEMLIA_REPLICATION_FACTOR,
+    GOSSIPSUB_MESH_N_LOW, GOSSIPSUB_MESH_OUTBOUND_MIN,
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::num::NonZeroUsize;
 use std::time::Duration;
 use tokio::sync::watch;
 
 /// Behaviour accessor for shared libp2p helpers.
 pub trait CoreBehaviourAccess {
     fn gossipsub_mut(&mut self) -> &mut gossipsub::Behaviour;
-    fn kademlia_mut(&mut self) -> &mut kad::Behaviour<kad::store::MemoryStore>;
 }
 
 /// Basic configuration for creating a libp2p node.
@@ -59,7 +55,11 @@ pub type SwarmSetup<B> = (
 );
 
 /// Construct a libp2p swarm with caller-provided behaviour factory.
-pub fn setup_swarm<B, F>(config: NodeConfig, behaviour_builder: F) -> Result<SwarmSetup<B>>
+pub fn setup_swarm<B, F>(
+    config: NodeConfig,
+    identity: libp2p::identity::Keypair,
+    behaviour_builder: F,
+) -> Result<SwarmSetup<B>>
 where
     B: NetworkBehaviour + CoreBehaviourAccess,
     F: FnOnce(&libp2p::identity::Keypair) -> B,
@@ -72,7 +72,7 @@ where
 
     let topic = gossipsub::IdentTopic::new(topic);
 
-    let mut swarm = libp2p::SwarmBuilder::with_new_identity()
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
         .with_quic()
         .with_dns()?
@@ -95,25 +95,6 @@ where
 
     let (peer_tx, peer_rx) = watch::channel(Vec::new());
     Ok((swarm, topic, peer_rx, peer_tx))
-}
-
-/// Create a default Kademlia configuration with podmesh-standard settings.
-///
-/// Uses constants from `protocol::libp2p_constants` for consistency across crates.
-pub fn default_kademlia_config() -> kad::Config {
-    let mut config = kad::Config::default();
-    config.set_replication_factor(
-        NonZeroUsize::new(KADEMLIA_REPLICATION_FACTOR).expect("replication factor is non-zero"),
-    );
-    config.set_max_packet_size(KADEMLIA_MAX_PACKET_SIZE);
-    config
-        .set_parallelism(NonZeroUsize::new(KADEMLIA_PARALLELISM).expect("parallelism is non-zero"));
-    config.set_query_timeout(Duration::from_secs(KADEMLIA_QUERY_TIMEOUT_SECS));
-    config.set_provider_record_ttl(Some(Duration::from_secs(KADEMLIA_PROVIDER_TTL_SECS)));
-    config.set_provider_publication_interval(Some(Duration::from_secs(
-        KADEMLIA_PROVIDER_PUBLICATION_INTERVAL_SECS,
-    )));
-    config
 }
 
 /// Create a default gossipsub configuration with podmesh-standard settings.

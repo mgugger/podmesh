@@ -152,7 +152,42 @@ fn load_receipt(workload_id: &str) -> Result<LocalReceipt> {
 }
 
 pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> Result<String> {
+    apply_file_internal(path, api_base, None).await
+}
+
+pub async fn apply_file_with_proxy_multiaddrs(
+    path: PathBuf,
+    api_base: Option<&str>,
+    proxy_multiaddrs: Vec<String>,
+) -> Result<String> {
+    apply_file_internal(path, api_base, Some(proxy_multiaddrs)).await
+}
+
+async fn apply_file_internal(
+    path: PathBuf,
+    api_base: Option<&str>,
+    explicit_proxy_multiaddrs: Option<Vec<String>>,
+) -> Result<String> {
     let (workload_name, manifest) = canonical_manifest(&path)?;
+    let annotations = protocol::PodmeshAnnotations::from_manifest_yaml(
+        std::str::from_utf8(&manifest).context("manifest is not UTF-8")?,
+    )?;
+    let proxy_multiaddrs = if let Some(explicit) = explicit_proxy_multiaddrs {
+        explicit
+    } else if annotations.proxy_peers.is_empty() {
+        std::env::var("PODMESH_PROXY_PEERS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|peer| !peer.is_empty())
+            .map(str::to_string)
+            .collect()
+    } else {
+        annotations.proxy_peers
+    };
+    let proxy_peers = protocol::proxy_peers_from_multiaddrs(&proxy_multiaddrs).context(
+        "initial proxy peers are required in podmesh.io/proxy-peers or PODMESH_PROXY_PEERS",
+    )?;
     let (manifest, resources) = protocol::validate_and_measure_manifest(&manifest)?;
     let resources = resources.with_default_sidecar()?;
     let (owner_public, owner_private) =
@@ -205,6 +240,7 @@ pub async fn apply_file(path: PathBuf, api_base: Option<&str>) -> Result<String>
     let execution = ExecutionSpec {
         workload_name,
         manifest,
+        proxy_peers,
     };
     let execution_bytes = postcard::to_allocvec(&execution)?;
     let mut dek = [0u8; 32];

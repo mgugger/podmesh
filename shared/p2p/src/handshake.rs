@@ -20,11 +20,11 @@ pub const HANDSHAKE_PROTOCOL: &str = "/podmesh/handshake/1.0.0";
 /// `POST /api/v1/node_cert`. The handshake response builder reads from this
 /// slot and embeds the cert in the signed handshake response so the
 /// connecting sidecar can verify tenant binding.
-pub type ProxyCertProvider = Arc<RwLock<Option<String>>>;
+pub type ProxyCertProvider = Arc<RwLock<HashMap<String, protocol::NodeCert>>>;
 
 /// Build an empty (no-cert) [`ProxyCertProvider`].
 pub fn empty_proxy_cert_provider() -> ProxyCertProvider {
-    Arc::new(RwLock::new(None))
+    Arc::new(RwLock::new(HashMap::new()))
 }
 
 /// Tracks handshake progress per peer.
@@ -131,10 +131,12 @@ fn handle_request(
     };
 
     match machine::root_as_handshake(&verified.payload) {
-        Ok(_) => {
+        Ok(handshake) => {
             track_peer(handshake_states, peer).confirmed = true;
 
-            let cert_b64 = proxy_cert.and_then(|p| p.read().ok().and_then(|guard| guard.clone()));
+            let cert_b64 = handshake
+                .tenant_owner_pubkey()
+                .and_then(|owner| select_proxy_cert(proxy_cert, owner));
 
             if let Ok(response) = build_signed_handshake_response(peer, cert_b64.as_deref()) {
                 response
@@ -148,6 +150,15 @@ fn handle_request(
             error_response
         }
     }
+}
+
+fn select_proxy_cert(provider: Option<&ProxyCertProvider>, owner: &str) -> Option<String> {
+    provider.and_then(|provider| {
+        provider
+            .read()
+            .ok()
+            .and_then(|certs| certs.get(owner).map(|cert| cert.to_b64()))
+    })
 }
 
 fn handle_response(
@@ -230,6 +241,33 @@ fn build_signed_handshake_request(
 pub fn build_handshake_request_for_kem_fetch(local_peer: &PeerId) -> Result<Vec<u8>> {
     let cfg = HandshakeDriveConfig::default();
     build_signed_handshake_request(local_peer, &cfg)
+}
+
+pub fn build_proxy_handshake_request(
+    local_peer: &PeerId,
+    tenant_owner_pubkey: &str,
+) -> Result<Vec<u8>> {
+    let cfg = HandshakeDriveConfig::default();
+    let timestamp = timestamp_millis();
+    let nonce = rand::thread_rng().r#gen::<u32>();
+    let payload = machine::build_handshake_with_tenant(
+        nonce,
+        timestamp,
+        cfg.protocol_version,
+        local_peer.to_string(),
+        tenant_owner_pubkey,
+    );
+    let envelope_nonce = format!("proxy_handshake_req_{nonce}");
+    let kem_pub_b64 = crypto::ensure_kem_keypair_on_disk()
+        .ok()
+        .map(|(pub_bytes, _)| crypto::b64_encode(&pub_bytes));
+    let sign_cfg = SignEnvelopeConfig {
+        nonce: Some(&envelope_nonce),
+        timestamp: Some(timestamp),
+        kem_pub_b64: kem_pub_b64.as_deref(),
+        ..Default::default()
+    };
+    Ok(sign_with_node_keys(&payload, "handshake", sign_cfg)?.bytes)
 }
 
 /// Extract KEM public key from a verified handshake response.
@@ -330,4 +368,43 @@ pub fn collect_handshake_actions(
         |peer| actions.drops.push(*peer),
     )?;
     Ok(actions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::{NodeCert, NodeRole};
+
+    fn cert(owner: &str, peer_id: &str) -> NodeCert {
+        NodeCert {
+            peer_id: peer_id.to_string(),
+            kem_pubkey: String::new(),
+            signing_pubkey: String::new(),
+            capabilities: Vec::new(),
+            role: NodeRole::Proxy,
+            valid_until: u64::MAX,
+            owner_pubkey: owner.to_string(),
+            owner_sig: String::new(),
+            endorsements: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn selects_only_requested_tenant_certificate() {
+        let provider = empty_proxy_cert_provider();
+        provider
+            .write()
+            .unwrap()
+            .insert("tenant-a".to_string(), cert("tenant-a", "proxy-a"));
+        provider
+            .write()
+            .unwrap()
+            .insert("tenant-b".to_string(), cert("tenant-b", "proxy-b"));
+
+        let selected = select_proxy_cert(Some(&provider), "tenant-b").unwrap();
+        let selected = NodeCert::from_b64(&selected).unwrap();
+        assert_eq!(selected.owner_pubkey, "tenant-b");
+        assert_eq!(selected.peer_id, "proxy-b");
+        assert!(select_proxy_cert(Some(&provider), "tenant-c").is_none());
+    }
 }

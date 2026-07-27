@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow};
-use protocol::sidecar_metadata::{BOOTSTRAP_ENV_VAR, METADATA_BLOB_ENV_VAR, SidecarMetadata};
+use protocol::sidecar_metadata::{METADATA_BLOB_ENV_VAR, SidecarMetadata};
+use protocol::{ProxyPeer, validate_proxy_peers};
 use serde_json::{Value, json};
 
 const SIDECAR_NAME: &str = "podmesh-sidecar";
@@ -18,14 +19,15 @@ pub fn inject(
     workload_id: &str,
     namespace_id: &str,
     sidecar_image: &str,
-    bootstrap_peer: &str,
+    proxy_peers: &[ProxyPeer],
 ) -> Result<Vec<u8>> {
+    validate_proxy_peers(proxy_peers, false)?;
     let original = manifest.to_vec();
     let metadata = SidecarMetadata {
         manifest_id: workload_id.to_string(),
         manifest_b64: crypto::b64_encode(&original),
         owner_public_key_b64: Some(namespace_id.to_string()),
-        bootstrap_peer: bootstrap_peer.to_string(),
+        proxy_peers: proxy_peers.to_vec(),
     };
     let metadata_blob = crypto::b64_encode(&serde_json::to_vec(&metadata)?);
     let sidecar = json!({
@@ -34,7 +36,6 @@ pub fn inject(
         "imagePullPolicy": "IfNotPresent",
         "env": [
             { "name": METADATA_BLOB_ENV_VAR, "value": metadata_blob },
-            { "name": BOOTSTRAP_ENV_VAR, "value": bootstrap_peer },
             { "name": "PODMESH_ENABLE_EGRESS", "value": "true" },
             { "name": "RUST_LOG", "value": "info" }
         ],
@@ -99,6 +100,10 @@ pub fn inject(
 mod tests {
     use super::*;
 
+    fn test_proxy_peers() -> Vec<ProxyPeer> {
+        protocol::proxy_peers_from_multiaddrs(&["/ip4/127.0.0.1/udp/4002/quic-v1/p2p/12D3KooWJ5WjY5GLqvC7V7abCdzYdHEgQmXW1HYXL7rGZQfJmY9D".to_string()]).unwrap()
+    }
+
     #[test]
     fn injects_sidecar_into_deployment() {
         let manifest = br#"apiVersion: apps/v1
@@ -115,7 +120,7 @@ spec:
             &"a".repeat(64),
             "owner",
             "podmesh/sidecar:latest",
-            "/dns4/proxy/udp/4002/quic-v1",
+            &test_proxy_peers(),
         )
         .unwrap();
         let docs = protocol::manifest_yaml::parse_yaml_documents_from_slice(&output).unwrap();
@@ -162,7 +167,7 @@ spec:
             &"a".repeat(64),
             "owner",
             "podmesh/sidecar:latest",
-            "/dns4/proxy/udp/4002/quic-v1",
+            &test_proxy_peers(),
         )
         .unwrap();
         let docs = protocol::manifest_yaml::parse_yaml_documents_from_slice(&output).unwrap();

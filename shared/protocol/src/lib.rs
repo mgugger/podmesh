@@ -18,13 +18,13 @@ pub mod manifest_yaml;
 pub mod podmesh_annotations;
 pub mod sidecar_metadata;
 pub use podmesh_annotations::PodmeshAnnotations;
-pub mod sidecar_registration;
-pub mod tenant_dht;
-pub use sidecar_registration::{SidecarRegistration, SidecarRegistrationAck, SidecarRoute};
-pub use tenant_dht::{
-    compute_tenant_proxy_dht_key, compute_tenant_proxy_dht_key_from_bytes,
-    compute_tenant_proxy_dht_key_hex,
+pub mod proxy_discovery;
+pub use proxy_discovery::{
+    ProxyDiscoveryRequest, ProxyDiscoveryResponse, ProxyPeer, proxy_peers_from_multiaddrs,
+    validate_proxy_peers,
 };
+pub mod sidecar_registration;
+pub use sidecar_registration::{SidecarRegistration, SidecarRegistrationAck, SidecarRoute};
 
 #[cfg(test)]
 mod tests {

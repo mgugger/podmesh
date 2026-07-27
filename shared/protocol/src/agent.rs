@@ -245,6 +245,7 @@ impl EncryptedWorkloadCapsule {
 pub struct ExecutionSpec {
     pub workload_name: String,
     pub manifest: Vec<u8>,
+    pub proxy_peers: Vec<crate::ProxyPeer>,
 }
 
 impl ExecutionSpec {
@@ -257,6 +258,7 @@ impl ExecutionSpec {
             !self.manifest.is_empty() && self.manifest.len() <= MAX_MANIFEST_BYTES,
             "invalid manifest length"
         );
+        crate::validate_proxy_peers(&self.proxy_peers, false)?;
         Ok(())
     }
 }

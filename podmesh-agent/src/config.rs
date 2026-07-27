@@ -40,9 +40,6 @@ pub struct Config {
     #[arg(long, default_value = "podmesh/sidecar:latest")]
     pub sidecar_image: String,
 
-    #[arg(long, default_value = protocol::sidecar_metadata::DEFAULT_SIDECAR_BOOTSTRAP_MULTIADDR)]
-    pub sidecar_bootstrap_peer: String,
-
     #[arg(long, default_value_t = DEFAULT_CPU_MILLI)]
     pub capacity_cpu_milli: u32,
 

@@ -1,0 +1,67 @@
+FROM rust:latest AS toolchain
+WORKDIR /app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates clang curl libclang-dev llvm musl-tools \
+    && rm -rf /var/lib/apt/lists/*
+RUN set -eu; \
+    case "$(uname -m)" in \
+      x86_64) rust_target=x86_64-unknown-linux-musl ;; \
+      aarch64|arm64) rust_target=aarch64-unknown-linux-musl ;; \
+      *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    rustup target add "$rust_target"
+
+FROM toolchain AS binaries
+COPY . .
+RUN set -eu; \
+    case "$(uname -m)" in \
+      x86_64) rust_target=x86_64-unknown-linux-musl ;; \
+      aarch64|arm64) rust_target=aarch64-unknown-linux-musl ;; \
+      *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    cargo build --release --locked --target "$rust_target" \
+      -p podmesh-scheduler \
+      -p podmesh-agent \
+      -p podmesh-proxy \
+      -p podmesh-sidecar; \
+    install -Dm0755 "target/$rust_target/release/podmesh-scheduler" /out/podmesh-scheduler; \
+    install -Dm0755 "target/$rust_target/release/podmesh-agent" /out/podmesh-agent; \
+    install -Dm0755 "target/$rust_target/release/podmesh-proxy" /out/podmesh-proxy; \
+    install -Dm0755 "target/$rust_target/release/podmesh-sidecar" /out/podmesh-sidecar
+
+FROM toolchain AS agent-assets
+ARG PODMAN_REMOTE_VERSION=5.6.2
+RUN set -eu; \
+    case "$(uname -m)" in \
+      x86_64) podman_arch=amd64 ;; \
+      aarch64|arm64) podman_arch=arm64 ;; \
+      *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/containers/podman/releases/download/v${PODMAN_REMOTE_VERSION}/podman-remote-static-linux_${podman_arch}.tar.gz" -o /tmp/podman.tar.gz; \
+    tar -xzf /tmp/podman.tar.gz -C /tmp; \
+    install -Dm0755 "/tmp/bin/podman-remote-static-linux_${podman_arch}" /out/podman
+
+FROM scratch AS scheduler
+COPY --from=binaries /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=binaries /out/podmesh-scheduler /usr/local/bin/podmesh-scheduler
+ENTRYPOINT ["/usr/local/bin/podmesh-scheduler"]
+
+FROM scratch AS agent
+ENV HOME=/var/lib/podmesh-agent
+ENV PATH=/usr/local/bin
+COPY --from=binaries /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=binaries /out/podmesh-agent /usr/local/bin/podmesh-agent
+COPY --from=agent-assets /out/podman /usr/local/bin/podman
+ENTRYPOINT ["/usr/local/bin/podmesh-agent"]
+
+FROM scratch AS proxy
+ENV HOME=/var/lib/podmesh-proxy
+COPY --from=binaries /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=binaries /out/podmesh-proxy /usr/local/bin/podmesh-proxy
+ENTRYPOINT ["/usr/local/bin/podmesh-proxy"]
+
+FROM scratch AS sidecar
+ENV HOME=/var/lib/podmesh-sidecar
+COPY --from=binaries /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=binaries /out/podmesh-sidecar /usr/local/bin/podmesh-sidecar
+ENTRYPOINT ["/usr/local/bin/podmesh-sidecar"]

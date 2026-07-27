@@ -375,7 +375,7 @@ impl AgentService {
             &grant.workload_id,
             &grant.namespace_id,
             &self.inner.config.sidecar_image,
-            &self.inner.config.sidecar_bootstrap_peer,
+            &execution.proxy_peers,
         )?;
         let (manifest, measured) = protocol::validate_and_measure_manifest(&manifest)?;
         anyhow::ensure!(
@@ -573,7 +573,7 @@ impl AgentService {
                     &workload_id,
                     &stored.grant.namespace_id,
                     &self.inner.config.sidecar_image,
-                    &self.inner.config.sidecar_bootstrap_peer,
+                    &execution.proxy_peers,
                 )?;
                 let (manifest, measured) = protocol::validate_and_measure_manifest(&manifest)?;
                 anyhow::ensure!(
@@ -699,6 +699,7 @@ mod tests {
         let execution = ExecutionSpec {
             workload_name: name.to_string(),
             manifest: manifest.clone(),
+            proxy_peers: protocol::proxy_peers_from_multiaddrs(&["/ip4/127.0.0.1/udp/4002/quic-v1/p2p/12D3KooWJ5WjY5GLqvC7V7abCdzYdHEgQmXW1HYXL7rGZQfJmY9D".to_string()]).unwrap(),
         };
         let mut dek = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut dek);
@@ -787,7 +788,6 @@ mod tests {
                 runtime: RuntimeKind::Mock,
                 workload_network: "podmesh".into(),
                 sidecar_image: "podmesh/sidecar:latest".into(),
-                sidecar_bootstrap_peer: "/dns4/proxy/udp/4002/quic-v1".into(),
                 capacity_cpu_milli: 1_000,
                 capacity_memory_bytes: 1024,
                 capacity_storage_bytes: 1024,
@@ -816,7 +816,6 @@ mod tests {
             runtime: RuntimeKind::Mock,
             workload_network: "podmesh".into(),
             sidecar_image: "podmesh/sidecar:latest".into(),
-            sidecar_bootstrap_peer: "/dns4/proxy/udp/4002/quic-v1".into(),
             capacity_cpu_milli: 1_000,
             capacity_memory_bytes: 2 * TEST_MEMORY_BYTES,
             capacity_storage_bytes: 2 * TEST_STORAGE_BYTES,
@@ -895,7 +894,6 @@ mod tests {
                 runtime: RuntimeKind::Mock,
                 workload_network: "podmesh".into(),
                 sidecar_image: "podmesh/sidecar:latest".into(),
-                sidecar_bootstrap_peer: "/dns4/proxy/udp/4002/quic-v1".into(),
                 capacity_cpu_milli: 1_000,
                 capacity_memory_bytes: 2 * TEST_MEMORY_BYTES,
                 capacity_storage_bytes: 2 * TEST_STORAGE_BYTES,
@@ -965,7 +963,6 @@ mod tests {
                 runtime: RuntimeKind::Mock,
                 workload_network: "podmesh".into(),
                 sidecar_image: "podmesh/sidecar:latest".into(),
-                sidecar_bootstrap_peer: "/dns4/proxy/udp/4002/quic-v1".into(),
                 capacity_cpu_milli: 1_000,
                 capacity_memory_bytes: 1024 * 1024 * 1024,
                 capacity_storage_bytes: TEST_STORAGE_BYTES,
@@ -1048,6 +1045,7 @@ mod tests {
         let execution = ExecutionSpec {
             workload_name: "demo".into(),
             manifest: manifest.clone(),
+            proxy_peers: protocol::proxy_peers_from_multiaddrs(&["/ip4/127.0.0.1/udp/4002/quic-v1/p2p/12D3KooWJ5WjY5GLqvC7V7abCdzYdHEgQmXW1HYXL7rGZQfJmY9D".to_string()]).unwrap(),
         };
         let mut dek = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut dek);

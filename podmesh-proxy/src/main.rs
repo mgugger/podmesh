@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::Parser;
 use log::{error, info};
@@ -8,8 +10,20 @@ use podmesh_proxy::{Config, Workload};
 #[derive(Parser, Debug)]
 #[command(name = "podmesh-proxy", author, version, about = "Podmesh proxy")]
 struct Args {
-    #[arg(long = "bootstrap-peer", env = "bootstrap_peer", value_delimiter = ',')]
-    bootstrap_peer: Vec<String>,
+    #[arg(
+        long = "proxy-peer",
+        env = "PODMESH_PROXY_PEERS",
+        value_delimiter = ','
+    )]
+    proxy_peer: Vec<String>,
+    #[arg(
+        long = "key-dir",
+        env = "PODMESH_PROXY_KEY_DIR",
+        default_value = "/var/lib/podmesh-proxy/keys"
+    )]
+    key_dir: PathBuf,
+    #[arg(long = "init-identity", default_value_t = false)]
+    init_identity: bool,
     #[arg(long = "libp2p-host", env = "libp2p_host", default_value = "0.0.0.0")]
     libp2p_host: String,
     #[arg(
@@ -28,12 +42,6 @@ struct Args {
     rest_port: u16,
     #[arg(long = "disable-rest-api", default_value_t = false)]
     disable_rest_api: bool,
-    #[arg(
-        long = "enable-proxy-provider",
-        env = "enable_proxy_provider",
-        default_value_t = false
-    )]
-    enable_proxy_provider: bool,
     #[arg(
         long = "enable-ingress",
         env = "enable_ingress",
@@ -56,25 +64,36 @@ async fn run() -> Result<()> {
     env_logger::init();
 
     let Args {
-        bootstrap_peer,
+        proxy_peer,
+        key_dir,
+        init_identity,
         libp2p_host,
         libp2p_quic_port,
         rest_host,
         rest_port,
         disable_rest_api,
-        enable_proxy_provider,
         enable_ingress,
         owner_pubkey,
     } = Args::parse();
 
+    if init_identity {
+        let identity = p2p::identity::load_or_initialize_identity(&key_dir)?;
+        info!(
+            "proxy identity initialized peer_id={} key_dir={}",
+            identity.public().to_peer_id(),
+            key_dir.display()
+        );
+        return Ok(());
+    }
+
     let mut cfg = Config {
-        bootstrap_peer_strings: bootstrap_peer,
+        proxy_peer_multiaddrs: proxy_peer,
+        identity: p2p::identity::IdentitySource::Persistent(key_dir),
         libp2p_host,
         libp2p_quic_port,
         rest_host,
         rest_port,
         disable_rest_api,
-        enable_proxy_provider,
         enable_ingress,
         owner_pubkey,
     };

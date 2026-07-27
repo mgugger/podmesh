@@ -36,30 +36,48 @@ Defined in `podmesh-proxy/src/p2p.rs`:
 
 - `gossipsub` on `podmesh-workload`
 - `handshake_rr` for signed peer handshake and tenant proxy certificate exchange
-- `kademlia` for workload-plane discovery
 - `proxy_rr` for ingress HTTP forwarding to sidecars
-- `manifest_rr` for sidecar manifest record fetches
 - `egress_stream` for sidecar egress tunnels
 - `registration_rr` for inbound sidecar route registration
+- `discovery_rr` for bounded tenant-scoped regional proxy peer exchange
 - `identify`, relay, and AutoNAT behaviours supplied by the shared swarm setup
 
-The proxy keeps an in-memory routing table populated by authenticated sidecar registrations. It
-checks this table before using the manifest-provider discovery fallback.
+Each logical proxy loads a persistent libp2p identity from its key directory. Ordinary process,
+container, host, and address changes therefore retain the same peer ID. Active regional proxies use
+distinct identities; one private key must not be active in two places concurrently.
+
+The proxy keeps an in-memory routing table populated only by authenticated sidecar registrations.
+If no registration exists for a workload, ingress fails closed without a distributed lookup.
 
 ## Sidecar `SidecarBehaviour`
 
 Defined in `podmesh-sidecar/src/lib.rs`:
 
-- `kademlia` for proxy and provider discovery
 - `handshake_rr` for peer identity and tenant proxy certificate verification
 - `proxy_rr` for inbound ingress requests
-- `manifest_rr` for serving signed manifest records
 - `egress_stream` for outbound tunnels
 - `registration_rr` for outbound registration with verified proxies
+- `discovery_rr` for fetching additional regional proxy identities from a verified proxy
 
-The agent injects the sidecar only after decrypting the workload. Sidecar metadata contains the
-namespace, workload identity, complete manifest, and bootstrap proxy address; this metadata is never
-sent to the scheduler.
+The tenant includes a bounded list of initial proxy records in the encrypted, owner-signed
+`ExecutionSpec`. The agent injects those records into sidecar metadata only after decrypting and
+validating the workload. Every record binds a stable peer ID to one or more dialable
+`/p2p/<peer-id>` multiaddrs. This metadata is never sent to the scheduler, and the selected agent
+does not choose tenant proxies.
+
+The sidecar treats configured and discovered records only as candidates. It requests the workload
+tenant's certificate in the signed handshake and accepts a proxy only when the returned `NodeCert`
+has a valid owner signature, role `Proxy`, a matching tenant owner key, a matching transport peer
+ID, and a current expiry. It registers routes with every verified regional proxy. A verified proxy
+can return additional bounded candidates through `/podmesh/proxy-discovery/1.0.0`; each candidate
+must pass the same handshake checks before use.
+
+```text
+owner-signed workload -> initial regional ProxyPeer records
+sidecar -> candidate proxy -> tenant-specific NodeCert handshake
+sidecar -> verified proxy -> bounded proxy discovery request
+sidecar -> every verified regional proxy -> authenticated route registration
+```
 
 ## `podctl` Endpoints
 
@@ -87,4 +105,6 @@ use multiple replicas and replica handoff.
 - The selected agent necessarily sees plaintext to execute the workload.
 - Proxy ingress is L7 HTTP and therefore not confidential from the proxy unless the application uses
   end-to-end TLS or another workload-terminated encrypted protocol.
+- Proxy peer exchange contains no workload data and cannot grant authority; tenant certificates are
+  verified again by every sidecar.
 - Public advertisements and network timing remain observable metadata.

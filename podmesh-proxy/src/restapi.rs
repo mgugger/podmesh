@@ -13,7 +13,7 @@ use axum::{
 use axum_support::{parse_socket_addr, spawn_tcp_server};
 use protocol::{NodeCert, NodeRole};
 use serde::Serialize;
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 
 /// Shared store of tenant-issued NodeCerts held by the proxy.
@@ -23,13 +23,6 @@ pub type CertStore = Arc<RwLock<HashMap<String, NodeCert>>>;
 /// Construct a fresh, empty cert store.
 pub fn new_cert_store() -> CertStore {
     Arc::new(RwLock::new(HashMap::new()))
-}
-
-/// Notification sent when a NodeCert is added/replaced — used by the p2p task
-/// to (re-)announce the tenant DHT key.
-#[derive(Debug, Clone)]
-pub struct CertAnnouncement {
-    pub owner_pubkey: String,
 }
 
 #[derive(Clone)]
@@ -60,12 +53,6 @@ pub struct RestServerOptions {
     pub local_peer_id: String,
     /// Shared store for cert persistence + lookup.
     pub cert_store: CertStore,
-    /// Channel that gets a [`CertAnnouncement`] every time a new cert is stored.
-    /// The p2p task uses this to start providing under the tenant DHT key.
-    pub cert_announce_tx: mpsc::UnboundedSender<CertAnnouncement>,
-    /// Optional shared slot updated with the most recently provisioned cert
-    /// (base64 postcard) so the handshake handler can include it in responses.
-    pub handshake_cert_slot: Arc<RwLock<Option<String>>>,
 }
 
 #[derive(Clone)]
@@ -74,8 +61,6 @@ struct RestState {
     peers: PeerSnapshot,
     local_peer_id: String,
     cert_store: CertStore,
-    cert_announce_tx: mpsc::UnboundedSender<CertAnnouncement>,
-    handshake_cert_slot: Arc<RwLock<Option<String>>>,
 }
 
 #[derive(Serialize)]
@@ -99,7 +84,6 @@ struct PeerIdResponse {
 struct CertAck {
     ok: bool,
     owner_pubkey: String,
-    tenant_dht_key_hex: String,
     valid_until: u64,
     message: String,
 }
@@ -116,8 +100,6 @@ pub fn spawn_rest_server(options: RestServerOptions) -> Result<JoinHandle<()>> {
         peer_rx,
         local_peer_id,
         cert_store,
-        cert_announce_tx,
-        handshake_cert_slot,
     } = options;
 
     let addr = parse_socket_addr(&host, port)?;
@@ -126,8 +108,6 @@ pub fn spawn_rest_server(options: RestServerOptions) -> Result<JoinHandle<()>> {
         peers: PeerSnapshot::new(peer_rx),
         local_peer_id,
         cert_store,
-        cert_announce_tx,
-        handshake_cert_slot,
     };
 
     let app = Router::new()
@@ -266,20 +246,6 @@ async fn post_node_cert(
 
     let owner_pubkey = cert.owner_pubkey.clone();
     let valid_until = cert.valid_until;
-    let dht_key_hex = match protocol::compute_tenant_proxy_dht_key_hex(&owner_pubkey) {
-        Ok(s) => s,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ApiError {
-                    error: format!("failed to compute tenant DHT key: {}", err),
-                }),
-            )
-                .into_response();
-        }
-    };
-    let cert_b64 = body.cert_b64.clone();
-
     {
         let mut store = match state.cert_store.write() {
             Ok(g) => g,
@@ -296,22 +262,11 @@ async fn post_node_cert(
         store.insert(owner_pubkey.clone(), cert);
     }
 
-    if let Ok(mut slot) = state.handshake_cert_slot.write() {
-        *slot = Some(cert_b64);
-    }
-
-    if let Err(err) = state.cert_announce_tx.send(CertAnnouncement {
-        owner_pubkey: owner_pubkey.clone(),
-    }) {
-        log::warn!("failed to notify p2p task of new cert: {}", err);
-    }
-
     (
         StatusCode::OK,
         Json(CertAck {
             ok: true,
             owner_pubkey,
-            tenant_dht_key_hex: dht_key_hex,
             valid_until,
             message: "NodeCert accepted".to_string(),
         }),

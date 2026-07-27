@@ -18,9 +18,11 @@ use std::process::{Command as StdCommand, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use podctl::{apply_file, delete_file};
+use podctl::{apply_file_with_proxy_multiaddrs, delete_file};
 use podmesh_agent::sidecar::workload_runtime_name;
-use podmesh_integration_tests::support::{init_ephemeral_keys, init_tracing, provision_proxy_cert};
+use podmesh_integration_tests::support::{
+    init_ephemeral_keys, init_tracing, prepare_podman_proxy_topology, provision_proxy_cert,
+};
 use reqwest::Client;
 use serde_json::Value;
 use serial_test::serial;
@@ -31,6 +33,7 @@ const ROOTLESS_MANIFEST_PATH: &str = "deploy/podmesh_rootless.yml";
 const ROOTFUL_MANIFEST_PATH: &str = "deploy/podmesh_rootful.yml";
 const EGRESS_TEST_MANIFEST_PATH: &str = "tests/sample_manifests/transparent_egress_test.yml";
 const EGRESS_TEST_URL: &str = "http://scheduler:3000/health";
+const PODMESH_PROXY_API_PORTS: [u16; 3] = [3001, 3002, 3003];
 const PODMESH_NETWORK: &str = "podmesh";
 const ROOTLESS_PODMAN_SOCKET: &str = "/run/user/1000/podman/podman.sock";
 const ROOTFUL_PODMAN_SOCKET: &str = "/run/podman/podman.sock";
@@ -98,20 +101,33 @@ async fn transparent_egress_routes_through_sidecar_and_proxy() -> Result<()> {
     // Wait for machine to be healthy and peers to register
     wait_for_machine_health(&client, Duration::from_secs(120)).await?;
     wait_for_agent_registration(&client, Duration::from_secs(120)).await?;
+    let proxy_peer_ids = wait_for_proxy_peer_ids(&client, Duration::from_secs(120)).await?;
     let (owner_public, owner_private) = crypto::ensure_keypair_on_disk()?;
-    provision_proxy_cert(
-        3001,
-        &owner_public,
-        &owner_private,
-        Duration::from_secs(120),
-    )
-    .await
-    .context("failed to provision tenant proxy certificate")?;
+    for port in PODMESH_PROXY_API_PORTS {
+        provision_proxy_cert(
+            port,
+            &owner_public,
+            &owner_private,
+            Duration::from_secs(120),
+        )
+        .await
+        .with_context(|| format!("failed to provision tenant proxy certificate on {port}"))?;
+    }
 
     // Deploy the egress test workload
-    let manifest_id = apply_file(egress_test_manifest.clone(), Some(MACHINE_API_URL))
-        .await
-        .context("podctl apply failed for egress test manifest")?;
+    let manifest_id = apply_file_with_proxy_multiaddrs(
+        egress_test_manifest.clone(),
+        Some(MACHINE_API_URL),
+        proxy_peer_ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, peer_id)| {
+                format!("/dns4/proxy/udp/{}/quic-v1/p2p/{peer_id}", 4002 + index)
+            })
+            .collect(),
+    )
+    .await
+    .context("podctl apply failed for egress test manifest")?;
     log::info!("podctl applied egress test manifest {manifest_id}");
     workload_guard.set(manifest_id.clone());
 
@@ -162,6 +178,33 @@ async fn is_podman_available() -> bool {
         Ok(status) => status.success(),
         Err(_) => false,
     }
+}
+
+async fn wait_for_proxy_peer_ids(client: &Client, timeout: Duration) -> Result<Vec<String>> {
+    let deadline = Instant::now() + timeout;
+    let mut peer_ids = vec![None; PODMESH_PROXY_API_PORTS.len()];
+    while Instant::now() < deadline {
+        for (index, port) in PODMESH_PROXY_API_PORTS.iter().enumerate() {
+            if peer_ids[index].is_some() {
+                continue;
+            }
+            let url = format!("http://127.0.0.1:{port}/api/v1/peer_id");
+            if let Ok(response) = client.get(&url).send().await
+                && response.status().is_success()
+            {
+                let value: Value = response.json().await?;
+                peer_ids[index] = value
+                    .get("peer_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+        }
+        if peer_ids.iter().all(Option::is_some) {
+            return Ok(peer_ids.into_iter().flatten().collect());
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    Err(anyhow!("not all regional proxy peer IDs became available"))
 }
 
 fn is_socket_available(socket_path: &str) -> bool {
@@ -233,6 +276,7 @@ impl PodmanKubeGuard {
         let manifest_arg = manifest_path.to_string_lossy().to_string();
         ensure_podman_network(PODMESH_NETWORK).await?;
         let _ = run_podman_command(&["kube", "down", &manifest_arg]).await;
+        prepare_podman_proxy_topology().await?;
         run_podman_command(&["kube", "play", "--network", PODMESH_NETWORK, &manifest_arg])
             .await
             .context("failed to start podmesh stack with podman kube play")?;

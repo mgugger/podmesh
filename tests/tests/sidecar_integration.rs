@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -23,25 +22,23 @@ use podmesh_integration_tests::support::{
     provision_proxy_cert,
 };
 
-const SIDECAR_PROVIDER_LABEL: &str = "podmesh-proxy-node";
 const DEMO_MANIFEST_ID: &str = "demo-nginx";
 const DEMO_MANIFEST: &[u8] = include_bytes!("../sample_manifests/demo_deployment.yml");
 
 fn build_workload_config(
     libp2p_port: u16,
     rest_port: u16,
-    bootstrap_peer_strings: Vec<String>,
-    enable_proxy_provider: bool,
+    proxy_peer_multiaddrs: Vec<String>,
     enable_ingress: bool,
 ) -> Config {
     Config {
-        bootstrap_peer_strings,
+        proxy_peer_multiaddrs,
+        identity: podmesh_proxy::IdentitySource::ephemeral(),
         libp2p_quic_port: libp2p_port,
         libp2p_host: "127.0.0.1".to_string(),
         rest_host: "127.0.0.1".to_string(),
         rest_port,
         disable_rest_api: false,
-        enable_proxy_provider,
         enable_ingress,
         owner_pubkey: None,
     }
@@ -49,122 +46,24 @@ fn build_workload_config(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn sidecar_discovers_workload_provider() -> Result<()> {
-    init_tracing();
-    init_ephemeral_keys();
-    let mut workloads = Vec::new();
-
-    let test_result: Result<()> = async {
-        let first = start_workload(Vec::new(), true, false)?;
-        let provider_peer_id = first.peer_id.clone();
-        let first_bootstrap = first.bootstrap_addr.clone();
-        workloads.push(first);
-
-        let second = start_workload(vec![first_bootstrap.clone()], false, false)?;
-        let second_bootstrap = second.bootstrap_addr.clone();
-        workloads.push(second);
-
-        let third = start_workload(vec![first_bootstrap, second_bootstrap], false, false)?;
-        workloads.push(third);
-
-        for node in &workloads {
-            wait_for_kad_ready(node.kad_rx(), Duration::from_secs(20)).await?;
-        }
-
-        if let Some(provider_node) = workloads.first() {
-            wait_for_proxy_provider(provider_node.proxy_provider_rx(), Duration::from_secs(10))
-                .await?;
-        }
-
-        let sidecar_bootstrap_peers: Vec<String> = workloads
-            .iter()
-            .map(|node| node.bootstrap_addr.clone())
-            .collect();
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        let (sidecar_cfg, _, _) =
-            build_sidecar_config(sidecar_bootstrap_peers, DEFAULT_SIDECAR_APP_PORT)?;
-
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-
-        let sidecar_task = tokio::spawn(async move {
-            run_sidecar_with_shutdown(sidecar_cfg, shutdown_rx, Some(event_tx))
-                .await
-                .expect("sidecar run");
-        });
-
-        let known_peer_ids: HashSet<String> =
-            workloads.iter().map(|node| node.peer_id.clone()).collect();
-        let mut connected_peers = HashSet::new();
-        let mut provider_seen = false;
-        let deadline = tokio::time::sleep(Duration::from_secs(30));
-        tokio::pin!(deadline);
-
-        while !(!connected_peers.is_empty() && provider_seen) {
-            tokio::select! {
-                Some(event) = event_rx.recv() => {
-                    match event {
-                        SidecarEvent::Connected { ref peer_id } => {
-                            if known_peer_ids.contains(peer_id) {
-                                connected_peers.insert(peer_id.clone());
-                            }
-                        }
-                        SidecarEvent::ProviderDiscovered { ref peer_id } => {
-                            if peer_id == &provider_peer_id {
-                                provider_seen = true;
-                            }
-                        }
-                        SidecarEvent::ProxyPeerDiscovered { .. }
-                        | SidecarEvent::EgressTunnelEstablished { .. }
-                        | SidecarEvent::EgressTunnelFailed { .. } => {
-                            // Ignored in this test
-                        }
-                    }
-                }
-                _ = &mut deadline => {
-                    break;
-                }
-            }
-        }
-
-        assert!(
-            !connected_peers.is_empty(),
-            "sidecar never connected to any workload peer"
-        );
-        assert!(
-            provider_seen,
-            "sidecar never observed provider {}",
-            provider_peer_id
-        );
-
-        let _ = shutdown_tx.send(());
-        let _ = sidecar_task.await;
-
-        Ok(())
-    }
-    .await;
-
-    for node in workloads.iter_mut() {
-        node.workload.close().await;
-    }
-
-    test_result
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
 async fn ingress_proxies_requests_via_sidecar() -> Result<()> {
     init_tracing();
     init_ephemeral_keys();
-    let mut handle = start_workload(Vec::new(), true, true)?;
+    let (owner_b64, owner_sk, owner_pk) = fresh_tenant_owner();
+    let mut handle = start_workload(Vec::new(), true)?;
     let mut sidecar_shutdown: Option<oneshot::Sender<()>> = None;
     let mut sidecar_task: Option<JoinHandle<()>> = None;
     let mut app_server: Option<JoinHandle<()>> = None;
     let test_result: Result<()> = async {
-        wait_for_kad_ready(handle.kad_rx(), Duration::from_secs(10)).await?;
-        wait_for_proxy_provider(handle.proxy_provider_rx(), Duration::from_secs(10)).await?;
+        wait_for_network_ready(handle.network_ready_rx(), Duration::from_secs(10)).await?;
+        wait_for_network_ready(handle.network_ready_rx(), Duration::from_secs(10)).await?;
+        provision_proxy_cert(
+            handle.rest_port,
+            &owner_pk,
+            &owner_sk,
+            Duration::from_secs(10),
+        )
+        .await?;
 
         let app_port = allocate_tcp_port();
 
@@ -173,8 +72,9 @@ async fn ingress_proxies_requests_via_sidecar() -> Result<()> {
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         sidecar_shutdown = Some(shutdown_tx);
-        let (sidecar_cfg, ingress_host, service_host) =
+        let (mut sidecar_cfg, ingress_host, service_host) =
             build_sidecar_config(vec![handle.bootstrap_addr.clone()], app_port)?;
+        sidecar_cfg.owner_public_key_b64 = Some(owner_b64.clone());
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let provider_peer_id = handle.peer_id.clone();
 
@@ -220,26 +120,25 @@ async fn ingress_proxies_requests_via_sidecar() -> Result<()> {
     test_result
 }
 
-/// Tests that a sidecar with egress enabled discovers the proxy provider via DHT.
+/// Tests that a sidecar with egress enabled discovers an explicitly configured proxy.
 ///
 /// This test verifies:
 /// 1. Proxy node announces itself as provider for `podmesh-proxy-node` key
-/// 2. Sidecar with enable_egress=true queries DHT for proxy providers
+/// 2. Sidecar connects to the configured stable proxy identity
 /// 3. Sidecar receives ProxyPeerDiscovered event with proxy's peer ID
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn sidecar_discovers_egress_proxy_via_dht() -> Result<()> {
+async fn sidecar_discovers_explicit_egress_proxy() -> Result<()> {
     init_tracing();
     init_ephemeral_keys();
 
     // Start a workload node that acts as the proxy provider
-    let mut handle = start_workload(Vec::new(), true, false)?;
+    let mut handle = start_workload(Vec::new(), false)?;
     let proxy_peer_id = handle.peer_id.clone();
 
     let test_result: Result<()> = async {
         // Wait for proxy to be ready and announce itself
-        wait_for_kad_ready(handle.kad_rx(), Duration::from_secs(10)).await?;
-        wait_for_proxy_provider(handle.proxy_provider_rx(), Duration::from_secs(10)).await?;
+        wait_for_network_ready(handle.network_ready_rx(), Duration::from_secs(10)).await?;
 
         // Create sidecar with egress enabled
         let (mut sidecar_cfg, _, _) = build_sidecar_config_with_egress(
@@ -309,6 +208,76 @@ async fn sidecar_discovers_egress_proxy_via_dht() -> Result<()> {
     test_result
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn sidecar_fetches_and_registers_with_additional_regional_proxy() -> Result<()> {
+    init_tracing();
+    init_ephemeral_keys();
+    let (owner_b64, owner_sk, owner_pk) = fresh_tenant_owner();
+
+    let mut first = start_workload(Vec::new(), false)?;
+    let mut second = start_workload(vec![first.bootstrap_addr.clone()], false)?;
+    let second_peer_id = second.peer_id.clone();
+
+    let test_result: Result<()> = async {
+        wait_for_network_ready(first.network_ready_rx(), Duration::from_secs(10)).await?;
+        wait_for_network_ready(second.network_ready_rx(), Duration::from_secs(10)).await?;
+        provision_proxy_cert(
+            first.rest_port,
+            &owner_pk,
+            &owner_sk,
+            Duration::from_secs(10),
+        )
+        .await?;
+        provision_proxy_cert(
+            second.rest_port,
+            &owner_pk,
+            &owner_sk,
+            Duration::from_secs(10),
+        )
+        .await?;
+
+        let (mut sidecar_cfg, _, _) =
+            build_sidecar_config(vec![first.bootstrap_addr.clone()], DEFAULT_SIDECAR_APP_PORT)?;
+        sidecar_cfg.owner_public_key_b64 = Some(owner_b64);
+        sidecar_cfg.lookup_interval = Duration::from_secs(1);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let sidecar_task = tokio::spawn(async move {
+            run_sidecar_with_shutdown(sidecar_cfg, shutdown_rx, Some(event_tx))
+                .await
+                .expect("sidecar run");
+        });
+
+        let first_table = first.workload.routing_table_handle().unwrap();
+        let second_table = second.workload.routing_table_handle().unwrap();
+        let registration_deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let first_registered = first_table.read().unwrap().contains_key(DEMO_MANIFEST_ID);
+            let second_registered = second_table.read().unwrap().contains_key(DEMO_MANIFEST_ID);
+            if first_registered && second_registered {
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < registration_deadline,
+                "sidecar did not discover {} and register routes with both regional proxies",
+                second_peer_id
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let _ = shutdown_tx.send(());
+        let _ = sidecar_task.await;
+        Ok(())
+    }
+    .await;
+
+    first.workload.close().await;
+    second.workload.close().await;
+    test_result
+}
+
 /// Tests that HTTP traffic can be routed through the sidecar's HTTP CONNECT proxy
 /// to an external HTTP server via the egress tunnel through the proxy node.
 ///
@@ -318,7 +287,7 @@ async fn sidecar_discovers_egress_proxy_via_dht() -> Result<()> {
 /// 2. Proxy node starts and is provisioned with a tenant-signed `NodeCert` via
 ///    `podctl::cert::grant_proxy_async` (simulating `podctl grant-proxy`)
 /// 3. Sidecar is configured with the same owner pubkey, discovers the proxy via
-///    the obfuscated `blake3(owner_pubkey)[..16]` DHT key, verifies the cert
+///    its explicit peer record, verifies the cert
 ///    during handshake, then routes egress traffic through the verified proxy
 /// 4. Response flows back through the tunnel
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -334,13 +303,12 @@ async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
     let target_server = spawn_test_app(target_port, target_body.clone()).await?;
 
     // Start proxy node that will handle egress tunnel streams
-    let mut handle = start_workload(Vec::new(), true, false)?;
+    let mut handle = start_workload(Vec::new(), false)?;
     let proxy_peer_id = handle.peer_id.clone();
 
     let test_result: Result<()> = async {
         // Wait for proxy to be ready
-        wait_for_kad_ready(handle.kad_rx(), Duration::from_secs(10)).await?;
-        wait_for_proxy_provider(handle.proxy_provider_rx(), Duration::from_secs(10)).await?;
+        wait_for_network_ready(handle.network_ready_rx(), Duration::from_secs(10)).await?;
 
         // Provision the proxy with a tenant-signed NodeCert via the REST API.
         // This is the in-test equivalent of `podctl grant-proxy --proxy-url <url>`.
@@ -357,11 +325,11 @@ async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
         let http_proxy_port = allocate_tcp_port();
 
         // Create sidecar with HTTP proxy enabled and tenant owner pubkey set so
-        // it discovers the proxy via the obfuscated tenant DHT key.
+        // it authenticates the explicitly configured proxy.
         let (mut sidecar_cfg, _, _) = build_sidecar_config_full(
             vec![handle.bootstrap_addr.clone()],
             DEFAULT_SIDECAR_APP_PORT,
-            false, // enable_egress=false: transparent proxy not needed, http_proxy_port triggers DHT lookups
+            false,
             Some(http_proxy_port),
         )?;
         sidecar_cfg.owner_public_key_b64 = Some(owner_b64.clone());
@@ -376,7 +344,7 @@ async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
                 .expect("sidecar run");
         });
 
-        // Wait for sidecar to discover the proxy peer (under tenant DHT key)
+        // Wait for sidecar to discover the tenant-authorized proxy peer.
         let mut proxy_discovered = false;
         let deadline = tokio::time::sleep(Duration::from_secs(30));
         tokio::pin!(deadline);
@@ -399,7 +367,7 @@ async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
 
         assert!(
             proxy_discovered,
-            "sidecar never discovered proxy peer {} for egress under tenant DHT key",
+            "sidecar never discovered tenant-authorized proxy peer {} for egress",
             proxy_peer_id
         );
 
@@ -449,35 +417,20 @@ struct WorkloadHandle {
     workload: Workload,
     peer_id: String,
     bootstrap_addr: String,
-    kad_rx: watch::Receiver<bool>,
-    proxy_provider_rx: watch::Receiver<bool>,
+    network_ready_rx: watch::Receiver<bool>,
     rest_port: u16,
 }
 
 impl WorkloadHandle {
-    fn kad_rx(&self) -> watch::Receiver<bool> {
-        self.kad_rx.clone()
-    }
-
-    fn proxy_provider_rx(&self) -> watch::Receiver<bool> {
-        self.proxy_provider_rx.clone()
+    fn network_ready_rx(&self) -> watch::Receiver<bool> {
+        self.network_ready_rx.clone()
     }
 }
 
-fn start_workload(
-    bootstrap_peers: Vec<String>,
-    enable_proxy_provider: bool,
-    enable_ingress: bool,
-) -> Result<WorkloadHandle> {
+fn start_workload(bootstrap_peers: Vec<String>, enable_ingress: bool) -> Result<WorkloadHandle> {
     let libp2p_port = allocate_udp_port();
     let rest_port = allocate_tcp_port();
-    let config = build_workload_config(
-        libp2p_port,
-        rest_port,
-        bootstrap_peers,
-        enable_proxy_provider,
-        enable_ingress,
-    );
+    let config = build_workload_config(libp2p_port, rest_port, bootstrap_peers, enable_ingress);
     let mut workload = Workload::new(config)?;
     workload.start()?;
 
@@ -486,24 +439,20 @@ fn start_workload(
         .map(|id| id.to_string())
         .ok_or_else(|| anyhow!("workload peer id unavailable"))?;
     let bootstrap_addr = format!("/ip4/127.0.0.1/udp/{libp2p_port}/quic-v1/p2p/{peer_id}");
-    let kad_rx = workload
-        .kad_bootstrap_rx()
-        .ok_or_else(|| anyhow!("kad bootstrap channel missing"))?;
-    let proxy_provider_rx = workload
-        .proxy_provider_announced_rx()
-        .ok_or_else(|| anyhow!("proxy provider channel missing"))?;
+    let network_ready_rx = workload
+        .network_ready_rx()
+        .ok_or_else(|| anyhow!("network readiness channel missing"))?;
 
     Ok(WorkloadHandle {
         workload,
         peer_id,
         bootstrap_addr,
-        kad_rx,
-        proxy_provider_rx,
+        network_ready_rx,
         rest_port,
     })
 }
 
-async fn wait_for_kad_ready(mut rx: watch::Receiver<bool>, timeout: Duration) -> Result<()> {
+async fn wait_for_network_ready(mut rx: watch::Receiver<bool>, timeout: Duration) -> Result<()> {
     if *rx.borrow() {
         return Ok(());
     }
@@ -512,35 +461,14 @@ async fn wait_for_kad_ready(mut rx: watch::Receiver<bool>, timeout: Duration) ->
         loop {
             rx.changed()
                 .await
-                .map_err(|_| anyhow!("kad channel closed before readiness"))?;
+                .map_err(|_| anyhow!("network readiness channel closed"))?;
             if *rx.borrow() {
                 return Ok::<(), anyhow::Error>(());
             }
         }
     })
     .await
-    .map_err(|_| anyhow!("kademlia routing table never updated"))??;
-
-    Ok(())
-}
-
-async fn wait_for_proxy_provider(mut rx: watch::Receiver<bool>, timeout: Duration) -> Result<()> {
-    if *rx.borrow() {
-        return Ok(());
-    }
-
-    tokio::time::timeout(timeout, async {
-        loop {
-            rx.changed()
-                .await
-                .map_err(|_| anyhow!("proxy provider channel closed before announcement"))?;
-            if *rx.borrow() {
-                return Ok::<(), anyhow::Error>(());
-            }
-        }
-    })
-    .await
-    .map_err(|_| anyhow!("proxy provider announcement never observed"))??;
+    .map_err(|_| anyhow!("proxy listener never became ready"))??;
 
     Ok(())
 }
@@ -587,21 +515,20 @@ async fn wait_for_sidecar_peer_ready(
 ) -> Result<()> {
     tokio::time::timeout(timeout, async {
         let mut connected = false;
-        let mut provider_seen = false;
-        while !(connected && provider_seen) {
+        let mut proxy_seen = false;
+        while !(connected && proxy_seen) {
             match rx.recv().await {
                 Some(SidecarEvent::Connected { peer_id }) => {
                     if peer_id == expected_peer_id {
                         connected = true;
                     }
                 }
-                Some(SidecarEvent::ProviderDiscovered { peer_id }) => {
+                Some(SidecarEvent::ProxyPeerDiscovered { peer_id }) => {
                     if peer_id == expected_peer_id {
-                        provider_seen = true;
+                        proxy_seen = true;
                     }
                 }
-                Some(SidecarEvent::ProxyPeerDiscovered { .. })
-                | Some(SidecarEvent::EgressTunnelEstablished { .. })
+                Some(SidecarEvent::EgressTunnelEstablished { .. })
                 | Some(SidecarEvent::EgressTunnelFailed { .. }) => {
                     // Ignore these events in this helper
                 }
@@ -615,7 +542,7 @@ async fn wait_for_sidecar_peer_ready(
     .await
     .map_err(|_| {
         anyhow!(
-            "sidecar did not become ready for provider {}",
+            "sidecar did not become ready for proxy {}",
             expected_peer_id
         )
     })??;
@@ -646,14 +573,11 @@ fn build_sidecar_config_full(
 ) -> Result<(SidecarConfig, String, String)> {
     let (routes, ingress_host, service_host) = demo_routes(app_port)?;
     let cfg = SidecarConfig {
-        provider_label: SIDECAR_PROVIDER_LABEL.to_string(),
-        bootstrap_peers,
-        bootstrap_peer_ip: None,
+        identity: podmesh_sidecar::IdentitySource::ephemeral(),
+        proxy_peers: protocol::proxy_peers_from_multiaddrs(&bootstrap_peers)?,
         lookup_interval: Duration::from_secs(2),
-        announce_interval: Duration::from_secs(5),
         libp2p_host: "0.0.0.0".to_string(),
         libp2p_port: 0,
-        announce_providers: false,
         manifest_id: DEMO_MANIFEST_ID.to_string(),
         ingress_host: ingress_host.clone(),
         app_port,
@@ -699,7 +623,7 @@ fn demo_routes(app_port: u16) -> Result<(Vec<SidecarRouteSpec>, String, String)>
 ///    - POST it to the proxy
 /// 4. Start a sidecar configured with the same owner pubkey.
 /// 5. Assert the sidecar discovers the proxy under the obfuscated tenant
-///    DHT key (`blake3(owner_pubkey)[..16]`) and emits a
+///    explicit proxy record and emits a
 ///    `ProxyPeerDiscovered` event for it.
 /// 6. Assert the proxy's in-memory routing table eventually contains the
 ///    sidecar registration for the demo manifest, proving the cert-gated
@@ -711,12 +635,11 @@ async fn sidecar_registers_with_tenant_signed_proxy_cert() -> Result<()> {
     init_ephemeral_keys();
     let (owner_b64, owner_sk, owner_pk) = fresh_tenant_owner();
 
-    let mut handle = start_workload(Vec::new(), true, false)?;
+    let mut handle = start_workload(Vec::new(), false)?;
     let proxy_peer_id = handle.peer_id.clone();
 
     let test_result: Result<()> = async {
-        wait_for_kad_ready(handle.kad_rx(), Duration::from_secs(10)).await?;
-        wait_for_proxy_provider(handle.proxy_provider_rx(), Duration::from_secs(10)).await?;
+        wait_for_network_ready(handle.network_ready_rx(), Duration::from_secs(10)).await?;
 
         // Provision the cert via the REST API. The proxy will:
         //   - verify the owner_sig
@@ -733,13 +656,13 @@ async fn sidecar_registers_with_tenant_signed_proxy_cert() -> Result<()> {
         .await
         .map_err(|e| anyhow!("provision_proxy_cert failed: {}", e))?;
         log::info!(
-            "proxy provisioned with cert: tenant_dht_key_hex={} valid_until={}",
-            ack.tenant_dht_key_hex,
+            "proxy provisioned with cert: owner_pubkey={} valid_until={}",
+            ack.owner_pubkey,
             ack.valid_until
         );
         assert!(
-            !ack.tenant_dht_key_hex.is_empty(),
-            "expected tenant_dht_key_hex in response"
+            ack.owner_pubkey == owner_b64,
+            "expected tenant owner binding in response"
         );
 
         // Sanity check: the cert should be visible in the proxy's in-process cert store.
@@ -792,7 +715,7 @@ async fn sidecar_registers_with_tenant_signed_proxy_cert() -> Result<()> {
         }
         assert!(
             tenant_proxy_seen,
-            "sidecar never discovered proxy peer {} under tenant DHT key",
+            "sidecar never discovered tenant-authorized proxy peer {}",
             proxy_peer_id
         );
 
@@ -831,7 +754,7 @@ async fn sidecar_registers_with_tenant_signed_proxy_cert() -> Result<()> {
 
 /// Negative test: when the proxy holds NO tenant cert, the sidecar (with a
 /// configured owner pubkey) should NOT be able to send a `SidecarRegistration`
-/// because there is no proxy under the tenant DHT key to verify, and even if
+/// because the explicitly configured proxy has no tenant certificate, and even if
 /// it dialed by some other means, the proxy would reject the registration.
 ///
 /// This test asserts the proxy's routing table stays empty.
@@ -842,10 +765,9 @@ async fn sidecar_registration_blocked_when_proxy_has_no_tenant_cert() -> Result<
     init_ephemeral_keys();
     let (owner_b64, _owner_sk, _owner_pk) = fresh_tenant_owner();
 
-    let mut handle = start_workload(Vec::new(), true, false)?;
+    let mut handle = start_workload(Vec::new(), false)?;
     let test_result: Result<()> = async {
-        wait_for_kad_ready(handle.kad_rx(), Duration::from_secs(10)).await?;
-        wait_for_proxy_provider(handle.proxy_provider_rx(), Duration::from_secs(10)).await?;
+        wait_for_network_ready(handle.network_ready_rx(), Duration::from_secs(10)).await?;
 
         // Intentionally do NOT call provision_proxy_cert.
 

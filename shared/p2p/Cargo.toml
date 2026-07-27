@@ -19,3 +19,6 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 libp2p-stream = "0.4.0-alpha"
+
+[dev-dependencies]
+tempfile = { workspace = true }

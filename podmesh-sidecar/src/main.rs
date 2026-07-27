@@ -6,39 +6,18 @@ use log::{error, warn};
 
 use podmesh_sidecar::{
     DEFAULT_SIDECAR_APP_PORT, SidecarConfig, manifest_routes::extract_sidecar_routes, run_sidecar,
-    split_csv,
 };
 use protocol::{
     libp2p_constants::MESH_DOMAIN_SUFFIX,
     machine::{SidecarRouteKind, SidecarRouteSpec},
-    sidecar_metadata::{DEFAULT_SIDECAR_BOOTSTRAP_MULTIADDR, SidecarMetadata},
+    sidecar_metadata::SidecarMetadata,
 };
 
 #[derive(Parser, Debug)]
 #[command(name = "podmesh-sidecar", author, version, about = " Podmesh sidecar")]
 struct Args {
-    #[arg(long, env = "namespace")]
-    namespace: Option<String>,
-    #[arg(long = "workload", env = "workload_name")]
-    workload_name: Option<String>,
-    #[arg(long, env = "provider_key")]
-    provider_key: Option<String>,
-    #[arg(
-        long,
-        env = "bootstrap_peers",
-        default_value = DEFAULT_SIDECAR_BOOTSTRAP_MULTIADDR
-    )]
-    bootstrap_peers: String,
-    #[arg(long = "bootstrap_ip", env = "bootstrap_ip")]
-    bootstrap_peer_ip: Option<String>,
     #[arg(long, env = "lookup_interval_secs", default_value_t = 15)]
     lookup_interval_secs: u64,
-    #[arg(
-        long = "announce-interval-secs",
-        env = "announce_interval_secs",
-        default_value_t = 60
-    )]
-    announce_interval_secs: u64,
     #[arg(long = "libp2p-host", env = "libp2p_host", default_value = "0.0.0.0")]
     libp2p_host: String,
     #[arg(long = "libp2p-port", env = "libp2p_port", default_value_t = 0)]
@@ -75,17 +54,6 @@ impl TryFrom<Args> for SidecarConfig {
     type Error = anyhow::Error;
 
     fn try_from(args: Args) -> Result<Self> {
-        let label = if let Some(key) = args.provider_key.filter(|s| !s.is_empty()) {
-            key
-        } else {
-            let ns = args.namespace.filter(|s| !s.is_empty()).unwrap_or_default();
-            let workload = args
-                .workload_name
-                .filter(|s| !s.is_empty())
-                .unwrap_or_default();
-            format!("{ns}/{workload}")
-        };
-
         let metadata = if let Some(blob) = args
             .metadata_b64
             .as_deref()
@@ -97,6 +65,9 @@ impl TryFrom<Args> for SidecarConfig {
                 anyhow::anyhow!("sidecar metadata missing at {}", args.metadata_path)
             })?
         };
+        metadata
+            .validate()
+            .context("validate sidecar proxy peers")?;
 
         let manifest_bytes = crypto::b64_decode(&metadata.manifest_b64)
             .context("failed to decode manifest payload from metadata")?;
@@ -120,18 +91,12 @@ impl TryFrom<Args> for SidecarConfig {
         }
         update_service_route_hosts(&mut routes, &manifest_id);
 
-        let mut bootstrap_peers = vec![metadata.bootstrap_peer.clone()];
-        bootstrap_peers.extend(split_csv(Some(args.bootstrap_peers)));
-
         Ok(Self {
-            provider_label: label,
-            bootstrap_peers,
-            bootstrap_peer_ip: args.bootstrap_peer_ip.filter(|s| !s.is_empty()),
+            identity: podmesh_sidecar::IdentitySource::ephemeral(),
+            proxy_peers: metadata.proxy_peers.clone(),
             lookup_interval: Duration::from_secs(args.lookup_interval_secs.max(1)),
-            announce_interval: Duration::from_secs(args.announce_interval_secs.max(1)),
             libp2p_host: args.libp2p_host,
             libp2p_port: args.libp2p_port,
-            announce_providers: true,
             manifest_id,
             ingress_host,
             app_port: DEFAULT_SIDECAR_APP_PORT,

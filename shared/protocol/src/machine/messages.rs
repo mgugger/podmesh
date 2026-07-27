@@ -7,6 +7,7 @@ pub struct Handshake {
     pub protocol_version: String,
     pub signature: String,
     pub proxy_cert_b64: String,
+    pub tenant_owner_pubkey: String,
 }
 
 impl Handshake {
@@ -24,6 +25,9 @@ impl Handshake {
     }
     pub fn proxy_cert_b64(&self) -> Option<&str> {
         non_empty(&self.proxy_cert_b64)
+    }
+    pub fn tenant_owner_pubkey(&self) -> Option<&str> {
+        non_empty(&self.tenant_owner_pubkey)
     }
     pub fn to_bytes(&self) -> Vec<u8> {
         postcard::to_allocvec(self).expect("handshake serialization should succeed")

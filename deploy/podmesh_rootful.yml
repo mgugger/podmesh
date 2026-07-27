@@ -65,7 +65,8 @@ spec:
       image: podmesh/proxy:latest
       args:
         - "--enable-ingress"
-        - "--enable-proxy-provider"
+        - "--key-dir"
+        - "/var/lib/podmesh-proxy/proxy-bootstrap"
       env:
         - name: libp2p_quic_port
           value: "4002"
@@ -92,21 +93,58 @@ spec:
         - containerPort: 8080
           hostPort: 8080
           protocol: TCP
+      volumeMounts:
+        - name: proxy-state
+          mountPath: /var/lib/podmesh-proxy
     - name: proxy-1
       image: podmesh/proxy:latest
       env:
-      - name: RUST_LOG
-        value: "info"
+        - name: RUST_LOG
+          value: "info"
+        - name: libp2p_quic_port
+          value: "4003"
+        - name: rest_api_port
+          value: "3002"
+        - name: PODMESH_PROXY_PEERS
+          valueFrom:
+            secretKeyRef:
+              name: podmesh-proxy-topology
+              key: bootstrap-peer
       args:
-        - "--bootstrap-peer"
-        - "/dns4/proxy/udp/4002/quic-v1"
-        - "--disable-rest-api"
+        - "--key-dir"
+        - "/var/lib/podmesh-proxy/proxy-1"
+      ports:
+        - containerPort: 3002
+          hostPort: 3002
+          protocol: TCP
+      volumeMounts:
+        - name: proxy-state
+          mountPath: /var/lib/podmesh-proxy
     - name: proxy-2
       image: podmesh/proxy:latest
       env:
-      - name: RUST_LOG
-        value: "info"
+        - name: RUST_LOG
+          value: "info"
+        - name: libp2p_quic_port
+          value: "4004"
+        - name: rest_api_port
+          value: "3003"
+        - name: PODMESH_PROXY_PEERS
+          valueFrom:
+            secretKeyRef:
+              name: podmesh-proxy-topology
+              key: bootstrap-peer
       args:
-        - "--bootstrap-peer"
-        - "/dns4/proxy/udp/4002/quic-v1"
-        - "--disable-rest-api"
+        - "--key-dir"
+        - "/var/lib/podmesh-proxy/proxy-2"
+      ports:
+        - containerPort: 3003
+          hostPort: 3003
+          protocol: TCP
+      volumeMounts:
+        - name: proxy-state
+          mountPath: /var/lib/podmesh-proxy
+  volumes:
+    - name: proxy-state
+      persistentVolumeClaim:
+        claimName: podmesh-proxy-state

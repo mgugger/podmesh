@@ -70,4 +70,3 @@ spec:
                 name: my-nginx-svc
                 port:
                   number: 80
-

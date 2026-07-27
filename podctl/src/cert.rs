@@ -170,7 +170,6 @@ pub async fn handle_cert_command(cmd: CertCommands) -> anyhow::Result<()> {
                 grant_proxy_async(&proxy_url, &owner_pk_bytes, &owner_sk_bytes, ttl_days).await?;
             println!("NodeCert provisioned to proxy at {}", proxy_url);
             println!("  owner_pubkey:        {}", ack.owner_pubkey);
-            println!("  tenant_dht_key_hex:  {}", ack.tenant_dht_key_hex);
             println!("  valid_until:         {}", ack.valid_until);
             println!("  message:             {}", ack.message);
         }
@@ -182,7 +181,6 @@ pub async fn handle_cert_command(cmd: CertCommands) -> anyhow::Result<()> {
 #[derive(Debug, Clone)]
 pub struct GrantProxyResult {
     pub owner_pubkey: String,
-    pub tenant_dht_key_hex: String,
     pub valid_until: u64,
     pub message: String,
 }
@@ -311,11 +309,6 @@ pub async fn grant_proxy_async(
             .get("owner_pubkey")
             .and_then(|v| v.as_str())
             .unwrap_or(&owner_pub_b64)
-            .to_string(),
-        tenant_dht_key_hex: ack
-            .get("tenant_dht_key_hex")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
             .to_string(),
         valid_until: ack
             .get("valid_until")
