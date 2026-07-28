@@ -1,4 +1,4 @@
-use std::{fs, io::ErrorKind, path::Path, time::Duration};
+use std::{fs, io::ErrorKind, net::SocketAddr, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -8,7 +8,7 @@ use podmesh_sidecar::{
     DEFAULT_SIDECAR_APP_PORT, SidecarConfig, manifest_routes::extract_sidecar_routes, run_sidecar,
 };
 use protocol::{
-    libp2p_constants::MESH_DOMAIN_SUFFIX,
+    MESH_DOMAIN_SUFFIX,
     machine::{SidecarRouteKind, SidecarRouteSpec},
     sidecar_metadata::SidecarMetadata,
 };
@@ -18,10 +18,12 @@ use protocol::{
 struct Args {
     #[arg(long, env = "lookup_interval_secs", default_value_t = 15)]
     lookup_interval_secs: u64,
-    #[arg(long = "libp2p-host", env = "libp2p_host", default_value = "0.0.0.0")]
-    libp2p_host: String,
-    #[arg(long = "libp2p-port", env = "libp2p_port", default_value_t = 0)]
-    libp2p_port: u16,
+    #[arg(
+        long = "iroh-bind",
+        env = "PODMESH_SIDECAR_IROH_BIND",
+        default_value = "0.0.0.0:0"
+    )]
+    iroh_bind_addr: SocketAddr,
     #[arg(
         long = "metadata-path",
         env = "PODMESH_SIDECAR_METADATA_PATH",
@@ -93,10 +95,11 @@ impl TryFrom<Args> for SidecarConfig {
 
         Ok(Self {
             identity: podmesh_sidecar::IdentitySource::ephemeral(),
-            proxy_peers: metadata.proxy_peers.clone(),
+            proxy_endpoints: metadata.proxy_endpoints.clone(),
+            workload_relay_auth_token: Some(metadata.workload_relay_auth_token.clone()),
+            workload_relay_ca_certificates: metadata.workload_relay_ca_certificates.clone(),
             lookup_interval: Duration::from_secs(args.lookup_interval_secs.max(1)),
-            libp2p_host: args.libp2p_host,
-            libp2p_port: args.libp2p_port,
+            iroh_bind_addr: args.iroh_bind_addr,
             manifest_id,
             ingress_host,
             app_port: DEFAULT_SIDECAR_APP_PORT,

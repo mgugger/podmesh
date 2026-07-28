@@ -16,3 +16,6 @@ serde_yaml = { workspace = true }
 regorus = { workspace = true }
 log = { workspace = true }
 blake3 = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "time"] }
+tokio-util = { workspace = true }
+biscuit-auth = { workspace = true }

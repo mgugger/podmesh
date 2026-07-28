@@ -1,9 +1,10 @@
 pub mod config;
 pub mod ingress;
-pub mod p2p;
+pub mod iroh_runtime;
+pub mod proxy_grants;
+pub mod relay;
 pub mod restapi;
 pub mod workload;
 
-pub use ::p2p::identity::IdentitySource;
-pub use config::Config;
+pub use config::{Config, IdentitySource};
 pub use workload::Workload;

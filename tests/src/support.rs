@@ -7,9 +7,8 @@ use tokio::process::Command;
 
 static INIT_LOGGING: Once = Once::new();
 static INIT_EPHEMERAL_KEYS: Once = Once::new();
-const PROXY_STATE_VOLUME: &str = "podmesh-proxy-state";
-const PROXY_TOPOLOGY_SECRET: &str = "podmesh-proxy-topology";
-const PROXY_IMAGE: &str = "localhost/podmesh/proxy:latest";
+/// Single volume the deploy manifests mount into every component.
+const PODMESH_STATE_VOLUME: &str = "podmesh-state";
 
 pub fn init_tracing() {
     INIT_LOGGING.call_once(|| {
@@ -50,51 +49,17 @@ pub fn allocate_tcp_port() -> u16 {
         .port()
 }
 
-pub async fn prepare_podman_proxy_topology() -> Result<String> {
-    if !podman_status(&["volume", "exists", PROXY_STATE_VOLUME]).await? {
-        podman_output(&["volume", "create", PROXY_STATE_VOLUME]).await?;
+/// Drops the shared state volume so the stack starts from cold identities.
+///
+/// The deploy manifests provision every relay keypair, relay token, and Iroh
+/// identity themselves on first start, so nothing has to be seeded here. A
+/// leftover volume would carry identities that no longer match the freshly
+/// generated owner keys, so it is removed instead of reused.
+pub async fn reset_podman_stack_state() -> Result<()> {
+    if podman_status(&["volume", "exists", PODMESH_STATE_VOLUME]).await? {
+        podman_output(&["volume", "rm", "--force", PODMESH_STATE_VOLUME]).await?;
     }
-
-    let identity_output = podman_output(&[
-        "run",
-        "--rm",
-        "--env",
-        "RUST_LOG=info",
-        "--volume",
-        "podmesh-proxy-state:/var/lib/podmesh-proxy",
-        PROXY_IMAGE,
-        "--init-identity",
-        "--key-dir",
-        "/var/lib/podmesh-proxy/proxy-bootstrap",
-    ])
-    .await?;
-    let peer_id = identity_output
-        .split_whitespace()
-        .find_map(|part| part.strip_prefix("peer_id="))
-        .ok_or_else(|| {
-            anyhow!("proxy identity output did not contain peer_id: {identity_output}")
-        })?;
-    let proxy_multiaddr = format!("/dns4/proxy/udp/4002/quic-v1/p2p/{peer_id}");
-
-    let secret_path =
-        std::env::temp_dir().join(format!("podmesh-proxy-topology-{}", std::process::id()));
-    let secret_yaml = format!(
-        "apiVersion: v1\nkind: Secret\nmetadata:\n  name: {PROXY_TOPOLOGY_SECRET}\nstringData:\n  bootstrap-peer: {proxy_multiaddr}\n"
-    );
-    std::fs::write(&secret_path, secret_yaml)
-        .with_context(|| format!("write topology secret {}", secret_path.display()))?;
-    let secret_path_arg = secret_path.to_string_lossy().to_string();
-    let create_result = podman_output(&[
-        "secret",
-        "create",
-        "--replace",
-        PROXY_TOPOLOGY_SECRET,
-        &secret_path_arg,
-    ])
-    .await;
-    let _ = std::fs::remove_file(&secret_path);
-    create_result?;
-    Ok(peer_id.to_string())
+    Ok(())
 }
 
 async fn podman_status(args: &[&str]) -> Result<bool> {
@@ -124,38 +89,11 @@ async fn podman_output(args: &[&str]) -> Result<String> {
     Ok(format!("{stdout}\n{stderr}"))
 }
 
-/// Generate a NodeCert for testing, signed by the ephemeral owner key.
-/// peer_id: the peer's string ID
-/// role: the node role
-pub fn generate_test_node_cert(peer_id: &str, role: protocol::NodeRole) -> protocol::NodeCert {
-    use crypto::ensure_keypair_ephemeral;
-
-    let (pk, sk) = ensure_keypair_ephemeral().unwrap();
-    let (kem_pk, _) = ensure_keypair_ephemeral().unwrap();
-
-    let cert = protocol::NodeCert {
-        peer_id: peer_id.to_string(),
-        kem_pubkey: crypto::b64_encode(&kem_pk),
-        signing_pubkey: crypto::b64_encode(&pk),
-        capabilities: vec!["test".to_string()],
-        role,
-        valid_until: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            + 86400 * 365,
-        owner_pubkey: crypto::b64_encode(&pk),
-        owner_sig: String::new(),
-        endorsements: vec![],
-    };
-    cert.sign(&sk, &pk).unwrap()
-}
-
 /// A tenant owner keypair generated freshly per test.
 ///
 /// Returns `(owner_pub_b64, owner_sk_bytes, owner_pub_bytes)`. Use this to
 /// drive the `podctl grant-proxy` flow in integration tests so the proxy
-/// holds a tenant-signed `NodeCert` and the sidecar can verify it.
+/// holds an owner-signed Biscuit grant and the sidecar can verify it.
 pub fn fresh_tenant_owner() -> (String, Vec<u8>, Vec<u8>) {
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
@@ -169,7 +107,7 @@ pub fn fresh_tenant_owner() -> (String, Vec<u8>, Vec<u8>) {
 }
 
 /// Wait until the proxy REST API at `http://127.0.0.1:{port}/healthz` becomes
-/// available, then issue a tenant-signed `NodeCert` to it via
+/// available, then issue an owner-signed Biscuit grant to it via
 /// `podctl::cert::grant_proxy_async`. Returns the issued cert's owner pubkey
 /// (base64) on success.
 pub async fn provision_proxy_cert(

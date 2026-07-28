@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
+use protocol::EndpointRecord;
 use protocol::sidecar_metadata::{METADATA_BLOB_ENV_VAR, SidecarMetadata};
-use protocol::{ProxyPeer, validate_proxy_peers};
 use serde_json::{Value, json};
 
 const SIDECAR_NAME: &str = "podmesh-sidecar";
@@ -19,16 +19,20 @@ pub fn inject(
     workload_id: &str,
     namespace_id: &str,
     sidecar_image: &str,
-    proxy_peers: &[ProxyPeer],
+    proxy_endpoints: &[EndpointRecord],
+    workload_relay_auth_token: &str,
+    workload_relay_ca_certificates: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
-    validate_proxy_peers(proxy_peers, false)?;
     let original = manifest.to_vec();
     let metadata = SidecarMetadata {
         manifest_id: workload_id.to_string(),
         manifest_b64: crypto::b64_encode(&original),
         owner_public_key_b64: Some(namespace_id.to_string()),
-        proxy_peers: proxy_peers.to_vec(),
+        proxy_endpoints: proxy_endpoints.to_vec(),
+        workload_relay_auth_token: workload_relay_auth_token.to_string(),
+        workload_relay_ca_certificates: workload_relay_ca_certificates.to_vec(),
     };
+    metadata.validate()?;
     let metadata_blob = crypto::b64_encode(&serde_json::to_vec(&metadata)?);
     let sidecar = json!({
         "name": SIDECAR_NAME,
@@ -100,8 +104,26 @@ pub fn inject(
 mod tests {
     use super::*;
 
-    fn test_proxy_peers() -> Vec<ProxyPeer> {
-        protocol::proxy_peers_from_multiaddrs(&["/ip4/127.0.0.1/udp/4002/quic-v1/p2p/12D3KooWJ5WjY5GLqvC7V7abCdzYdHEgQmXW1HYXL7rGZQfJmY9D".to_string()]).unwrap()
+    fn test_proxy_endpoints() -> Vec<EndpointRecord> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let (public, private) = crypto::ensure_keypair_ephemeral().unwrap();
+        vec![
+            EndpointRecord {
+                version: protocol::ENDPOINT_RECORD_VERSION,
+                endpoint_id: iroh::SecretKey::generate().public().as_bytes().to_vec(),
+                relay_url: Some("https://relay.example.test".into()),
+                direct_addresses: vec!["127.0.0.1:4002".into()],
+                signing_pubkey: String::new(),
+                issued_at_secs: now,
+                expires_at_secs: now + 60,
+                signature: String::new(),
+            }
+            .sign(&public, &private, now)
+            .unwrap(),
+        ]
     }
 
     #[test]
@@ -120,7 +142,9 @@ spec:
             &"a".repeat(64),
             "owner",
             "podmesh/sidecar:latest",
-            &test_proxy_peers(),
+            &test_proxy_endpoints(),
+            &"r".repeat(32),
+            &[],
         )
         .unwrap();
         let docs = protocol::manifest_yaml::parse_yaml_documents_from_slice(&output).unwrap();
@@ -167,7 +191,9 @@ spec:
             &"a".repeat(64),
             "owner",
             "podmesh/sidecar:latest",
-            &test_proxy_peers(),
+            &test_proxy_endpoints(),
+            &"r".repeat(32),
+            &[],
         )
         .unwrap();
         let docs = protocol::manifest_yaml::parse_yaml_documents_from_slice(&output).unwrap();

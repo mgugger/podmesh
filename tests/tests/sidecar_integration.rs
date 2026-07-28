@@ -26,16 +26,18 @@ const DEMO_MANIFEST_ID: &str = "demo-nginx";
 const DEMO_MANIFEST: &[u8] = include_bytes!("../sample_manifests/demo_deployment.yml");
 
 fn build_workload_config(
-    libp2p_port: u16,
+    iroh_port: u16,
     rest_port: u16,
-    proxy_peer_multiaddrs: Vec<String>,
+    proxy_endpoints: Vec<protocol::EndpointRecord>,
     enable_ingress: bool,
 ) -> Config {
     Config {
-        proxy_peer_multiaddrs,
+        proxy_endpoints,
         identity: podmesh_proxy::IdentitySource::ephemeral(),
-        libp2p_quic_port: libp2p_port,
-        libp2p_host: "127.0.0.1".to_string(),
+        iroh_bind_addr: format!("127.0.0.1:{iroh_port}").parse().unwrap(),
+        workload_relay: None,
+        workload_relay_certificate_der: Vec::new(),
+        publish_relay_bootstrap: false,
         rest_host: "127.0.0.1".to_string(),
         rest_port,
         disable_rest_api: false,
@@ -50,7 +52,7 @@ async fn ingress_proxies_requests_via_sidecar() -> Result<()> {
     init_tracing();
     init_ephemeral_keys();
     let (owner_b64, owner_sk, owner_pk) = fresh_tenant_owner();
-    let mut handle = start_workload(Vec::new(), true)?;
+    let mut handle = start_workload(Vec::new(), true).await?;
     let mut sidecar_shutdown: Option<oneshot::Sender<()>> = None;
     let mut sidecar_task: Option<JoinHandle<()>> = None;
     let mut app_server: Option<JoinHandle<()>> = None;
@@ -73,7 +75,7 @@ async fn ingress_proxies_requests_via_sidecar() -> Result<()> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         sidecar_shutdown = Some(shutdown_tx);
         let (mut sidecar_cfg, ingress_host, service_host) =
-            build_sidecar_config(vec![handle.bootstrap_addr.clone()], app_port)?;
+            build_sidecar_config(vec![handle.endpoint_record.clone()], app_port)?;
         sidecar_cfg.owner_public_key_b64 = Some(owner_b64.clone());
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let provider_peer_id = handle.peer_id.clone();
@@ -133,7 +135,7 @@ async fn sidecar_discovers_explicit_egress_proxy() -> Result<()> {
     init_ephemeral_keys();
 
     // Start a workload node that acts as the proxy provider
-    let mut handle = start_workload(Vec::new(), false)?;
+    let mut handle = start_workload(Vec::new(), false).await?;
     let proxy_peer_id = handle.peer_id.clone();
 
     let test_result: Result<()> = async {
@@ -142,7 +144,7 @@ async fn sidecar_discovers_explicit_egress_proxy() -> Result<()> {
 
         // Create sidecar with egress enabled
         let (mut sidecar_cfg, _, _) = build_sidecar_config_with_egress(
-            vec![handle.bootstrap_addr.clone()],
+            vec![handle.endpoint_record.clone()],
             DEFAULT_SIDECAR_APP_PORT,
             true, // enable_egress
         )?;
@@ -215,8 +217,8 @@ async fn sidecar_fetches_and_registers_with_additional_regional_proxy() -> Resul
     init_ephemeral_keys();
     let (owner_b64, owner_sk, owner_pk) = fresh_tenant_owner();
 
-    let mut first = start_workload(Vec::new(), false)?;
-    let mut second = start_workload(vec![first.bootstrap_addr.clone()], false)?;
+    let mut first = start_workload(Vec::new(), false).await?;
+    let mut second = start_workload(vec![first.endpoint_record.clone()], false).await?;
     let second_peer_id = second.peer_id.clone();
 
     let test_result: Result<()> = async {
@@ -237,8 +239,10 @@ async fn sidecar_fetches_and_registers_with_additional_regional_proxy() -> Resul
         )
         .await?;
 
-        let (mut sidecar_cfg, _, _) =
-            build_sidecar_config(vec![first.bootstrap_addr.clone()], DEFAULT_SIDECAR_APP_PORT)?;
+        let (mut sidecar_cfg, _, _) = build_sidecar_config(
+            vec![first.endpoint_record.clone()],
+            DEFAULT_SIDECAR_APP_PORT,
+        )?;
         sidecar_cfg.owner_public_key_b64 = Some(owner_b64);
         sidecar_cfg.lookup_interval = Duration::from_secs(1);
 
@@ -284,7 +288,7 @@ async fn sidecar_fetches_and_registers_with_additional_regional_proxy() -> Resul
 /// This test exercises the **tenant-cert-gated** discovery path mandated by the
 /// sidecar-proxy-auth spec:
 /// 1. Owner keypair is generated for this test
-/// 2. Proxy node starts and is provisioned with a tenant-signed `NodeCert` via
+/// 2. Proxy node starts and is provisioned with an owner-signed Biscuit grant via
 ///    `podctl::cert::grant_proxy_async` (simulating `podctl grant-proxy`)
 /// 3. Sidecar is configured with the same owner pubkey, discovers the proxy via
 ///    its explicit peer record, verifies the cert
@@ -303,14 +307,14 @@ async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
     let target_server = spawn_test_app(target_port, target_body.clone()).await?;
 
     // Start proxy node that will handle egress tunnel streams
-    let mut handle = start_workload(Vec::new(), false)?;
+    let mut handle = start_workload(Vec::new(), false).await?;
     let proxy_peer_id = handle.peer_id.clone();
 
     let test_result: Result<()> = async {
         // Wait for proxy to be ready
         wait_for_network_ready(handle.network_ready_rx(), Duration::from_secs(10)).await?;
 
-        // Provision the proxy with a tenant-signed NodeCert via the REST API.
+        // Provision the proxy with an owner-signed Biscuit grant via the REST API.
         // This is the in-test equivalent of `podctl grant-proxy --proxy-url <url>`.
         provision_proxy_cert(
             handle.rest_port,
@@ -327,7 +331,7 @@ async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
         // Create sidecar with HTTP proxy enabled and tenant owner pubkey set so
         // it authenticates the explicitly configured proxy.
         let (mut sidecar_cfg, _, _) = build_sidecar_config_full(
-            vec![handle.bootstrap_addr.clone()],
+            vec![handle.endpoint_record.clone()],
             DEFAULT_SIDECAR_APP_PORT,
             false,
             Some(http_proxy_port),
@@ -416,7 +420,7 @@ async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
 struct WorkloadHandle {
     workload: Workload,
     peer_id: String,
-    bootstrap_addr: String,
+    endpoint_record: protocol::EndpointRecord,
     network_ready_rx: watch::Receiver<bool>,
     rest_port: u16,
 }
@@ -427,18 +431,23 @@ impl WorkloadHandle {
     }
 }
 
-fn start_workload(bootstrap_peers: Vec<String>, enable_ingress: bool) -> Result<WorkloadHandle> {
-    let libp2p_port = allocate_udp_port();
+async fn start_workload(
+    bootstrap_peers: Vec<protocol::EndpointRecord>,
+    enable_ingress: bool,
+) -> Result<WorkloadHandle> {
+    let iroh_port = allocate_udp_port();
     let rest_port = allocate_tcp_port();
-    let config = build_workload_config(libp2p_port, rest_port, bootstrap_peers, enable_ingress);
+    let config = build_workload_config(iroh_port, rest_port, bootstrap_peers, enable_ingress);
     let mut workload = Workload::new(config)?;
-    workload.start()?;
+    workload.start().await?;
 
     let peer_id = workload
         .peer_id()
         .map(|id| id.to_string())
         .ok_or_else(|| anyhow!("workload peer id unavailable"))?;
-    let bootstrap_addr = format!("/ip4/127.0.0.1/udp/{libp2p_port}/quic-v1/p2p/{peer_id}");
+    let endpoint_record = workload
+        .endpoint_record()
+        .ok_or_else(|| anyhow!("workload EndpointRecord unavailable"))?;
     let network_ready_rx = workload
         .network_ready_rx()
         .ok_or_else(|| anyhow!("network readiness channel missing"))?;
@@ -446,7 +455,7 @@ fn start_workload(bootstrap_peers: Vec<String>, enable_ingress: bool) -> Result<
     Ok(WorkloadHandle {
         workload,
         peer_id,
-        bootstrap_addr,
+        endpoint_record,
         network_ready_rx,
         rest_port,
     })
@@ -551,14 +560,14 @@ async fn wait_for_sidecar_peer_ready(
 }
 
 fn build_sidecar_config(
-    bootstrap_peers: Vec<String>,
+    bootstrap_peers: Vec<protocol::EndpointRecord>,
     app_port: u16,
 ) -> Result<(SidecarConfig, String, String)> {
     build_sidecar_config_with_egress(bootstrap_peers, app_port, false)
 }
 
 fn build_sidecar_config_with_egress(
-    bootstrap_peers: Vec<String>,
+    bootstrap_peers: Vec<protocol::EndpointRecord>,
     app_port: u16,
     enable_egress: bool,
 ) -> Result<(SidecarConfig, String, String)> {
@@ -566,7 +575,7 @@ fn build_sidecar_config_with_egress(
 }
 
 fn build_sidecar_config_full(
-    bootstrap_peers: Vec<String>,
+    bootstrap_peers: Vec<protocol::EndpointRecord>,
     app_port: u16,
     enable_egress: bool,
     http_proxy_port: Option<u16>,
@@ -574,10 +583,11 @@ fn build_sidecar_config_full(
     let (routes, ingress_host, service_host) = demo_routes(app_port)?;
     let cfg = SidecarConfig {
         identity: podmesh_sidecar::IdentitySource::ephemeral(),
-        proxy_peers: protocol::proxy_peers_from_multiaddrs(&bootstrap_peers)?,
+        proxy_endpoints: bootstrap_peers,
+        workload_relay_auth_token: None,
+        workload_relay_ca_certificates: Vec::new(),
         lookup_interval: Duration::from_secs(2),
-        libp2p_host: "0.0.0.0".to_string(),
-        libp2p_port: 0,
+        iroh_bind_addr: "127.0.0.1:0".parse()?,
         manifest_id: DEMO_MANIFEST_ID.to_string(),
         ingress_host: ingress_host.clone(),
         app_port,
@@ -615,11 +625,11 @@ fn demo_routes(app_port: u16) -> Result<(Vec<SidecarRouteSpec>, String, String)>
 ///
 /// 1. Generate a tenant owner Ed25519 keypair (the operator's key).
 /// 2. Start a proxy. Its REST API exposes `signing_pubkey`, `kem_pubkey`,
-///    `peer_id` and accepts a `NodeCert` POST.
+///    `peer_id` and accepts a proxy grant POST.
 /// 3. Call `podctl::cert::grant_proxy_async` (the in-process equivalent of
 ///    `podctl grant-proxy`) to:
 ///    - Fetch the proxy's keys + peer_id
-///    - Build a `NodeRole::Proxy` `NodeCert` signed with the owner key
+///    - Mint an owner-signed Biscuit grant naming the proxy endpoint
 ///    - POST it to the proxy
 /// 4. Start a sidecar configured with the same owner pubkey.
 /// 5. Assert the sidecar discovers the proxy under the obfuscated tenant
@@ -635,17 +645,17 @@ async fn sidecar_registers_with_tenant_signed_proxy_cert() -> Result<()> {
     init_ephemeral_keys();
     let (owner_b64, owner_sk, owner_pk) = fresh_tenant_owner();
 
-    let mut handle = start_workload(Vec::new(), false)?;
+    let mut handle = start_workload(Vec::new(), false).await?;
     let proxy_peer_id = handle.peer_id.clone();
 
     let test_result: Result<()> = async {
         wait_for_network_ready(handle.network_ready_rx(), Duration::from_secs(10)).await?;
 
         // Provision the cert via the REST API. The proxy will:
-        //   - verify the owner_sig
-        //   - check peer_id matches its own libp2p identity
-        //   - check role == Proxy
-        //   - store the cert keyed by owner_pubkey
+        //   - verify the owner's Biscuit signature
+        //   - check the grant names its own authenticated endpoint
+        //   - check the grant is neither expired nor post-dated
+        //   - store the grant keyed by owner_pubkey
         //   - announce under blake3(owner_pubkey)[..16]
         let ack = provision_proxy_cert(
             handle.rest_port,
@@ -656,7 +666,7 @@ async fn sidecar_registers_with_tenant_signed_proxy_cert() -> Result<()> {
         .await
         .map_err(|e| anyhow!("provision_proxy_cert failed: {}", e))?;
         log::info!(
-            "proxy provisioned with cert: owner_pubkey={} valid_until={}",
+            "proxy provisioned with grant: owner_pubkey={} valid_until={}",
             ack.owner_pubkey,
             ack.valid_until
         );
@@ -665,19 +675,23 @@ async fn sidecar_registers_with_tenant_signed_proxy_cert() -> Result<()> {
             "expected tenant owner binding in response"
         );
 
-        // Sanity check: the cert should be visible in the proxy's in-process cert store.
+        // Sanity check: the grant should be live in the proxy's in-process store.
         let store = handle
             .workload
-            .cert_store()
-            .ok_or_else(|| anyhow!("proxy cert_store unavailable"))?;
-        {
-            let g = store.read().unwrap();
-            assert!(
-                g.contains_key(&owner_b64),
-                "expected proxy cert store to contain owner_pubkey {}",
-                owner_b64
-            );
-        }
+            .grant_store()
+            .ok_or_else(|| anyhow!("proxy grant_store unavailable"))?;
+        assert!(
+            store.holds_live_grant(
+                &owner_b64,
+                &handle.peer_id,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock before unix epoch")
+                    .as_secs(),
+            ),
+            "expected proxy grant store to hold a live grant for owner_pubkey {}",
+            owner_b64
+        );
 
         // Build the sidecar with the matching tenant pubkey.
         let app_port = allocate_tcp_port();
@@ -685,7 +699,7 @@ async fn sidecar_registers_with_tenant_signed_proxy_cert() -> Result<()> {
         let app_server = spawn_test_app(app_port, app_body.clone()).await?;
 
         let (mut sidecar_cfg, _, _) =
-            build_sidecar_config(vec![handle.bootstrap_addr.clone()], app_port)?;
+            build_sidecar_config(vec![handle.endpoint_record.clone()], app_port)?;
         sidecar_cfg.owner_public_key_b64 = Some(owner_b64.clone());
         sidecar_cfg.lookup_interval = Duration::from_secs(1);
 
@@ -721,7 +735,7 @@ async fn sidecar_registers_with_tenant_signed_proxy_cert() -> Result<()> {
 
         // Wait for the proxy's routing table to contain the sidecar registration.
         // This proves: handshake exchanged → cert verified by sidecar → registration sent →
-        // proxy verified registration against stored NodeCert → routes stored.
+        // proxy verified registration against its stored grant → routes stored.
         let routing_table = handle.workload.routing_table_handle();
         let routing_deadline = Instant::now() + Duration::from_secs(20);
         let mut registered = false;
@@ -765,7 +779,7 @@ async fn sidecar_registration_blocked_when_proxy_has_no_tenant_cert() -> Result<
     init_ephemeral_keys();
     let (owner_b64, _owner_sk, _owner_pk) = fresh_tenant_owner();
 
-    let mut handle = start_workload(Vec::new(), false)?;
+    let mut handle = start_workload(Vec::new(), false).await?;
     let test_result: Result<()> = async {
         wait_for_network_ready(handle.network_ready_rx(), Duration::from_secs(10)).await?;
 
@@ -773,7 +787,7 @@ async fn sidecar_registration_blocked_when_proxy_has_no_tenant_cert() -> Result<
 
         let app_port = allocate_tcp_port();
         let (mut sidecar_cfg, _, _) =
-            build_sidecar_config(vec![handle.bootstrap_addr.clone()], app_port)?;
+            build_sidecar_config(vec![handle.endpoint_record.clone()], app_port)?;
         sidecar_cfg.owner_public_key_b64 = Some(owner_b64.clone());
         sidecar_cfg.lookup_interval = Duration::from_secs(1);
 

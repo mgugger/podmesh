@@ -18,10 +18,10 @@ use std::process::{Command as StdCommand, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use podctl::{apply_file_with_proxy_multiaddrs, delete_file};
+use podctl::{apply_file_with_proxy_urls, delete_file};
 use podmesh_agent::sidecar::workload_runtime_name;
 use podmesh_integration_tests::support::{
-    init_ephemeral_keys, init_tracing, prepare_podman_proxy_topology, provision_proxy_cert,
+    init_ephemeral_keys, init_tracing, reset_podman_stack_state,
 };
 use reqwest::Client;
 use serde_json::Value;
@@ -32,9 +32,24 @@ const MACHINE_API_URL: &str = "http://127.0.0.1:3000";
 const ROOTLESS_MANIFEST_PATH: &str = "deploy/podmesh_rootless.yml";
 const ROOTFUL_MANIFEST_PATH: &str = "deploy/podmesh_rootful.yml";
 const EGRESS_TEST_MANIFEST_PATH: &str = "tests/sample_manifests/transparent_egress_test.yml";
-const EGRESS_TEST_URL: &str = "http://scheduler:3000/health";
-const PODMESH_PROXY_API_PORTS: [u16; 3] = [3001, 3002, 3003];
+/// Workload name declared by the egress manifest, used to derive the same
+/// per-replica workload id the agent names its pod after.
+const EGRESS_WORKLOAD_NAME: &str = "egress-test";
+/// The egress manifest declares a single replica.
+const EGRESS_REPLICA_INDEX: u32 = 0;
+const EGRESS_TEST_URL: &str = "http://podmesh-control:3000/health";
+/// REST APIs of the three proxies the deploy manifests start. `podctl`
+/// bootstraps its proxy endpoints, relay token, and relay CA certificates from
+/// these and mints an owner-signed grant for each.
+const PODMESH_PROXY_API_URLS: &str =
+    "http://127.0.0.1:3010,http://127.0.0.1:3011,http://127.0.0.1:3012";
 const PODMESH_NETWORK: &str = "podmesh";
+/// Name prefix `podman kube play` gives the proxy containers, derived from the
+/// `podmesh-proxies` pod in the deploy manifests.
+const PROXY_CONTAINER_NAME_PREFIX: &str = "podmesh-proxies-proxy-";
+/// `GET /api/v1/agents/select` gossips a capacity query and waits for offers,
+/// which takes several seconds, so probes must outlast a full solicitation.
+const HTTP_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const ROOTLESS_PODMAN_SOCKET: &str = "/run/user/1000/podman/podman.sock";
 const ROOTFUL_PODMAN_SOCKET: &str = "/run/podman/podman.sock";
 const REQUIRED_IMAGES: [&str; 4] = [
@@ -94,48 +109,37 @@ async fn transparent_egress_routes_through_sidecar_and_proxy() -> Result<()> {
     let mut workload_guard = WorkloadGuard::default();
 
     let client = Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(HTTP_PROBE_TIMEOUT)
         .build()
         .context("failed to build HTTP client")?;
 
     // Wait for machine to be healthy and peers to register
     wait_for_machine_health(&client, Duration::from_secs(120)).await?;
-    wait_for_agent_registration(&client, Duration::from_secs(120)).await?;
-    let proxy_peer_ids = wait_for_proxy_peer_ids(&client, Duration::from_secs(120)).await?;
-    let (owner_public, owner_private) = crypto::ensure_keypair_on_disk()?;
-    for port in PODMESH_PROXY_API_PORTS {
-        provision_proxy_cert(
-            port,
-            &owner_public,
-            &owner_private,
-            Duration::from_secs(120),
-        )
-        .await
-        .with_context(|| format!("failed to provision tenant proxy certificate on {port}"))?;
-    }
+    wait_for_agent_registration(&client, Duration::from_secs(180)).await?;
 
     // Deploy the egress test workload
-    let manifest_id = apply_file_with_proxy_multiaddrs(
+    let manifest_id = apply_file_with_proxy_urls(
         egress_test_manifest.clone(),
         Some(MACHINE_API_URL),
-        proxy_peer_ids
-            .into_iter()
-            .enumerate()
-            .map(|(index, peer_id)| {
-                format!("/dns4/proxy/udp/{}/quic-v1/p2p/{peer_id}", 4002 + index)
-            })
-            .collect(),
+        PODMESH_PROXY_API_URLS.to_string(),
     )
     .await
     .context("podctl apply failed for egress test manifest")?;
     log::info!("podctl applied egress test manifest {manifest_id}");
-    workload_guard.set(manifest_id.clone());
+    // `podctl` returns the deployment id, while the agent names the pod after
+    // the per-replica workload id. Derive the latter to find the containers.
+    let (owner_public, _owner_private) =
+        crypto::ensure_keypair_on_disk().context("load namespace signing key")?;
+    let workload_id =
+        protocol::workload_id(&owner_public, EGRESS_WORKLOAD_NAME, EGRESS_REPLICA_INDEX);
+    workload_guard.set(workload_id.clone());
 
     // Wait for workload containers to be running
-    wait_for_egress_test_containers(&manifest_id, Duration::from_secs(180)).await?;
-    wait_for_sidecar_registration(&manifest_id, Duration::from_secs(120)).await?;
+    let workload_containers =
+        wait_for_egress_test_containers(&workload_id, Duration::from_secs(180)).await?;
+    wait_for_sidecar_registration(&workload_containers.sidecar, Duration::from_secs(30)).await?;
 
-    let curl_output = execute_egress_curl(&manifest_id).await?;
+    let curl_output = execute_egress_curl(&workload_containers.curl).await?;
     log::info!("egress curl succeeded: {} bytes", curl_output.len());
 
     // Wait a moment for logs to be written
@@ -143,7 +147,7 @@ async fn transparent_egress_routes_through_sidecar_and_proxy() -> Result<()> {
 
     // Verify sidecar logs show transparent proxy activity (nftables redirect working)
     // This validates our rustables/netlink nftables implementation
-    verify_sidecar_egress_logs(&manifest_id).await?;
+    verify_sidecar_egress_logs(&workload_containers.sidecar).await?;
 
     verify_proxy_egress_logs().await?;
 
@@ -155,7 +159,7 @@ async fn transparent_egress_routes_through_sidecar_and_proxy() -> Result<()> {
     delete_file(egress_test_manifest.clone(), true, Some(MACHINE_API_URL))
         .await
         .context("podctl delete failed")?;
-    wait_for_workload_teardown(&manifest_id, Duration::from_secs(90)).await?;
+    wait_for_workload_teardown(&workload_id, Duration::from_secs(90)).await?;
     workload_guard.disarm();
 
     stack_guard.shutdown().await?;
@@ -178,33 +182,6 @@ async fn is_podman_available() -> bool {
         Ok(status) => status.success(),
         Err(_) => false,
     }
-}
-
-async fn wait_for_proxy_peer_ids(client: &Client, timeout: Duration) -> Result<Vec<String>> {
-    let deadline = Instant::now() + timeout;
-    let mut peer_ids = vec![None; PODMESH_PROXY_API_PORTS.len()];
-    while Instant::now() < deadline {
-        for (index, port) in PODMESH_PROXY_API_PORTS.iter().enumerate() {
-            if peer_ids[index].is_some() {
-                continue;
-            }
-            let url = format!("http://127.0.0.1:{port}/api/v1/peer_id");
-            if let Ok(response) = client.get(&url).send().await
-                && response.status().is_success()
-            {
-                let value: Value = response.json().await?;
-                peer_ids[index] = value
-                    .get("peer_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-            }
-        }
-        if peer_ids.iter().all(Option::is_some) {
-            return Ok(peer_ids.into_iter().flatten().collect());
-        }
-        sleep(Duration::from_millis(200)).await;
-    }
-    Err(anyhow!("not all regional proxy peer IDs became available"))
 }
 
 fn is_socket_available(socket_path: &str) -> bool {
@@ -276,7 +253,7 @@ impl PodmanKubeGuard {
         let manifest_arg = manifest_path.to_string_lossy().to_string();
         ensure_podman_network(PODMESH_NETWORK).await?;
         let _ = run_podman_command(&["kube", "down", &manifest_arg]).await;
-        prepare_podman_proxy_topology().await?;
+        reset_podman_stack_state().await?;
         run_podman_command(&["kube", "play", "--network", PODMESH_NETWORK, &manifest_arg])
             .await
             .context("failed to start podmesh stack with podman kube play")?;
@@ -382,28 +359,35 @@ async fn wait_for_agent_registration(client: &Client, timeout: Duration) -> Resu
     Err(last_err.unwrap_or_else(|| anyhow!("scheduler never reported an available agent")))
 }
 
-async fn wait_for_egress_test_containers(workload_name: &str, timeout: Duration) -> Result<()> {
+struct EgressWorkloadContainers {
+    curl: String,
+    sidecar: String,
+}
+
+async fn wait_for_egress_test_containers(
+    workload_name: &str,
+    timeout: Duration,
+) -> Result<EgressWorkloadContainers> {
     let deadline = Instant::now() + timeout;
     let runtime_name = workload_runtime_name(workload_name);
-    let targets: HashSet<&str> = ["curl-client", "sidecar"].iter().copied().collect();
-    let mut satisfied: HashSet<&str> = HashSet::new();
     let mut last_err: Option<anyhow::Error> = None;
 
     while Instant::now() < deadline {
         match capture_podman_containers().await {
             Ok(containers) => {
-                satisfied.clear();
-                for target in &targets {
-                    if containers.iter().any(|c| c.matches(&runtime_name, target)) {
-                        satisfied.insert(target);
-                    }
-                }
-                if satisfied.len() == targets.len() {
+                let find = |pattern: &str| {
+                    containers
+                        .iter()
+                        .find(|container| container.matches(&runtime_name, pattern))
+                        .and_then(|container| container.names.first())
+                        .cloned()
+                };
+                if let (Some(curl), Some(sidecar)) = (find("curl-client"), find("sidecar")) {
                     log::info!(
                         "egress test workload containers are running for workload {}",
                         workload_name
                     );
-                    return Ok(());
+                    return Ok(EgressWorkloadContainers { curl, sidecar });
                 }
             }
             Err(err) => last_err = Some(err),
@@ -447,29 +431,33 @@ async fn wait_for_workload_teardown(workload_name: &str, timeout: Duration) -> R
     ))
 }
 
-async fn wait_for_sidecar_registration(workload_name: &str, timeout: Duration) -> Result<()> {
-    let sidecar_container = find_container_by_pattern(workload_name, "sidecar").await?;
+async fn wait_for_sidecar_registration(sidecar_container: &str, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
+    let mut last_logs = String::new();
 
     while Instant::now() < deadline {
-        let logs = get_container_logs(&sidecar_container).await?;
+        let logs = get_container_logs(sidecar_container).await?;
         if logs.contains(SIDECAR_REGISTRATION_PATTERN) {
             log::info!("sidecar registered with an authenticated tenant proxy");
             return Ok(());
         }
+        last_logs = logs;
         sleep(Duration::from_millis(500)).await;
     }
 
+    let mut start = last_logs.len().saturating_sub(8 * 1024);
+    while !last_logs.is_char_boundary(start) {
+        start += 1;
+    }
     Err(anyhow!(
-        "sidecar did not register with an authenticated tenant proxy"
+        "sidecar did not register with an authenticated tenant proxy; recent logs:\n{}",
+        &last_logs[start..]
     ))
 }
 
 /// Execute an HTTP request from the workload pod to another pod in the mesh.
 /// The request must be intercepted and tunneled through the authenticated proxy.
-async fn execute_egress_curl(workload_name: &str) -> Result<String> {
-    let curl_container = find_container_by_pattern(workload_name, "curl-client").await?;
-
+async fn execute_egress_curl(curl_container: &str) -> Result<String> {
     log::info!(
         "executing curl to {} from container {}",
         EGRESS_TEST_URL,
@@ -486,7 +474,7 @@ async fn execute_egress_curl(workload_name: &str) -> Result<String> {
 
         let result = run_podman_command(&[
             "exec",
-            &curl_container,
+            curl_container,
             "curl",
             "-s",
             "-S", // Show errors
@@ -529,9 +517,8 @@ async fn execute_egress_curl(workload_name: &str) -> Result<String> {
 }
 
 /// Verify sidecar logs contain evidence of transparent proxy activity
-async fn verify_sidecar_egress_logs(workload_name: &str) -> Result<()> {
-    let sidecar_container = find_container_by_pattern(workload_name, "sidecar").await?;
-    let logs = get_container_logs(&sidecar_container).await?;
+async fn verify_sidecar_egress_logs(sidecar_container: &str) -> Result<()> {
+    let logs = get_container_logs(sidecar_container).await?;
 
     log::debug!("sidecar logs:\n{}", logs);
 
@@ -579,7 +566,7 @@ async fn verify_proxy_egress_logs() -> Result<()> {
     let proxy_containers: Vec<String> = containers
         .iter()
         .flat_map(|container| container.names.iter())
-        .filter(|name| name.starts_with("proxy-proxy"))
+        .filter(|name| name.starts_with(PROXY_CONTAINER_NAME_PREFIX))
         .cloned()
         .collect();
     anyhow::ensure!(!proxy_containers.is_empty(), "no proxy containers found");
@@ -619,26 +606,6 @@ async fn get_container_logs(container_name: &str) -> Result<String> {
     // Return combined output (most container output goes to stderr)
     let combined = format!("{}{}", stdout, stderr);
     Ok(combined)
-}
-
-/// Find a container matching the manifest ID and name pattern
-async fn find_container_by_pattern(workload_name: &str, pattern: &str) -> Result<String> {
-    let runtime_name = workload_runtime_name(workload_name);
-    let containers = capture_podman_containers().await?;
-
-    for container in &containers {
-        if container.matches(&runtime_name, pattern)
-            && let Some(name) = container.names.first()
-        {
-            return Ok(name.clone());
-        }
-    }
-
-    Err(anyhow!(
-        "could not find container matching workload={} pattern={}",
-        workload_name,
-        pattern
-    ))
 }
 
 async fn capture_podman_containers() -> Result<Vec<PodmanContainer>> {

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, anyhow, bail};
 use protocol::{
-    libp2p_constants::MESH_DOMAIN_SUFFIX,
+    MESH_DOMAIN_SUFFIX,
     machine::{SidecarRouteKind, SidecarRouteSpec},
 };
 use serde::Deserialize;

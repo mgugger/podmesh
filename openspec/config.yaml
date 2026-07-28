@@ -1,5 +1,30 @@
 schema: spec-driven
 
+context: |
+  Podmesh is a decentralized, zero-trust workload system written in Rust (2024 edition,
+  cargo workspace). Crates: podctl, podmesh-scheduler, podmesh-agent, podmesh-proxy,
+  podmesh-sidecar, and shared/{crypto,protocol,iroh_support,axum_support}.
+
+  Architecture invariants:
+  - The scheduler is a stateless selector and blind relay. It never sees workload plaintext,
+    tenant keys, lifecycle state, or logs, and keeps no durable agent records.
+  - podctl is a plain HTTP CLI with no Iroh endpoint. It decides replica placement itself.
+  - The agent owns admission, aggregate resource accounting, Podman, sidecar injection,
+    encrypted per-workload persistence, restart reconciliation, status, logs, and deletion.
+  - Proxy and sidecar form a separate workload traffic plane using owner-signed Biscuit grants.
+
+  Transport is Iroh (no libp2p, no DHT in the workload plane). Crypto is Ed25519 signing,
+  X25519 KEM, XChaCha20-Poly1305, and Biscuit for delegatable service grants.
+
+  Conventions: log:: macros never println!, files under 300 lines, named constants for every
+  bound and timeout, no TODO/FIXME placeholders, anyhow with .context(), no backward
+  compatibility guarantees.
+
+rules:
+  spec:
+    - Each requirement's first body line must contain SHALL or MUST
+    - Prefer observable behaviour over implementation detail in scenarios
+
 # Project context (optional)
 # This is shown to AI when creating artifacts.
 # Add your tech stack, conventions, style guides, domain knowledge, etc.

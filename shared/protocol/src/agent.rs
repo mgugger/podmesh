@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 pub const AGENT_PROTOCOL_VERSION: u16 = 1;
-pub const MAX_AGENT_ADDRESS_LEN: usize = 2_048;
-pub const MAX_CAPABILITIES: usize = 64;
-pub const MAX_CAPABILITY_LEN: usize = 128;
 pub const MAX_ENCRYPTED_CAPSULE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_WRAPPED_KEY_BYTES: usize = 4 * 1024;
 pub const MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
+/// Upper bound on replicas per deployment. Each replica consumes one agent, so
+/// this also bounds how many agents a single `podctl apply` can occupy.
+pub const MAX_WORKLOAD_REPLICAS: u32 = 64;
 
 fn canonical<T: Serialize>(value: &T) -> anyhow::Result<Vec<u8>> {
     postcard::to_allocvec(value).map_err(Into::into)
@@ -31,85 +31,6 @@ fn validate_hex_id(value: &str, field: &str) -> anyhow::Result<()> {
         "{field} must be hex"
     );
     Ok(())
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AgentAdvertisement {
-    pub version: u16,
-    pub node_id: String,
-    pub kem_pubkey: String,
-    pub relay_url: String,
-    pub capabilities: Vec<String>,
-    pub available: bool,
-    pub load_percent: u8,
-    pub expires_at_secs: u64,
-    pub nonce: String,
-    pub signature: String,
-}
-
-impl AgentAdvertisement {
-    fn canonical_bytes(&self) -> anyhow::Result<Vec<u8>> {
-        canonical(&Self {
-            signature: String::new(),
-            ..self.clone()
-        })
-    }
-
-    pub fn validate(&self, now_secs: u64) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.version == AGENT_PROTOCOL_VERSION,
-            "unsupported agent protocol version"
-        );
-        decode_fixed(&self.node_id, 32, "node_id")?;
-        decode_fixed(&self.kem_pubkey, 32, "kem_pubkey")?;
-        anyhow::ensure!(
-            !self.relay_url.is_empty() && self.relay_url.len() <= MAX_AGENT_ADDRESS_LEN,
-            "invalid relay_url length"
-        );
-        anyhow::ensure!(
-            self.relay_url.starts_with("http://") || self.relay_url.starts_with("https://"),
-            "relay_url must use http or https"
-        );
-        anyhow::ensure!(
-            self.capabilities.len() <= MAX_CAPABILITIES,
-            "too many capabilities"
-        );
-        anyhow::ensure!(
-            self.capabilities
-                .iter()
-                .all(|capability| !capability.is_empty() && capability.len() <= MAX_CAPABILITY_LEN),
-            "invalid capability length"
-        );
-        anyhow::ensure!(self.load_percent <= 100, "load_percent must be <= 100");
-        anyhow::ensure!(
-            self.expires_at_secs >= now_secs,
-            "agent advertisement expired"
-        );
-        anyhow::ensure!(
-            !self.nonce.is_empty() && self.nonce.len() <= 128,
-            "invalid nonce"
-        );
-        Ok(())
-    }
-
-    pub fn sign(mut self, signing_public: &[u8], signing_private: &[u8]) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            signing_public.len() == 32,
-            "signing public key must be 32 bytes"
-        );
-        self.node_id = crypto::b64_encode(signing_public);
-        self.signature.clear();
-        let signature = crypto::sign_data_with_key(signing_private, &self.canonical_bytes()?)?;
-        self.signature = crypto::b64_encode(&signature);
-        Ok(self)
-    }
-
-    pub fn verify(&self, now_secs: u64) -> anyhow::Result<()> {
-        self.validate(now_secs)?;
-        let public = decode_fixed(&self.node_id, 32, "node_id")?;
-        let signature = decode_fixed(&self.signature, 64, "signature")?;
-        crypto::verify_envelope(&public, &self.canonical_bytes()?, &signature)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -244,8 +165,15 @@ impl EncryptedWorkloadCapsule {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionSpec {
     pub workload_name: String,
+    /// Zero-based index of this replica within the deployment.
+    pub replica_index: u32,
+    /// Total replicas the owner asked for. Every replica is placed on a
+    /// distinct agent, and each agent runs exactly one pod for it.
+    pub replica_count: u32,
     pub manifest: Vec<u8>,
-    pub proxy_peers: Vec<crate::ProxyPeer>,
+    pub proxy_endpoints: Vec<crate::EndpointRecord>,
+    pub workload_relay_auth_token: String,
+    pub workload_relay_ca_certificates: Vec<Vec<u8>>,
 }
 
 impl ExecutionSpec {
@@ -255,10 +183,45 @@ impl ExecutionSpec {
             "invalid workload name"
         );
         anyhow::ensure!(
+            self.replica_count >= 1 && self.replica_count <= MAX_WORKLOAD_REPLICAS,
+            "replica count must be between 1 and {MAX_WORKLOAD_REPLICAS}"
+        );
+        anyhow::ensure!(
+            self.replica_index < self.replica_count,
+            "replica index is outside the deployment"
+        );
+        anyhow::ensure!(
             !self.manifest.is_empty() && self.manifest.len() <= MAX_MANIFEST_BYTES,
             "invalid manifest length"
         );
-        crate::validate_proxy_peers(&self.proxy_peers, false)?;
+        anyhow::ensure!(
+            !self.proxy_endpoints.is_empty()
+                && self.proxy_endpoints.len()
+                    <= crate::proxy_endpoint_discovery::MAX_PROXY_ENDPOINTS,
+            "invalid proxy endpoint count"
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        for endpoint in &self.proxy_endpoints {
+            endpoint.verify(now)?;
+        }
+        anyhow::ensure!(
+            self.workload_relay_auth_token.len() >= 32
+                && self.workload_relay_auth_token.len() <= 4 * 1024,
+            "invalid workload relay auth token length"
+        );
+        anyhow::ensure!(
+            self.workload_relay_ca_certificates.len() <= 8,
+            "too many workload relay CA certificates"
+        );
+        for certificate in &self.workload_relay_ca_certificates {
+            anyhow::ensure!(
+                !certificate.is_empty() && certificate.len() <= 64 * 1024,
+                "invalid workload relay CA certificate size"
+            );
+        }
         Ok(())
     }
 }
@@ -480,12 +443,28 @@ impl DeploymentReceipt {
     }
 }
 
-pub fn workload_id(namespace_id: &[u8], workload_name: &str) -> String {
+/// Identifies one deployment within a namespace. It is the stable key a client
+/// uses to find every replica of a workload again.
+pub fn deployment_id(namespace_id: &[u8], workload_name: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"podmesh/deployment/v1\0");
+    hasher.update(namespace_id);
+    hasher.update(b"\0");
+    hasher.update(workload_name.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Identifies a single replica of a deployment. Each replica is admitted,
+/// executed, and deleted independently on its own agent, so every replica needs
+/// its own workload identity.
+pub fn workload_id(namespace_id: &[u8], workload_name: &str, replica_index: u32) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"podmesh/workload/v1\0");
     hasher.update(namespace_id);
     hasher.update(b"\0");
     hasher.update(workload_name.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(&replica_index.to_le_bytes());
     hasher.finalize().to_hex().to_string()
 }
 
@@ -505,31 +484,6 @@ mod tests {
     }
 
     #[test]
-    fn advertisement_signature_covers_address_and_capacity() {
-        let (public, private) = crypto::ensure_keypair_ephemeral().unwrap();
-        let kem_public = [7u8; 32];
-        let advertisement = AgentAdvertisement {
-            version: AGENT_PROTOCOL_VERSION,
-            node_id: String::new(),
-            kem_pubkey: crypto::b64_encode(&kem_public),
-            relay_url: "http://127.0.0.1:3100".into(),
-            capabilities: vec!["podman".into()],
-            available: true,
-            load_percent: 4,
-            expires_at_secs: now() + 30,
-            nonce: "n-1".into(),
-            signature: String::new(),
-        }
-        .sign(&public, &private)
-        .unwrap();
-
-        advertisement.verify(now()).unwrap();
-        let mut tampered = advertisement;
-        tampered.load_percent = 3;
-        assert!(tampered.verify(now()).is_err());
-    }
-
-    #[test]
     fn deployment_grant_rejects_tampered_capsule() {
         let (owner_public, owner_private) = crypto::ensure_keypair_ephemeral().unwrap();
         let (agent_public, _) = crypto::ensure_keypair_ephemeral().unwrap();
@@ -537,7 +491,7 @@ mod tests {
         let mut grant = DeploymentGrant {
             version: AGENT_PROTOCOL_VERSION,
             namespace_id: crypto::b64_encode(&owner_public),
-            workload_id: workload_id(&owner_public, "demo"),
+            workload_id: workload_id(&owner_public, "demo", 0),
             revision_id: revision_id(b"manifest"),
             target_node_id: crypto::b64_encode(&agent_public),
             response_kem_pubkey: crypto::b64_encode(&response_kem),
@@ -561,8 +515,32 @@ mod tests {
 
     #[test]
     fn workload_identity_is_namespaced_and_revision_is_content_addressed() {
-        assert_ne!(workload_id(&[1; 32], "demo"), workload_id(&[2; 32], "demo"));
+        assert_ne!(
+            workload_id(&[1; 32], "demo", 0),
+            workload_id(&[2; 32], "demo", 0)
+        );
         assert_ne!(revision_id(b"a"), revision_id(b"b"));
         assert_eq!(revision_id(b"a").len(), 64);
+    }
+
+    #[test]
+    fn every_replica_gets_its_own_workload_identity() {
+        let first = workload_id(&[1; 32], "demo", 0);
+        let second = workload_id(&[1; 32], "demo", 1);
+        assert_ne!(first, second);
+        assert_eq!(first, workload_id(&[1; 32], "demo", 0));
+        assert_ne!(first, deployment_id(&[1; 32], "demo"));
+    }
+
+    #[test]
+    fn deployment_identity_is_stable_across_replica_counts() {
+        assert_eq!(
+            deployment_id(&[1; 32], "demo"),
+            deployment_id(&[1; 32], "demo")
+        );
+        assert_ne!(
+            deployment_id(&[1; 32], "demo"),
+            deployment_id(&[2; 32], "demo")
+        );
     }
 }

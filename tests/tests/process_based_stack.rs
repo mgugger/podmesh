@@ -1,16 +1,17 @@
-//! Process-based stack integration tests
+//! Process-based workload-plane integration tests
 //!
-//! This module tests the complete podmesh stack (schedulers, proxies, sidecars)
-//! using native OS processes instead of containers. This allows testing the full
-//! system behavior without depending on Docker or Podman.
+//! This module exercises the workload traffic plane — proxy ingress, proxy
+//! egress, and sidecar route matching — using native OS processes instead of
+//! containers, so it can run without Podman.
 //!
-//! The test spins up:
-//! - Multiple scheduler nodes (forming a P2P mesh)
-//! - Multiple proxy nodes (handling ingress)
-//! - Sidecars spawned as child processes (not containers)
-//!
-//! This tests the exact same code paths as the containerized deployment,
-//! but using the ProcessEngine runtime instead of PodmanEngine.
+//! Scope and non-scope:
+//! - In scope: proxy and sidecar wired over Iroh, owner-signed Biscuit grant handshake,
+//!   ingress routing to an in-process application, and egress tunnelling.
+//! - Not in scope: the machine plane. Scheduler placement and agent deployment
+//!   are covered by `podmesh-agent/tests/scheduler_relay.rs`, which runs a real
+//!   scheduler and a real agent and drives the same HTTP client API `podctl`
+//!   uses. Full multi-replica deployment over Podman is covered by
+//!   `complete_rootless_stack.rs` behind the `podman-tests` feature.
 
 use std::time::{Duration, Instant};
 
@@ -40,16 +41,18 @@ const DEMO_MANIFEST: &[u8] = include_bytes!("../sample_manifests/demo_deployment
 
 /// Configuration for test workloads.
 fn build_proxy_config(
-    libp2p_port: u16,
+    iroh_port: u16,
     rest_port: u16,
-    proxy_peer_multiaddrs: Vec<String>,
+    proxy_endpoints: Vec<protocol::EndpointRecord>,
     enable_ingress: bool,
 ) -> ProxyConfig {
     ProxyConfig {
-        proxy_peer_multiaddrs,
+        proxy_endpoints,
         identity: podmesh_proxy::IdentitySource::ephemeral(),
-        libp2p_quic_port: libp2p_port,
-        libp2p_host: "127.0.0.1".to_string(),
+        iroh_bind_addr: format!("127.0.0.1:{iroh_port}").parse().unwrap(),
+        workload_relay: None,
+        workload_relay_certificate_der: Vec::new(),
+        publish_relay_bootstrap: false,
         rest_host: "127.0.0.1".to_string(),
         rest_port,
         disable_rest_api: false,
@@ -62,7 +65,7 @@ fn build_proxy_config(
 struct ProxyHandle {
     workload: ProxyWorkload,
     peer_id: String,
-    bootstrap_addr: String,
+    endpoint_record: protocol::EndpointRecord,
     rest_port: u16,
     network_ready_rx: watch::Receiver<bool>,
 }
@@ -74,18 +77,23 @@ impl ProxyHandle {
 }
 
 /// Start a proxy workload.
-fn start_proxy(bootstrap_peers: Vec<String>, enable_ingress: bool) -> Result<ProxyHandle> {
-    let libp2p_port = allocate_udp_port();
+async fn start_proxy(
+    bootstrap_peers: Vec<protocol::EndpointRecord>,
+    enable_ingress: bool,
+) -> Result<ProxyHandle> {
+    let iroh_port = allocate_udp_port();
     let rest_port = allocate_tcp_port();
-    let config = build_proxy_config(libp2p_port, rest_port, bootstrap_peers, enable_ingress);
+    let config = build_proxy_config(iroh_port, rest_port, bootstrap_peers, enable_ingress);
     let mut workload = ProxyWorkload::new(config)?;
-    workload.start()?;
+    workload.start().await?;
 
     let peer_id = workload
         .peer_id()
         .map(|id| id.to_string())
         .ok_or_else(|| anyhow!("workload peer id unavailable"))?;
-    let bootstrap_addr = format!("/ip4/127.0.0.1/udp/{libp2p_port}/quic-v1/p2p/{peer_id}");
+    let endpoint_record = workload
+        .endpoint_record()
+        .ok_or_else(|| anyhow!("workload EndpointRecord unavailable"))?;
     let network_ready_rx = workload
         .network_ready_rx()
         .ok_or_else(|| anyhow!("network readiness channel missing"))?;
@@ -93,7 +101,7 @@ fn start_proxy(bootstrap_peers: Vec<String>, enable_ingress: bool) -> Result<Pro
     Ok(ProxyHandle {
         workload,
         peer_id,
-        bootstrap_addr,
+        endpoint_record,
         rest_port,
         network_ready_rx,
     })
@@ -203,16 +211,17 @@ async fn wait_for_sidecar_peer_ready(
 
 /// Build sidecar configuration for testing.
 fn build_sidecar_config(
-    bootstrap_peers: Vec<String>,
+    proxy_endpoints: Vec<protocol::EndpointRecord>,
     app_port: u16,
 ) -> Result<(SidecarConfig, String, String)> {
     let (routes, ingress_host, service_host) = demo_routes(app_port)?;
     let cfg = SidecarConfig {
         identity: podmesh_sidecar::IdentitySource::ephemeral(),
-        proxy_peers: protocol::proxy_peers_from_multiaddrs(&bootstrap_peers)?,
+        proxy_endpoints,
+        workload_relay_auth_token: None,
+        workload_relay_ca_certificates: Vec::new(),
         lookup_interval: Duration::from_secs(2),
-        libp2p_host: "0.0.0.0".to_string(),
-        libp2p_port: 0,
+        iroh_bind_addr: "127.0.0.1:0".parse()?,
         manifest_id: DEMO_MANIFEST_ID.to_string(),
         ingress_host: ingress_host.clone(),
         app_port,
@@ -272,15 +281,15 @@ async fn process_based_stack_with_multiple_nodes() -> Result<()> {
     let test_result: Result<()> = async {
         // Start first proxy node (acts as bootstrap)
         log::info!("Starting first proxy node (bootstrap)");
-        let first = start_proxy(Vec::new(), true)?;
-        let first_bootstrap = first.bootstrap_addr.clone();
+        let first = start_proxy(Vec::new(), true).await?;
+        let first_bootstrap = first.endpoint_record.clone();
         let provider_peer_id = first.peer_id.clone();
         proxies.push(first);
 
         // Start second proxy node
         log::info!("Starting second proxy node");
-        let second = start_proxy(vec![first_bootstrap.clone()], false)?;
-        let second_bootstrap = second.bootstrap_addr.clone();
+        let second = start_proxy(vec![first_bootstrap.clone()], false).await?;
+        let second_bootstrap = second.endpoint_record.clone();
         proxies.push(second);
 
         // Start third proxy node
@@ -288,7 +297,8 @@ async fn process_based_stack_with_multiple_nodes() -> Result<()> {
         let third = start_proxy(
             vec![first_bootstrap.clone(), second_bootstrap.clone()],
             false,
-        )?;
+        )
+        .await?;
         proxies.push(third);
 
         log::info!("Waiting for proxy listeners to be ready");
@@ -318,8 +328,10 @@ async fn process_based_stack_with_multiple_nodes() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Collect bootstrap peers for the sidecar
-        let sidecar_bootstrap_peers: Vec<String> =
-            proxies.iter().map(|p| p.bootstrap_addr.clone()).collect();
+        let sidecar_bootstrap_peers = proxies
+            .iter()
+            .map(|proxy| proxy.endpoint_record.clone())
+            .collect::<Vec<_>>();
 
         // Build sidecar configuration
         let (mut sidecar_cfg, ingress_host, service_host) =

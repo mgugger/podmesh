@@ -1,0 +1,23 @@
+mod attachments;
+mod config;
+mod coordinator;
+mod discovery;
+mod forward;
+mod gossip;
+mod identity;
+mod members;
+mod offer_handler;
+mod placement;
+mod query;
+
+pub use attachments::{AgentAttachmentHandler, AttachmentManager};
+pub use config::{MachineConfig, ValidatedMachineConfig};
+pub use coordinator::{CapacityCoordinator, CapacityService};
+pub use discovery::run_peer_discovery;
+pub use forward::{AgentControlForwarder, ForwardError};
+pub use gossip::{GossipPublisher, PeerJoiner, SCHEDULER_GOSSIP_ALPN, SchedulerGossip};
+pub use identity::SchedulerIdentity;
+pub use members::{IssuerRegistry, MemberRegistry};
+pub use offer_handler::CapacityOfferHandler;
+pub use placement::PlacementHandler;
+pub use query::{BegunQuery, CapacityCriteria, QueryManager};

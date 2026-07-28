@@ -61,7 +61,7 @@ enum Commands {
         #[arg(short, long)]
         file: String,
     },
-    /// NodeCert management (issue, show, verify, grant-proxy)
+    /// Proxy grant management
     Cert {
         #[command(subcommand)]
         cmd: cert::CertCommands,

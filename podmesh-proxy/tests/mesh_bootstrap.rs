@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use podmesh_proxy::{Config, Workload};
+use protocol::EndpointRecord;
 use serde::Deserialize;
 use serial_test::serial;
 use tokio::sync::watch::Receiver;
@@ -31,7 +32,7 @@ async fn workload_mesh_bootstraps_three_nodes() -> Result<()> {
     let mut nodes = Vec::new();
     let test_result: Result<()> = async {
         let node1 = start_node(allocate_udp_port(), allocate_tcp_port(), Vec::new(), false).await?;
-        let bootstrap1 = node1.bootstrap_multiaddr();
+        let bootstrap1 = node1.endpoint_record.clone();
         nodes.push(node1);
 
         let node2 = start_node(
@@ -41,7 +42,7 @@ async fn workload_mesh_bootstraps_three_nodes() -> Result<()> {
             false,
         )
         .await?;
-        let bootstrap2 = node2.bootstrap_multiaddr();
+        let bootstrap2 = node2.endpoint_record.clone();
         nodes.push(node2);
 
         let node3 = start_node(
@@ -86,16 +87,18 @@ async fn workload_mesh_single_node_reports_zero_peers() -> Result<()> {
 }
 
 async fn start_node(
-    libp2p_port: u16,
+    iroh_port: u16,
     rest_port: u16,
-    bootstrap_peers: Vec<String>,
+    bootstrap_peers: Vec<EndpointRecord>,
     enable_ingress: bool,
 ) -> Result<NodeHandle> {
     let cfg = Config {
-        proxy_peer_multiaddrs: bootstrap_peers,
+        proxy_endpoints: bootstrap_peers,
         identity: podmesh_proxy::IdentitySource::ephemeral(),
-        libp2p_quic_port: libp2p_port,
-        libp2p_host: "127.0.0.1".to_string(),
+        iroh_bind_addr: format!("127.0.0.1:{iroh_port}").parse()?,
+        workload_relay: None,
+        workload_relay_certificate_der: Vec::new(),
+        publish_relay_bootstrap: false,
         rest_host: "127.0.0.1".to_string(),
         rest_port,
         disable_rest_api: false,
@@ -104,11 +107,10 @@ async fn start_node(
     };
 
     let mut workload = Workload::new(cfg)?;
-    workload.start()?;
-    let peer_id = workload
-        .peer_id()
-        .map(|p| p.to_string())
-        .ok_or_else(|| anyhow!("workload peer id unavailable"))?;
+    workload.start().await?;
+    let endpoint_record = workload
+        .endpoint_record()
+        .ok_or_else(|| anyhow!("workload EndpointRecord unavailable"))?;
     let network_ready_rx = workload
         .network_ready_rx()
         .ok_or_else(|| anyhow!("network readiness channel missing"))?;
@@ -116,8 +118,7 @@ async fn start_node(
     Ok(NodeHandle {
         workload,
         rest_port,
-        libp2p_port,
-        peer_id,
+        endpoint_record,
         network_ready_rx,
     })
 }
@@ -125,19 +126,11 @@ async fn start_node(
 struct NodeHandle {
     workload: Workload,
     rest_port: u16,
-    libp2p_port: u16,
-    peer_id: String,
+    endpoint_record: EndpointRecord,
     network_ready_rx: Receiver<bool>,
 }
 
 impl NodeHandle {
-    fn bootstrap_multiaddr(&self) -> String {
-        format!(
-            "/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}",
-            self.libp2p_port, self.peer_id
-        )
-    }
-
     fn health_url(&self) -> String {
         format!("http://127.0.0.1:{}/healthz", self.rest_port)
     }

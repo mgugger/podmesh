@@ -11,19 +11,26 @@ blake3 = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 crypto = { workspace = true }
 env_logger = { workspace = true }
+futures = { workspace = true }
+iroh = { workspace = true }
+iroh-support = { workspace = true }
 log = { workspace = true }
 postcard = { workspace = true }
 protocol = { workspace = true }
 redb = { workspace = true }
-reqwest = { workspace = true }
+rustls-pki-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["fs", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { workspace = true }
+reqwest = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+hex = { workspace = true }
 podmesh-scheduler = { workspace = true }
 rand = { workspace = true }
+reqwest = { workspace = true }
 serial_test = { workspace = true }

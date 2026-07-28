@@ -26,14 +26,14 @@ pub fn build_handshake(
     build_handshake_with_options(nonce, timestamp, version, signature, None, None)
 }
 
-pub fn build_handshake_with_cert(
+pub fn build_handshake_with_grant(
     nonce: u32,
     timestamp: u64,
     version: impl Into<String>,
     signature: impl Into<String>,
-    proxy_cert_b64: Option<&str>,
+    proxy_grant_b64: Option<&str>,
 ) -> Vec<u8> {
-    build_handshake_with_options(nonce, timestamp, version, signature, proxy_cert_b64, None)
+    build_handshake_with_options(nonce, timestamp, version, signature, proxy_grant_b64, None)
 }
 
 pub fn build_handshake_with_tenant(
@@ -58,7 +58,7 @@ fn build_handshake_with_options(
     timestamp: u64,
     version: impl Into<String>,
     signature: impl Into<String>,
-    proxy_cert_b64: Option<&str>,
+    proxy_grant_b64: Option<&str>,
     tenant_owner_pubkey: Option<&str>,
 ) -> Vec<u8> {
     Handshake {
@@ -66,7 +66,7 @@ fn build_handshake_with_options(
         timestamp,
         protocol_version: version.into(),
         signature: signature.into(),
-        proxy_cert_b64: proxy_cert_b64.unwrap_or_default().to_string(),
+        proxy_grant_b64: proxy_grant_b64.unwrap_or_default().to_string(),
         tenant_owner_pubkey: tenant_owner_pubkey.unwrap_or_default().to_string(),
     }
     .to_bytes()

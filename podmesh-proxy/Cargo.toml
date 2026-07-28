@@ -6,24 +6,31 @@ edition = "2024"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["env"] }
-libp2p = { workspace = true, features = ["relay", "autonat", "identify"] }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-util = { version = "0.7", features = ["compat"] }
+tokio-util = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
-p2p = { workspace = true }
 protocol = { workspace = true }
-futures = { workspace = true }
 axum = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 axum-support = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 postcard = { workspace = true }
 sha2 = { workspace = true }
 crypto = { workspace = true }
+blake3 = { workspace = true }
+iroh = { workspace = true }
+iroh-relay = { workspace = true }
+iroh-support = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
 
 [dev-dependencies]
+rcgen = { workspace = true }
 reqwest = { workspace = true }
 serial_test = { workspace = true }
+tempfile = { workspace = true }
 

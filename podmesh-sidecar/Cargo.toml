@@ -9,12 +9,12 @@ authors = ["Podmesh"]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 crypto = { workspace = true }
-futures = { workspace = true }
-libp2p = { workspace = true }
+iroh = { workspace = true }
+iroh-support = { workspace = true }
+rustls-pki-types = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 log = { workspace = true }
 env_logger = { workspace = true }
-p2p = { workspace = true }
 protocol = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -26,7 +26,7 @@ rustables = "0.8"
 libc = "0.2"
 socket2 = "0.5"
 ipnetwork = "0.21"
-tokio-util = { version = "0.7", features = ["compat"] }
+tokio-util = { workspace = true }
 postcard = { workspace = true }
 sha2 = { workspace = true }
 

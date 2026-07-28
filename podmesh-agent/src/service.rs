@@ -4,45 +4,30 @@ use crate::{
     store::{AgentStore, StoredWorkload},
 };
 use anyhow::{Context, Result, anyhow};
-use axum::{
-    Router,
-    body::Bytes,
-    extract::{DefaultBodyLimit, State},
-    http::StatusCode,
-    routing::{get, post},
-};
+use axum::{Router, routing::get};
 use protocol::{
-    AGENT_PROTOCOL_VERSION, AdmissionRequest, AgentAdvertisement, DeploymentGrant,
-    DeploymentReceipt, ExecutionSpec, Reservation, WorkloadCommand, WorkloadCommandResponse,
-    WorkloadOperation,
+    AGENT_PROTOCOL_VERSION, AdmissionRequest, AgentAttachmentHello, CAPACITY_PROTOCOL_VERSION,
+    CapacityOffer, CapacityQuery, DeploymentGrant, DeploymentReceipt, ENDPOINT_RECORD_VERSION,
+    EndpointRecord, ExecutionSpec, MachineRole, Reservation, SCHEDULER_MESH_PROTOCOL_VERSION,
+    WorkloadCommand, WorkloadCommandResponse, WorkloadOperation,
 };
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
 
-const ADVERTISEMENT_TTL_SECS: u64 = 30;
-const REGISTRATION_INTERVAL: Duration = Duration::from_secs(10);
 const RESERVATION_TTL_SECS: u64 = 30;
-const MAX_AGENT_BODY_BYTES: usize = 20 * 1024 * 1024;
 const MAX_REPLAY_ENTRIES: usize = 16_384;
 const MAX_RESERVATIONS: usize = 1_024;
 const MAX_CONFIGURED_WORKLOADS: usize = 10_000;
-
-type ApiResult<T> = std::result::Result<T, (StatusCode, String)>;
 
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn bad_request(error: impl std::fmt::Display) -> (StatusCode, String) {
-    log::warn!("agent rejected request: {error}");
-    (StatusCode::BAD_REQUEST, "invalid encrypted request".into())
 }
 
 #[derive(Clone)]
@@ -106,16 +91,6 @@ impl WorkloadState {
     }
 }
 
-fn utilization_percent(used: u64, capacity: u64) -> u8 {
-    if capacity == 0 {
-        return 100;
-    }
-    used.saturating_mul(100)
-        .checked_div(capacity)
-        .unwrap_or(100)
-        .min(100) as u8
-}
-
 impl AgentService {
     pub async fn new(config: Config, runtime: Arc<dyn WorkloadRuntime>) -> Result<Self> {
         anyhow::ensure!(
@@ -147,91 +122,131 @@ impl AgentService {
         Ok(service)
     }
 
+    /// The agent exposes no HTTP control plane. Owner-signed admission,
+    /// deployment, and lifecycle traffic arrives exclusively over the
+    /// authenticated Iroh `AGENT_CONTROL_ALPN` protocol, relayed by a
+    /// scheduler. Only liveness probing stays on HTTP.
     pub fn router(&self) -> Router {
-        Router::new()
-            .route("/health", get(|| async { "ok" }))
-            .route("/api/v1/advertisement", get(get_advertisement))
-            .route("/api/v1/admission", post(post_admission))
-            .route("/api/v1/deploy", post(post_deploy))
-            .route("/api/v1/command", post(post_command))
-            .layer(DefaultBodyLimit::max(MAX_AGENT_BODY_BYTES))
-            .with_state(self.clone())
+        Router::new().route("/health", get(|| async { "ok" }))
     }
 
-    pub fn spawn_registration_loop(&self) -> tokio::task::JoinHandle<()> {
-        let service = self.clone();
-        tokio::spawn(async move {
-            let client = reqwest::Client::new();
-            let mut interval = tokio::time::interval(REGISTRATION_INTERVAL);
-            loop {
-                interval.tick().await;
-                let advertisement = match service.advertisement().await {
-                    Ok(value) => value,
-                    Err(error) => {
-                        log::error!("failed to build agent advertisement: {error}");
-                        continue;
-                    }
-                };
-                let url = format!(
-                    "{}/api/v1/agents",
-                    service.inner.config.scheduler_url.trim_end_matches('/')
-                );
-                match client.post(url).json(&advertisement).send().await {
-                    Ok(response) if response.status().is_success() => {}
-                    Ok(response) => log::warn!(
-                        "scheduler rejected agent advertisement: {}",
-                        response.status()
-                    ),
-                    Err(error) => log::warn!("failed to register with scheduler: {error}"),
-                }
-            }
-        })
+    pub(crate) fn attachment_hello(
+        &self,
+        endpoint_address: &iroh::EndpointAddr,
+        now: u64,
+    ) -> Result<AgentAttachmentHello> {
+        let expires_at = now + protocol::scheduler_mesh::MAX_AGENT_ATTACHMENT_LIFETIME_SECS;
+        let agent_endpoint = self.signed_endpoint_record(endpoint_address, now, expires_at)?;
+        AgentAttachmentHello {
+            version: SCHEDULER_MESH_PROTOCOL_VERSION,
+            role: MachineRole::Agent,
+            agent_endpoint,
+            nonce: uuid::Uuid::new_v4().to_string(),
+            issued_at_secs: now,
+            expires_at_secs: expires_at,
+            signing_pubkey: String::new(),
+            signature: String::new(),
+        }
+        .sign(&self.inner.signing_public, &self.inner.signing_private, now)
     }
 
-    async fn advertisement(&self) -> Result<AgentAdvertisement> {
+    pub(crate) async fn capacity_offer(
+        &self,
+        query: &CapacityQuery,
+        endpoint_address: &iroh::EndpointAddr,
+        now: u64,
+    ) -> Result<Option<CapacityOffer>> {
+        query.verify(now)?;
+        if query
+            .excluded_endpoint_ids
+            .iter()
+            .any(|excluded| excluded == endpoint_address.id.as_bytes())
+        {
+            return Ok(None);
+        }
+        let capabilities = vec!["multi-workload".to_string()];
+        if !query
+            .required_capabilities
+            .iter()
+            .all(|required| capabilities.contains(required))
+        {
+            return Ok(None);
+        }
+
         let mut state = self.inner.state.lock().await;
-        let now = now_secs();
         state
             .reservations
             .retain(|_, reservation| reservation.expires_at_secs >= now);
         let usage = state.usage();
         let workload_slots = state.active.len().saturating_add(state.reservations.len());
-        let available = workload_slots < self.inner.config.max_workloads
-            && usage.cpu_milli < u64::from(self.inner.config.capacity_cpu_milli)
-            && usage.memory_bytes < self.inner.config.capacity_memory_bytes
-            && usage.storage_bytes < self.inner.config.capacity_storage_bytes;
-        let load_percent = [
-            utilization_percent(
-                usage.cpu_milli,
-                u64::from(self.inner.config.capacity_cpu_milli),
-            ),
-            utilization_percent(usage.memory_bytes, self.inner.config.capacity_memory_bytes),
-            utilization_percent(
-                usage.storage_bytes,
-                self.inner.config.capacity_storage_bytes,
-            ),
-            utilization_percent(
-                workload_slots as u64,
-                self.inner.config.max_workloads as u64,
-            ),
-        ]
-        .into_iter()
-        .max()
-        .unwrap_or(100);
+        let available_cpu =
+            u64::from(self.inner.config.capacity_cpu_milli).saturating_sub(usage.cpu_milli);
+        let available_memory = self
+            .inner
+            .config
+            .capacity_memory_bytes
+            .saturating_sub(usage.memory_bytes);
+        let available_storage = self
+            .inner
+            .config
+            .capacity_storage_bytes
+            .saturating_sub(usage.storage_bytes);
+        let can_satisfy = workload_slots < self.inner.config.max_workloads
+            && available_cpu >= u64::from(query.cpu_milli)
+            && available_memory >= query.memory_bytes
+            && available_storage >= query.storage_bytes;
         drop(state);
-        AgentAdvertisement {
-            version: AGENT_PROTOCOL_VERSION,
-            node_id: String::new(),
+        if !can_satisfy {
+            return Ok(None);
+        }
+
+        let expires_at = now + protocol::capacity::MAX_CAPACITY_OFFER_LIFETIME_SECS;
+        let agent_endpoint = self.signed_endpoint_record(endpoint_address, now, expires_at)?;
+        CapacityOffer {
+            version: CAPACITY_PROTOCOL_VERSION,
+            query_id: query.query_id.clone(),
+            agent_endpoint,
             kem_pubkey: crypto::b64_encode(&self.inner.kem_public),
-            relay_url: self.inner.config.advertise_url.clone(),
-            capabilities: vec!["multi-workload".into()],
-            available,
-            load_percent,
-            expires_at_secs: now + ADVERTISEMENT_TTL_SECS,
-            nonce: uuid::Uuid::new_v4().to_string(),
+            available_cpu_milli: u32::try_from(available_cpu)
+                .unwrap_or(self.inner.config.capacity_cpu_milli),
+            available_memory_bytes: available_memory,
+            available_storage_bytes: available_storage,
+            capabilities,
+            issued_at_secs: now,
+            expires_at_secs: expires_at,
+            signing_pubkey: String::new(),
             signature: String::new(),
         }
-        .sign(&self.inner.signing_public, &self.inner.signing_private)
+        .sign(&self.inner.signing_public, &self.inner.signing_private, now)
+        .map(Some)
+    }
+
+    fn signed_endpoint_record(
+        &self,
+        endpoint_address: &iroh::EndpointAddr,
+        now: u64,
+        expires_at: u64,
+    ) -> Result<EndpointRecord> {
+        let relay_url = endpoint_address
+            .relay_urls()
+            .next()
+            .map(ToString::to_string);
+        let direct_addresses = endpoint_address
+            .ip_addrs()
+            .take(protocol::MAX_ENDPOINT_DIRECT_ADDRESSES)
+            .map(ToString::to_string)
+            .collect();
+        EndpointRecord {
+            version: ENDPOINT_RECORD_VERSION,
+            endpoint_id: endpoint_address.id.as_bytes().to_vec(),
+            relay_url,
+            direct_addresses,
+            signing_pubkey: String::new(),
+            issued_at_secs: now,
+            expires_at_secs: expires_at,
+            signature: String::new(),
+        }
+        .sign(&self.inner.signing_public, &self.inner.signing_private, now)
     }
 
     async fn check_replay(&self, namespace: &str, nonce: &str, expires_at: u64) -> Result<()> {
@@ -248,7 +263,7 @@ impl AgentService {
         Ok(())
     }
 
-    fn decrypt<T: for<'de> serde::Deserialize<'de>>(&self, body: &[u8]) -> Result<T> {
+    pub(crate) fn decrypt<T: for<'de> serde::Deserialize<'de>>(&self, body: &[u8]) -> Result<T> {
         let plaintext = crypto::decrypt_payload_from_recipient_blob(body, &self.inner.kem_private)?;
         postcard::from_bytes(&plaintext).map_err(Into::into)
     }
@@ -259,7 +274,7 @@ impl AgentService {
         crypto::encrypt_payload_for_recipient(&recipient, &plaintext)
     }
 
-    async fn admit(&self, request: AdmissionRequest) -> Result<Vec<u8>> {
+    pub(crate) async fn admit(&self, request: AdmissionRequest) -> Result<Vec<u8>> {
         let now = now_secs();
         request.verify(now)?;
         self.check_replay(
@@ -334,7 +349,8 @@ impl AgentService {
         spec.validate()?;
         let namespace = crypto::b64_decode(&grant.namespace_id)?;
         anyhow::ensure!(
-            protocol::workload_id(&namespace, &spec.workload_name) == grant.workload_id,
+            protocol::workload_id(&namespace, &spec.workload_name, spec.replica_index)
+                == grant.workload_id,
             "workload identity mismatch"
         );
         anyhow::ensure!(
@@ -344,7 +360,7 @@ impl AgentService {
         Ok(spec)
     }
 
-    async fn deploy(&self, grant: DeploymentGrant) -> Result<Vec<u8>> {
+    pub(crate) async fn deploy(&self, grant: DeploymentGrant) -> Result<Vec<u8>> {
         let now = now_secs();
         grant.verify(now)?;
         anyhow::ensure!(
@@ -375,7 +391,9 @@ impl AgentService {
             &grant.workload_id,
             &grant.namespace_id,
             &self.inner.config.sidecar_image,
-            &execution.proxy_peers,
+            &execution.proxy_endpoints,
+            &execution.workload_relay_auth_token,
+            &execution.workload_relay_ca_certificates,
         )?;
         let (manifest, measured) = protocol::validate_and_measure_manifest(&manifest)?;
         anyhow::ensure!(
@@ -447,7 +465,7 @@ impl AgentService {
         self.encrypt(&receipt, &grant.response_kem_pubkey)
     }
 
-    async fn command(&self, command: WorkloadCommand) -> Result<Vec<u8>> {
+    pub(crate) async fn command(&self, command: WorkloadCommand) -> Result<Vec<u8>> {
         let now = now_secs();
         command.verify(now)?;
         self.check_replay(
@@ -573,7 +591,9 @@ impl AgentService {
                     &workload_id,
                     &stored.grant.namespace_id,
                     &self.inner.config.sidecar_image,
-                    &execution.proxy_peers,
+                    &execution.proxy_endpoints,
+                    &execution.workload_relay_auth_token,
+                    &execution.workload_relay_ca_certificates,
                 )?;
                 let (manifest, measured) = protocol::validate_and_measure_manifest(&manifest)?;
                 anyhow::ensure!(
@@ -606,37 +626,6 @@ impl AgentService {
     }
 }
 
-async fn get_advertisement(
-    State(service): State<AgentService>,
-) -> ApiResult<axum::Json<AgentAdvertisement>> {
-    service
-        .advertisement()
-        .await
-        .map(axum::Json)
-        .map_err(bad_request)
-}
-
-async fn post_admission(State(service): State<AgentService>, body: Bytes) -> ApiResult<Vec<u8>> {
-    let request = service
-        .decrypt::<AdmissionRequest>(&body)
-        .map_err(bad_request)?;
-    service.admit(request).await.map_err(bad_request)
-}
-
-async fn post_deploy(State(service): State<AgentService>, body: Bytes) -> ApiResult<Vec<u8>> {
-    let grant = service
-        .decrypt::<DeploymentGrant>(&body)
-        .map_err(bad_request)?;
-    service.deploy(grant).await.map_err(bad_request)
-}
-
-async fn post_command(State(service): State<AgentService>, body: Bytes) -> ApiResult<Vec<u8>> {
-    let command = service
-        .decrypt::<WorkloadCommand>(&body)
-        .map_err(bad_request)?;
-    service.command(command).await.map_err(bad_request)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,6 +633,25 @@ mod tests {
     use rand::RngCore;
     use serial_test::serial;
     use std::path::PathBuf;
+
+    fn test_proxy_endpoints() -> Vec<EndpointRecord> {
+        let now = now_secs();
+        let (public, private) = crypto::ensure_keypair_ephemeral().unwrap();
+        vec![
+            EndpointRecord {
+                version: ENDPOINT_RECORD_VERSION,
+                endpoint_id: iroh::SecretKey::generate().public().as_bytes().to_vec(),
+                relay_url: Some("https://relay.example.test".into()),
+                direct_addresses: vec!["127.0.0.1:4002".into()],
+                signing_pubkey: String::new(),
+                issued_at_secs: now,
+                expires_at_secs: now + 60,
+                signature: String::new(),
+            }
+            .sign(&public, &private, now)
+            .unwrap(),
+        ]
+    }
 
     const TEST_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
     const TEST_STORAGE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -654,6 +662,77 @@ mod tests {
         owner_private: Vec<u8>,
         response_public: Vec<u8>,
         response_private: Vec<u8>,
+    }
+
+    fn signed_admission(
+        name: &str,
+        cpu_milli: u32,
+        memory_bytes: u64,
+        storage_bytes: u64,
+    ) -> (AdmissionRequest, Vec<u8>) {
+        let (owner_public, owner_private) = crypto::ensure_keypair_ephemeral().unwrap();
+        let (response_public, response_private) =
+            crypto::keypair_manager::KeypairManager::generate_fresh_keypair(
+                crypto::keypair_manager::KeypairType::Kem,
+            )
+            .unwrap();
+        let request = AdmissionRequest {
+            version: AGENT_PROTOCOL_VERSION,
+            request_id: format!("request-{name}"),
+            namespace_id: crypto::b64_encode(&owner_public),
+            workload_id: protocol::workload_id(&owner_public, name, 0),
+            response_kem_pubkey: crypto::b64_encode(&response_public),
+            cpu_milli,
+            memory_bytes,
+            storage_bytes,
+            expires_at_secs: now_secs() + 30,
+            nonce: format!("admission-{name}"),
+            owner_signature: String::new(),
+        }
+        .sign(&owner_private)
+        .unwrap();
+        (request, response_private)
+    }
+
+    fn decode_reservation(body: &[u8], response_private: &[u8]) -> Reservation {
+        postcard::from_bytes(
+            &crypto::decrypt_payload_from_recipient_blob(body, response_private).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn signed_capacity_query(query_id: &str, cpu_milli: u32, now: u64) -> CapacityQuery {
+        let scheduler_transport = iroh::SecretKey::generate();
+        let (scheduler_public, scheduler_private) = crypto::ensure_keypair_ephemeral().unwrap();
+        let reply_endpoint = EndpointRecord {
+            version: ENDPOINT_RECORD_VERSION,
+            endpoint_id: scheduler_transport.public().as_bytes().to_vec(),
+            relay_url: None,
+            direct_addresses: vec!["127.0.0.1:4000".into()],
+            signing_pubkey: String::new(),
+            issued_at_secs: now,
+            expires_at_secs: now + 10,
+            signature: String::new(),
+        }
+        .sign(&scheduler_public, &scheduler_private, now)
+        .unwrap();
+        CapacityQuery {
+            version: CAPACITY_PROTOCOL_VERSION,
+            query_id: query_id.into(),
+            nonce: format!("nonce-{query_id}"),
+            cpu_milli,
+            memory_bytes: 100,
+            storage_bytes: 100,
+            required_capabilities: vec!["multi-workload".into()],
+            excluded_endpoint_ids: Vec::new(),
+            reply_endpoint,
+            issued_at_secs: now,
+            expires_at_secs: now + 10,
+            signing_pubkey: String::new(),
+            signature: String::new(),
+        }
+        .sign(&scheduler_public, &scheduler_private, now)
+        .unwrap()
     }
 
     async fn deploy_test_workload(
@@ -668,7 +747,7 @@ mod tests {
             )
             .unwrap();
         let namespace_id = crypto::b64_encode(&owner_public);
-        let workload_id = protocol::workload_id(&owner_public, name);
+        let workload_id = protocol::workload_id(&owner_public, name, 0);
         let admission = AdmissionRequest {
             version: AGENT_PROTOCOL_VERSION,
             request_id: format!("request-{name}"),
@@ -698,8 +777,12 @@ mod tests {
         .into_bytes();
         let execution = ExecutionSpec {
             workload_name: name.to_string(),
+            replica_index: 0,
+            replica_count: 1,
             manifest: manifest.clone(),
-            proxy_peers: protocol::proxy_peers_from_multiaddrs(&["/ip4/127.0.0.1/udp/4002/quic-v1/p2p/12D3KooWJ5WjY5GLqvC7V7abCdzYdHEgQmXW1HYXL7rGZQfJmY9D".to_string()]).unwrap(),
+            proxy_endpoints: test_proxy_endpoints(),
+            workload_relay_auth_token: "r".repeat(32),
+            workload_relay_ca_certificates: Vec::new(),
         };
         let mut dek = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut dek);
@@ -776,13 +859,11 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn empty_agent_advertises_available() {
+    async fn empty_agent_offers_its_full_capacity() {
         let temp = tempfile::tempdir().unwrap();
         let service = AgentService::new(
             Config {
                 listen: "127.0.0.1:0".into(),
-                advertise_url: "http://127.0.0.1:3100".into(),
-                scheduler_url: "http://127.0.0.1:3000".into(),
                 key_dir: temp.path().join("keys"),
                 state_path: temp.path().join("state.redb"),
                 runtime: RuntimeKind::Mock,
@@ -792,15 +873,43 @@ mod tests {
                 capacity_memory_bytes: 1024,
                 capacity_storage_bytes: 1024,
                 max_workloads: 4,
+                machine: crate::machine::MachineConfig::default(),
             },
             Arc::new(MockRuntime::default()),
         )
         .await
         .unwrap();
-        let advertisement = service.advertisement().await.unwrap();
-        assert!(advertisement.available);
-        advertisement.verify(now_secs()).unwrap();
+        let now = now_secs();
+        let offer = service
+            .capacity_offer(
+                &signed_capacity_query("empty-agent", 1_000, now),
+                &test_agent_address(),
+                now,
+            )
+            .await
+            .unwrap()
+            .expect("an idle agent must offer capacity");
+        offer.verify(now).unwrap();
+        assert_eq!(offer.available_cpu_milli, 1_000);
         assert_ne!(PathBuf::from(""), service.inner.config.key_dir);
+    }
+
+    fn test_agent_address() -> iroh::EndpointAddr {
+        iroh::EndpointAddr::new(iroh::SecretKey::generate().public())
+            .with_ip_addr("127.0.0.1:4100".parse().unwrap())
+    }
+
+    async fn offers_capacity(service: &AgentService) -> bool {
+        let now = now_secs();
+        service
+            .capacity_offer(
+                &signed_capacity_query(&uuid::Uuid::new_v4().to_string(), 1, now),
+                &test_agent_address(),
+                now,
+            )
+            .await
+            .unwrap()
+            .is_some()
     }
 
     #[tokio::test]
@@ -809,8 +918,6 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let config = Config {
             listen: "127.0.0.1:0".into(),
-            advertise_url: "http://127.0.0.1:3100".into(),
-            scheduler_url: "http://127.0.0.1:3000".into(),
             key_dir: temp.path().join("keys"),
             state_path: temp.path().join("state.redb"),
             runtime: RuntimeKind::Mock,
@@ -820,6 +927,7 @@ mod tests {
             capacity_memory_bytes: 2 * TEST_MEMORY_BYTES,
             capacity_storage_bytes: 2 * TEST_STORAGE_BYTES,
             max_workloads: 2,
+            machine: crate::machine::MachineConfig::default(),
         };
         let service = AgentService::new(config.clone(), Arc::new(MockRuntime::default()))
             .await
@@ -828,7 +936,7 @@ mod tests {
         let first = deploy_test_workload(&service, "first", 400).await;
         let second = deploy_test_workload(&service, "second", 400).await;
         assert_eq!(service.inner.state.lock().await.active.len(), 2);
-        assert!(!service.advertisement().await.unwrap().available);
+        assert!(!offers_capacity(&service).await);
         assert!(
             command_test_workload(&service, &first, WorkloadOperation::Status, "status-first")
                 .await
@@ -851,7 +959,7 @@ mod tests {
                 .ok
         );
         assert_eq!(service.inner.state.lock().await.active.len(), 1);
-        assert!(service.advertisement().await.unwrap().available);
+        assert!(offers_capacity(&service).await);
         assert!(
             command_test_workload(
                 &service,
@@ -887,8 +995,6 @@ mod tests {
         let service = AgentService::new(
             Config {
                 listen: "127.0.0.1:0".into(),
-                advertise_url: "http://127.0.0.1:3100".into(),
-                scheduler_url: "http://127.0.0.1:3000".into(),
                 key_dir: temp.path().join("keys"),
                 state_path: temp.path().join("state.redb"),
                 runtime: RuntimeKind::Mock,
@@ -898,6 +1004,7 @@ mod tests {
                 capacity_memory_bytes: 2 * TEST_MEMORY_BYTES,
                 capacity_storage_bytes: 2 * TEST_STORAGE_BYTES,
                 max_workloads: 5,
+                machine: crate::machine::MachineConfig::default(),
             },
             Arc::new(MockRuntime::default()),
         )
@@ -915,7 +1022,7 @@ mod tests {
             version: AGENT_PROTOCOL_VERSION,
             request_id: "overcommit-request".into(),
             namespace_id: crypto::b64_encode(&owner_public),
-            workload_id: protocol::workload_id(&owner_public, "overcommit"),
+            workload_id: protocol::workload_id(&owner_public, "overcommit", 0),
             response_kem_pubkey: crypto::b64_encode(&response_public),
             cpu_milli: 400,
             memory_bytes: TEST_MEMORY_BYTES,
@@ -938,210 +1045,219 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn encrypted_http_lifecycle_uses_stateless_scheduler() {
+    async fn capacity_offers_account_for_reservations_without_reserving() {
         let temp = tempfile::tempdir().unwrap();
-        let scheduler_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let scheduler_address = scheduler_listener.local_addr().unwrap();
-        let scheduler = tokio::spawn(
-            axum::serve(
-                scheduler_listener,
-                podmesh_scheduler::router(podmesh_scheduler::AgentRegistry::default()),
-            )
-            .into_future(),
-        );
-
-        let agent_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let agent_address = agent_listener.local_addr().unwrap();
-        let agent_url = format!("http://{agent_address}");
         let service = AgentService::new(
             Config {
-                listen: agent_address.to_string(),
-                advertise_url: agent_url.clone(),
-                scheduler_url: format!("http://{scheduler_address}"),
+                listen: "127.0.0.1:0".into(),
                 key_dir: temp.path().join("keys"),
                 state_path: temp.path().join("state.redb"),
                 runtime: RuntimeKind::Mock,
                 workload_network: "podmesh".into(),
                 sidecar_image: "podmesh/sidecar:latest".into(),
                 capacity_cpu_milli: 1_000,
-                capacity_memory_bytes: 1024 * 1024 * 1024,
-                capacity_storage_bytes: TEST_STORAGE_BYTES,
+                capacity_memory_bytes: 1_000,
+                capacity_storage_bytes: 1_000,
                 max_workloads: 4,
+                machine: crate::machine::MachineConfig::default(),
             },
             Arc::new(MockRuntime::default()),
         )
         .await
         .unwrap();
-        let agent = tokio::spawn(axum::serve(agent_listener, service.router()).into_future());
-        let client = reqwest::Client::new();
-
-        let advertisement = service.advertisement().await.unwrap();
-        client
-            .post(format!("http://{scheduler_address}/api/v1/agents"))
-            .json(&advertisement)
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap();
-        let selected = client
-            .get(format!("http://{scheduler_address}/api/v1/agents/select"))
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json::<AgentAdvertisement>()
-            .await
-            .unwrap();
-        assert_eq!(selected.node_id, advertisement.node_id);
-
         let (owner_public, owner_private) = crypto::ensure_keypair_ephemeral().unwrap();
-        let (response_public, response_private) =
-            crypto::keypair_manager::KeypairManager::get_kem_keypair(
-                crypto::keypair_manager::StorageMode::Ephemeral,
-            )
-            .unwrap();
-        let workload_id = protocol::workload_id(&owner_public, "demo");
-        let request = AdmissionRequest {
+        let (response_public, _) = crypto::keypair_manager::KeypairManager::get_kem_keypair(
+            crypto::keypair_manager::StorageMode::Ephemeral,
+        )
+        .unwrap();
+        let admission = AdmissionRequest {
             version: AGENT_PROTOCOL_VERSION,
-            request_id: "request-1".into(),
+            request_id: "reserved-capacity".into(),
             namespace_id: crypto::b64_encode(&owner_public),
-            workload_id: workload_id.clone(),
+            workload_id: protocol::workload_id(&owner_public, "reserved", 0),
             response_kem_pubkey: crypto::b64_encode(&response_public),
-            cpu_milli: 500,
-            memory_bytes: TEST_MEMORY_BYTES,
-            storage_bytes: TEST_STORAGE_BYTES,
+            cpu_milli: 600,
+            memory_bytes: 100,
+            storage_bytes: 100,
             expires_at_secs: now_secs() + 30,
-            nonce: "admission-nonce".into(),
+            nonce: "reserved-capacity-nonce".into(),
             owner_signature: String::new(),
         }
         .sign(&owner_private)
         .unwrap();
-        let admission_body = crypto::encrypt_payload_for_recipient(
-            &crypto::b64_decode(&selected.kem_pubkey).unwrap(),
-            &postcard::to_allocvec(&request).unwrap(),
-        )
-        .unwrap();
-        let reservation_body = client
-            .post(format!("{agent_url}/api/v1/admission"))
-            .body(admission_body)
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
-        let reservation: Reservation = postcard::from_bytes(
-            &crypto::decrypt_payload_from_recipient_blob(&reservation_body, &response_private)
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(reservation.accepted);
+        service.admit(admission).await.unwrap();
+        assert_eq!(service.inner.state.lock().await.reservations.len(), 1);
 
-        let manifest = br#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"demo"},"spec":{"containers":[{"name":"app","image":"nginx"}]}}"#.to_vec();
-        let execution = ExecutionSpec {
-            workload_name: "demo".into(),
-            manifest: manifest.clone(),
-            proxy_peers: protocol::proxy_peers_from_multiaddrs(&["/ip4/127.0.0.1/udp/4002/quic-v1/p2p/12D3KooWJ5WjY5GLqvC7V7abCdzYdHEgQmXW1HYXL7rGZQfJmY9D".to_string()]).unwrap(),
-        };
-        let mut dek = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut dek);
-        let (ciphertext, nonce) =
-            crypto::encrypt_payload_with_key(&dek, &postcard::to_allocvec(&execution).unwrap())
-                .unwrap();
-        let grant = DeploymentGrant {
-            version: AGENT_PROTOCOL_VERSION,
-            namespace_id: crypto::b64_encode(&owner_public),
-            workload_id: workload_id.clone(),
-            revision_id: protocol::revision_id(&manifest),
-            target_node_id: selected.node_id.clone(),
-            response_kem_pubkey: crypto::b64_encode(&response_public),
-            reservation_id: reservation.reservation_id,
-            capsule: protocol::EncryptedWorkloadCapsule {
-                ciphertext,
-                nonce: nonce.to_vec(),
-                wrapped_dek: crypto::encrypt_payload_for_recipient(
-                    &crypto::b64_decode(&selected.kem_pubkey).unwrap(),
-                    &dek,
-                )
-                .unwrap(),
+        let now = now_secs();
+        let scheduler_transport = iroh::SecretKey::generate();
+        let (scheduler_public, scheduler_private) = crypto::ensure_keypair_ephemeral().unwrap();
+        let reply_endpoint = EndpointRecord {
+            version: ENDPOINT_RECORD_VERSION,
+            endpoint_id: scheduler_transport.public().as_bytes().to_vec(),
+            relay_url: None,
+            direct_addresses: vec!["127.0.0.1:4000".into()],
+            signing_pubkey: String::new(),
+            issued_at_secs: now,
+            expires_at_secs: now + 10,
+            signature: String::new(),
+        }
+        .sign(&scheduler_public, &scheduler_private, now)
+        .unwrap();
+        let query = CapacityQuery {
+            version: CAPACITY_PROTOCOL_VERSION,
+            query_id: "capacity-query".into(),
+            nonce: "capacity-query-nonce".into(),
+            cpu_milli: 300,
+            memory_bytes: 100,
+            storage_bytes: 100,
+            required_capabilities: vec!["multi-workload".into()],
+            excluded_endpoint_ids: Vec::new(),
+            reply_endpoint,
+            issued_at_secs: now,
+            expires_at_secs: now + 10,
+            signing_pubkey: String::new(),
+            signature: String::new(),
+        }
+        .sign(&scheduler_public, &scheduler_private, now)
+        .unwrap();
+        let agent_transport = iroh::SecretKey::generate();
+        let agent_address = iroh::EndpointAddr::new(agent_transport.public())
+            .with_ip_addr("127.0.0.1:4100".parse().unwrap());
+        let offer = service
+            .capacity_offer(&query, &agent_address, now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(offer.available_cpu_milli, 400);
+        assert!(offer.expires_at_secs > query.expires_at_secs);
+        assert_eq!(
+            offer.expires_at_secs,
+            now + protocol::capacity::MAX_CAPACITY_OFFER_LIFETIME_SECS
+        );
+        offer.verify(now).unwrap();
+        assert_eq!(service.inner.state.lock().await.reservations.len(), 1);
+
+        let mut oversized = query;
+        oversized.query_id = "oversized-query".into();
+        oversized.cpu_milli = 500;
+        oversized = oversized
+            .sign(&scheduler_public, &scheduler_private, now)
+            .unwrap();
+        assert!(
+            service
+                .capacity_offer(&oversized, &agent_address, now)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(service.inner.state.lock().await.reservations.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn concurrent_offers_and_admissions_never_overcommit() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = AgentService::new(
+            Config {
+                listen: "127.0.0.1:0".into(),
+                key_dir: temp.path().join("keys"),
+                state_path: temp.path().join("state.redb"),
+                runtime: RuntimeKind::Mock,
+                workload_network: "podmesh".into(),
+                sidecar_image: "podmesh/sidecar:latest".into(),
+                capacity_cpu_milli: 1_000,
+                capacity_memory_bytes: 1_000,
+                capacity_storage_bytes: 1_000,
+                max_workloads: 4,
+                machine: crate::machine::MachineConfig::default(),
             },
-            issued_at_secs: now_secs(),
-            expires_at_secs: now_secs() + 30,
-            nonce: "deploy-nonce".into(),
-            owner_signature: String::new(),
-        }
-        .sign(&owner_private)
-        .unwrap();
-        let deploy_body = crypto::encrypt_payload_for_recipient(
-            &crypto::b64_decode(&selected.kem_pubkey).unwrap(),
-            &postcard::to_allocvec(&grant).unwrap(),
+            Arc::new(MockRuntime::default()),
         )
+        .await
         .unwrap();
-        let receipt_body = client
-            .post(format!("{agent_url}/api/v1/deploy"))
-            .body(deploy_body)
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
-        let receipt: DeploymentReceipt = postcard::from_bytes(
-            &crypto::decrypt_payload_from_recipient_blob(&receipt_body, &response_private).unwrap(),
-        )
-        .unwrap();
-        receipt.verify().unwrap();
-
-        for (operation, nonce) in [
-            (WorkloadOperation::Status, "status-nonce"),
-            (WorkloadOperation::Delete, "delete-nonce"),
-        ] {
-            let command = WorkloadCommand {
-                version: AGENT_PROTOCOL_VERSION,
-                request_id: nonce.into(),
-                namespace_id: crypto::b64_encode(&owner_public),
-                workload_id: workload_id.clone(),
-                operation,
-                log_tail: None,
-                response_kem_pubkey: crypto::b64_encode(&response_public),
-                expires_at_secs: now_secs() + 30,
-                nonce: nonce.into(),
-                owner_signature: String::new(),
+        let (first, first_response_key) = signed_admission("race-first", 600, 100, 100);
+        let (second, second_response_key) = signed_admission("race-second", 600, 100, 100);
+        let now = now_secs();
+        let query = signed_capacity_query("race-query", 100, now);
+        let agent_address = iroh::EndpointAddr::new(iroh::SecretKey::generate().public())
+            .with_ip_addr("127.0.0.1:4100".parse().unwrap());
+        let offer_futures = (0..32).map(|_| {
+            let service = service.clone();
+            let query = query.clone();
+            let agent_address = agent_address.clone();
+            async move {
+                service
+                    .capacity_offer(&query, &agent_address, now)
+                    .await
+                    .unwrap()
             }
-            .sign(&owner_private)
-            .unwrap();
-            let body = crypto::encrypt_payload_for_recipient(
-                &crypto::b64_decode(&selected.kem_pubkey).unwrap(),
-                &postcard::to_allocvec(&command).unwrap(),
-            )
-            .unwrap();
-            let response_body = client
-                .post(format!("{agent_url}/api/v1/command"))
-                .body(body)
-                .send()
-                .await
-                .unwrap()
-                .error_for_status()
-                .unwrap()
-                .bytes()
-                .await
-                .unwrap();
-            let response: WorkloadCommandResponse = postcard::from_bytes(
-                &crypto::decrypt_payload_from_recipient_blob(&response_body, &response_private)
-                    .unwrap(),
-            )
-            .unwrap();
-            response.verify().unwrap();
-            assert!(response.ok);
-        }
+        });
+        let (offers, first_body, second_body) = tokio::join!(
+            futures::future::join_all(offer_futures),
+            service.admit(first),
+            service.admit(second),
+        );
+        let reservations = [
+            decode_reservation(&first_body.unwrap(), &first_response_key),
+            decode_reservation(&second_body.unwrap(), &second_response_key),
+        ];
+        assert_eq!(
+            reservations
+                .iter()
+                .filter(|reservation| reservation.accepted)
+                .count(),
+            1
+        );
+        assert!(offers.iter().all(|offer| {
+            offer.as_ref().is_some_and(|offer| {
+                offer.available_cpu_milli == 1_000 || offer.available_cpu_milli == 400
+            })
+        }));
+        let state = service.inner.state.lock().await;
+        assert_eq!(state.reservations.len(), 1);
+        assert_eq!(state.usage().cpu_milli, 600);
+    }
 
-        agent.abort();
-        scheduler.abort();
+    #[tokio::test]
+    #[serial]
+    async fn replay_is_rejected_and_expired_reservation_releases_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = AgentService::new(
+            Config {
+                listen: "127.0.0.1:0".into(),
+                key_dir: temp.path().join("keys"),
+                state_path: temp.path().join("state.redb"),
+                runtime: RuntimeKind::Mock,
+                workload_network: "podmesh".into(),
+                sidecar_image: "podmesh/sidecar:latest".into(),
+                capacity_cpu_milli: 1_000,
+                capacity_memory_bytes: 1_000,
+                capacity_storage_bytes: 1_000,
+                max_workloads: 4,
+                machine: crate::machine::MachineConfig::default(),
+            },
+            Arc::new(MockRuntime::default()),
+        )
+        .await
+        .unwrap();
+        let (request, _) = signed_admission("replay", 600, 100, 100);
+        service.admit(request.clone()).await.unwrap();
+        assert!(service.admit(request).await.is_err());
+        for reservation in service.inner.state.lock().await.reservations.values_mut() {
+            reservation.expires_at_secs = 0;
+        }
+        let now = now_secs();
+        let offer = service
+            .capacity_offer(
+                &signed_capacity_query("after-expiry", 1_000, now),
+                &iroh::EndpointAddr::new(iroh::SecretKey::generate().public())
+                    .with_ip_addr("127.0.0.1:4100".parse().unwrap()),
+                now,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(offer.available_cpu_milli, 1_000);
+        assert!(service.inner.state.lock().await.reservations.is_empty());
     }
 }

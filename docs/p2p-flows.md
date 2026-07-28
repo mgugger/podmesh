@@ -1,110 +1,112 @@
 # Podmesh Network Flows
 
-Podmesh currently uses direct HTTP for scheduling and workload lifecycle, and libp2p QUIC for the
-proxy/sidecar traffic plane. Protocol records are transport-neutral so agent HTTP endpoints can be
-replaced by Iroh later without changing workload identity or authorization.
+Podmesh uses Iroh for both network planes while keeping their trust and relay configuration
+separate.
 
-## Scheduler And Agent
-
-The scheduler has no libp2p behaviour and no durable state.
+## Machine Plane
 
 ```text
-agent --POST signed AgentAdvertisement--> scheduler /api/v1/agents
-podctl --GET candidate------------------> scheduler /api/v1/agents/select
-podctl ==encrypted AdmissionRequest=====> agent /api/v1/admission
-podctl ==encrypted DeploymentGrant======> agent /api/v1/deploy
-podctl ==encrypted WorkloadCommand======> agent /api/v1/command
+scheduler <== authenticated Iroh gossip ==> scheduler
+agent ===== persistent capacity streams ===> scheduler
+podctl ---- HTTP placement request --------> scheduler
+podctl ==== HTTP encrypted lifecycle ======> scheduler ==Iroh==> selected agent
 ```
 
-Agent advertisements reveal only node identity, KEM key, endpoint, coarse load, capabilities, and
-expiry. Workload requirements are encrypted to the selected agent and never reach the scheduler.
+`podctl` is a plain CLI. It has no Iroh endpoint and cannot be dialed, so it speaks HTTP to any
+reachable scheduler. The scheduler answers placement from the mesh and then relays the owner's
+already-encrypted control payload to the selected agent over `/podmesh/agent-control/1`. It moves
+opaque bytes it can neither read nor forge.
 
-Each agent can run many workloads. Admission accounts for active workloads and outstanding signed
-reservations against:
+Every scheduler supervises a machine `iroh-relay`. Machine grants admit only scheduler and agent
+EndpointIds. Relays forward encrypted QUIC packets and never receive workload plaintext or
+application keys.
 
-- `max_workloads`
-- total CPU millicores
-- total memory bytes
-- total storage bytes
+Schedulers retain only bounded pending queries, offers, and attachment sessions. Agents remain
+authoritative for admission, reservations, execution, persistence, status, logs, and deletion.
 
-The agent persists one encrypted redb row per workload, keyed by the full workload ID. On restart it
-reconciles every row independently. Deleting one workload removes only that row and runtime pod.
+### HTTP Bootstrap
 
-## Proxy `WorkloadBehaviour`
+Iroh endpoints have to be learned before they can be dialed, so both the scheduler mesh and the
+agent attachment bootstrap over plain HTTP:
 
-Defined in `podmesh-proxy/src/p2p.rs`:
+- `GET /api/v1/endpoint_record` on a scheduler returns its signed, expiring `EndpointRecord`, its
+  endpoint id, and its signing public key.
+- Agents resolve `PODMESH_AGENT_SCHEDULER_URLS` through that endpoint before attaching. A URL that
+  does not answer fails startup.
+- Schedulers poll `PODMESH_SCHEDULER_PEER_URLS` in the background, skipping their own record, and
+  add each verified peer to the gossip member allowlist and the relay trusted issuer set at
+  runtime. Both registries are bounded. Start order therefore does not matter, and an unreachable
+  peer is a normal transient condition rather than an error.
 
-- `gossipsub` on `podmesh-workload`
-- `handshake_rr` for signed peer handshake and tenant proxy certificate exchange
-- `proxy_rr` for ingress HTTP forwarding to sidecars
-- `egress_stream` for sidecar egress tunnels
-- `registration_rr` for inbound sidecar route registration
-- `discovery_rr` for bounded tenant-scoped regional proxy peer exchange
-- `identify`, relay, and AutoNAT behaviours supplied by the shared swarm setup
+The records are self-signed and self-expiring, so an attacker on the HTTP path can only cause a
+verification failure, never an impersonation.
 
-Each logical proxy loads a persistent libp2p identity from its key directory. Ordinary process,
-container, host, and address changes therefore retain the same peer ID. Active regional proxies use
-distinct identities; one private key must not be active in two places concurrently.
-
-The proxy keeps an in-memory routing table populated only by authenticated sidecar registrations.
-If no registration exists for a workload, ingress fails closed without a distributed lookup.
-
-## Sidecar `SidecarBehaviour`
-
-Defined in `podmesh-sidecar/src/lib.rs`:
-
-- `handshake_rr` for peer identity and tenant proxy certificate verification
-- `proxy_rr` for inbound ingress requests
-- `egress_stream` for outbound tunnels
-- `registration_rr` for outbound registration with verified proxies
-- `discovery_rr` for fetching additional regional proxy identities from a verified proxy
-
-The tenant includes a bounded list of initial proxy records in the encrypted, owner-signed
-`ExecutionSpec`. The agent injects those records into sidecar metadata only after decrypting and
-validating the workload. Every record binds a stable peer ID to one or more dialable
-`/p2p/<peer-id>` multiaddrs. This metadata is never sent to the scheduler, and the selected agent
-does not choose tenant proxies.
-
-The sidecar treats configured and discovered records only as candidates. It requests the workload
-tenant's certificate in the signed handshake and accepts a proxy only when the returned `NodeCert`
-has a valid owner signature, role `Proxy`, a matching tenant owner key, a matching transport peer
-ID, and a current expiry. It registers routes with every verified regional proxy. A verified proxy
-can return additional bounded candidates through `/podmesh/proxy-discovery/1.0.0`; each candidate
-must pass the same handshake checks before use.
+## Workload Plane
 
 ```text
-owner-signed workload -> initial regional ProxyPeer records
-sidecar -> candidate proxy -> tenant-specific NodeCert handshake
-sidecar -> verified proxy -> bounded proxy discovery request
-sidecar -> every verified regional proxy -> authenticated route registration
+sidecar ===== Iroh connection =====> proxy endpoint
+          \=== relay fallback ====> proxy-hosted workload relay
+
+proxy  -- opens ingress stream --> sidecar --> local application
+sidecar -- opens egress stream --> proxy --> destination
+sidecar -- registration stream --> proxy route table
+sidecar -- discovery stream ----> proxy EndpointRecords
+proxy  -- signed announcement --> connected regional proxy
 ```
 
-## `podctl` Endpoints
+The workload ALPN is `/podmesh/workload/1`. Every bidirectional stream starts with a bounded
+operation frame identifying handshake, registration, proxy discovery, proxy announcement, ingress,
+or egress. Egress switches to raw bounded byte forwarding only after the existing tunnel request and
+response succeed.
 
-| Command | Network path |
-|---|---|
-| `apply -f` | scheduler selection, then encrypted agent admission and deployment |
-| `delete -f` | owner-signed encrypted command sent directly to receipt agent |
-| `get pods` | local receipt catalog only |
-| `get pods <id>` | owner-signed encrypted status command to receipt agent |
-| `logs <id>` | owner-signed encrypted logs command to receipt agent |
-| `convert` | local only |
-| `cert grant-proxy` | proxy REST identity endpoints and certificate provisioning |
+Each proxy loads a persistent Iroh secret and supervises an authenticated TLS `iroh-relay` service.
+Each sidecar is an ordinary Iroh endpoint: it does not host a relay, join gossip, publish to a DHT,
+or participate in scheduler protocols. Iroh may migrate proxy-sidecar connections from relay to a
+direct path when connectivity allows.
 
-## Availability Boundary
+## Identity And Discovery
 
-The scheduler may restart without affecting workloads; agents republish advertisements. Agent
-process restart reconciles all workloads from encrypted local state. Remote recovery after loss of an
-agent and its durable keys is not implemented. Workloads requiring that guarantee must eventually
-use multiple replicas and replica handoff.
+A signed EndpointRecord contains an Iroh EndpointId, one relay hint, bounded direct socket address
+hints, issue time, and expiry. Proxies refresh their own records before expiry and exchange them over
+transport-bound signed announcement streams. Proxy discovery remains tenant-scoped and bounded.
 
-## Current Security Boundary
+The application authorization behavior is unchanged:
 
-- Complete workload specifications and lifecycle responses are encrypted between `podctl` and the
-  selected agent.
-- The selected agent necessarily sees plaintext to execute the workload.
-- Proxy ingress is L7 HTTP and therefore not confidential from the proxy unless the application uses
-  end-to-end TLS or another workload-terminated encrypted protocol.
-- Proxy peer exchange contains no workload data and cannot grant authority; tenant certificates are
-  verified again by every sidecar.
-- Public advertisements and network timing remain observable metadata.
+1. The sidecar opens an Iroh connection to a configured EndpointRecord.
+2. The existing signed handshake is bound to the authenticated remote EndpointId.
+3. The proxy returns the owner-signed Biscuit grant it holds for that tenant, re-verified and
+   evicted if expired. The grant store is bounded.
+4. The sidecar verifies the grant's tenant owner against the owner key it was injected with, the
+   proxy endpoint binding, the signature, and the expiry, allowing bounded clock skew.
+5. Only verified proxies receive sidecar registration, discovery, and egress streams.
+6. The proxy verifies sidecar registration signature, tenant owner, endpoint binding, and expiry.
+
+Grants are Biscuit tokens rather than opaque certificates so a proxy can later attenuate and
+delegate its authority without the owner reissuing. They authenticate only the proxy-to-sidecar
+relationship; external ingress clients never present one.
+
+Route registration remains the only ingress routing authority. Routes expire after 120 seconds and
+are refreshed every 30 seconds. Ingress fails closed when no live route or connection exists.
+
+## Deployment Data Boundary
+
+Podctl accepts base64 signed EndpointRecords from `podmesh.io/proxy-endpoints` or
+`PODMESH_PROXY_ENDPOINTS`. The workload relay token comes from
+`PODMESH_WORKLOAD_RELAY_AUTH_TOKEN`; optional private CA certificates come from
+`PODMESH_WORKLOAD_RELAY_CA_CERTS` as base64 DER values.
+
+When those are not supplied, `PODMESH_PROXY_URL` bootstraps all three from the proxies' REST APIs
+via `GET /api/v1/workload_relay_bootstrap`. Every listed proxy must report the same relay token,
+because a sidecar is injected with exactly one; proxies achieve that by adopting a peer's token
+rather than each minting its own. Podctl also mints one owner-signed Biscuit grant per proxy and
+posts it to `POST /api/v1/proxy_grant` before deploying.
+
+Podctl puts these values only in the encrypted owner-signed execution specification. The selected
+agent injects them into sidecar metadata. They are not sent to the scheduler or the machine relay.
+
+## Availability
+
+A scheduler restart does not affect running workloads. A proxy relay outage interrupts relay-only
+paths to that proxy, while established direct paths may continue. Configure several regional proxy
+EndpointRecords for redundancy. Remote recovery after loss of an agent and its durable keys remains
+out of scope.

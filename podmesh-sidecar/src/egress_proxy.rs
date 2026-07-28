@@ -2,28 +2,24 @@
 //!
 //! Listens for connections redirected by nftables REDIRECT rules,
 //! recovers the original destination using SO_ORIGINAL_DST, and
-//! tunnels the traffic through libp2p to the proxy node.
+//! tunnels the traffic through the workload transport to the proxy node.
 
 use anyhow::{Context, Result};
-use libp2p::PeerId;
 use protocol::egress::EgressProtocol as Protocol;
 use socket2::{Domain, Socket, Type};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::unix::io::AsRawFd;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 
 /// Port where the transparent proxy listens for redirected traffic
 pub const EGRESS_PROXY_PORT: u16 = 15001;
 
-/// Maximum concurrent connections to handle
-#[allow(dead_code)]
+/// Maximum number of redirected connections handled concurrently. Connections
+/// beyond this bound are dropped immediately instead of growing the task set.
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
-
-/// Buffer size for bidirectional copy
-#[allow(dead_code)]
-const BUFFER_SIZE: usize = 16 * 1024;
 
 /// SO_ORIGINAL_DST socket option for recovering the original destination
 /// from a REDIRECT'd connection.
@@ -39,15 +35,12 @@ const IP_TRANSPARENT: libc::c_int = 19;
 pub struct EgressProxyConfig {
     /// Port to listen on for redirected connections
     pub listen_port: u16,
-    /// Proxy peer ID to tunnel traffic through
-    pub proxy_peer_id: Option<PeerId>,
 }
 
 impl Default for EgressProxyConfig {
     fn default() -> Self {
         Self {
             listen_port: EGRESS_PROXY_PORT,
-            proxy_peer_id: None,
         }
     }
 }
@@ -178,12 +171,21 @@ impl EgressProxy {
             addr
         );
 
+        let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
         loop {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
+                    let Ok(permit) = permits.clone().try_acquire_owned() else {
+                        log::warn!(
+                            "egress proxy dropped connection from {peer_addr}: concurrency limit of {MAX_CONCURRENT_CONNECTIONS} reached"
+                        );
+                        drop(stream);
+                        continue;
+                    };
                     let tunnel_tx = self.tunnel_tx.clone();
 
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = handle_connection(stream, peer_addr, tunnel_tx).await {
                             log::error!(
                                 "Failed to handle egress connection from {}: {}",
@@ -262,6 +264,5 @@ mod tests {
     fn test_default_config() {
         let config = EgressProxyConfig::default();
         assert_eq!(config.listen_port, EGRESS_PROXY_PORT);
-        assert!(config.proxy_peer_id.is_none());
     }
 }

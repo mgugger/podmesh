@@ -11,15 +11,15 @@ pub struct PodmeshAnnotations {
     pub replicas: Option<u32>,
     /// Lease TTL in seconds
     pub lease_ttl_secs: Option<u32>,
-    /// Initial regional proxy multiaddrs, each ending in `/p2p/<peer-id>`.
-    pub proxy_peers: Vec<String>,
+    /// Base64-encoded signed proxy EndpointRecords.
+    pub proxy_endpoints: Vec<String>,
 }
 
 impl PodmeshAnnotations {
     pub const TRUST_POLICY: &'static str = "podmesh.io/trust-policy";
     pub const REPLICAS: &'static str = "podmesh.io/replicas";
     pub const LEASE_TTL: &'static str = "podmesh.io/lease-ttl";
-    pub const PROXY_PEERS: &'static str = "podmesh.io/proxy-peers";
+    pub const PROXY_ENDPOINTS: &'static str = "podmesh.io/proxy-endpoints";
 
     /// Parse annotations from a serde_yaml Value (the annotations map from a k8s manifest).
     pub fn from_yaml_annotations(annotations: &serde_yaml::Value) -> Self {
@@ -35,7 +35,7 @@ impl PodmeshAnnotations {
         result.trust_policy = get(Self::TRUST_POLICY);
         result.replicas = get(Self::REPLICAS).and_then(|s| s.parse().ok());
         result.lease_ttl_secs = get(Self::LEASE_TTL).and_then(|s| s.parse().ok());
-        result.proxy_peers = get(Self::PROXY_PEERS)
+        result.proxy_endpoints = get(Self::PROXY_ENDPOINTS)
             .map(|value| {
                 value
                     .split(',')
@@ -59,7 +59,7 @@ impl PodmeshAnnotations {
                 if parsed.trust_policy.is_some()
                     || parsed.replicas.is_some()
                     || parsed.lease_ttl_secs.is_some()
-                    || !parsed.proxy_peers.is_empty()
+                    || !parsed.proxy_endpoints.is_empty()
                 {
                     return Ok(parsed);
                 }
@@ -90,7 +90,7 @@ metadata:
       allow { input.capabilities[_] == "gpu" }
     podmesh.io/replicas: "2"
     podmesh.io/lease-ttl: "120"
-    podmesh.io/proxy-peers: "/ip4/192.0.2.1/udp/4002/quic-v1/p2p/peer-a,/ip4/192.0.2.2/udp/4002/quic-v1/p2p/peer-b"
+    podmesh.io/proxy-endpoints: "record-a,record-b"
 spec:
   template:
     spec:
@@ -116,7 +116,7 @@ spec:
         assert!(ann.trust_policy.is_some());
         assert_eq!(ann.replicas, Some(2));
         assert_eq!(ann.lease_ttl_secs, Some(120));
-        assert_eq!(ann.proxy_peers.len(), 2);
+        assert_eq!(ann.proxy_endpoints.len(), 2);
     }
 
     #[test]

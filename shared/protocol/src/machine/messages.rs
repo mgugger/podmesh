@@ -6,7 +6,7 @@ pub struct Handshake {
     pub timestamp: u64,
     pub protocol_version: String,
     pub signature: String,
-    pub proxy_cert_b64: String,
+    pub proxy_grant_b64: String,
     pub tenant_owner_pubkey: String,
 }
 
@@ -23,8 +23,8 @@ impl Handshake {
     pub fn signature(&self) -> Option<&str> {
         non_empty(&self.signature)
     }
-    pub fn proxy_cert_b64(&self) -> Option<&str> {
-        non_empty(&self.proxy_cert_b64)
+    pub fn proxy_grant_b64(&self) -> Option<&str> {
+        non_empty(&self.proxy_grant_b64)
     }
     pub fn tenant_owner_pubkey(&self) -> Option<&str> {
         non_empty(&self.tenant_owner_pubkey)

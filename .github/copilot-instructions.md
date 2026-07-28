@@ -10,7 +10,14 @@ separate workload traffic plane.
 * Treat every non-selected node as untrusted. Complete workload specifications and lifecycle
   commands are signed by the namespace owner and encrypted to the selected agent's KEM key.
 * The scheduler MUST remain stateless: no Podman access, workload ciphertext, keys, lifecycle state,
-  status, logs, deletion, sidecar injection, or durable agent records.
+  status, logs, deletion, sidecar injection, or durable agent records. It relays owner-encrypted
+  bytes to agents but can neither read nor forge them.
+* `podctl` is a plain CLI with no Iroh endpoint. It speaks HTTP to any reachable scheduler; the
+  scheduler queries the mesh and proxies control traffic to the selected agent over Iroh.
+* Replica placement is a client decision. `podctl` reads `spec.replicas` (or `podmesh.io/replicas`),
+  pins the manifest it ships to a single pod, then asks a scheduler for one agent per replica while
+  excluding the agents it already picked. It admits and deploys against each agent itself. The
+  scheduler never learns the replica count and never fans a deployment out on its own.
 * `podmesh-agent` owns workload admission, aggregate resource accounting, Podman, sidecar injection,
   encrypted per-workload persistence, local restart reconciliation, status, logs, and deletion.
 * An agent can host many workloads, bounded by `max_workloads`, CPU, memory, storage, reservation,
@@ -26,59 +33,61 @@ The project consists of the following crates:
 
 | Crate | Description |
 |-------|-------------|
-| `podctl` | Namespace client: encrypted deployment, direct lifecycle commands, local receipts |
+| `podctl` | Namespace CLI: replica placement, encrypted deployment and lifecycle over HTTP to a scheduler, local receipts |
 | `shared/crypto` | Cryptographic primitives: signing, encryption, envelope validation |
-| `shared/protocol` | Bounded signed/encrypted records and workload-plane libp2p constants |
-| `shared/p2p` | Common libp2p utilities shared across components |
+| `shared/protocol` | Bounded signed/encrypted records and Iroh protocol constants |
+| `shared/iroh_support` | Common Iroh utilities shared across components |
 | `shared/axum_support` | Axum middleware and REST API helpers |
-| `podmesh-scheduler` | Stateless HTTP registry and deterministic agent selector |
+| `podmesh-scheduler` | Stateless placement over Iroh gossip plus the HTTP client API and agent relay |
 | `podmesh-agent` | Multi-workload admission, encrypted persistence, Podman, sidecar injection |
 | `podmesh-proxy` | Ingress/egress gateway: routes external traffic to sidecars |
-| `podmesh-sidecar` | In-pod companion: publishes to DHT, forwards traffic to app container |
+| `podmesh-sidecar` | In-pod companion: registers routes, forwards traffic to app container |
 
 ## Architecture
 
 ```text
-podmesh-agent --signed, expiring advertisement--> podmesh-scheduler
-podctl -------candidate selection---------------> podmesh-scheduler
-podctl ==encrypted admission/deployment=========> selected podmesh-agent
-podmesh-agent --Podman + sidecar injection------> many workloads
-podctl ==encrypted status/log/delete============> receipt agent
+podmesh-agent ==persistent authenticated Iroh attachment==> podmesh-scheduler
+podmesh-scheduler <==authenticated Iroh gossip==> podmesh-scheduler
+podctl --HTTP: select an agent (once per replica)--> podmesh-scheduler
+podctl ==HTTP: encrypted admission/deploy===> podmesh-scheduler ==Iroh==> agent
+podctl ==HTTP: encrypted status/log/delete==> podmesh-scheduler ==Iroh==> agent
+podmesh-agent --Podman + sidecar injection--> many workloads
 
-external client --> podmesh-proxy ==libp2p QUIC==> podmesh-sidecar --> application
-application --> podmesh-sidecar ==egress stream==> podmesh-proxy --> destination
+external client --> podmesh-proxy ==Iroh QUIC==> podmesh-sidecar --> application
+application --> podmesh-sidecar ==egress tunnel==> podmesh-proxy --> destination
 ```
 
 ### Component Details
 
 #### Scheduler (`podmesh-scheduler`)
-- **Registration**: Validates signed, short-lived `AgentAdvertisement` records in memory
-- **Selection**: Deterministically returns one available non-excluded agent by coarse load and node ID
-- **No workload ownership**: Never receives workload requirements, ciphertext, DEKs, status, or logs
+- **Attachment**: Accepts persistent authenticated Iroh connections from agents; holds no durable records
+- **Placement**: Gossips a bounded, signed, short-lived `CapacityQuery` and collects signed `CapacityOffer`s
+- **Relay**: Carries owner-encrypted control payloads to an attached agent over `AGENT_CONTROL_ALPN`
+- **No workload ownership**: Never sees workload plaintext, DEKs, lifecycle state, or logs
 
 #### Agent (`podmesh-agent`)
 - **Admission**: Verifies encrypted owner requests and reserves aggregate CPU, memory, and storage
 - **Execution**: Decrypts target-bound grants, injects sidecars, and deploys through Podman
 - **Persistence**: Stores one encrypted redb row per full workload ID and reconciles all rows on restart
 - **Lifecycle**: Handles owner-signed encrypted status, logs, and delete commands independently per workload
+- **HTTP**: Exposes only `/health`; all control traffic arrives over Iroh
 
 #### Proxy (`podmesh-proxy`)
 - **Ingress Gateway**: Accepts external HTTP traffic on configured ports
-- **DHT Discovery**: Looks up `podmesh/manifest/{manifest_id}` records to find sidecar endpoints
-- **P2P Forwarding**: Routes requests to sidecars via `/podmesh/ingress-proxy/1.0.0` protocol
-- **Caching**: Caches manifest-to-sidecar mappings for performance
+- **Discovery**: Resolves sidecar `EndpointRecord`s for a workload
+- **Forwarding**: Routes requests to sidecars over the `/podmesh/workload/1` Iroh protocol
 
 #### Sidecar (`podmesh-sidecar`)
-- **DHT Publishing**: Announces manifest routes to Kademlia DHT with TTL-based expiration
+- **Registration**: Announces its routes to the proxy over an authenticated stream
 - **Route Matching**: Matches incoming requests by path/host to local app endpoints
 - **Traffic Forwarding**: Proxies HTTP requests to the app container on localhost
 - **Metadata**: Reads pod metadata from `/var/run/podmesh/sidecar/metadata.json`
 
 ## Message Security
 
-**All workload-bearing and lifecycle communication MUST be encrypted and signed.** Public agent
-advertisements are intentionally not encrypted because they contain no workload or tenant data, but
-they MUST be self-signed, bounded, short-lived, and replay-resistant.
+**All workload-bearing and lifecycle communication MUST be encrypted and signed.** Capacity queries
+and offers are not encrypted because they carry no workload or tenant data, but they MUST be signed,
+bounded, short-lived, and replay-resistant.
 
 ### Envelope Structure
 
@@ -93,7 +102,7 @@ Envelope {
     alg: String,           // Signature algorithm ("ed25519")
     sig: String,           // Base64-encoded signature
     pubkey: String,        // Sender's signing public key (base64)
-    peer_id: String,       // Sender's libp2p peer ID
+    peer_id: String,       // Sender's endpoint identifier
     kem_pubkey: String,    // Sender's X25519 public key for encrypted responses
 }
 ```
@@ -124,34 +133,40 @@ Keys are managed via `shared/crypto/src/keypair_manager.rs`:
 
 ## Network Protocols
 
-### Scheduler And Agent HTTP
+### Scheduler Client HTTP API
+
+Consumed by `podctl`, which has no Iroh endpoint of its own.
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /api/v1/agents` | Register a signed, expiring agent advertisement |
-| `GET /api/v1/agents/select` | Select an available agent without workload data |
-| `POST agent:/api/v1/admission` | Encrypted owner-signed resource admission |
-| `POST agent:/api/v1/deploy` | Encrypted target-bound deployment grant |
-| `POST agent:/api/v1/command` | Encrypted status, logs, or delete command |
+| `GET /api/v1/agents/select` | Solicit the mesh and return one signed `CapacityOffer`. `?exclude=<hex>,<hex>` withholds agents the client already occupies, which is how it spreads replicas |
+| `POST /api/v1/agents/{endpoint_id}/admission` | Relay an encrypted owner admission request |
+| `POST /api/v1/agents/{endpoint_id}/deploy` | Relay an encrypted target-bound deployment grant |
+| `POST /api/v1/agents/{endpoint_id}/command` | Relay an encrypted status, logs, or delete command |
 
-HTTP is the initial transport. Records in `shared/protocol/src/agent.rs` must remain transport-neutral
-for a future Iroh endpoint implementation.
+`{endpoint_id}` is the agent's Iroh EndpointId as lowercase hex, taken from the `CapacityOffer`.
+The agent itself serves only `GET /health` over HTTP.
 
-### Proxy And Sidecar libp2p
+### Machine Plane Iroh Protocols
 
-The workload traffic plane uses libp2p QUIC. Active protocol IDs are defined in
-`shared/protocol/src/libp2p_constants.rs`.
+Protocol IDs live in `shared/protocol/src/{scheduler_mesh,agent_control,workload_stream}.rs`.
 
 | Protocol | Purpose |
 |---|---|
-| `/podmesh/handshake/1.0.0` | Peer handshake and tenant proxy certificate exchange |
-| `/podmesh/ingress-proxy/1.0.0` | Proxy-to-sidecar HTTP forwarding |
-| `/podmesh/sidecar-manifest/1.0.0` | Signed sidecar manifest fetch |
-| `/podmesh/egress-tunnel/1.0.0` | Sidecar-to-proxy TCP tunnel |
-| `/podmesh/sidecar-registration/1.0.0` | Authenticated route registration |
+| `/podmesh/scheduler-gossip/1` | Scheduler-to-scheduler capacity gossip |
+| `/podmesh/agent-capacity/1` | Persistent agent-to-scheduler attachment and capacity queries |
+| `/podmesh/capacity-offer/1` | Agent-to-scheduler signed capacity offers |
+| `/podmesh/scheduler-placement/1` | Scheduler-to-scheduler placement requests |
+| `/podmesh/agent-control/1` | Scheduler-to-agent relay of owner-encrypted control payloads |
 
-Kademlia and gossipsub are workload-plane discovery mechanisms for proxy and sidecar. The scheduler
-does not participate in libp2p or DHT storage.
+### Workload Plane Iroh Protocol
+
+| Protocol | Purpose |
+|---|---|
+| `/podmesh/workload/1` | Proxy/sidecar handshake, ingress forwarding, registration, and egress tunnels |
+
+There is no DHT, Kademlia, or gossipsub in the workload plane. Sidecars register their routes with
+the proxy over an authenticated stream.
 
 ## Rust Idioms
 

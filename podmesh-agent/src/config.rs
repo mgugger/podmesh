@@ -16,14 +16,10 @@ pub enum RuntimeKind {
 #[derive(Debug, Clone, Parser)]
 #[command(author, version, about)]
 pub struct Config {
+    /// Liveness-only HTTP listener. The agent's control plane is reachable
+    /// exclusively over Iroh, so nothing else is served here.
     #[arg(long, default_value = "0.0.0.0:3100")]
     pub listen: String,
-
-    #[arg(long, default_value = "http://127.0.0.1:3100")]
-    pub advertise_url: String,
-
-    #[arg(long, default_value = "http://127.0.0.1:3000")]
-    pub scheduler_url: String,
 
     #[arg(long, default_value = "/etc/podmesh/agent")]
     pub key_dir: PathBuf,
@@ -51,4 +47,7 @@ pub struct Config {
 
     #[arg(long, default_value_t = DEFAULT_MAX_WORKLOADS)]
     pub max_workloads: usize,
+
+    #[command(flatten)]
+    pub machine: crate::machine::MachineConfig,
 }

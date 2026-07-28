@@ -17,6 +17,7 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 crypto = { workspace = true }
+hex = { workspace = true }
 protocol = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }

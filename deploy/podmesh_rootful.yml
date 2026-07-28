@@ -1,37 +1,180 @@
+# Rootful local mesh: 3 schedulers, 3 agents, 3 proxies.
+#
+# No pre-created secrets. Every relay TLS pair and auth token is generated on
+# first start and persisted under the component's key directory. Schedulers
+# discover each other over HTTP, agents bootstrap from scheduler HTTP URLs, and
+# proxies 2 and 3 adopt proxy 1's relay token so a sidecar's single token works
+# against all three relays.
+#
+# Start with:  sudo podman kube play deploy/podmesh_rootful.yml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: podmesh-state
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
 apiVersion: v1
 kind: Pod
 metadata:
-  name: scheduler
+  name: podmesh-control
   labels:
-    app: scheduler
+    app: podmesh
 spec:
   restartPolicy: Always
   containers:
-    - name: scheduler
+    - name: scheduler-1
       image: podmesh/scheduler:latest
       env:
-      - name: RUST_LOG
-        value: "info"
+        - name: RUST_LOG
+          value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
+        - name: PODMESH_SCHEDULER_LISTEN
+          value: "0.0.0.0:3000"
+        - name: PODMESH_SCHEDULER_MACHINE_KEY_DIR
+          value: "/var/lib/podmesh/scheduler-1/keys"
+        - name: PODMESH_SCHEDULER_MACHINE_BIND
+          value: "0.0.0.0:5001"
+        - name: PODMESH_RELAY_AUDIENCE
+          value: "https://podmesh-control:7440"
+        - name: PODMESH_RELAY_HTTP_LISTEN
+          value: "0.0.0.0:7070"
+        - name: PODMESH_RELAY_HTTPS_LISTEN
+          value: "0.0.0.0:7440"
+        - name: PODMESH_RELAY_QAD_LISTEN
+          value: "0.0.0.0:7840"
+        - name: PODMESH_RELAY_METRICS_LISTEN
+          value: "0.0.0.0:9090"
+        # Every scheduler trusts every relay. A scheduler that comes up before
+        # its peers have written their relay certificates exits and is
+        # restarted until all three exist, so the order of startup is free.
+        - name: PODMESH_SCHEDULER_MACHINE_RELAY_URLS
+          value: "https://podmesh-control:7440,https://podmesh-control:7441,https://podmesh-control:7442"
+        - name: PODMESH_SCHEDULER_MACHINE_RELAY_CA_CERTIFICATES
+          value: "/var/lib/podmesh/scheduler-1/keys/machine-relay/relay.crt,/var/lib/podmesh/scheduler-2/keys/machine-relay/relay.crt,/var/lib/podmesh/scheduler-3/keys/machine-relay/relay.crt"
+        # Every scheduler lists every peer, including itself. Peers are
+        # admitted as they come up, so the three converge without any of them
+        # needing to be started first.
+        - name: PODMESH_SCHEDULER_PEER_URLS
+          value: "http://localhost:3000,http://localhost:3001,http://localhost:3002"
       ports:
         - containerPort: 3000
           hostPort: 3000
           protocol: TCP
-    - name: agent
+      volumeMounts:
+        - name: podmesh-state
+          mountPath: /var/lib/podmesh
+    - name: scheduler-2
+      image: podmesh/scheduler:latest
+      env:
+        - name: RUST_LOG
+          value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
+        - name: PODMESH_SCHEDULER_LISTEN
+          value: "0.0.0.0:3001"
+        - name: PODMESH_SCHEDULER_MACHINE_KEY_DIR
+          value: "/var/lib/podmesh/scheduler-2/keys"
+        - name: PODMESH_SCHEDULER_MACHINE_BIND
+          value: "0.0.0.0:5002"
+        - name: PODMESH_RELAY_AUDIENCE
+          value: "https://podmesh-control:7441"
+        - name: PODMESH_RELAY_HTTP_LISTEN
+          value: "0.0.0.0:7071"
+        - name: PODMESH_RELAY_HTTPS_LISTEN
+          value: "0.0.0.0:7441"
+        - name: PODMESH_RELAY_QAD_LISTEN
+          value: "0.0.0.0:7841"
+        - name: PODMESH_RELAY_METRICS_LISTEN
+          value: "0.0.0.0:9091"
+        - name: PODMESH_SCHEDULER_MACHINE_RELAY_URLS
+          value: "https://podmesh-control:7440,https://podmesh-control:7441,https://podmesh-control:7442"
+        - name: PODMESH_SCHEDULER_MACHINE_RELAY_CA_CERTIFICATES
+          value: "/var/lib/podmesh/scheduler-1/keys/machine-relay/relay.crt,/var/lib/podmesh/scheduler-2/keys/machine-relay/relay.crt,/var/lib/podmesh/scheduler-3/keys/machine-relay/relay.crt"
+        - name: PODMESH_SCHEDULER_PEER_URLS
+          value: "http://localhost:3000,http://localhost:3001,http://localhost:3002"
+      ports:
+        - containerPort: 3001
+          hostPort: 3001
+          protocol: TCP
+      volumeMounts:
+        - name: podmesh-state
+          mountPath: /var/lib/podmesh
+    - name: scheduler-3
+      image: podmesh/scheduler:latest
+      env:
+        - name: RUST_LOG
+          value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
+        - name: PODMESH_SCHEDULER_LISTEN
+          value: "0.0.0.0:3002"
+        - name: PODMESH_SCHEDULER_MACHINE_KEY_DIR
+          value: "/var/lib/podmesh/scheduler-3/keys"
+        - name: PODMESH_SCHEDULER_MACHINE_BIND
+          value: "0.0.0.0:5003"
+        - name: PODMESH_RELAY_AUDIENCE
+          value: "https://podmesh-control:7442"
+        - name: PODMESH_RELAY_HTTP_LISTEN
+          value: "0.0.0.0:7072"
+        - name: PODMESH_RELAY_HTTPS_LISTEN
+          value: "0.0.0.0:7442"
+        - name: PODMESH_RELAY_QAD_LISTEN
+          value: "0.0.0.0:7842"
+        - name: PODMESH_RELAY_METRICS_LISTEN
+          value: "0.0.0.0:9092"
+        - name: PODMESH_SCHEDULER_MACHINE_RELAY_URLS
+          value: "https://podmesh-control:7440,https://podmesh-control:7441,https://podmesh-control:7442"
+        - name: PODMESH_SCHEDULER_MACHINE_RELAY_CA_CERTIFICATES
+          value: "/var/lib/podmesh/scheduler-1/keys/machine-relay/relay.crt,/var/lib/podmesh/scheduler-2/keys/machine-relay/relay.crt,/var/lib/podmesh/scheduler-3/keys/machine-relay/relay.crt"
+        - name: PODMESH_SCHEDULER_PEER_URLS
+          value: "http://localhost:3000,http://localhost:3001,http://localhost:3002"
+      ports:
+        - containerPort: 3002
+          hostPort: 3002
+          protocol: TCP
+      volumeMounts:
+        - name: podmesh-state
+          mountPath: /var/lib/podmesh
+  volumes:
+    - name: podmesh-state
+      persistentVolumeClaim:
+        claimName: podmesh-state
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: podmesh-agents
+  labels:
+    app: podmesh
+spec:
+  restartPolicy: Always
+  containers:
+    # Each agent attaches to all three schedulers. It bootstraps their signed
+    # EndpointRecords over HTTP, so nothing has to be copied by hand. An agent
+    # that starts before the schedulers have written their relay certificates
+    # exits and is restarted until they exist.
+    - name: agent-1
       image: podmesh/agent:latest
       env:
-      - name: RUST_LOG
-        value: "info"
-      - name: CONTAINER_HOST
-        value: "unix:///run/podman/podman.sock"
+        - name: RUST_LOG
+          value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
+        - name: CONTAINER_HOST
+          value: "unix:///run/podman/podman.sock"
+        - name: PODMESH_AGENT_SCHEDULER_URLS
+          value: "http://podmesh-control:3000,http://podmesh-control:3001,http://podmesh-control:3002"
+        - name: PODMESH_AGENT_MACHINE_RELAY_URLS
+          value: "https://podmesh-control:7440,https://podmesh-control:7441,https://podmesh-control:7442"
+        - name: PODMESH_AGENT_MACHINE_RELAY_CA_CERTIFICATES
+          value: "/var/lib/podmesh/scheduler-1/keys/machine-relay/relay.crt,/var/lib/podmesh/scheduler-2/keys/machine-relay/relay.crt,/var/lib/podmesh/scheduler-3/keys/machine-relay/relay.crt"
+        - name: PODMESH_AGENT_MACHINE_BIND
+          value: "0.0.0.0:5011"
       args:
-        - "--advertise-url"
-        - "http://127.0.0.1:3100"
-        - "--scheduler-url"
-        - "http://127.0.0.1:3000"
+        - "--listen"
+        - "0.0.0.0:3100"
         - "--key-dir"
-        - "/var/lib/podmesh-agent/keys"
+        - "/var/lib/podmesh/agent-1/keys"
         - "--state-path"
-        - "/var/lib/podmesh-agent/state.redb"
+        - "/var/lib/podmesh/agent-1/state.redb"
         - "--max-workloads"
         - "100"
       ports:
@@ -41,110 +184,200 @@ spec:
       volumeMounts:
         - name: podman-socket
           mountPath: /run/podman/podman.sock
-        - name: agent-state
-          mountPath: /var/lib/podmesh-agent
+        - name: podmesh-state
+          mountPath: /var/lib/podmesh
+    - name: agent-2
+      image: podmesh/agent:latest
+      env:
+        - name: RUST_LOG
+          value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
+        - name: CONTAINER_HOST
+          value: "unix:///run/podman/podman.sock"
+        - name: PODMESH_AGENT_SCHEDULER_URLS
+          value: "http://podmesh-control:3000,http://podmesh-control:3001,http://podmesh-control:3002"
+        - name: PODMESH_AGENT_MACHINE_RELAY_URLS
+          value: "https://podmesh-control:7440,https://podmesh-control:7441,https://podmesh-control:7442"
+        - name: PODMESH_AGENT_MACHINE_RELAY_CA_CERTIFICATES
+          value: "/var/lib/podmesh/scheduler-1/keys/machine-relay/relay.crt,/var/lib/podmesh/scheduler-2/keys/machine-relay/relay.crt,/var/lib/podmesh/scheduler-3/keys/machine-relay/relay.crt"
+        - name: PODMESH_AGENT_MACHINE_BIND
+          value: "0.0.0.0:5012"
+      args:
+        - "--listen"
+        - "0.0.0.0:3101"
+        - "--key-dir"
+        - "/var/lib/podmesh/agent-2/keys"
+        - "--state-path"
+        - "/var/lib/podmesh/agent-2/state.redb"
+        - "--max-workloads"
+        - "100"
+      ports:
+        - containerPort: 3101
+          hostPort: 3101
+          protocol: TCP
+      volumeMounts:
+        - name: podman-socket
+          mountPath: /run/podman/podman.sock
+        - name: podmesh-state
+          mountPath: /var/lib/podmesh
+    - name: agent-3
+      image: podmesh/agent:latest
+      env:
+        - name: RUST_LOG
+          value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
+        - name: CONTAINER_HOST
+          value: "unix:///run/podman/podman.sock"
+        - name: PODMESH_AGENT_SCHEDULER_URLS
+          value: "http://podmesh-control:3000,http://podmesh-control:3001,http://podmesh-control:3002"
+        - name: PODMESH_AGENT_MACHINE_RELAY_URLS
+          value: "https://podmesh-control:7440,https://podmesh-control:7441,https://podmesh-control:7442"
+        - name: PODMESH_AGENT_MACHINE_RELAY_CA_CERTIFICATES
+          value: "/var/lib/podmesh/scheduler-1/keys/machine-relay/relay.crt,/var/lib/podmesh/scheduler-2/keys/machine-relay/relay.crt,/var/lib/podmesh/scheduler-3/keys/machine-relay/relay.crt"
+        - name: PODMESH_AGENT_MACHINE_BIND
+          value: "0.0.0.0:5013"
+      args:
+        - "--listen"
+        - "0.0.0.0:3102"
+        - "--key-dir"
+        - "/var/lib/podmesh/agent-3/keys"
+        - "--state-path"
+        - "/var/lib/podmesh/agent-3/state.redb"
+        - "--max-workloads"
+        - "100"
+      ports:
+        - containerPort: 3102
+          hostPort: 3102
+          protocol: TCP
+      volumeMounts:
+        - name: podman-socket
+          mountPath: /run/podman/podman.sock
+        - name: podmesh-state
+          mountPath: /var/lib/podmesh
   volumes:
     - name: podman-socket
       hostPath:
         path: /run/podman/podman.sock
         type: Socket
-    - name: agent-state
+    - name: podmesh-state
       persistentVolumeClaim:
-        claimName: podmesh-agent-state
+        claimName: podmesh-state
 ---
 apiVersion: v1
 kind: Pod
 metadata:
-  name: proxy
+  name: podmesh-proxies
   labels:
     app: podmesh
 spec:
   restartPolicy: Always
   containers:
-    - name: proxy-bootstrap
+    # proxy-1 mints the workload relay token and publishes it, along with its
+    # relay CA certificate and signed EndpointRecord, so podctl and the other
+    # proxies can bootstrap without a pre-created secret. Only enable
+    # --publish-relay-bootstrap on a network you trust.
+    - name: proxy-1
       image: podmesh/proxy:latest
       args:
         - "--enable-ingress"
         - "--key-dir"
-        - "/var/lib/podmesh-proxy/proxy-bootstrap"
+        - "/var/lib/podmesh/proxy-1/keys"
       env:
-        - name: libp2p_quic_port
-          value: "4002"
-        - name: rest_api_port
-          value: "3001"
         - name: RUST_LOG
-          value: "debug"
+          value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
+        - name: PODMESH_PROXY_IROH_BIND
+          value: "0.0.0.0:4001"
+        - name: PODMESH_PROXY_PUBLISH_RELAY_BOOTSTRAP
+          value: "true"
+        - name: PODMESH_WORKLOAD_RELAY_URL
+          value: "https://podmesh-proxies:7450"
+        - name: PODMESH_WORKLOAD_RELAY_HTTP_LISTEN
+          value: "0.0.0.0:7080"
+        - name: PODMESH_WORKLOAD_RELAY_HTTPS_LISTEN
+          value: "0.0.0.0:7450"
+        - name: PODMESH_WORKLOAD_RELAY_QAD_LISTEN
+          value: "0.0.0.0:7850"
+        - name: PODMESH_WORKLOAD_RELAY_METRICS_LISTEN
+          value: "0.0.0.0:9100"
+        - name: rest_api_port
+          value: "3010"
       ports:
-        - containerPort: 4002
-          hostPort: 4002
-          protocol: UDP
-        - containerPort: 4002
-          hostPort: 4002
+        - containerPort: 3010
+          hostPort: 3010
           protocol: TCP
-        - containerPort: 3001
-          hostPort: 3001
-          protocol: TCP
-        - containerPort: 3001
-          hostPort: 3001
-          protocol: UDP
-        - containerPort: 8080
-          hostPort: 8080
-          protocol: UDP
         - containerPort: 8080
           hostPort: 8080
           protocol: TCP
       volumeMounts:
-        - name: proxy-state
-          mountPath: /var/lib/podmesh-proxy
-    - name: proxy-1
-      image: podmesh/proxy:latest
-      env:
-        - name: RUST_LOG
-          value: "info"
-        - name: libp2p_quic_port
-          value: "4003"
-        - name: rest_api_port
-          value: "3002"
-        - name: PODMESH_PROXY_PEERS
-          valueFrom:
-            secretKeyRef:
-              name: podmesh-proxy-topology
-              key: bootstrap-peer
-      args:
-        - "--key-dir"
-        - "/var/lib/podmesh-proxy/proxy-1"
-      ports:
-        - containerPort: 3002
-          hostPort: 3002
-          protocol: TCP
-      volumeMounts:
-        - name: proxy-state
-          mountPath: /var/lib/podmesh-proxy
+        - name: podmesh-state
+          mountPath: /var/lib/podmesh
     - name: proxy-2
       image: podmesh/proxy:latest
-      env:
-        - name: RUST_LOG
-          value: "info"
-        - name: libp2p_quic_port
-          value: "4004"
-        - name: rest_api_port
-          value: "3003"
-        - name: PODMESH_PROXY_PEERS
-          valueFrom:
-            secretKeyRef:
-              name: podmesh-proxy-topology
-              key: bootstrap-peer
       args:
         - "--key-dir"
-        - "/var/lib/podmesh-proxy/proxy-2"
+        - "/var/lib/podmesh/proxy-2/keys"
+      env:
+        - name: RUST_LOG
+          value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
+        - name: PODMESH_PROXY_IROH_BIND
+          value: "0.0.0.0:4002"
+        - name: PODMESH_PROXY_PUBLISH_RELAY_BOOTSTRAP
+          value: "true"
+        # A sidecar carries one relay token, so proxy-2 adopts proxy-1's
+        # instead of minting a token that would lock the others out.
+        - name: PODMESH_WORKLOAD_RELAY_BOOTSTRAP_URL
+          value: "http://localhost:3010"
+        - name: PODMESH_WORKLOAD_RELAY_URL
+          value: "https://podmesh-proxies:7451"
+        - name: PODMESH_WORKLOAD_RELAY_HTTP_LISTEN
+          value: "0.0.0.0:7081"
+        - name: PODMESH_WORKLOAD_RELAY_HTTPS_LISTEN
+          value: "0.0.0.0:7451"
+        - name: PODMESH_WORKLOAD_RELAY_QAD_LISTEN
+          value: "0.0.0.0:7851"
+        - name: PODMESH_WORKLOAD_RELAY_METRICS_LISTEN
+          value: "0.0.0.0:9101"
+        - name: rest_api_port
+          value: "3011"
       ports:
-        - containerPort: 3003
-          hostPort: 3003
+        - containerPort: 3011
+          hostPort: 3011
           protocol: TCP
       volumeMounts:
-        - name: proxy-state
-          mountPath: /var/lib/podmesh-proxy
+        - name: podmesh-state
+          mountPath: /var/lib/podmesh
+    - name: proxy-3
+      image: podmesh/proxy:latest
+      args:
+        - "--key-dir"
+        - "/var/lib/podmesh/proxy-3/keys"
+      env:
+        - name: RUST_LOG
+          value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
+        - name: PODMESH_PROXY_IROH_BIND
+          value: "0.0.0.0:4003"
+        - name: PODMESH_PROXY_PUBLISH_RELAY_BOOTSTRAP
+          value: "true"
+        - name: PODMESH_WORKLOAD_RELAY_BOOTSTRAP_URL
+          value: "http://localhost:3010"
+        - name: PODMESH_WORKLOAD_RELAY_URL
+          value: "https://podmesh-proxies:7452"
+        - name: PODMESH_WORKLOAD_RELAY_HTTP_LISTEN
+          value: "0.0.0.0:7082"
+        - name: PODMESH_WORKLOAD_RELAY_HTTPS_LISTEN
+          value: "0.0.0.0:7452"
+        - name: PODMESH_WORKLOAD_RELAY_QAD_LISTEN
+          value: "0.0.0.0:7852"
+        - name: PODMESH_WORKLOAD_RELAY_METRICS_LISTEN
+          value: "0.0.0.0:9102"
+        - name: rest_api_port
+          value: "3012"
+      ports:
+        - containerPort: 3012
+          hostPort: 3012
+          protocol: TCP
+      volumeMounts:
+        - name: podmesh-state
+          mountPath: /var/lib/podmesh
   volumes:
-    - name: proxy-state
+    - name: podmesh-state
       persistentVolumeClaim:
-        claimName: podmesh-proxy-state
+        claimName: podmesh-state

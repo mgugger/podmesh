@@ -16,9 +16,9 @@ use log::{error, info, warn};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-use crate::p2p::ProxyClient;
-use p2p::http_proxy::ProxyHttpRequest;
-use protocol::libp2p_constants::MESH_DOMAIN_SUFFIX;
+use crate::iroh_runtime::ProxyClient;
+use protocol::MESH_DOMAIN_SUFFIX;
+use protocol::ProxyHttpRequest;
 const MAX_PROXY_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct IngressServer {

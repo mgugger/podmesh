@@ -71,6 +71,16 @@ pub fn convert_manifest(yaml_str: &str) -> anyhow::Result<(String, Vec<String>)>
             kind.as_str(),
             "Pod" | "Deployment" | "ReplicaSet" | "StatefulSet"
         ) {
+            // Carry the manifest's own replica count into the annotation so the
+            // podmesh-native form keeps requesting the same spread across
+            // agents. Podmesh places one pod per agent, never N pods on one.
+            let replicas = value
+                .get("spec")
+                .and_then(|spec| spec.get("replicas"))
+                .and_then(serde_yaml::Value::as_u64)
+                .unwrap_or(1)
+                .clamp(1, u64::from(protocol::MAX_WORKLOAD_REPLICAS))
+                .to_string();
             let metadata = value.get_mut("metadata").and_then(|m| m.as_mapping_mut());
             if let Some(meta) = metadata {
                 let annotations = meta
@@ -79,7 +89,7 @@ pub fn convert_manifest(yaml_str: &str) -> anyhow::Result<(String, Vec<String>)>
                 if let Some(ann_map) = annotations.as_mapping_mut() {
                     // Only inject if not already present
                     let defaults = [
-                        (PodmeshAnnotations::REPLICAS, "1"),
+                        (PodmeshAnnotations::REPLICAS, replicas.as_str()),
                         (PodmeshAnnotations::LEASE_TTL, "60"),
                     ];
                     for (key, default_val) in defaults {
