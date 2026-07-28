@@ -17,8 +17,8 @@ use podmesh_agent::{
 use podmesh_scheduler::{
     clientapi::ClientApi,
     machine::{
-        AgentControlForwarder, AttachmentManager, CapacityCoordinator, PlacementHandler,
-        QueryManager, SchedulerGossip, SchedulerIdentity, ValidatedMachineConfig,
+        AgentControlForwarder, AttachmentManager, CapacityCoordinator, PeerControlRelay,
+        PlacementHandler, QueryManager, SchedulerGossip, SchedulerIdentity, ValidatedMachineConfig,
     },
 };
 use protocol::AgentControlOperation;
@@ -118,9 +118,11 @@ async fn podctl_http_reaches_the_agent_through_the_scheduler() -> Result<()> {
     let forwarder = AgentControlForwarder::new(
         scheduler_endpoint.clone(),
         attachments.clone(),
+        PeerControlRelay::new(scheduler_endpoint.clone(), gossip.members(), TEST_TIMEOUT),
         TEST_TIMEOUT,
         MAX_CONCURRENT_RELAYS,
     );
+    gossip.control_relay().install(forwarder.clone())?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let api_base = format!("http://{}", listener.local_addr()?);
     let http = tokio::spawn(

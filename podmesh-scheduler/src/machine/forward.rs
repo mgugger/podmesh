@@ -5,6 +5,10 @@
 //! forwarded here is already signed by the namespace owner and encrypted to the
 //! agent's KEM key: the scheduler moves opaque bytes and can neither read nor
 //! forge them.
+//!
+//! An agent attaches to one scheduler, but a client may reach any of them, so
+//! a scheduler that does not hold the attachment hands the payload to the peer
+//! that does. That second hop is equally blind and is never taken twice.
 
 use std::time::Duration;
 
@@ -16,19 +20,20 @@ use protocol::{
 };
 use tokio::sync::Semaphore;
 
-use super::AttachmentManager;
+use super::{AttachmentManager, PeerControlRelay};
 
 #[derive(Clone)]
 pub struct AgentControlForwarder {
     endpoint: Endpoint,
     attachments: AttachmentManager,
+    peers: PeerControlRelay,
     operation_timeout: Duration,
     permits: std::sync::Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardError {
-    /// No attached agent holds this EndpointId.
+    /// No scheduler in the mesh holds an attachment for this EndpointId.
     UnknownAgent,
     /// The scheduler is already relaying its configured maximum.
     Busy,
@@ -41,7 +46,7 @@ pub enum ForwardError {
 impl std::fmt::Display for ForwardError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
-            Self::UnknownAgent => "agent is not attached to this scheduler",
+            Self::UnknownAgent => "agent is not attached to any scheduler in the mesh",
             Self::Busy => "scheduler control relay is saturated",
             Self::Rejected => "agent rejected the request",
             Self::Unavailable => "agent control endpoint is unreachable",
@@ -54,18 +59,52 @@ impl AgentControlForwarder {
     pub fn new(
         endpoint: Endpoint,
         attachments: AttachmentManager,
+        peers: PeerControlRelay,
         operation_timeout: Duration,
         max_concurrent: usize,
     ) -> Self {
         Self {
             endpoint,
             attachments,
+            peers,
             operation_timeout,
             permits: std::sync::Arc::new(Semaphore::new(max_concurrent)),
         }
     }
 
+    /// Whether this scheduler currently holds the agent's attachment.
+    pub async fn holds_attachment(&self, agent: EndpointId) -> bool {
+        self.attachments.agent_addr(agent).await.is_some()
+    }
+
+    /// Entry point for the client HTTP API.
+    ///
+    /// Falls back to a single peer hop when the agent is attached elsewhere,
+    /// which is what makes every scheduler an equally valid control entry
+    /// point regardless of where an agent happens to be attached.
     pub async fn forward(
+        &self,
+        agent: EndpointId,
+        operation: AgentControlOperation,
+        encrypted_payload: Vec<u8>,
+    ) -> Result<Vec<u8>, ForwardError> {
+        // Checked before moving the payload: a deployment grant can be tens of
+        // megabytes and must not be cloned just to pick a route.
+        if self.holds_attachment(agent).await {
+            return self
+                .forward_attached(agent, operation, encrypted_payload)
+                .await;
+        }
+        self.peers
+            .deliver(agent, operation, encrypted_payload)
+            .await
+    }
+
+    /// Local-only delivery to an agent attached to this scheduler.
+    ///
+    /// The peer relay handler calls exactly this, never [`Self::forward`], so a
+    /// relayed request can never trigger a second hop.
+    pub async fn forward_attached(
         &self,
         agent: EndpointId,
         operation: AgentControlOperation,

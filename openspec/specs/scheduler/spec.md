@@ -56,10 +56,42 @@ The scheduler SHALL accept persistent authenticated Iroh attachments from agents
 `POST /api/v1/agents/{endpoint_id}/{admission,deploy,command}`. The `{endpoint_id}` SHALL be the
 agent's Iroh endpoint id as lowercase hex.
 
-#### Scenario: Relay to an unattached agent
+#### Scenario: Relay to an agent no scheduler holds
 
-- **WHEN** a client addresses an agent that is not currently attached
+- **WHEN** a client addresses an agent that is not attached anywhere in the mesh
 - **THEN** the scheduler returns an error rather than buffering the payload
+
+### Requirement: Any scheduler SHALL be a valid control entry point
+
+A scheduler that does not hold the target attachment SHALL relay the owner-encrypted payload
+through the peer scheduler that does, over `/podmesh/agent-control-relay/1`, because an agent holds
+exactly one attachment while a client may address any scheduler. The peer hop SHALL be taken at
+most once: a scheduler serving a relayed request SHALL consult only its own attachments and SHALL
+NOT forward it onward. The relayed bytes SHALL be the client's bytes unchanged, so the extra hop
+grants no scheduler any ability it did not already have.
+
+#### Scenario: Client reaches an agent attached to another scheduler
+
+- **GIVEN** an agent attached to scheduler B
+- **WHEN** a client sends an admission, deployment, or lifecycle payload to scheduler A
+- **THEN** scheduler A relays it through scheduler B and returns the agent's answer
+
+#### Scenario: A relayed request never fans out
+
+- **WHEN** a scheduler receives a relayed control request for an agent it does not hold
+- **THEN** it answers that it does not hold the agent
+- **AND** it does not ask any further peer
+
+#### Scenario: Only admitted schedulers may relay
+
+- **WHEN** an endpoint outside the member allowlist opens the control relay protocol
+- **THEN** the connection is refused
+
+#### Scenario: Locating an agent does not move the payload
+
+- **WHEN** a scheduler searches for the peer holding an attachment
+- **THEN** it probes peers without the payload
+- **AND** it transfers the payload only to the peer that claims the attachment
 
 ### Requirement: The scheduler SHALL publish its identity over HTTP for bootstrap
 

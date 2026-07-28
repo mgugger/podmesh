@@ -20,7 +20,10 @@ use tokio::{sync::broadcast, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use super::ValidatedMachineConfig;
-use super::{AgentAttachmentHandler, CapacityOfferHandler, MemberRegistry, PlacementHandler};
+use super::{
+    AgentAttachmentHandler, AgentControlRelayHandler, CapacityOfferHandler, MemberRegistry,
+    PlacementHandler,
+};
 
 pub const SCHEDULER_GOSSIP_ALPN: &[u8] = b"/podmesh/scheduler-gossip/1";
 pub const SCHEDULER_GOSSIP_TOPIC: TopicId = TopicId::from_bytes([0x50; 32]);
@@ -59,6 +62,7 @@ pub struct SchedulerGossip {
     receiver_task: JoinHandle<Result<()>>,
     cancellation: CancellationToken,
     members: MemberRegistry,
+    control_relay: AgentControlRelayHandler,
 }
 
 #[derive(Clone)]
@@ -110,6 +114,13 @@ impl SchedulerGossip {
             "scheduler gossip message bound was not applied"
         );
         let members = MemberRegistry::new(config.scheduler_members.clone())?;
+        // The forwarder cannot exist before the router is up, so the handler is
+        // created here and completed with `install` once startup finishes.
+        let control_relay = AgentControlRelayHandler::new(
+            members.clone(),
+            crate::clientapi::MAX_CONCURRENT_CLIENT_RELAYS,
+            crate::clientapi::CLIENT_RELAY_TIMEOUT,
+        );
         let router = Router::builder(endpoint)
             .accept(
                 SCHEDULER_GOSSIP_ALPN,
@@ -121,6 +132,7 @@ impl SchedulerGossip {
             .accept(protocol::AGENT_CAPACITY_ALPN, attachment_handler)
             .accept(protocol::CAPACITY_OFFER_ALPN, offer_handler)
             .accept(protocol::SCHEDULER_PLACEMENT_ALPN, placement_handler)
+            .accept(protocol::AGENT_CONTROL_RELAY_ALPN, control_relay.clone())
             .spawn();
         // Subscription must not depend on a peer being up. A scheduler that
         // cannot reach its bootstrap peers still serves clients and attached
@@ -196,6 +208,7 @@ impl SchedulerGossip {
             receiver_task,
             cancellation,
             members,
+            control_relay,
         })
     }
 
@@ -203,6 +216,12 @@ impl SchedulerGossip {
     /// admit schedulers that were not reachable at startup.
     pub fn members(&self) -> MemberRegistry {
         self.members.clone()
+    }
+
+    /// Handle onto the peer control relay, so startup can install the
+    /// forwarder it delivers through.
+    pub fn control_relay(&self) -> AgentControlRelayHandler {
+        self.control_relay.clone()
     }
 
     /// Dials newly discovered peers into the gossip mesh.

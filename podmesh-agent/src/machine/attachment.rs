@@ -143,14 +143,13 @@ async fn process_query(
     bytes: &[u8],
 ) -> Result<()> {
     let now = now_secs();
+    // Placement is mesh-wide: a client may reach any scheduler, so a query can
+    // legitimately originate from one this agent never configured. The agent's
+    // scheduler list is a bootstrap list, not an authorization list. What makes
+    // the query trustworthy is that it is signed, unexpired, replay-checked
+    // here, and was fanned out over the authenticated attachment by the one
+    // scheduler this agent chose, which admits only mesh members as origins.
     let query = CapacityQuery::from_bytes(bytes, now)?;
-    ensure!(
-        config.scheduler_endpoints.iter().any(|scheduler| {
-            scheduler.endpoint_id == query.reply_endpoint.endpoint_id
-                && scheduler.signing_pubkey == query.signing_pubkey
-        }),
-        "capacity query origin is not a configured scheduler"
-    );
     if !seen.lock().await.insert(
         query.signing_pubkey.clone(),
         query.query_id.clone(),

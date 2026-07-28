@@ -11,6 +11,13 @@ pub use agent_control::{
     MAX_AGENT_CONTROL_PAYLOAD_BYTES,
 };
 
+pub mod agent_control_relay;
+pub use agent_control_relay::{
+    AGENT_CONTROL_RELAY_ALPN, AGENT_CONTROL_RELAY_PROTOCOL_VERSION, AgentControlRelayError,
+    AgentControlRelayIntent, AgentControlRelayRequest, AgentControlRelayResponse,
+    MAX_AGENT_CONTROL_RELAY_FRAME_BYTES,
+};
+
 pub mod capacity;
 pub use capacity::{
     CAPACITY_PROTOCOL_VERSION, CapacityOffer, CapacityQuery, MAX_CAPACITY_MESSAGE_BYTES,

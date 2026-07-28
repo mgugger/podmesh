@@ -139,12 +139,21 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         &machine_config,
     );
     placement.install(capacity_service.clone())?;
+    let peer_control_relay = machine::PeerControlRelay::new(
+        machine_endpoint.clone(),
+        scheduler_gossip.members(),
+        clientapi::CLIENT_RELAY_TIMEOUT,
+    );
     let forwarder = machine::AgentControlForwarder::new(
         machine_endpoint.clone(),
         attachments,
+        peer_control_relay,
         clientapi::CLIENT_RELAY_TIMEOUT,
         clientapi::MAX_CONCURRENT_CLIENT_RELAYS,
     );
+    scheduler_gossip
+        .control_relay()
+        .install(forwarder.clone())?;
     log::info!(
         "stateless scheduler listening on {}",
         listener.local_addr()?

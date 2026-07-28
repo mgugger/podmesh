@@ -1,3 +1,9 @@
+//! Helpers shared by the scheduler integration tests.
+//!
+//! Every test binary compiles this module separately, so a helper that only
+//! some of them need is not dead code even though one binary sees it unused.
+#![allow(dead_code)]
+
 use std::{collections::HashSet, time::Duration};
 
 use anyhow::{Context, Result};

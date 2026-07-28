@@ -149,10 +149,16 @@ metadata:
 spec:
   restartPolicy: Always
   containers:
-    # Each agent attaches to all three schedulers. It bootstraps their signed
-    # EndpointRecords over HTTP, so nothing has to be copied by hand. An agent
-    # that starts before the schedulers have written their relay certificates
-    # exits and is restarted until they exist.
+    # Agents deliberately do not attach evenly: agent-1 and agent-2 attach to
+    # scheduler-2, agent-3 to scheduler-3, and nothing attaches to scheduler-1.
+    # A client can still drive everything through scheduler-1, because a
+    # scheduler relays control traffic through the peer that holds an agent's
+    # attachment. Each agent bootstraps its scheduler's signed EndpointRecord
+    # over HTTP, so nothing has to be copied by hand. The relay URL and CA
+    # lists stay complete on every agent because they are allowlists, which
+    # makes re-pointing an agent a one-line change. An agent that starts before
+    # the schedulers have written their relay certificates exits and is
+    # restarted until they exist.
     - name: agent-1
       image: podmesh/agent:latest
       env:
@@ -161,7 +167,7 @@ spec:
         - name: CONTAINER_HOST
           value: "unix:///run/podman/podman.sock"
         - name: PODMESH_AGENT_SCHEDULER_URLS
-          value: "http://podmesh-control:3000,http://podmesh-control:3001,http://podmesh-control:3002"
+          value: "http://podmesh-control:3001"
         - name: PODMESH_AGENT_MACHINE_RELAY_URLS
           value: "https://podmesh-control:7440,https://podmesh-control:7441,https://podmesh-control:7442"
         - name: PODMESH_AGENT_MACHINE_RELAY_CA_CERTIFICATES
@@ -194,7 +200,7 @@ spec:
         - name: CONTAINER_HOST
           value: "unix:///run/podman/podman.sock"
         - name: PODMESH_AGENT_SCHEDULER_URLS
-          value: "http://podmesh-control:3000,http://podmesh-control:3001,http://podmesh-control:3002"
+          value: "http://podmesh-control:3001"
         - name: PODMESH_AGENT_MACHINE_RELAY_URLS
           value: "https://podmesh-control:7440,https://podmesh-control:7441,https://podmesh-control:7442"
         - name: PODMESH_AGENT_MACHINE_RELAY_CA_CERTIFICATES
@@ -227,7 +233,7 @@ spec:
         - name: CONTAINER_HOST
           value: "unix:///run/podman/podman.sock"
         - name: PODMESH_AGENT_SCHEDULER_URLS
-          value: "http://podmesh-control:3000,http://podmesh-control:3001,http://podmesh-control:3002"
+          value: "http://podmesh-control:3002"
         - name: PODMESH_AGENT_MACHINE_RELAY_URLS
           value: "https://podmesh-control:7440,https://podmesh-control:7441,https://podmesh-control:7442"
         - name: PODMESH_AGENT_MACHINE_RELAY_CA_CERTIFICATES

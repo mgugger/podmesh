@@ -116,23 +116,24 @@ select@3001 http=200 time=5.043524
 select@3002 http=200 time=5.008195
 ```
 
-`http=200` from all three means the mesh is up. The ~5 s is the offer collection window, not
-latency. `http=503 no agent capacity available` means no agent is attached yet — give it a few more
-seconds, then read the troubleshooting section.
+`http=200` from all three means the mesh is up, including `:3000`, which has no agents attached at
+all — its offers come from agents attached to its peers. The ~5 s is the offer collection window,
+not latency. `http=503 no agent capacity available` means no agent is attached yet — give it a few
+more seconds, then read the troubleshooting section.
 
 ### What is listening
 
-| Component | HTTP API | Iroh bind | Relay (http/https/qad/metrics) |
-|---|---|---|---|
-| scheduler-1 | 3000 | 5001 | 7070 / 7440 / 7840 / 9090 |
-| scheduler-2 | 3001 | 5002 | 7071 / 7441 / 7841 / 9091 |
-| scheduler-3 | 3002 | 5003 | 7072 / 7442 / 7842 / 9092 |
-| agent-1 | 3100 (`/health` only) | 5011 | — |
-| agent-2 | 3101 (`/health` only) | 5012 | — |
-| agent-3 | 3102 (`/health` only) | 5013 | — |
-| proxy-1 | 3010 (ingress on 8080) | 4001 | 7080 / 7450 / 7850 / 9100 |
-| proxy-2 | 3011 | 4002 | 7081 / 7451 / 7851 / 9101 |
-| proxy-3 | 3012 | 4003 | 7082 / 7452 / 7852 / 9102 |
+| Component | HTTP API | Iroh bind | Relay (http/https/qad/metrics) | Attached agents |
+|---|---|---|---|---|
+| scheduler-1 | 3000 | 5001 | 7070 / 7440 / 7840 / 9090 | none |
+| scheduler-2 | 3001 | 5002 | 7071 / 7441 / 7841 / 9091 | agent-1, agent-2 |
+| scheduler-3 | 3002 | 5003 | 7072 / 7442 / 7842 / 9092 | agent-3 |
+| agent-1 | 3100 (`/health` only) | 5011 | — | — |
+| agent-2 | 3101 (`/health` only) | 5012 | — | — |
+| agent-3 | 3102 (`/health` only) | 5013 | — | — |
+| proxy-1 | 3010 (ingress on 8080) | 4001 | 7080 / 7450 / 7850 / 9100 | — |
+| proxy-2 | 3011 | 4002 | 7081 / 7451 / 7851 / 9101 | — |
+| proxy-3 | 3012 | 4003 | 7082 / 7452 / 7852 / 9102 | — |
 
 ### How the mesh finds itself
 
@@ -141,7 +142,16 @@ seconds, then read the troubleshooting section.
   background. Peers are admitted to the gossip allowlist and the relay issuer set as they appear,
   and their addresses are fed into the endpoint's address book so gossip can dial them.
 * **Agents** get `PODMESH_AGENT_SCHEDULER_URLS`, fetch those same records over HTTP, and attach to
-  all three schedulers over Iroh.
+  exactly one scheduler over Iroh. The sample topology is deliberately lopsided: agent-1 and agent-2
+  attach to scheduler-2, agent-3 attaches to scheduler-3, and **scheduler-1 holds no agents at all**.
+  That is the case a real multi-region mesh always has, and it is the one that would otherwise go
+  untested.
+* **Control traffic crosses schedulers.** Placement already worked from any scheduler, because a
+  capacity query is gossiped and agents answer the querying scheduler directly. Lifecycle traffic
+  now does too: a scheduler that does not hold the target attachment probes its peers over
+  `/podmesh/agent-control-relay/1`, then hands the owner-encrypted payload to the peer that does.
+  The hop is taken at most once and the bytes are never touched, so the relaying scheduler learns
+  nothing the first one did not already know.
 * **Proxies** each run their own relay with their own self-signed TLS. A sidecar carries exactly one
   relay token, so proxy-2 and proxy-3 adopt proxy-1's token through
   `PODMESH_WORKLOAD_RELAY_BOOTSTRAP_URL` instead of minting their own.
@@ -161,7 +171,9 @@ export PODMESH_API=http://127.0.0.1:3000
 export PODMESH_PROXY_URL=http://127.0.0.1:3010,http://127.0.0.1:3011,http://127.0.0.1:3012
 ```
 
-Any of `:3000`, `:3001`, `:3002` works — schedulers are stateless and interchangeable.
+Any of `:3000`, `:3001`, `:3002` works. Schedulers are stateless and hold no durable agent records,
+and one that does not hold an agent's attachment relays through the peer that does — so pointing
+`podctl` at `:3000`, which has no agents attached, exercises exactly that path.
 
 Owner keys live in `~/.podmesh/` and are created on first use. They are your tenant identity: they
 sign the workload specification, mint the Biscuit grants the proxies present to sidecars, and are
@@ -342,7 +354,7 @@ podman logs podmesh-agents-agent-1 2>&1 | grep -i 'attach\|bootstrap'
 ```
 
 ```
-bootstrapped scheduler endpoint record from http://podmesh-control:3000
+bootstrapped scheduler endpoint record from http://podmesh-control:3001
 agent attached to scheduler acbdd0e706
 ```
 
@@ -350,6 +362,17 @@ agent attached to scheduler acbdd0e706
 relay URL a scheduler advertises is not byte-for-byte in that agent's
 `PODMESH_AGENT_MACHINE_RELAY_URLS`. The comparison is an exact string match, so `localhost` and
 `podmesh-control` are different relays.
+
+**A lifecycle call returns 404 `agent is not attached to any scheduler in the mesh`.**
+The scheduler you addressed does not hold the attachment and no peer claimed it either. Either the
+agent is down, or the schedulers have not finished admitting each other yet — the peer probe only
+reaches schedulers already in the member allowlist:
+
+```bash
+podman logs podmesh-control-scheduler-1 2>&1 | grep 'admitted scheduler'
+```
+
+A 502 instead means a peer does hold the attachment but could not reach the agent.
 
 **The logs are drowning in Iroh transport spam.** The manifests already set
 `RUST_LOG=info,iroh=warn,iroh_relay=warn,iroh_quinn=warn`. To read a component's own lines only:

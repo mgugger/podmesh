@@ -80,6 +80,20 @@ impl MemberRegistry {
             })
     }
 
+    /// Currently admitted peers, bounded by `MAX_CONVERGED_MEMBERS`.
+    ///
+    /// A poisoned lock yields an empty set so callers degrade to "no peers"
+    /// instead of panicking on a control path.
+    pub fn snapshot(&self) -> Vec<EndpointId> {
+        self.inner
+            .read()
+            .map(|members| members.iter().copied().collect())
+            .unwrap_or_else(|_| {
+                log::error!("scheduler member registry lock poisoned; reporting no peers");
+                Vec::new()
+            })
+    }
+
     pub fn len(&self) -> usize {
         self.inner.read().map(|members| members.len()).unwrap_or(0)
     }

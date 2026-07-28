@@ -86,6 +86,24 @@ that does not answer SHALL be a startup error.
 - **WHEN** a configured bootstrap URL cannot be resolved
 - **THEN** the agent exits with an error rather than starting half-configured
 
+### Requirement: The agent SHALL answer capacity queries from any scheduler in the mesh
+
+The agent SHALL treat its configured scheduler list as a bootstrap list, not an authorization list,
+and SHALL answer a capacity query that originates from a scheduler it never configured. The query
+MUST still be signed, unexpired, and unseen, and MUST have arrived over the authenticated
+attachment, because the attached scheduler already restricts fan-out to admitted mesh members.
+
+#### Scenario: Placement reaches an agent through a scheduler it does not know
+
+- **GIVEN** an agent attached to exactly one scheduler
+- **WHEN** a different scheduler in the mesh originates a capacity query
+- **THEN** the agent returns a signed offer directly to that scheduler
+
+#### Scenario: Replayed or expired queries are still refused
+
+- **WHEN** a query is expired, unsigned, or repeats a query id already seen
+- **THEN** the agent drops it and stays attached
+
 ### Requirement: Remote recovery after agent loss SHALL NOT be implied
 
 Loss of an agent together with its durable keys SHALL be treated as loss of the workloads it hosted.

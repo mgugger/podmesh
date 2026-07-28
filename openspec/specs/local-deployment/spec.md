@@ -25,6 +25,23 @@ directories.
 - **WHEN** the operator plays the rootful manifest
 - **THEN** the same topology starts and agents reach Podman through the system socket
 
+### Requirement: The sample topology SHALL spread agents unevenly across schedulers
+
+The manifests SHALL attach no agent to the first scheduler, two agents to the second, and one agent
+to the third. Attaching every agent to every scheduler hides the case a real multi-region mesh
+always has: a scheduler a client can reach that holds none of the agents it needs.
+
+#### Scenario: A client uses the scheduler with no agents
+
+- **GIVEN** the sample topology
+- **WHEN** a client deploys, inspects, and deletes a workload through the first scheduler
+- **THEN** every operation succeeds through the peer that holds the agent's attachment
+
+#### Scenario: Placement is not limited to the reached scheduler
+
+- **WHEN** a client asks the first scheduler to select an agent
+- **THEN** it receives a signed offer from an agent attached to another scheduler
+
 ### Requirement: The local deployment SHALL require no pre-created secrets
 
 The manifests SHALL NOT reference operator-created secrets. All relay TLS material, relay auth

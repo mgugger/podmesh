@@ -1,5 +1,6 @@
 mod attachments;
 mod config;
+mod control_relay;
 mod coordinator;
 mod discovery;
 mod forward;
@@ -12,6 +13,9 @@ mod query;
 
 pub use attachments::{AgentAttachmentHandler, AttachmentManager};
 pub use config::{MachineConfig, ValidatedMachineConfig};
+pub use control_relay::{
+    AgentControlRelayHandler, MAX_CONTROL_RELAY_PEER_PROBES, PeerControlRelay,
+};
 pub use coordinator::{CapacityCoordinator, CapacityService};
 pub use discovery::run_peer_discovery;
 pub use forward::{AgentControlForwarder, ForwardError};
