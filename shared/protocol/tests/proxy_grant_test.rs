@@ -5,7 +5,7 @@ const PROXY: &str = "3f2a9c1d4b5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d
 const OTHER_PROXY: &str = "aa2a9c1d4b5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8";
 
 fn owner() -> (Vec<u8>, Vec<u8>) {
-    let (public, private) = crypto::ensure_keypair_ephemeral().unwrap();
+    let (public, private) = crypto::generate_signing_keypair();
     (public, private)
 }
 
@@ -88,4 +88,53 @@ fn claims_must_match_the_signing_key() {
     let (other_public, _) = owner();
     let impersonating = claims(&other_public, PROXY, 3600);
     assert!(mint_proxy_grant(&private, &public, &impersonating, NOW).is_err());
+}
+
+/// Biscuit's default authorizer gives up after a millisecond of wall clock, so
+/// a valid grant would be refused whenever the machine is busy — precisely when
+/// a proxy is under load. Verification must depend on the token, not on how
+/// contended the host is.
+#[test]
+fn verification_does_not_depend_on_machine_load() {
+    let (owner_public, owner_private) = crypto::generate_signing_keypair();
+    let owner_b64 = crypto::b64_encode(&owner_public);
+    let grant = mint_proxy_grant(
+        &owner_private,
+        &owner_public,
+        &ProxyGrantClaims {
+            tenant_owner: owner_b64.clone(),
+            proxy_endpoint: PROXY.into(),
+            issued_at_secs: NOW,
+            expires_at_secs: NOW + 3600,
+            token_id: "load-test".into(),
+        },
+        NOW,
+    )
+    .expect("mint");
+
+    // Saturate the machine while verifying, so any wall-clock-sensitive bound
+    // would trip.
+    let threads: Vec<_> = (0..std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4))
+        .map(|_| {
+            std::thread::spawn(|| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+                let mut spin = 0u64;
+                while std::time::Instant::now() < deadline {
+                    spin = spin.wrapping_add(1);
+                }
+                spin
+            })
+        })
+        .collect();
+
+    for _ in 0..200 {
+        verify_proxy_grant(&grant, &owner_public, &owner_b64, PROXY, NOW)
+            .expect("a valid grant must verify regardless of machine load");
+    }
+
+    for thread in threads {
+        let _ = thread.join();
+    }
 }

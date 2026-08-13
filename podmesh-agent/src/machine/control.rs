@@ -78,6 +78,15 @@ impl AgentControlHandler {
                     .decrypt::<WorkloadCommand>(&request.encrypted_payload)?;
                 self.service.command(command).await
             }
+            AgentControlOperation::List => {
+                // A list request is not sealed: it carries nothing secret and
+                // must be broadcastable to agents the client cannot name.
+                let list = protocol::WorkloadListRequest::from_bytes(
+                    &request.encrypted_payload,
+                    crate::service::now_secs(),
+                )?;
+                self.service.list(list).await
+            }
         }
     }
 }

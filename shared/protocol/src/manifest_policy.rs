@@ -25,72 +25,158 @@ pub const DEFAULT_MEMORY_REQUEST: &str = "64Mi";
 /// Default ephemeral storage request to inject when omitted.
 pub const DEFAULT_STORAGE_REQUEST: &str = "512Mi";
 
-/// Built-in Rego policy that enforces podmesh security constraints.
+/// Name of the sidecar container podmesh injects. It is the only container in
+/// a pod allowed to hold `NET_ADMIN`, because it programs the egress redirect.
+pub const INJECTED_SIDECAR_NAME: &str = "podmesh-sidecar";
+
+/// Built-in Rego policy enforcing podmesh's pod security constraints.
+///
+/// The rule set is deny-by-default and deliberately narrow for the first
+/// release: an agent runs tenant workloads against a Podman socket that is
+/// equivalent to host control, so anything that could reach the host, another
+/// tenant's containers, or the node's namespaces is refused outright rather
+/// than filtered. Notably **no volumes of any kind are permitted**, because a
+/// single `hostPath` entry is a complete container escape and the allow-listing
+/// needed to admit the safe subset is not yet built.
+///
+/// Every rule inspects `all_containers`, which includes `initContainers` and
+/// `ephemeralContainers`. Checking only `spec.containers` would leave the
+/// obvious bypass of putting the privileged work in an init container.
 const BUILTIN_POLICY: &str = r#"
 package podmesh.policy
 
 import rego.v1
 
-# Default deny
 default allow := false
 
-# Allow if all checks pass
-allow if {
-    not privileged_container_found
-    not unauthorized_net_admin
+allow if count(violations) == 0
+
+pod_spec := input.spec if input.kind == "Pod"
+
+pod_spec := input.spec.template.spec if {
+    input.kind in ["Deployment", "ReplicaSet", "DaemonSet", "StatefulSet", "Job", "CronJob"]
 }
 
-# Check for privileged containers
-privileged_container_found if {
-    some container in input_containers
-    container.securityContext.privileged == true
-}
+input_containers := object.get(pod_spec, "containers", [])
 
-# Check for unauthorized CAP_NET_ADMIN
-unauthorized_net_admin if {
-    some container in input_containers
-    has_net_admin(container)
-    not is_sidecar_container(container)
-}
+init_containers := object.get(pod_spec, "initContainers", [])
 
-# Sidecar containers are allowed to have NET_ADMIN
-is_sidecar_container(container) if {
-    container.name == "sidecar"
-}
+ephemeral_containers := object.get(pod_spec, "ephemeralContainers", [])
 
-is_sidecar_container(container) if {
-    container.name == "podmesh-sidecar"
-}
+all_containers := array.concat(
+    array.concat(input_containers, init_containers),
+    ephemeral_containers,
+)
 
-# Helper to check if container has CAP_NET_ADMIN
-has_net_admin(container) if {
-    some cap in container.securityContext.capabilities.add
-    cap == "NET_ADMIN"
-}
+is_injected_sidecar(container) if container.name == "podmesh-sidecar"
 
-# Get all containers from various manifest types
-input_containers := containers if {
-    input.kind == "Pod"
-    containers := input.spec.containers
-}
+# --- container security context -------------------------------------------
 
-input_containers := containers if {
-    input.kind in ["Deployment", "ReplicaSet", "DaemonSet", "StatefulSet"]
-    containers := input.spec.template.spec.containers
-}
-
-# Collect all violations for detailed error messages
 violations contains msg if {
-    some container in input_containers
+    some container in all_containers
     container.securityContext.privileged == true
-    msg := sprintf("container '%s' has privileged: true", [container.name])
+    msg := sprintf("container '%s' requests privileged: true", [container.name])
 }
 
 violations contains msg if {
-    some container in input_containers
-    has_net_admin(container)
-    not is_sidecar_container(container)
-    msg := sprintf("container '%s' has CAP_NET_ADMIN but only sidecar is allowed", [container.name])
+    some container in all_containers
+    container.securityContext.allowPrivilegeEscalation == true
+    msg := sprintf("container '%s' requests allowPrivilegeEscalation: true", [container.name])
+}
+
+violations contains msg if {
+    some container in all_containers
+    not is_injected_sidecar(container)
+    some capability in object.get(object.get(object.get(container, "securityContext", {}), "capabilities", {}), "add", [])
+    msg := sprintf("container '%s' adds capability %s; only the injected sidecar may add capabilities", [container.name, capability])
+}
+
+violations contains msg if {
+    some container in all_containers
+    is_injected_sidecar(container)
+    some capability in object.get(object.get(object.get(container, "securityContext", {}), "capabilities", {}), "add", [])
+    capability != "NET_ADMIN"
+    msg := sprintf("injected sidecar may only add NET_ADMIN, not %s", [capability])
+}
+
+violations contains msg if {
+    some container in all_containers
+    container.securityContext.runAsUser == 0
+    msg := sprintf("container '%s' requests runAsUser: 0", [container.name])
+}
+
+violations contains msg if {
+    some container in all_containers
+    container.securityContext.runAsNonRoot == false
+    msg := sprintf("container '%s' sets runAsNonRoot: false", [container.name])
+}
+
+violations contains msg if {
+    some container in all_containers
+    object.get(container, "securityContext", {}).procMount == "Unmasked"
+    msg := sprintf("container '%s' requests an unmasked /proc", [container.name])
+}
+
+# --- pod-level namespace sharing ------------------------------------------
+
+violations contains msg if {
+    pod_spec.hostNetwork == true
+    msg := "pod requests hostNetwork"
+}
+
+violations contains msg if {
+    pod_spec.hostPID == true
+    msg := "pod requests hostPID"
+}
+
+violations contains msg if {
+    pod_spec.hostIPC == true
+    msg := "pod requests hostIPC"
+}
+
+violations contains msg if {
+    pod_spec.shareProcessNamespace == true
+    msg := "pod requests shareProcessNamespace, which exposes the sidecar's environment to the application"
+}
+
+violations contains msg if {
+    pod_spec.securityContext.runAsUser == 0
+    msg := "pod securityContext requests runAsUser: 0"
+}
+
+violations contains msg if {
+    pod_spec.securityContext.runAsNonRoot == false
+    msg := "pod securityContext sets runAsNonRoot: false"
+}
+
+violations contains msg if {
+    pod_spec.hostUsers == true
+    msg := "pod requests hostUsers, disabling user-namespace isolation"
+}
+
+# --- host ports ------------------------------------------------------------
+
+violations contains msg if {
+    some container in all_containers
+    some port in object.get(container, "ports", [])
+    object.get(port, "hostPort", 0) != 0
+    msg := sprintf("container '%s' requests hostPort %v", [container.name, port.hostPort])
+}
+
+# --- volumes ---------------------------------------------------------------
+# No volume type is permitted yet. hostPath alone is a container escape, and
+# the projected/CSI/PVC types need per-tenant naming rules that do not exist.
+
+violations contains msg if {
+    count(object.get(pod_spec, "volumes", [])) > 0
+    msg := "pod declares volumes; volume mounts are not supported yet"
+}
+
+violations contains msg if {
+    some container in all_containers
+    count(object.get(container, "volumeMounts", [])) > 0
+    not is_injected_sidecar(container)
+    msg := sprintf("container '%s' declares volumeMounts; volume mounts are not supported yet", [container.name])
 }
 "#;
 
@@ -223,12 +309,6 @@ impl PolicyEngine {
     }
 }
 
-impl Default for PolicyEngine {
-    fn default() -> Self {
-        Self::new().expect("failed to create default PolicyEngine")
-    }
-}
-
 /// Mutate a manifest to inject default resource limits where missing.
 fn mutate_manifest_defaults(manifest_yaml: &str) -> Result<String> {
     let mut docs = crate::manifest_yaml::parse_yaml_documents_from_str(manifest_yaml)
@@ -243,17 +323,28 @@ fn mutate_manifest_defaults(manifest_yaml: &str) -> Result<String> {
 }
 
 /// Mutate a single document to inject defaults.
+///
+/// Init containers are mutated too. They consume the same CPU and memory as
+/// regular containers, so leaving them unlimited would let a workload use far
+/// more than the reservation the agent accounted for.
 fn mutate_document_defaults(doc: &mut serde_yaml::Value) {
-    let containers = get_containers_mut(doc);
-    if let Some(containers) = containers {
-        for container in containers {
-            inject_resource_defaults(container);
+    for field in CONTAINER_FIELDS {
+        if let Some(containers) = containers_mut(doc, field) {
+            for container in containers {
+                inject_resource_defaults(container);
+            }
         }
     }
 }
 
-/// Get mutable reference to containers array based on manifest kind.
-fn get_containers_mut(doc: &mut serde_yaml::Value) -> Option<&mut Vec<serde_yaml::Value>> {
+/// Container lists a pod spec may carry. Every one of them runs tenant code.
+pub const CONTAINER_FIELDS: [&str; 2] = ["containers", "initContainers"];
+
+/// Get a mutable reference to one container list based on manifest kind.
+fn containers_mut<'a>(
+    doc: &'a mut serde_yaml::Value,
+    field: &str,
+) -> Option<&'a mut Vec<serde_yaml::Value>> {
     let kind = doc
         .as_mapping()
         .and_then(|m| m.get(serde_yaml::Value::String("kind".to_string())))
@@ -261,13 +352,13 @@ fn get_containers_mut(doc: &mut serde_yaml::Value) -> Option<&mut Vec<serde_yaml
 
     let spec = match kind {
         "Pod" => doc.get_mut("spec")?,
-        "Deployment" | "ReplicaSet" | "DaemonSet" | "StatefulSet" => {
+        "Deployment" | "ReplicaSet" | "DaemonSet" | "StatefulSet" | "Job" => {
             doc.get_mut("spec")?.get_mut("template")?.get_mut("spec")?
         }
         _ => return None,
     };
 
-    spec.get_mut("containers")?.as_sequence_mut()
+    spec.get_mut(field)?.as_sequence_mut()
 }
 
 /// Inject default resource requests and limits into a container if missing.
@@ -448,12 +539,75 @@ spec:
   containers:
   - name: app
     image: nginx:latest
-  - name: sidecar
+  - name: podmesh-sidecar
     image: podmesh/sidecar:latest
     securityContext:
       capabilities:
         add:
         - NET_ADMIN
+"#;
+
+    const TENANT_CONTAINER_NAMED_SIDECAR: &str = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: impostor
+spec:
+  containers:
+  - name: sidecar
+    image: nginx:latest
+    securityContext:
+      capabilities:
+        add:
+        - NET_ADMIN
+"#;
+
+    const PRIVILEGED_INIT_CONTAINER: &str = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sneaky
+spec:
+  initContainers:
+  - name: setup
+    image: busybox:latest
+    securityContext:
+      privileged: true
+  containers:
+  - name: app
+    image: nginx:latest
+"#;
+
+    const HOST_NAMESPACE_POD: &str = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hostile
+spec:
+  hostNetwork: true
+  hostPID: true
+  shareProcessNamespace: true
+  containers:
+  - name: app
+    image: nginx:latest
+"#;
+
+    const HOST_PATH_VOLUME_POD: &str = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: escape
+spec:
+  volumes:
+  - name: host-root
+    hostPath:
+      path: /
+  containers:
+  - name: app
+    image: nginx:latest
+    volumeMounts:
+    - name: host-root
+      mountPath: /host
 "#;
 
     #[test]
@@ -495,8 +649,75 @@ spec:
     fn test_authorized_sidecar_net_admin_allowed() {
         let result =
             validate_manifest(AUTHORIZED_SIDECAR_NET_ADMIN).expect("validation should succeed");
-        assert!(result.allowed, "sidecar with NET_ADMIN should be allowed");
-        assert!(result.violations.is_empty(), "should have no violations");
+        assert!(
+            result.allowed,
+            "the injected sidecar may hold NET_ADMIN: {:?}",
+            result.violations
+        );
+    }
+
+    #[test]
+    fn a_tenant_container_named_sidecar_cannot_take_capabilities() {
+        // Only the container podmesh injects is exempt. Matching on a shorter
+        // name would let a tenant name its own container `sidecar` and inherit
+        // the exemption.
+        let result =
+            validate_manifest(TENANT_CONTAINER_NAMED_SIDECAR).expect("validation should succeed");
+        assert!(!result.allowed, "violations: {:?}", result.violations);
+        assert!(result.violations.iter().any(|v| v.contains("NET_ADMIN")));
+    }
+
+    #[test]
+    fn a_privileged_init_container_is_rejected() {
+        let result =
+            validate_manifest(PRIVILEGED_INIT_CONTAINER).expect("validation should succeed");
+        assert!(!result.allowed, "violations: {:?}", result.violations);
+        assert!(result.violations.iter().any(|v| v.contains("privileged")));
+    }
+
+    #[test]
+    fn host_namespace_sharing_is_rejected() {
+        let result = validate_manifest(HOST_NAMESPACE_POD).expect("validation should succeed");
+        assert!(!result.allowed);
+        for expected in ["hostNetwork", "hostPID", "shareProcessNamespace"] {
+            assert!(
+                result.violations.iter().any(|v| v.contains(expected)),
+                "expected a {expected} violation in {:?}",
+                result.violations
+            );
+        }
+    }
+
+    #[test]
+    fn volumes_are_rejected_outright() {
+        let result = validate_manifest(HOST_PATH_VOLUME_POD).expect("validation should succeed");
+        assert!(!result.allowed);
+        assert!(
+            result.violations.iter().any(|v| v.contains("volume")),
+            "violations: {:?}",
+            result.violations
+        );
+    }
+
+    #[test]
+    fn init_container_resources_are_measured() {
+        let manifest = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: measured
+spec:
+  initContainers:
+  - name: setup
+    image: busybox:latest
+  containers:
+  - name: app
+    image: nginx:latest
+"#;
+        let (_, resources) =
+            crate::validate_and_measure_manifest(manifest.as_bytes()).expect("measure");
+        // Two containers at the injected default of 100m each.
+        assert_eq!(resources.cpu_milli, 200);
     }
 
     #[test]

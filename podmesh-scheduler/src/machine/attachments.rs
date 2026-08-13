@@ -16,6 +16,21 @@ use uuid::Uuid;
 
 const MAX_CONCURRENT_FANOUT: usize = 32;
 
+/// Domain separator for the fanout ordering hash.
+const FANOUT_RANK_CONTEXT: &str = "podmesh/agent-fanout-rank/v1";
+
+/// Where one agent sorts for one query.
+///
+/// Uniform over agents for any given query, and uncorrelated between queries,
+/// so no agent is systematically favoured or starved.
+fn fanout_rank(endpoint_id: EndpointId, query_id: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(FANOUT_RANK_CONTEXT);
+    hasher.update(endpoint_id.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(query_id.as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
 #[derive(Clone)]
 pub struct AttachmentManager {
     inner: Arc<Mutex<HashMap<EndpointId, AttachmentSession>>>,
@@ -71,6 +86,10 @@ impl AttachmentManager {
         }
     }
 
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
+    }
+
     pub async fn len(&self) -> usize {
         self.inner.lock().await.len()
     }
@@ -84,6 +103,15 @@ impl AttachmentManager {
             .map(|session| session.agent_addr.clone())
     }
 
+    /// Endpoint ids of the agents currently attached here.
+    ///
+    /// Used to broadcast an owner's list request, which unlike placement must
+    /// reach every agent rather than a fan-out window: a workload the owner has
+    /// lost track of could be on any of them.
+    pub async fn attached_agents(&self) -> Vec<EndpointId> {
+        self.inner.lock().await.keys().copied().collect()
+    }
+
     pub async fn fanout(&self, query: &CapacityQuery) -> Result<usize> {
         let bytes = query.to_bytes(now_secs())?;
         let mut sessions: Vec<_> = self
@@ -93,7 +121,14 @@ impl AttachmentManager {
             .iter()
             .map(|(endpoint_id, session)| (*endpoint_id, session.connection.clone()))
             .collect();
-        sessions.sort_unstable_by_key(|(endpoint_id, _)| *endpoint_id);
+        // Ordered per query rather than by EndpointId. A fixed order truncates
+        // to the same lowest-ranked agents on every query, so everything past
+        // the fanout bound would never be asked for capacity and could never be
+        // placed on — silently, and permanently. Hashing the agent together
+        // with the query id gives each query a different subset while staying
+        // deterministic, and needs no state, which a rotating cursor would.
+        sessions
+            .sort_unstable_by_key(|(endpoint_id, _)| fanout_rank(*endpoint_id, &query.query_id));
         sessions.truncate(self.max_agent_fanout);
         let timeout = self.operation_timeout;
         let successes = stream::iter(sessions)
@@ -265,4 +300,78 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent(seed: u16) -> EndpointId {
+        let mut bytes = [0u8; 32];
+        bytes[..2].copy_from_slice(&seed.to_be_bytes());
+        iroh::SecretKey::from_bytes(&bytes).public()
+    }
+
+    /// The agents a query reaches, if fanout is bounded to `fanout`.
+    fn selected(agents: &[EndpointId], query_id: &str, fanout: usize) -> Vec<EndpointId> {
+        let mut ranked: Vec<EndpointId> = agents.to_vec();
+        ranked.sort_unstable_by_key(|endpoint_id| fanout_rank(*endpoint_id, query_id));
+        ranked.truncate(fanout);
+        ranked
+    }
+
+    /// The bug this replaces: ordering by EndpointId truncates to the same
+    /// agents every time, so an agent past the bound is never asked for
+    /// capacity and can never be placed on.
+    #[test]
+    fn every_agent_is_reachable_across_queries() {
+        let agents: Vec<EndpointId> = (0..64).map(agent).collect();
+        let mut ever_selected = std::collections::HashSet::new();
+        for query in 0..200 {
+            ever_selected.extend(selected(&agents, &format!("query-{query}"), 8));
+        }
+        assert_eq!(
+            ever_selected.len(),
+            agents.len(),
+            "an agent that is never selected can never receive a workload"
+        );
+    }
+
+    #[test]
+    fn one_query_reaches_at_most_the_fanout_bound() {
+        let agents: Vec<EndpointId> = (0..64).map(agent).collect();
+        assert_eq!(selected(&agents, "query-1", 8).len(), 8);
+    }
+
+    /// Retrying the same query must not silently search a different part of the
+    /// fleet, or a caller could not reason about what "no capacity" means.
+    #[test]
+    fn one_query_selects_the_same_agents_every_time() {
+        let agents: Vec<EndpointId> = (0..64).map(agent).collect();
+        assert_eq!(
+            selected(&agents, "query-1", 8),
+            selected(&agents, "query-1", 8)
+        );
+    }
+
+    #[test]
+    fn different_queries_select_different_agents() {
+        let agents: Vec<EndpointId> = (0..64).map(agent).collect();
+        assert_ne!(
+            selected(&agents, "query-1", 8),
+            selected(&agents, "query-2", 8)
+        );
+    }
+
+    /// Selection must not track the order agents happen to be stored in.
+    #[test]
+    fn selection_does_not_depend_on_input_order() {
+        let agents: Vec<EndpointId> = (0..64).map(agent).collect();
+        let mut reversed = agents.clone();
+        reversed.reverse();
+        assert_eq!(
+            selected(&agents, "query-1", 8),
+            selected(&reversed, "query-1", 8)
+        );
+    }
 }

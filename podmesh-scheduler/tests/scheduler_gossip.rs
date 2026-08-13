@@ -6,7 +6,8 @@ use anyhow::{Context, Result, ensure};
 use common::{TEST_TIMEOUT, config, endpoint, now_secs, signed_query};
 use iroh::{SecretKey, address_lookup::memory::MemoryLookup};
 use podmesh_scheduler::machine::{
-    AttachmentManager, PlacementHandler, QueryManager, SCHEDULER_GOSSIP_ALPN, SchedulerGossip,
+    AttachmentManager, LocationRegistry, MemberIssuers, PlacementHandler, QueryManager,
+    SCHEDULER_GOSSIP_ALPN, SchedulerGossip, SchedulerGossipServices,
 };
 use tokio::time::timeout;
 
@@ -29,19 +30,29 @@ async fn authorized_schedulers_exchange_queries_and_unauthorized_peer_is_closed(
     let first_queries = QueryManager::new(16, 8, TEST_TIMEOUT);
     let second_queries = QueryManager::new(16, 8, TEST_TIMEOUT);
     let first_gossip = SchedulerGossip::start(
-        first.clone(),
+        SchedulerGossipServices {
+            endpoint: first.clone(),
+            attachments: AttachmentManager::new(16, 8, TEST_TIMEOUT).handler(),
+            offers: first_queries.offer_handler(),
+            placement: PlacementHandler::new(16, TEST_TIMEOUT),
+            locations: LocationRegistry::new(),
+            member_issuers: MemberIssuers::new(),
+            lookup: MemoryLookup::new(),
+        },
         &first_config,
-        AttachmentManager::new(16, 8, TEST_TIMEOUT).handler(),
-        first_queries.offer_handler(),
-        PlacementHandler::new(16, TEST_TIMEOUT),
     )
     .await?;
     let second_gossip = SchedulerGossip::start(
-        second.clone(),
+        SchedulerGossipServices {
+            endpoint: second.clone(),
+            attachments: AttachmentManager::new(16, 8, TEST_TIMEOUT).handler(),
+            offers: second_queries.offer_handler(),
+            placement: PlacementHandler::new(16, TEST_TIMEOUT),
+            locations: LocationRegistry::new(),
+            member_issuers: MemberIssuers::new(),
+            lookup: MemoryLookup::new(),
+        },
         &second_config,
-        AttachmentManager::new(16, 8, TEST_TIMEOUT).handler(),
-        second_queries.offer_handler(),
-        PlacementHandler::new(16, TEST_TIMEOUT),
     )
     .await?;
     let mut second_events = second_gossip.subscribe_queries();
@@ -88,20 +99,30 @@ async fn scheduler_rejoins_after_partition_with_the_same_identity() -> Result<()
     let second_config = config(members, vec![first.id()]);
     let first_queries = QueryManager::new(8, 8, TEST_TIMEOUT);
     let first_gossip = SchedulerGossip::start(
-        first.clone(),
+        SchedulerGossipServices {
+            endpoint: first.clone(),
+            attachments: AttachmentManager::new(8, 8, TEST_TIMEOUT).handler(),
+            offers: first_queries.offer_handler(),
+            placement: PlacementHandler::new(8, TEST_TIMEOUT),
+            locations: LocationRegistry::new(),
+            member_issuers: MemberIssuers::new(),
+            lookup: MemoryLookup::new(),
+        },
         &first_config,
-        AttachmentManager::new(8, 8, TEST_TIMEOUT).handler(),
-        first_queries.offer_handler(),
-        PlacementHandler::new(8, TEST_TIMEOUT),
     )
     .await?;
     let second_queries = QueryManager::new(8, 8, TEST_TIMEOUT);
     let second_gossip = SchedulerGossip::start(
-        second.clone(),
+        SchedulerGossipServices {
+            endpoint: second.clone(),
+            attachments: AttachmentManager::new(8, 8, TEST_TIMEOUT).handler(),
+            offers: second_queries.offer_handler(),
+            placement: PlacementHandler::new(8, TEST_TIMEOUT),
+            locations: LocationRegistry::new(),
+            member_issuers: MemberIssuers::new(),
+            lookup: MemoryLookup::new(),
+        },
         &second_config,
-        AttachmentManager::new(8, 8, TEST_TIMEOUT).handler(),
-        second_queries.offer_handler(),
-        PlacementHandler::new(8, TEST_TIMEOUT),
     )
     .await?;
     timeout(TEST_TIMEOUT, second_gossip.shutdown()).await??;
@@ -115,11 +136,16 @@ async fn scheduler_rejoins_after_partition_with_the_same_identity() -> Result<()
     lookup.add_endpoint_info(recovered.addr());
     let recovered_queries = QueryManager::new(8, 8, TEST_TIMEOUT);
     let recovered_gossip = SchedulerGossip::start(
-        recovered.clone(),
+        SchedulerGossipServices {
+            endpoint: recovered.clone(),
+            attachments: AttachmentManager::new(8, 8, TEST_TIMEOUT).handler(),
+            offers: recovered_queries.offer_handler(),
+            placement: PlacementHandler::new(8, TEST_TIMEOUT),
+            locations: LocationRegistry::new(),
+            member_issuers: MemberIssuers::new(),
+            lookup: MemoryLookup::new(),
+        },
         &second_config,
-        AttachmentManager::new(8, 8, TEST_TIMEOUT).handler(),
-        recovered_queries.offer_handler(),
-        PlacementHandler::new(8, TEST_TIMEOUT),
     )
     .await?;
     let mut recovered_events = recovered_gossip.subscribe_queries();

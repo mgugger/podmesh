@@ -6,9 +6,11 @@
 //! each one into the gossip allowlist and the machine relay's issuer trust as
 //! it appears, then dialing it into the gossip mesh.
 //!
-//! HTTP is used only for reachability, never for authority: every record is
-//! signed by the peer's own key and self-expiring, so an intermediary can stall
-//! or withhold discovery but cannot inject a scheduler into the mesh.
+//! HTTP is used only for reachability, never for authority. A signature alone
+//! settles nothing here, because a peer record is self-signed: whoever answers
+//! the URL picks the key that validates it. Each peer URL is therefore bound to
+//! one identity by [`PeerPins`], so an intermediary can stall or withhold
+//! discovery but cannot substitute a scheduler of its own.
 
 use std::time::Duration;
 
@@ -16,7 +18,11 @@ use anyhow::{Context, Result, ensure};
 use iroh::{EndpointAddr, EndpointId, address_lookup::memory::MemoryLookup};
 use tokio_util::sync::CancellationToken;
 
-use crate::machine::{IssuerRegistry, MemberRegistry, PeerJoiner};
+use crate::machine::{
+    IssuerRegistry, MemberRegistry, PeerJoiner,
+    peer_pins::{PeerPin, PeerPins},
+};
+use std::sync::Arc;
 
 /// Upper bound on configured peer URLs, matched to the member allowlist bound.
 pub const MAX_PEER_URLS: usize = 16;
@@ -27,6 +33,18 @@ const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Delay between discovery sweeps. Short enough that a mesh started all at
 /// once converges quickly, long enough not to hammer a peer that is down.
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How often a scheduler announces itself on the gossip mesh.
+///
+/// Announcements are what let membership grow past the peers configured on each
+/// node: a scheduler admitted by one operator-configured peer becomes reachable
+/// to the whole mesh without anybody editing configuration elsewhere. Repeating
+/// them refreshes addresses and reaches schedulers that joined later.
+const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Lifetime stamped on an announcement, comfortably longer than the interval so
+/// a missed round does not expire a peer.
+const ANNOUNCE_LIFETIME_SECS: u64 = 300;
 
 /// Refuses to buffer an oversized discovery response body.
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = 16 * 1024;
@@ -40,16 +58,40 @@ struct EndpointRecordResponse {
     signing_pubkey_b64: String,
 }
 
+/// Everything peer discovery converges into.
+pub struct PeerDiscovery {
+    pub peer_urls: Vec<String>,
+    pub local_endpoint: EndpointId,
+    pub members: MemberRegistry,
+    pub issuers: IssuerRegistry,
+    pub joiner: PeerJoiner,
+    pub lookup: MemoryLookup,
+    pub pins: Arc<PeerPins>,
+    /// Publishes this scheduler's own announcements.
+    pub publisher: crate::machine::GossipPublisher,
+    /// Identity used to sign them.
+    pub identity: crate::machine::SchedulerIdentity,
+    /// Address peers should use to reach this scheduler.
+    pub endpoint: iroh::Endpoint,
+}
+
 /// Polls `peer_urls` until cancelled, converging membership and relay trust.
 pub async fn run_peer_discovery(
-    peer_urls: Vec<String>,
-    local_endpoint: EndpointId,
-    members: MemberRegistry,
-    issuers: IssuerRegistry,
-    joiner: PeerJoiner,
-    lookup: MemoryLookup,
+    discovery: PeerDiscovery,
     cancellation: CancellationToken,
 ) -> Result<()> {
+    let PeerDiscovery {
+        peer_urls,
+        local_endpoint,
+        members,
+        issuers,
+        joiner,
+        lookup,
+        pins,
+        publisher,
+        identity,
+        endpoint,
+    } = discovery;
     ensure!(
         peer_urls.len() <= MAX_PEER_URLS,
         "at most {MAX_PEER_URLS} scheduler peer URLs are supported"
@@ -60,13 +102,25 @@ pub async fn run_peer_discovery(
         .context("build scheduler peer discovery HTTP client")?;
     let mut ticker = tokio::time::interval(DISCOVERY_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut announce = tokio::time::interval(ANNOUNCE_INTERVAL);
+    announce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => return Ok(()),
+            _ = announce.tick() => {
+                match announcement(&identity, &endpoint) {
+                    Ok(record) => {
+                        if let Err(error) = publisher.publish_announcement(record).await {
+                            log::debug!("announcing this scheduler failed: {error:#}");
+                        }
+                    }
+                    Err(error) => log::warn!("building a scheduler announcement failed: {error:#}"),
+                }
+            }
             _ = ticker.tick() => {
                 let mut discovered = Vec::new();
                 for url in &peer_urls {
-                    match discover_peer(&client, url).await {
+                    match discover_peer(&client, url, &pins).await {
                         Ok((address, signing_key)) => {
                             let endpoint_id = address.id;
                             if endpoint_id == local_endpoint {
@@ -104,7 +158,11 @@ pub async fn run_peer_discovery(
     }
 }
 
-async fn discover_peer(client: &reqwest::Client, url: &str) -> Result<(EndpointAddr, Vec<u8>)> {
+async fn discover_peer(
+    client: &reqwest::Client,
+    url: &str,
+    pins: &PeerPins,
+) -> Result<(EndpointAddr, Vec<u8>)> {
     let base = url.trim().trim_end_matches('/');
     ensure!(!base.is_empty(), "empty scheduler peer URL");
     let response = client
@@ -148,5 +206,21 @@ async fn discover_peer(client: &reqwest::Client, url: &str) -> Result<(EndpointA
         crypto::b64_encode(&signing_key) == record.signing_pubkey,
         "peer signing key does not match the key that signed its endpoint record"
     );
+    // Everything above only proves the response is internally consistent. The
+    // pin is what ties this URL to one identity across restarts.
+    pins.accept(url, &PeerPin::new(address.id, &signing_key))
+        .context("peer identity does not match its pinned identity")?;
     Ok((address, signing_key))
+}
+
+/// This scheduler's own signed record, for announcing to the mesh.
+fn announcement(
+    identity: &crate::machine::SchedulerIdentity,
+    endpoint: &iroh::Endpoint,
+) -> Result<protocol::EndpointRecord> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before the unix epoch")?
+        .as_secs();
+    identity.endpoint_record(&endpoint.addr(), now, now + ANNOUNCE_LIFETIME_SECS)
 }

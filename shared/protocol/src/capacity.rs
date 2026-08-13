@@ -43,8 +43,9 @@ impl CapacityQuery {
         self.signing_pubkey = crypto::b64_encode(signing_public);
         self.signature.clear();
         self.validate_unsigned(now_secs)?;
-        self.signature = crypto::b64_encode(&crypto::sign_data_with_key(
+        self.signature = crypto::b64_encode(&crypto::sign_domain(
             signing_private,
+            crypto::SignatureDomain::CapacityQuery,
             &self.canonical_bytes()?,
         )?);
         self.validate(now_secs)?;
@@ -56,6 +57,7 @@ impl CapacityQuery {
         verify_signature(
             &self.signing_pubkey,
             &self.signature,
+            crypto::SignatureDomain::CapacityQuery,
             &self.canonical_bytes()?,
         )
     }
@@ -141,8 +143,9 @@ impl CapacityOffer {
         self.signing_pubkey = crypto::b64_encode(signing_public);
         self.signature.clear();
         self.validate_unsigned(now_secs)?;
-        self.signature = crypto::b64_encode(&crypto::sign_data_with_key(
+        self.signature = crypto::b64_encode(&crypto::sign_domain(
             signing_private,
+            crypto::SignatureDomain::CapacityOffer,
             &self.canonical_bytes()?,
         )?);
         self.validate(now_secs)?;
@@ -154,6 +157,7 @@ impl CapacityOffer {
         verify_signature(
             &self.signing_pubkey,
             &self.signature,
+            crypto::SignatureDomain::CapacityOffer,
             &self.canonical_bytes()?,
         )
     }
@@ -284,10 +288,15 @@ fn validate_signature_fields(signing_pubkey: &str, signature: &str) -> Result<()
     Ok(())
 }
 
-fn verify_signature(signing_pubkey: &str, signature: &str, canonical: &[u8]) -> Result<()> {
+fn verify_signature(
+    signing_pubkey: &str,
+    signature: &str,
+    domain: crypto::SignatureDomain,
+    canonical: &[u8],
+) -> Result<()> {
     let public = crypto::b64_decode(signing_pubkey)?;
     let signature = crypto::b64_decode(signature)?;
-    crypto::verify_envelope(&public, canonical, &signature)
+    crypto::verify_domain(&public, domain, canonical, &signature)
 }
 
 fn encode_bounded(value: &impl Serialize, field: &str) -> Result<Vec<u8>> {

@@ -40,27 +40,32 @@ pub fn validate_and_measure_manifest(manifest: &[u8]) -> Result<(Vec<u8>, Manife
     let mut container_count = 0usize;
 
     for document in &documents {
-        let Some(containers) = containers(document) else {
-            continue;
-        };
-        for container in containers {
-            container_count = container_count.saturating_add(1);
-            let limits = container
-                .get("resources")
-                .and_then(|resources| resources.get("limits"))
-                .ok_or_else(|| anyhow!("container resource limits are required"))?;
-            cpu_milli = cpu_milli
-                .checked_add(u64::from(parse_cpu(required_quantity(limits, "cpu")?)?))
-                .ok_or_else(|| anyhow!("aggregate CPU limit overflow"))?;
-            memory_bytes = memory_bytes
-                .checked_add(parse_bytes(required_quantity(limits, "memory")?)?)
-                .ok_or_else(|| anyhow!("aggregate memory limit overflow"))?;
-            storage_bytes = storage_bytes
-                .checked_add(parse_bytes(required_quantity(
-                    limits,
-                    "ephemeral-storage",
-                )?)?)
-                .ok_or_else(|| anyhow!("aggregate storage limit overflow"))?;
+        // Init containers are measured alongside regular containers: they run
+        // tenant code with the same limits, so a reservation that ignored them
+        // would understate what the pod can consume.
+        for containers in crate::manifest_policy::CONTAINER_FIELDS
+            .iter()
+            .filter_map(|field| containers(document, field))
+        {
+            for container in containers {
+                container_count = container_count.saturating_add(1);
+                let limits = container
+                    .get("resources")
+                    .and_then(|resources| resources.get("limits"))
+                    .ok_or_else(|| anyhow!("container resource limits are required"))?;
+                cpu_milli = cpu_milli
+                    .checked_add(u64::from(parse_cpu(required_quantity(limits, "cpu")?)?))
+                    .ok_or_else(|| anyhow!("aggregate CPU limit overflow"))?;
+                memory_bytes = memory_bytes
+                    .checked_add(parse_bytes(required_quantity(limits, "memory")?)?)
+                    .ok_or_else(|| anyhow!("aggregate memory limit overflow"))?;
+                storage_bytes = storage_bytes
+                    .checked_add(parse_bytes(required_quantity(
+                        limits,
+                        "ephemeral-storage",
+                    )?)?)
+                    .ok_or_else(|| anyhow!("aggregate storage limit overflow"))?;
+            }
         }
     }
     anyhow::ensure!(container_count > 0, "workload contains no containers");
@@ -75,14 +80,17 @@ pub fn validate_and_measure_manifest(manifest: &[u8]) -> Result<(Vec<u8>, Manife
     ))
 }
 
-fn containers(document: &serde_yaml::Value) -> Option<&Vec<serde_yaml::Value>> {
+fn containers<'a>(
+    document: &'a serde_yaml::Value,
+    field: &str,
+) -> Option<&'a Vec<serde_yaml::Value>> {
     let kind = document.get("kind").and_then(serde_yaml::Value::as_str)?;
     let spec = if kind == "Pod" {
         document.get("spec")?
     } else {
         document.get("spec")?.get("template")?.get("spec")?
     };
-    spec.get("containers")?.as_sequence()
+    spec.get(field)?.as_sequence()
 }
 
 fn required_quantity<'a>(limits: &'a serde_yaml::Value, key: &str) -> Result<&'a str> {

@@ -10,6 +10,7 @@
 //! Tests drive this harness through the scheduler's client HTTP API, the same
 //! surface `podctl` uses.
 
+use iroh::address_lookup::memory::MemoryLookup;
 use std::{collections::HashSet, future::IntoFuture, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
@@ -22,8 +23,9 @@ use podmesh_agent::{
 use podmesh_scheduler::{
     clientapi::ClientApi,
     machine::{
-        AgentControlForwarder, AttachmentManager, CapacityCoordinator, PeerControlRelay,
-        PlacementHandler, QueryManager, SchedulerGossip, SchedulerIdentity, ValidatedMachineConfig,
+        AgentControlForwarder, AttachmentManager, CapacityCoordinator, LocationRegistry,
+        PeerControlRelay, PlacementHandler, QueryManager, SchedulerGossip, SchedulerGossipServices,
+        SchedulerIdentity, ValidatedMachineConfig,
     },
 };
 use tokio::time::timeout;
@@ -35,7 +37,9 @@ const RELAY_URL: &str = "https://relay.example.test/";
 const MAX_CONCURRENT_RELAYS: usize = 16;
 const MAX_ATTACHED_AGENTS: usize = 16;
 const MAX_AGENT_FANOUT: usize = 16;
-const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+/// Query lifetime used by the harness. Exposed so a test can assert that
+/// placement finishes well inside it rather than sleeping to expiry.
+pub const MESH_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 const AGENT_CPU_MILLI: u32 = 8_000;
 const AGENT_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const AGENT_STORAGE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
@@ -52,6 +56,10 @@ fn now_secs() -> u64 {
 pub struct TestAgent {
     /// Lowercase hex Iroh EndpointId, the form `podctl` addresses agents by.
     pub endpoint_id: String,
+    /// Base64 Ed25519 application signing key. `podctl` will only deploy to
+    /// agents whose signing key the owner has listed as trusted, so a test has
+    /// to state which agents it expects — exactly as an operator would.
+    pub signing_pubkey: String,
     /// Records the manifests the agent actually deployed, after sidecar
     /// injection.
     pub runtime: Arc<MockRuntime>,
@@ -75,7 +83,7 @@ impl TestMesh {
     /// attached, so placement is deterministic once this returns.
     pub async fn start(agent_count: usize) -> Result<Self> {
         anyhow::ensure!(
-            agent_count >= 1 && agent_count <= MAX_ATTACHED_AGENTS,
+            (1..=MAX_ATTACHED_AGENTS).contains(&agent_count),
             "agent_count must be between 1 and {MAX_ATTACHED_AGENTS}"
         );
         let temp = tempfile::tempdir()?;
@@ -86,7 +94,7 @@ impl TestMesh {
             relay_ca_certificates: Vec::new(),
             scheduler_members: HashSet::from([identity.endpoint_id()]),
             scheduler_bootstraps: Vec::new(),
-            query_timeout: QUERY_TIMEOUT,
+            query_timeout: MESH_QUERY_TIMEOUT,
             max_pending_queries: MAX_ATTACHED_AGENTS,
             max_seen_queries: 64,
             max_attached_agents: MAX_ATTACHED_AGENTS,
@@ -98,13 +106,19 @@ impl TestMesh {
         let attachments =
             AttachmentManager::new(MAX_ATTACHED_AGENTS, MAX_AGENT_FANOUT, MESH_TIMEOUT)
                 .with_relay_grant_issuer(identity.clone(), RELAY_URL.into());
-        let queries = QueryManager::new(MAX_ATTACHED_AGENTS, MAX_ATTACHED_AGENTS, QUERY_TIMEOUT);
+        let queries =
+            QueryManager::new(MAX_ATTACHED_AGENTS, MAX_ATTACHED_AGENTS, MESH_QUERY_TIMEOUT);
         let gossip = SchedulerGossip::start(
-            endpoint.clone(),
+            SchedulerGossipServices {
+                endpoint: endpoint.clone(),
+                attachments: attachments.handler(),
+                offers: queries.offer_handler(),
+                placement: PlacementHandler::new(MAX_ATTACHED_AGENTS, MESH_TIMEOUT),
+                locations: LocationRegistry::new(),
+                member_issuers: podmesh_scheduler::machine::MemberIssuers::new(),
+                lookup: MemoryLookup::new(),
+            },
             &config,
-            attachments.handler(),
-            queries.offer_handler(),
-            PlacementHandler::new(MAX_ATTACHED_AGENTS, MESH_TIMEOUT),
         )
         .await?;
         let (capacity, coordinator) = CapacityCoordinator::start(
@@ -118,7 +132,13 @@ impl TestMesh {
         let forwarder = AgentControlForwarder::new(
             endpoint.clone(),
             attachments.clone(),
-            PeerControlRelay::new(endpoint.clone(), gossip.members(), MESH_TIMEOUT),
+            PeerControlRelay::new(
+                endpoint.clone(),
+                gossip.members(),
+                LocationRegistry::new(),
+                identity.clone(),
+                MESH_TIMEOUT,
+            ),
             MESH_TIMEOUT,
             MAX_CONCURRENT_RELAYS,
         );
@@ -128,7 +148,11 @@ impl TestMesh {
         let http = tokio::spawn(
             axum::serve(
                 listener,
-                ClientApi::new(capacity, forwarder, identity, endpoint.clone()).router(),
+                // The client API carries per-peer middleware, so it has to be
+                // served with connect info.
+                axum_support::with_connect_info(
+                    ClientApi::new(capacity, forwarder, identity, endpoint.clone()).router(),
+                ),
             )
             .into_future(),
         );
@@ -163,6 +187,14 @@ impl TestMesh {
             .find(|agent| agent.endpoint_id == endpoint_id)
     }
 
+    /// Base64 signing keys of every agent, for a `podctl` trusted agent list.
+    pub fn trusted_agent_keys(&self) -> Vec<String> {
+        self.agents
+            .iter()
+            .map(|agent| agent.signing_pubkey.clone())
+            .collect()
+    }
+
     /// Total workloads currently deployed across every agent in the mesh.
     pub async fn total_deployed_workloads(&self) -> usize {
         let mut total = 0;
@@ -181,6 +213,7 @@ async fn start_agent(scheduler_endpoint: &str) -> Result<TestAgent> {
         state_path: temp.path().join("state.redb"),
         runtime: RuntimeKind::Mock,
         workload_network: "podmesh".into(),
+        max_reserved_capacity_percent: podmesh_agent::config::DEFAULT_MAX_RESERVED_CAPACITY_PERCENT,
         sidecar_image: "podmesh/sidecar:latest".into(),
         capacity_cpu_milli: AGENT_CPU_MILLI,
         capacity_memory_bytes: AGENT_MEMORY_BYTES,
@@ -206,9 +239,12 @@ async fn start_agent(scheduler_endpoint: &str) -> Result<TestAgent> {
     };
     let runtime = Arc::new(MockRuntime::default());
     let service = AgentService::new(config.clone(), runtime.clone()).await?;
+    let signing_pubkey =
+        crypto::b64_encode(&crypto::load_or_create_signing_keypair(&config.key_dir)?.0);
     let machine = AgentMachine::start(&config, service).await?;
     Ok(TestAgent {
         endpoint_id: hex::encode(machine.endpoint().id().as_bytes()),
+        signing_pubkey,
         runtime,
         _machine: machine,
         _temp: temp,
@@ -219,7 +255,7 @@ async fn start_agent(scheduler_endpoint: &str) -> Result<TestAgent> {
 /// a well-formed discovery seed rather than a live proxy.
 pub fn test_proxy_endpoint() -> Result<protocol::EndpointRecord> {
     let now = now_secs();
-    let (public, private) = crypto::ensure_keypair_ephemeral()?;
+    let (public, private) = crypto::generate_signing_keypair();
     protocol::EndpointRecord {
         version: protocol::ENDPOINT_RECORD_VERSION,
         endpoint_id: iroh::SecretKey::generate().public().as_bytes().to_vec(),

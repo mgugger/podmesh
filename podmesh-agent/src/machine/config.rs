@@ -178,7 +178,7 @@ impl MachineConfig {
             .collect::<Result<Vec<_>>>()?;
         let scheduler_ids = scheduler_endpoints
             .iter()
-            .map(|record| endpoint_id(record))
+            .map(endpoint_id)
             .collect::<Result<HashSet<_>>>()?;
         ensure!(
             scheduler_ids.len() == scheduler_endpoints.len(),

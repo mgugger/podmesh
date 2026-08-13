@@ -35,8 +35,9 @@ impl EndpointRecord {
         self.signing_pubkey = crypto::b64_encode(signing_public);
         self.signature.clear();
         self.validate_unsigned(now_secs)?;
-        self.signature = crypto::b64_encode(&crypto::sign_data_with_key(
+        self.signature = crypto::b64_encode(&crypto::sign_domain(
             signing_private,
+            crypto::SignatureDomain::EndpointRecord,
             &self.canonical_bytes()?,
         )?);
         self.validate(now_secs)?;
@@ -45,9 +46,31 @@ impl EndpointRecord {
 
     pub fn verify(&self, now_secs: u64) -> Result<()> {
         self.validate(now_secs)?;
+        self.verify_signature()
+    }
+
+    /// Verify the record's structure and signature but ignore its validity
+    /// window.
+    ///
+    /// Used where a record was stored earlier and is being re-read rather than
+    /// acted on: an agent reconciling its persisted workloads after a reboot
+    /// must not refuse to start simply because the proxy records the owner
+    /// shipped have since aged out. A stale address can only fail to dial; it
+    /// cannot be forged, because the signature is still checked.
+    pub fn verify_structure(&self) -> Result<()> {
+        self.validate_structure()?;
+        self.verify_signature()
+    }
+
+    fn verify_signature(&self) -> Result<()> {
         let signing_public = crypto::b64_decode(&self.signing_pubkey)?;
         let signature = crypto::b64_decode(&self.signature)?;
-        crypto::verify_envelope(&signing_public, &self.canonical_bytes()?, &signature)
+        crypto::verify_domain(
+            &signing_public,
+            crypto::SignatureDomain::EndpointRecord,
+            &self.canonical_bytes()?,
+            &signature,
+        )
     }
 
     pub fn to_bytes(&self, now_secs: u64) -> Result<Vec<u8>> {
@@ -76,6 +99,17 @@ impl EndpointRecord {
 
     fn validate(&self, now_secs: u64) -> Result<()> {
         self.validate_unsigned(now_secs)?;
+        self.validate_signature_fields()
+    }
+
+    fn validate_structure(&self) -> Result<()> {
+        // Reuse the full unsigned check with the record's own issue time, which
+        // exercises every structural rule while leaving freshness aside.
+        self.validate_unsigned(self.issued_at_secs)?;
+        self.validate_signature_fields()
+    }
+
+    fn validate_signature_fields(&self) -> Result<()> {
         let signing_public = crypto::b64_decode(&self.signing_pubkey)?;
         ensure!(
             signing_public.len() == 32,
@@ -173,7 +207,7 @@ mod tests {
     const NOW: u64 = 1_000;
 
     fn signed_record() -> EndpointRecord {
-        let (public, private) = crypto::ensure_keypair_ephemeral().unwrap();
+        let (public, private) = crypto::generate_signing_keypair();
         EndpointRecord {
             version: ENDPOINT_RECORD_VERSION,
             endpoint_id: vec![7; IROH_ENDPOINT_ID_BYTES],

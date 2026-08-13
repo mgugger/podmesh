@@ -7,8 +7,16 @@
 //!
 //! The scheduler stays stateless and blind: it never holds workload ciphertext,
 //! DEKs, lifecycle state, or receipts. It only moves opaque owner-signed bytes.
+//!
+//! The API is deliberately unauthenticated — the mesh is open, and anyone with a
+//! keypair may place a workload. It is not, however, unbounded: a selection
+//! request is one cheap HTTP call that fans a signed query out to every agent in
+//! the mesh, and a relay call opens a QUIC connection, so both are throttled per
+//! peer address. That is a availability bound, not access control.
 
 use std::time::Duration;
+
+use futures::StreamExt;
 
 use axum::{
     Json, Router,
@@ -35,6 +43,36 @@ const PLACEMENT_PROBE_STORAGE_BYTES: u64 = 1;
 /// Upper bound on a relayed owner payload, matched to the agent control frame.
 const MAX_CLIENT_BODY_BYTES: usize = MAX_AGENT_CONTROL_PAYLOAD_BYTES;
 
+/// Requests per minute a single peer address may make.
+///
+/// Sized against the busiest legitimate client: one `podctl apply` spends three
+/// calls per replica and is capped at `MAX_WORKLOAD_REPLICAS` replicas, so a
+/// maximal deployment costs a few hundred requests. The default leaves room for
+/// several of those a minute while still bounding a caller that only wants to
+/// enumerate agents or burn placement capacity.
+pub const DEFAULT_CLIENT_RATE_LIMIT_PER_MINUTE: u32 = 1_200;
+
+/// Offers a selection waits for before answering, when the client says nothing.
+///
+/// More offers means a better-informed choice; waiting for all of them means
+/// every placement costs the full query lifetime. A handful is enough to avoid
+/// packing every deployment onto whichever agent answers first.
+pub const DEFAULT_TARGET_OFFERS: usize = 4;
+
+/// Ceiling on the offers a client may ask a selection to wait for, so one
+/// caller cannot make a query hold open for the full lifetime on purpose.
+pub const MAX_TARGET_OFFERS: usize = 64;
+
+/// Agents a single list broadcast will contact.
+///
+/// Listing exists to find workloads an owner lost track of, so it has to reach
+/// every agent rather than a sample. The bound keeps one HTTP call from turning
+/// into unbounded fan-out on a very large scheduler.
+pub const MAX_LIST_BROADCAST_AGENTS: usize = 2_048;
+
+/// Agents contacted at once during a list broadcast.
+const MAX_CONCURRENT_LIST_PROBES: usize = 32;
+
 /// Lifetime stamped on the `EndpointRecord` served over HTTP. Bootstrapping
 /// peers must re-fetch after this expires, which keeps a stale address from
 /// being pinned forever.
@@ -47,6 +85,7 @@ pub struct ClientApi {
     forwarder: AgentControlForwarder,
     identity: SchedulerIdentity,
     endpoint: iroh::Endpoint,
+    rate_limit_per_minute: u32,
 }
 
 impl ClientApi {
@@ -61,20 +100,42 @@ impl ClientApi {
             forwarder,
             identity,
             endpoint,
+            rate_limit_per_minute: DEFAULT_CLIENT_RATE_LIMIT_PER_MINUTE,
         }
     }
 
+    /// Override the per-peer request budget. Zero disables throttling, which is
+    /// appropriate only where every caller shares one source address.
+    pub fn with_rate_limit(mut self, requests_per_minute: u32) -> Self {
+        self.rate_limit_per_minute = requests_per_minute;
+        self
+    }
+
+    /// Build the HTTP router.
+    ///
+    /// The result carries per-peer middleware, so it must be served through
+    /// [`axum_support::with_connect_info`]. Handing the bare router to
+    /// `axum::serve` leaves the peer address unavailable and every throttled
+    /// route answers 500.
     pub fn router(self) -> Router {
-        Router::new()
-            .route("/health", get(|| async { "ok" }))
-            .route("/ready", get(|| async { "ready" }))
+        let rate_limit_per_minute = self.rate_limit_per_minute;
+        let router = Router::new()
             .route("/api/v1/endpoint_record", get(get_endpoint_record))
             .route("/api/v1/agents/select", get(select_agent))
             .route("/api/v1/agents/{agent}/admission", post(post_admission))
             .route("/api/v1/agents/{agent}/deploy", post(post_deploy))
             .route("/api/v1/agents/{agent}/command", post(post_command))
+            .route("/api/v1/workloads/list", post(post_workload_list))
             .layer(DefaultBodyLimit::max(MAX_CLIENT_BODY_BYTES))
-            .with_state(self)
+            .with_state(self);
+
+        // Liveness probes are deliberately outside the limiter: an orchestrator
+        // polling health must never be throttled by unrelated client traffic,
+        // and the answer is a constant.
+        Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route("/ready", get(|| async { "ready" }))
+            .merge(axum_support::with_rate_limit(router, rate_limit_per_minute))
     }
 }
 
@@ -134,6 +195,13 @@ struct SelectQuery {
     /// mesh answers with a different one.
     #[serde(default)]
     exclude: Option<String>,
+    /// How many offers to collect before answering.
+    ///
+    /// A client placing several replicas wants to choose between at least that
+    /// many agents; one placing a single workload does not need to wait for the
+    /// whole mesh to answer.
+    #[serde(default)]
+    candidates: Option<usize>,
 }
 
 async fn select_agent(
@@ -147,7 +215,11 @@ async fn select_agent(
         required_capabilities: Vec::new(),
         excluded_endpoint_ids: parse_exclusions(query.exclude.as_deref())?,
     };
-    match api.capacity.solicit(criteria).await {
+    let target_offers = query
+        .candidates
+        .unwrap_or(DEFAULT_TARGET_OFFERS)
+        .clamp(1, MAX_TARGET_OFFERS);
+    match api.capacity.solicit(criteria, target_offers).await {
         Ok(Some(offer)) => Ok(Json(offer)),
         Ok(None) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -202,6 +274,94 @@ async fn post_command(
     body: Bytes,
 ) -> ApiResult<Vec<u8>> {
     relay(api, agent, AgentControlOperation::Command, body).await
+}
+
+/// One agent's answer to a broadcast list request.
+#[derive(serde::Serialize)]
+struct WorkloadListEntry {
+    /// Lowercase hex EndpointId of the agent that answered.
+    agent_endpoint_id: String,
+    /// The agent's owner-sealed `WorkloadListResponse`, base64 encoded.
+    ///
+    /// The scheduler relays it unopened: it holds no tenant key and must not
+    /// learn which workloads an owner is running.
+    response_b64: String,
+}
+
+#[derive(serde::Serialize)]
+struct WorkloadListReply {
+    answered: Vec<WorkloadListEntry>,
+    /// Agents that did not answer, so a caller knows its view is partial rather
+    /// than concluding a workload is gone.
+    unreachable: Vec<String>,
+}
+
+/// Broadcast an owner-signed list request to every attached agent.
+///
+/// `podctl` keeps the only index of where it placed replicas, so this is how an
+/// owner finds workloads after losing or outdating that index — which means it
+/// cannot name the agents to ask, and the scheduler must reach all of them.
+///
+/// The request body is the signed request verbatim. It is not sealed, because
+/// it carries nothing secret; each agent's answer is sealed to the owner, so the
+/// scheduler learns nothing from relaying it.
+async fn post_workload_list(
+    State(api): State<ClientApi>,
+    body: Bytes,
+) -> ApiResult<Json<WorkloadListReply>> {
+    if body.is_empty() || body.len() > protocol::MAX_WORKLOAD_LIST_REQUEST_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "list request size is invalid".to_string(),
+        ));
+    }
+    // Verified here only to refuse obvious junk before fanning out; the agents
+    // verify it again, and they are the ones that decide what to answer.
+    protocol::WorkloadListRequest::from_bytes(&body, crate::now_secs()).map_err(|error| {
+        log::debug!("refusing malformed workload list request: {error:#}");
+        (
+            StatusCode::BAD_REQUEST,
+            "invalid workload list request".to_string(),
+        )
+    })?;
+
+    let attached = api.forwarder.attached_agents().await;
+    let mut answered = Vec::new();
+    let mut unreachable = Vec::new();
+
+    let mut probes = futures::stream::iter(
+        attached
+            .into_iter()
+            .take(MAX_LIST_BROADCAST_AGENTS)
+            .map(|agent| {
+                let api = api.clone();
+                let payload = body.to_vec();
+                async move {
+                    let answer: Option<Vec<u8>> = api
+                        .forwarder
+                        .forward(agent, AgentControlOperation::List, payload)
+                        .await
+                        .ok();
+                    (agent, answer)
+                }
+            }),
+    )
+    .buffer_unordered(MAX_CONCURRENT_LIST_PROBES);
+
+    while let Some((agent, answer)) = probes.next().await {
+        let agent_endpoint_id = hex::encode(agent.as_bytes());
+        match answer {
+            Some(response) => answered.push(WorkloadListEntry {
+                agent_endpoint_id,
+                response_b64: crypto::b64_encode(&response),
+            }),
+            None => unreachable.push(agent_endpoint_id),
+        }
+    }
+    Ok(Json(WorkloadListReply {
+        answered,
+        unreachable,
+    }))
 }
 
 async fn relay(

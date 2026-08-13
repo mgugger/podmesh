@@ -1,17 +1,30 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+//! Mutual handshake on the workload plane.
+//!
+//! Both directions travel in a signed [`Envelope`] that names the sender, the
+//! intended recipient, and the direction of the exchange. Because the recipient
+//! and the role are inside the signature, a captured handshake cannot be
+//! forwarded to a third peer, and a response cannot be replayed as a request.
+//!
+//! Identity keys are passed in explicitly rather than read from a process-wide
+//! location, so every component in a process — and every component in a test —
+//! signs with its own key.
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use iroh::EndpointId;
-use protocol::machine::{self, Handshake};
+use protocol::machine::{Envelope, EnvelopeParts, EnvelopeValidator, Handshake, HandshakeRole};
 use uuid::Uuid;
 
-const HANDSHAKE_PROTOCOL_VERSION: &str = "podmesh/1.0";
-const HANDSHAKE_PAYLOAD_TYPE: &str = "handshake";
-const SIGNATURE_ALGORITHM: &str = "ed25519";
-const SIGNATURE_PREFIX: &str = "ed25519";
-const MAX_TIMESTAMP_DRIFT_MS: u64 = 90 * 1_000;
-const NONCE_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// The identity a component signs its handshakes with.
+#[derive(Clone)]
+pub struct HandshakeIdentity {
+    pub signing_public: Vec<u8>,
+    pub signing_private: Vec<u8>,
+    pub kem_public: Option<Vec<u8>>,
+}
 
+/// A handshake whose envelope passed every validation rule.
 #[derive(Clone, Debug)]
 pub struct VerifiedWorkloadHandshake {
     pub handshake: Handshake,
@@ -19,167 +32,99 @@ pub struct VerifiedWorkloadHandshake {
     pub kem_pubkey: Option<Vec<u8>>,
 }
 
+/// Build the sidecar's opening handshake, addressed to a specific proxy.
 pub fn build_workload_handshake_request(
+    identity: &HandshakeIdentity,
     local_endpoint: EndpointId,
+    remote_endpoint: EndpointId,
     tenant_owner_pubkey: Option<&str>,
+    manifest_id: Option<&str>,
+    workload_credential_b64: Option<&str>,
 ) -> Result<Vec<u8>> {
-    build_signed_handshake(local_endpoint, tenant_owner_pubkey, None)
+    seal(
+        identity,
+        local_endpoint,
+        remote_endpoint,
+        HandshakeRole::Request,
+        &Handshake::request(tenant_owner_pubkey, manifest_id, workload_credential_b64),
+    )
 }
 
+/// Build the proxy's answer, addressed to the sidecar that opened the session.
 pub fn build_workload_handshake_response(
+    identity: &HandshakeIdentity,
     local_endpoint: EndpointId,
+    remote_endpoint: EndpointId,
     proxy_grant_b64: Option<&str>,
 ) -> Result<Vec<u8>> {
-    build_signed_handshake(local_endpoint, None, proxy_grant_b64)
+    seal(
+        identity,
+        local_endpoint,
+        remote_endpoint,
+        HandshakeRole::Response,
+        &Handshake::response(proxy_grant_b64),
+    )
 }
 
+/// Validate a handshake received from `remote_endpoint` and addressed to
+/// `local_endpoint`, in the expected direction.
 pub fn verify_workload_handshake(
     bytes: &[u8],
+    local_endpoint: EndpointId,
     remote_endpoint: EndpointId,
+    expected_role: HandshakeRole,
 ) -> Result<VerifiedWorkloadHandshake> {
-    let envelope =
-        machine::root_as_envelope(bytes).context("decode workload handshake envelope")?;
-    ensure!(
-        envelope.payload_type() == Some(HANDSHAKE_PAYLOAD_TYPE),
-        "unexpected workload handshake payload type"
-    );
-    ensure!(
-        envelope.alg() == Some(SIGNATURE_ALGORITHM),
-        "unsupported workload handshake signature algorithm"
-    );
-    let remote = remote_endpoint.to_string();
-    ensure!(
-        envelope.peer_id() == Some(remote.as_str()),
-        "workload handshake endpoint binding does not match transport"
-    );
-    validate_timestamp(envelope.ts())?;
+    let envelope = EnvelopeValidator::new(
+        &local_endpoint.to_string(),
+        &remote_endpoint.to_string(),
+        now_millis()?,
+    )
+    .accept(bytes, expected_role.payload_type())
+    .context("validate workload handshake envelope")?;
 
-    let nonce = envelope.nonce().unwrap_or_default();
-    ensure!(!nonce.is_empty(), "workload handshake nonce is missing");
-    crypto::nonce_helper::check_and_insert_nonce_for_peer(nonce, NONCE_WINDOW, &remote)?;
-
-    let payload = envelope.payload().unwrap_or_default();
-    let canonical = machine::build_envelope_canonical_with_peer(
-        payload,
-        HANDSHAKE_PAYLOAD_TYPE,
-        nonce,
-        envelope.ts(),
-        SIGNATURE_ALGORITHM,
-        &remote,
-        envelope.kem_pubkey(),
-    );
-    let signing_pubkey = crypto::b64_decode(envelope.pubkey().unwrap_or_default())
-        .context("decode workload handshake signing key")?;
-    let signature = crypto::nonce_helper::normalize_and_decode_signature(envelope.sig())?;
-    crypto::verify_envelope(&signing_pubkey, &canonical, &signature)
-        .context("verify workload handshake signature")?;
-
-    let handshake = machine::root_as_handshake(payload).context("decode workload handshake")?;
-    ensure!(
-        handshake.protocol_version() == Some(HANDSHAKE_PROTOCOL_VERSION),
-        "unsupported workload handshake protocol version"
-    );
-    ensure!(
-        handshake.signature() == Some(remote.as_str()),
-        "workload handshake identity does not match transport"
-    );
-    let kem_pubkey = envelope
-        .kem_pubkey()
-        .filter(|value| !value.is_empty())
-        .map(crypto::b64_decode)
-        .transpose()
-        .context("decode workload handshake KEM key")?;
+    let handshake =
+        Handshake::from_bytes(&envelope.payload).context("decode workload handshake payload")?;
 
     Ok(VerifiedWorkloadHandshake {
         handshake,
-        signing_pubkey,
-        kem_pubkey,
+        signing_pubkey: envelope.sender_signing_key()?,
+        kem_pubkey: envelope.sender_kem_key()?,
     })
 }
 
-fn build_signed_handshake(
+fn seal(
+    identity: &HandshakeIdentity,
     local_endpoint: EndpointId,
-    tenant_owner_pubkey: Option<&str>,
-    proxy_grant_b64: Option<&str>,
+    remote_endpoint: EndpointId,
+    role: HandshakeRole,
+    handshake: &Handshake,
 ) -> Result<Vec<u8>> {
-    let now = now_millis()?;
-    let message_id = Uuid::new_v4();
-    let nonce_bytes: [u8; 4] = message_id.as_bytes()[..4]
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid handshake nonce source"))?;
-    let local = local_endpoint.to_string();
-    let payload = match (tenant_owner_pubkey, proxy_grant_b64) {
-        (Some(owner), None) => machine::build_handshake_with_tenant(
-            u32::from_be_bytes(nonce_bytes),
-            now,
-            HANDSHAKE_PROTOCOL_VERSION,
-            &local,
-            owner,
-        ),
-        (None, cert) => machine::build_handshake_with_grant(
-            u32::from_be_bytes(nonce_bytes),
-            now,
-            HANDSHAKE_PROTOCOL_VERSION,
-            &local,
-            cert,
-        ),
-        (Some(_), Some(_)) => {
-            anyhow::bail!("handshake cannot contain tenant and proxy certificate")
-        }
-    };
-    let (signing_public, signing_private) = crypto::ensure_keypair_on_disk()?;
-    let kem_public = crypto::ensure_kem_keypair_on_disk()
-        .ok()
-        .map(|(public, _)| crypto::b64_encode(&public));
-    let nonce = message_id.to_string();
-    let canonical = machine::build_envelope_canonical_with_peer(
-        &payload,
-        HANDSHAKE_PAYLOAD_TYPE,
-        &nonce,
-        now,
-        SIGNATURE_ALGORITHM,
-        &local,
-        kem_public.as_deref(),
-    );
-    let (signature, public_key) =
-        crypto::sign_envelope(&signing_private, &signing_public, &canonical)?;
-    Ok(machine::build_envelope_signed(
-        machine::SignedEnvelopeParams {
-            payload: &payload,
-            payload_type: HANDSHAKE_PAYLOAD_TYPE,
-            nonce: &nonce,
-            timestamp: now,
-            algorithm: SIGNATURE_ALGORITHM,
-            signature_prefix: SIGNATURE_PREFIX,
-            signature_b64: &signature,
-            public_key_b64: &public_key,
-            peer_id: Some(&local),
-            kem_public_key_b64: kem_public.as_deref(),
-        },
-    ))
-}
-
-fn validate_timestamp(timestamp: u64) -> Result<()> {
-    let now = now_millis()?;
-    let normalized = if timestamp < now / 100 {
-        timestamp
-            .checked_mul(1_000)
-            .ok_or_else(|| anyhow::anyhow!("workload handshake timestamp overflow"))?
-    } else {
-        timestamp
-    };
     ensure!(
-        normalized.abs_diff(now) <= MAX_TIMESTAMP_DRIFT_MS,
-        "workload handshake timestamp is outside the allowed window"
+        local_endpoint != remote_endpoint,
+        "a workload handshake cannot be addressed to its own endpoint"
     );
-    Ok(())
+    let payload = handshake.to_bytes()?;
+    Envelope::seal(
+        EnvelopeParts {
+            payload: &payload,
+            payload_type: role.payload_type(),
+            nonce: &Uuid::new_v4().to_string(),
+            ts_millis: now_millis()?,
+            sender_id: &local_endpoint.to_string(),
+            recipient_id: &remote_endpoint.to_string(),
+            sender_signing_pubkey: &identity.signing_public,
+            sender_kem_pubkey: identity.kem_public.as_deref(),
+        },
+        &identity.signing_private,
+    )?
+    .to_bytes()
 }
 
 fn now_millis() -> Result<u64> {
-    Ok(SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock precedes Unix epoch")?
         .as_millis()
         .try_into()
-        .context("system time exceeds u64 milliseconds")?)
+        .context("system time exceeds u64 milliseconds")
 }

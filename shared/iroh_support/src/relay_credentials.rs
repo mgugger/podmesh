@@ -73,9 +73,15 @@ pub fn ensure_relay_tls(
     }
 }
 
-/// Returns the relay's shared access token, generating a random one in
-/// `directory` when the operator did not supply theirs.
-pub fn ensure_relay_auth_token(directory: &Path, token_override: Option<String>) -> Result<String> {
+/// Returns the mesh-wide relay secret, generating a random one in `directory`
+/// when the operator did not supply theirs.
+///
+/// The secret is never handed to a workload: each tenant receives only a token
+/// derived from it, so one tenant's credential cannot be used for another.
+pub fn ensure_relay_mesh_secret(
+    directory: &Path,
+    token_override: Option<String>,
+) -> Result<String> {
     if let Some(token) = token_override {
         return Ok(token);
     }
@@ -260,8 +266,8 @@ mod tests {
     #[test]
     fn generated_token_is_reused_and_long_enough() {
         let temp = tempfile::tempdir().unwrap();
-        let first = ensure_relay_auth_token(temp.path(), None).unwrap();
-        let second = ensure_relay_auth_token(temp.path(), None).unwrap();
+        let first = ensure_relay_mesh_secret(temp.path(), None).unwrap();
+        let second = ensure_relay_mesh_secret(temp.path(), None).unwrap();
         assert_eq!(first, second);
         assert!(first.len() >= 32, "token must satisfy the relay minimum");
         assert!(
@@ -275,7 +281,7 @@ mod tests {
     fn an_explicit_token_is_never_overwritten() {
         let temp = tempfile::tempdir().unwrap();
         let explicit = "operator-supplied-token-0123456789".to_string();
-        let resolved = ensure_relay_auth_token(temp.path(), Some(explicit.clone())).unwrap();
+        let resolved = ensure_relay_mesh_secret(temp.path(), Some(explicit.clone())).unwrap();
         assert_eq!(resolved, explicit);
         assert!(!temp.path().join(AUTH_TOKEN_FILE).exists());
     }

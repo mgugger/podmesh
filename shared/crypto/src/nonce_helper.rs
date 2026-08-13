@@ -1,103 +1,110 @@
-use anyhow::Context;
+//! Per-peer nonce replay cache for envelope validation.
+//!
+//! Every accepted nonce is remembered for the duration of the drift window, so
+//! a captured envelope cannot be presented twice. The cache is bounded on both
+//! axes and evicts in FIFO order, because a cache that fails closed when full
+//! would let one peer deny service to everybody else.
+
+use anyhow::{Result, ensure};
 use log::warn;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Maximum number of unique peers to track in the nonce store (prevents memory exhaustion)
+/// Maximum number of distinct peers tracked at once.
 const MAX_TRACKED_PEERS: usize = 10_000;
-
-/// Maximum nonces per peer to prevent memory exhaustion from a single peer
+/// Maximum nonces remembered per peer.
 const MAX_NONCES_PER_PEER: usize = 1_000;
+/// Longest nonce string accepted. Nonces are UUIDs in practice; the bound stops
+/// a peer from filling its bucket with megabyte-sized keys.
+pub const MAX_NONCE_LEN: usize = 128;
 
-static NONCE_STORE: OnceLock<Mutex<HashMap<String, HashMap<String, Instant>>>> = OnceLock::new();
-
-fn nonce_store() -> &'static Mutex<HashMap<String, HashMap<String, Instant>>> {
-    NONCE_STORE.get_or_init(|| Mutex::new(HashMap::new()))
+/// One peer's nonces, with insertion order kept so eviction is O(1).
+#[derive(Default)]
+struct PeerNonces {
+    seen: HashMap<String, Instant>,
+    order: VecDeque<String>,
 }
 
-/// Accept a signature string potentially prefixed (e.g. "ed25519:<b64>") and return decoded bytes.
-/// Keeps prefix-handling logic centralized.
-pub fn normalize_and_decode_signature(sig_opt: Option<&str>) -> anyhow::Result<Vec<u8>> {
-    let sig_str = sig_opt.unwrap_or("");
-    let b64_part = if let Some(idx) = sig_str.find(':') {
-        &sig_str[idx + 1..]
-    } else {
-        sig_str
-    };
-    crate::b64_decode(b64_part).context("failed to base64-decode signature")
-}
-
-/// Check replay protection: ensure nonce is not seen in `nonce_window` and insert it.
-/// Returns Err if duplicate or invalid.
-pub fn check_and_insert_nonce(nonce_str: &str, nonce_window: Duration) -> anyhow::Result<()> {
-    check_and_insert_nonce_for_peer(nonce_str, nonce_window, "global")
-}
-
-/// Check replay protection for a specific peer: ensure nonce is not seen in `nonce_window` and insert it.
-/// Returns Err if duplicate or invalid.
-pub fn check_and_insert_nonce_for_peer(
-    nonce_str: &str,
-    nonce_window: Duration,
-    peer_id: &str,
-) -> anyhow::Result<()> {
-    if nonce_str.is_empty() {
-        return Err(anyhow::anyhow!("nonce cannot be empty"));
+impl PeerNonces {
+    fn prune_expired(&mut self, now: Instant, window: Duration) {
+        while let Some(oldest) = self.order.front() {
+            match self.seen.get(oldest) {
+                Some(recorded) if now.duration_since(*recorded) > window => {
+                    let key = self.order.pop_front().expect("front checked above");
+                    self.seen.remove(&key);
+                }
+                Some(_) => break,
+                None => {
+                    self.order.pop_front();
+                }
+            }
+        }
     }
+
+    fn insert(&mut self, nonce: &str, now: Instant) {
+        if self.order.len() >= MAX_NONCES_PER_PEER
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.seen.remove(&evicted);
+        }
+        self.seen.insert(nonce.to_string(), now);
+        self.order.push_back(nonce.to_string());
+    }
+}
+
+/// The whole cache, with peer insertion order kept for the same reason.
+#[derive(Default)]
+struct NonceStore {
+    peers: HashMap<String, PeerNonces>,
+    order: VecDeque<String>,
+}
+
+static NONCE_STORE: OnceLock<Mutex<NonceStore>> = OnceLock::new();
+
+fn nonce_store() -> &'static Mutex<NonceStore> {
+    NONCE_STORE.get_or_init(|| Mutex::new(NonceStore::default()))
+}
+
+/// Record `nonce` against `peer_id`, refusing it if already seen in `window`.
+pub fn check_and_insert_nonce_for_peer(nonce: &str, window: Duration, peer_id: &str) -> Result<()> {
+    ensure!(!nonce.is_empty(), "nonce cannot be empty");
+    ensure!(
+        nonce.len() <= MAX_NONCE_LEN,
+        "nonce is {} bytes, over the {MAX_NONCE_LEN} byte limit",
+        nonce.len()
+    );
 
     let now = Instant::now();
     let mut store = nonce_store()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    // Enforce maximum peer count with LRU-like eviction
-    if !store.contains_key(peer_id) && store.len() >= MAX_TRACKED_PEERS {
-        // Evict the peer with the oldest average nonce timestamp
-        if let Some(oldest_peer) = store
-            .iter()
-            .filter_map(|(k, inner)| {
-                inner
-                    .values()
-                    .min()
-                    .map(|oldest_time| (k.clone(), *oldest_time))
-            })
-            .min_by_key(|(_, time)| *time)
-            .map(|(k, _)| k)
-        {
-            warn!(
-                "nonce store at capacity ({} peers), evicting oldest peer: {}",
-                MAX_TRACKED_PEERS, oldest_peer
-            );
-            store.remove(&oldest_peer);
-        }
+    if !store.peers.contains_key(peer_id)
+        && store.order.len() >= MAX_TRACKED_PEERS
+        && let Some(evicted) = store.order.pop_front()
+    {
+        warn!("nonce store at {MAX_TRACKED_PEERS} peers, evicting oldest peer {evicted}");
+        store.peers.remove(&evicted);
     }
 
-    // Get or create peer-specific nonce store
-    let peer_store = store.entry(peer_id.to_string()).or_default();
-
-    // prune old nonces for this peer
-    peer_store.retain(|_, &mut t| now.duration_since(t) <= nonce_window);
-
-    // Enforce maximum nonces per peer
-    if peer_store.len() >= MAX_NONCES_PER_PEER {
-        // Evict the oldest nonce for this peer
-        if let Some(oldest_nonce) = peer_store
-            .iter()
-            .min_by_key(|(_, time)| *time)
-            .map(|(k, _)| k.clone())
-        {
-            warn!(
-                "peer {} at nonce capacity ({}), evicting oldest nonce",
-                peer_id, MAX_NONCES_PER_PEER
-            );
-            peer_store.remove(&oldest_nonce);
-        }
+    if !store.peers.contains_key(peer_id) {
+        store
+            .peers
+            .insert(peer_id.to_string(), PeerNonces::default());
+        store.order.push_back(peer_id.to_string());
     }
 
-    if peer_store.contains_key(nonce_str) {
-        return Err(anyhow::anyhow!("replay detected: nonce already seen"));
-    }
-    peer_store.insert(nonce_str.to_string(), now);
+    let peer = store
+        .peers
+        .get_mut(peer_id)
+        .expect("peer inserted immediately above");
+    peer.prune_expired(now, window);
+    ensure!(
+        !peer.seen.contains_key(nonce),
+        "replay detected: nonce already seen for this peer"
+    );
+    peer.insert(nonce, now);
     Ok(())
 }
 
@@ -106,39 +113,47 @@ pub fn check_and_insert_nonce_for_peer(
 /// (a `#[cfg(test)]` item in a library is not visible to tests in dependent
 /// crates).
 pub fn reset_nonce_store_for_test() {
-    nonce_store()
+    let mut store = nonce_store()
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clear();
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    store.peers.clear();
+    store.order.clear();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+
+    const WINDOW: Duration = Duration::from_secs(60);
 
     #[test]
-    fn test_nonce_replay_protection() {
-        let nonce = "test-nonce-unique";
-        let window = Duration::from_secs(60);
-
-        // First use should succeed
-        assert!(check_and_insert_nonce(nonce, window).is_ok());
-
-        // Second use should fail (replay)
-        assert!(check_and_insert_nonce(nonce, window).is_err());
+    fn replayed_nonce_is_refused_for_the_same_peer() {
+        assert!(check_and_insert_nonce_for_peer("nonce-a", WINDOW, "peer-1").is_ok());
+        assert!(check_and_insert_nonce_for_peer("nonce-a", WINDOW, "peer-1").is_err());
     }
 
     #[test]
-    fn test_signature_prefix_handling() {
-        // Test with prefix
-        let sig_with_prefix = "ed25519:dGVzdA=="; // "test" in base64
-        let decoded = normalize_and_decode_signature(Some(sig_with_prefix)).unwrap();
-        assert_eq!(decoded, b"test");
+    fn the_same_nonce_from_a_different_peer_is_accepted() {
+        assert!(check_and_insert_nonce_for_peer("nonce-b", WINDOW, "peer-2").is_ok());
+        assert!(check_and_insert_nonce_for_peer("nonce-b", WINDOW, "peer-3").is_ok());
+    }
 
-        // Test without prefix
-        let sig_without_prefix = "dGVzdA==";
-        let decoded = normalize_and_decode_signature(Some(sig_without_prefix)).unwrap();
-        assert_eq!(decoded, b"test");
+    #[test]
+    fn oversized_and_empty_nonces_are_refused() {
+        assert!(check_and_insert_nonce_for_peer("", WINDOW, "peer-4").is_err());
+        let oversized = "n".repeat(MAX_NONCE_LEN + 1);
+        assert!(check_and_insert_nonce_for_peer(&oversized, WINDOW, "peer-4").is_err());
+    }
+
+    #[test]
+    fn a_single_peer_cannot_exhaust_the_store() {
+        // Filling one peer's bucket past its bound must evict that peer's own
+        // oldest entries rather than start failing closed.
+        for index in 0..(MAX_NONCES_PER_PEER + 16) {
+            check_and_insert_nonce_for_peer(&format!("bulk-{index}"), WINDOW, "peer-bulk")
+                .expect("insert must keep succeeding under pressure");
+        }
+        check_and_insert_nonce_for_peer("bulk-fresh", WINDOW, "peer-bulk")
+            .expect("store must still accept new nonces");
     }
 }

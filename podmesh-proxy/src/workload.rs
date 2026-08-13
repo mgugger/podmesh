@@ -35,7 +35,7 @@ impl Workload {
         }
         let relay = self.cfg.workload_relay.as_ref()?;
         Some(restapi::WorkloadRelayBootstrap {
-            auth_token: relay.auth_token.clone(),
+            mesh_secret: relay.mesh_secret.clone(),
             ca_certificate_der: self.cfg.workload_relay_certificate_der.clone(),
         })
     }
@@ -66,6 +66,7 @@ impl Workload {
                 endpoint_record,
                 grant_store,
                 relay_bootstrap: self.relay_bootstrap(),
+                rate_limit_per_minute: self.cfg.rest_rate_limit_per_minute,
             })?)
         };
 
@@ -78,6 +79,7 @@ impl Workload {
                 self.cfg.rest_host.clone(),
                 DEFAULT_INGRESS_PORT,
                 ingress::proxy_sidecar_client(proxy_client),
+                self.routes(),
             )?;
             self.ingress = Some(ingress_server);
         } else {
@@ -124,7 +126,7 @@ impl Workload {
 
     /// Direct access to the in-memory routing table populated by sidecar registrations.
     /// Useful for integration tests asserting that a verified registration was stored.
-    pub fn routing_table_handle(&self) -> Option<iroh_runtime::RoutingTable> {
-        self.p2p_node.as_ref().map(|node| node.routing_table())
+    pub fn routes(&self) -> Option<std::sync::Arc<crate::routes::RouteTable>> {
+        self.p2p_node.as_ref().map(|node| node.routes())
     }
 }

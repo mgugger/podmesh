@@ -32,11 +32,19 @@ use tokio::{
 };
 
 use podmesh_integration_tests::support::{
-    allocate_tcp_port, allocate_udp_port, fresh_tenant_owner, init_ephemeral_keys, init_tracing,
-    provision_proxy_cert,
+    allocate_tcp_port, allocate_udp_port, fresh_tenant_owner, init_tracing, provision_proxy_cert,
 };
 
-const DEMO_MANIFEST_ID: &str = "demo-nginx";
+const DEMO_WORKLOAD_NAME: &str = "demo-nginx";
+
+/// The routing key is derived from the tenant owner key, so every helper that
+/// builds or inspects the demo workload has to agree on that key.
+fn demo_manifest_id(owner_b64: &str) -> String {
+    protocol::route_id(
+        &crypto::b64_decode(owner_b64).expect("owner key"),
+        DEMO_WORKLOAD_NAME,
+    )
+}
 const DEMO_MANIFEST: &[u8] = include_bytes!("../sample_manifests/demo_deployment.yml");
 
 /// Configuration for test workloads.
@@ -57,6 +65,8 @@ fn build_proxy_config(
         rest_port,
         disable_rest_api: false,
         enable_ingress,
+        advertise_addresses: Vec::new(),
+        rest_rate_limit_per_minute: podmesh_proxy::restapi::DEFAULT_REST_RATE_LIMIT_PER_MINUTE,
         owner_pubkey: None,
     }
 }
@@ -211,22 +221,32 @@ async fn wait_for_sidecar_peer_ready(
 
 /// Build sidecar configuration for testing.
 fn build_sidecar_config(
+    owner_b64: &str,
+    owner_sk: &[u8],
     proxy_endpoints: Vec<protocol::EndpointRecord>,
     app_port: u16,
 ) -> Result<(SidecarConfig, String, String)> {
-    let (routes, ingress_host, service_host) = demo_routes(app_port)?;
+    let (routes, ingress_host, service_host) = demo_routes(owner_b64, app_port)?;
     let cfg = SidecarConfig {
         identity: podmesh_sidecar::IdentitySource::ephemeral(),
         proxy_endpoints,
+        workload_credential_b64: Some(podmesh_integration_tests::support::workload_credential(
+            owner_sk,
+            owner_b64,
+            DEMO_WORKLOAD_NAME,
+        )),
         workload_relay_auth_token: None,
         workload_relay_ca_certificates: Vec::new(),
         lookup_interval: Duration::from_secs(2),
         iroh_bind_addr: "127.0.0.1:0".parse()?,
-        manifest_id: DEMO_MANIFEST_ID.to_string(),
+        workload_name: DEMO_WORKLOAD_NAME.to_string(),
+        manifest_id: demo_manifest_id(owner_b64),
+        replica_index: 0,
+        replica_count: 1,
         ingress_host: ingress_host.clone(),
         app_port,
         routes,
-        owner_public_key_b64: None,
+        owner_public_key_b64: Some(owner_b64.to_string()),
         enable_egress: false,
         skip_egress_nft: false,
         http_proxy_port: None,
@@ -235,8 +255,8 @@ fn build_sidecar_config(
 }
 
 /// Extract routes from the demo manifest.
-fn demo_routes(app_port: u16) -> Result<(Vec<SidecarRouteSpec>, String, String)> {
-    let extraction = extract_sidecar_routes(DEMO_MANIFEST, DEMO_MANIFEST_ID)?;
+fn demo_routes(owner_b64: &str, app_port: u16) -> Result<(Vec<SidecarRouteSpec>, String, String)> {
+    let extraction = extract_sidecar_routes(DEMO_MANIFEST, &demo_manifest_id(owner_b64))?;
     let mut routes = extraction.routes;
     for route in routes.iter_mut() {
         route.target_port = app_port;
@@ -270,7 +290,6 @@ fn demo_routes(app_port: u16) -> Result<(Vec<SidecarRouteSpec>, String, String)>
 #[serial]
 async fn process_based_stack_with_multiple_nodes() -> Result<()> {
     init_tracing();
-    init_ephemeral_keys();
     let (owner_b64, owner_sk, owner_pk) = fresh_tenant_owner();
 
     let mut proxies: Vec<ProxyHandle> = Vec::new();
@@ -334,8 +353,12 @@ async fn process_based_stack_with_multiple_nodes() -> Result<()> {
             .collect::<Vec<_>>();
 
         // Build sidecar configuration
-        let (mut sidecar_cfg, ingress_host, service_host) =
-            build_sidecar_config(sidecar_bootstrap_peers.clone(), app_port)?;
+        let (mut sidecar_cfg, ingress_host, service_host) = build_sidecar_config(
+            &owner_b64,
+            &owner_sk,
+            sidecar_bootstrap_peers.clone(),
+            app_port,
+        )?;
         sidecar_cfg.owner_public_key_b64 = Some(owner_b64.clone());
 
         log::info!(

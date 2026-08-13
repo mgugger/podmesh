@@ -13,13 +13,15 @@
 //! and the result still verifies against the same owner key. Attenuation can
 //! only ever remove authority, so a proxy cannot widen what the owner granted.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, ensure};
 use biscuit_auth::{
-    AuthorizerBuilder, Biscuit,
+    AuthorizerBuilder, AuthorizerLimits, Biscuit,
     builder::{Term, fact, string},
 };
 
-use crate::workload_authz::{
+use crate::biscuit_keys::{
     MAX_AUTHZ_VALUE_LEN, MAX_BISCUIT_TOKEN_BYTES, biscuit_keypair_from_ed25519,
     biscuit_public_key_from_ed25519,
 };
@@ -37,6 +39,22 @@ pub const MAX_PROXY_GRANT_LIFETIME_SECS: u64 = 90 * 24 * 60 * 60;
 pub const MAX_PROXY_GRANT_CLOCK_SKEW_SECS: u64 = 60;
 /// Bounds the base64 form so an oversized token is rejected before decoding.
 pub const MAX_PROXY_GRANT_B64_LEN: usize = 4 * MAX_BISCUIT_TOKEN_BYTES.div_ceil(3);
+
+/// Work bounds for grant authorization.
+///
+/// Biscuit's defaults cut evaluation off after one millisecond of wall clock,
+/// which makes the outcome depend on how busy the machine is: a perfectly valid
+/// grant is refused under load, exactly when a proxy is least able to afford it.
+/// A grant is evaluated against a fixed policy over a handful of facts, so the
+/// meaningful bounds are on facts and iterations — those are deterministic. The
+/// time bound stays only as a backstop against a pathological token.
+pub(crate) fn authorizer_limits() -> AuthorizerLimits {
+    AuthorizerLimits {
+        max_facts: 1_000,
+        max_iterations: 100,
+        max_time: Duration::from_secs(1),
+    }
+}
 
 /// What an owner asserts about a proxy.
 #[derive(Debug, Clone)]
@@ -136,7 +154,7 @@ pub fn verify_proxy_grant(
         expected_tenant_owner == crypto::b64_encode(owner_public),
         "proxy grant tenant owner does not match the trusted owner key"
     );
-    let root_public = biscuit_public_key_from_ed25519(owner_public)?;
+    let root_public = biscuit_root_from_owner(owner_public)?;
     let token =
         Biscuit::from(encoded, root_public).context("verify proxy grant Biscuit signature")?;
     let mut authorizer = AuthorizerBuilder::new()
@@ -152,7 +170,7 @@ pub fn verify_proxy_grant(
         .code(PROXY_GRANT_POLICY)?
         .build(&token)?;
     authorizer
-        .authorize()
+        .authorize_with_limits(authorizer_limits())
         .context("proxy grant authorization failed")?;
     Ok(())
 }
@@ -183,7 +201,7 @@ allow if tenant_owner($tenant), request_tenant_owner($tenant),
 deny if true;
 "#;
 
-fn validate_value(value: &str, field: &str) -> Result<()> {
+pub(crate) fn validate_value(value: &str, field: &str) -> Result<()> {
     ensure!(
         !value.is_empty() && value.len() <= MAX_AUTHZ_VALUE_LEN,
         "{field} length is invalid"
@@ -191,10 +209,15 @@ fn validate_value(value: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
+/// The owner's Ed25519 public key, as the Biscuit root that signed a token.
+pub(crate) fn biscuit_root_from_owner(owner_public: &[u8]) -> Result<biscuit_auth::PublicKey> {
+    biscuit_public_key_from_ed25519(owner_public)
+}
+
 fn to_i64(value: u64) -> Result<i64> {
     i64::try_from(value).context("proxy grant timestamp exceeds i64")
 }
 
-fn int_term(value: i64) -> Term {
+pub(crate) fn int_term(value: i64) -> Term {
     value.into()
 }

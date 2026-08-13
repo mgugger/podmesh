@@ -24,9 +24,17 @@ pub struct CapacityService {
 }
 
 impl CapacityService {
+    /// Gossip a placement query and answer with one offer.
+    ///
+    /// `target_offers` is how many offers the caller wants to choose between.
+    /// The wait ends as soon as that many have arrived, so placement latency
+    /// tracks how fast agents answer rather than the query lifetime. Waiting for
+    /// every agent in a large mesh would make every placement cost the full
+    /// timeout, and a deployment pays that cost once per replica.
     pub async fn solicit(
         &self,
         criteria: CapacityCriteria,
+        target_offers: usize,
     ) -> Result<Option<protocol::CapacityOffer>> {
         ensure!(
             !self.cancellation.is_cancelled(),
@@ -35,7 +43,13 @@ impl CapacityService {
         let now = now_secs();
         let begun = self
             .queries
-            .begin(criteria, &self.identity, &self.endpoint.addr(), now)
+            .begin(
+                criteria,
+                &self.identity,
+                &self.endpoint.addr(),
+                target_offers,
+                now,
+            )
             .await?;
         if begun.newly_created
             && let Err(error) = self.publisher.publish(begun.query.clone()).await
@@ -44,9 +58,16 @@ impl CapacityService {
             return Err(error);
         }
         let wait = Duration::from_secs(begun.query.expires_at_secs.saturating_sub(now));
+        let mut offers = begun.offers.clone();
+        let enough = begun.target_offers;
         tokio::select! {
             _ = self.cancellation.cancelled() => {
                 anyhow::bail!("scheduler capacity request cancelled during shutdown")
+            }
+            // `wait_for` checks the current value before suspending, so an offer
+            // that arrived while the query was being published is not missed.
+            result = offers.wait_for(|collected| *collected >= enough) => {
+                let _ = result;
             }
             _ = tokio::time::sleep(wait) => {}
         }

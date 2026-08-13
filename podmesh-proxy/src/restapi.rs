@@ -9,7 +9,9 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use axum_support::{parse_socket_addr, spawn_tcp_server};
+use axum_support::{parse_socket_addr, spawn_tcp_server, with_rate_limit};
+
+use crate::relay_bootstrap_api::{get_workload_relay_bootstrap, get_workload_relay_mesh_secret};
 use serde::Serialize;
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
@@ -43,11 +45,24 @@ impl PeerSnapshot {
 /// development mesh.
 #[derive(Clone)]
 pub struct WorkloadRelayBootstrap {
-    pub auth_token: String,
+    /// Never served as-is. Each caller receives only the token derived for the
+    /// tenant it asks about, so obtaining one tenant's token does not yield
+    /// another's.
+    pub mesh_secret: String,
     pub ca_certificate_der: Vec<u8>,
 }
 
 /// Inputs to the REST server.
+/// Requests per minute a single peer address may make against the proxy REST
+/// API.
+///
+/// `POST /api/v1/proxy_grant` is deliberately unauthenticated — a grant proves
+/// its own authority — but verifying one costs a signature check plus a Datalog
+/// evaluation, and every accepted grant occupies a slot in a bounded store. A
+/// per-peer budget keeps that from being a free way to wedge the store. Real
+/// clients post one grant per proxy per deploy, so the budget is generous.
+pub const DEFAULT_REST_RATE_LIMIT_PER_MINUTE: u32 = 600;
+
 pub struct RestServerOptions {
     pub host: String,
     pub port: u16,
@@ -59,16 +74,18 @@ pub struct RestServerOptions {
     pub grant_store: ProxyGrantStore,
     /// When set, `GET /api/v1/workload_relay_bootstrap` serves these values.
     pub relay_bootstrap: Option<WorkloadRelayBootstrap>,
+    /// Per-peer request budget. Zero disables throttling.
+    pub rate_limit_per_minute: u32,
 }
 
 #[derive(Clone)]
-struct RestState {
+pub(crate) struct RestState {
     started_at: Instant,
     peers: PeerSnapshot,
     local_peer_id: String,
-    endpoint_record: Arc<RwLock<protocol::EndpointRecord>>,
+    pub(crate) endpoint_record: Arc<RwLock<protocol::EndpointRecord>>,
     grant_store: ProxyGrantStore,
-    relay_bootstrap: Option<WorkloadRelayBootstrap>,
+    pub(crate) relay_bootstrap: Option<WorkloadRelayBootstrap>,
 }
 
 #[derive(Serialize)]
@@ -76,11 +93,6 @@ struct HealthResponse {
     status: &'static str,
     uptime_secs: u64,
     peer_count: usize,
-}
-
-#[derive(Serialize)]
-struct PubkeyResponse {
-    pubkey_b64: String,
 }
 
 #[derive(Serialize)]
@@ -96,19 +108,19 @@ struct CertAck {
 }
 
 #[derive(Serialize)]
-struct ApiError {
-    error: String,
+pub(crate) struct ApiError {
+    pub(crate) error: String,
 }
 
-/// Response body for `GET /api/v1/workload_relay_bootstrap`.
+/// Response body for `GET /api/v1/endpoint_record`.
+///
+/// `peer_id` is a convenience for humans; consumers must take the endpoint id
+/// from the signed record, because only that is attested.
 #[derive(Serialize)]
-struct WorkloadRelayBootstrapResponse {
-    /// Base64-postcard `EndpointRecord` identifying this proxy.
+struct EndpointRecordResponse {
     endpoint_record_b64: String,
-    /// Shared access token for this proxy's workload relay.
-    auth_token: String,
-    /// Base64 DER of the relay's certificate, pinned by sidecars.
-    ca_certificate_b64: String,
+    peer_id: String,
+    signing_pubkey_b64: String,
 }
 
 pub fn spawn_rest_server(options: RestServerOptions) -> Result<JoinHandle<()>> {
@@ -120,6 +132,7 @@ pub fn spawn_rest_server(options: RestServerOptions) -> Result<JoinHandle<()>> {
         endpoint_record,
         grant_store,
         relay_bootstrap,
+        rate_limit_per_minute,
     } = options;
 
     let addr = parse_socket_addr(&host, port)?;
@@ -132,18 +145,28 @@ pub fn spawn_rest_server(options: RestServerOptions) -> Result<JoinHandle<()>> {
         relay_bootstrap,
     };
 
-    let app = Router::new()
-        .route("/healthz", get(healthz))
+    let health_state = state.clone();
+    let limited = Router::new()
         .route("/api/v1/peer_id", get(get_peer_id))
         .route("/api/v1/endpoint_record", get(get_endpoint_record))
         .route(
             "/api/v1/workload_relay_bootstrap",
             get(get_workload_relay_bootstrap),
         )
-        .route("/api/v1/signing_pubkey", get(get_signing_pubkey))
-        .route("/api/v1/kem_pubkey", get(get_kem_pubkey))
+        .route(
+            "/api/v1/workload_relay_mesh_secret",
+            get(get_workload_relay_mesh_secret),
+        )
         .route("/api/v1/proxy_grant", post(post_proxy_grant))
         .with_state(state);
+
+    // Liveness stays outside the limiter so an orchestrator polling health is
+    // never throttled by unrelated client traffic.
+    let app = with_rate_limit(limited, rate_limit_per_minute).merge(
+        Router::new()
+            .route("/healthz", get(healthz))
+            .with_state(health_state),
+    );
 
     Ok(spawn_tcp_server(addr, app, "workload-rest-api"))
 }
@@ -183,57 +206,15 @@ async fn get_endpoint_record(State(state): State<RestState>) -> impl IntoRespons
                 .into_response();
         }
     };
+    let signing_pubkey_b64 = record.signing_pubkey.clone();
+    let peer_id = hex::encode(&record.endpoint_id);
     match record.to_bytes(now) {
         Ok(bytes) => (
             StatusCode::OK,
-            Json(PubkeyResponse {
-                pubkey_b64: crypto::b64_encode(&bytes),
-            }),
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError {
-                error: format!("failed to encode EndpointRecord: {error}"),
-            }),
-        )
-            .into_response(),
-    }
-}
-
-async fn get_workload_relay_bootstrap(State(state): State<RestState>) -> impl IntoResponse {
-    let Some(bootstrap) = state.relay_bootstrap.clone() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(ApiError {
-                error: "this proxy does not publish workload relay credentials".into(),
-            }),
-        )
-            .into_response();
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let record = match state.endpoint_record.read() {
-        Ok(record) => record.clone(),
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: "proxy EndpointRecord lock poisoned".into(),
-                }),
-            )
-                .into_response();
-        }
-    };
-    match record.to_bytes(now) {
-        Ok(bytes) => (
-            StatusCode::OK,
-            Json(WorkloadRelayBootstrapResponse {
+            Json(EndpointRecordResponse {
                 endpoint_record_b64: crypto::b64_encode(&bytes),
-                auth_token: bootstrap.auth_token,
-                ca_certificate_b64: crypto::b64_encode(&bootstrap.ca_certificate_der),
+                peer_id,
+                signing_pubkey_b64,
             }),
         )
             .into_response(),
@@ -241,44 +222,6 @@ async fn get_workload_relay_bootstrap(State(state): State<RestState>) -> impl In
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiError {
                 error: format!("failed to encode EndpointRecord: {error}"),
-            }),
-        )
-            .into_response(),
-    }
-}
-
-async fn get_signing_pubkey(State(_state): State<RestState>) -> impl IntoResponse {
-    match crypto::ensure_keypair_on_disk() {
-        Ok((pub_bytes, _)) => (
-            StatusCode::OK,
-            Json(PubkeyResponse {
-                pubkey_b64: crypto::b64_encode(&pub_bytes),
-            }),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError {
-                error: format!("failed to load signing keypair: {}", err),
-            }),
-        )
-            .into_response(),
-    }
-}
-
-async fn get_kem_pubkey(State(_state): State<RestState>) -> impl IntoResponse {
-    match crypto::ensure_kem_keypair_on_disk() {
-        Ok((pub_bytes, _)) => (
-            StatusCode::OK,
-            Json(PubkeyResponse {
-                pubkey_b64: crypto::b64_encode(&pub_bytes),
-            }),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError {
-                error: format!("failed to load kem keypair: {}", err),
             }),
         )
             .into_response(),
@@ -333,10 +276,12 @@ async fn post_proxy_grant(
             }),
         )
             .into_response(),
-        Err(error) => (
+        Err(_error) => (
             StatusCode::BAD_REQUEST,
+            // Only a generic reason is returned; the detail goes to the log,
+            // because this endpoint is reachable by anyone.
             Json(ApiError {
-                error: format!("proxy grant rejected: {error:#}"),
+                error: "proxy grant rejected".into(),
             }),
         )
             .into_response(),

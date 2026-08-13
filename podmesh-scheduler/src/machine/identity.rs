@@ -31,7 +31,7 @@ pub struct SchedulerIdentity {
 impl SchedulerIdentity {
     #[cfg(test)]
     pub(crate) fn ephemeral() -> Result<Self> {
-        let (signing_public, signing_private) = crypto::ensure_keypair_ephemeral()?;
+        let (signing_public, signing_private) = crypto::generate_signing_keypair();
         Ok(Self {
             transport_secret: SecretKey::generate(),
             signing_public,
@@ -42,13 +42,9 @@ impl SchedulerIdentity {
 
     pub fn load(key_dir: &Path) -> Result<Self> {
         let transport_secret = iroh_support::load_or_initialize_iroh_secret(&key_dir.join("iroh"))?;
-        crypto::set_keypair_config(crypto::KeypairConfig {
-            signing_mode: crypto::KeypairMode::Persistent,
-            kem_mode: crypto::KeypairMode::Persistent,
-            key_directory: Some(key_dir.join("signing")),
-        });
-        let (signing_public, signing_private) = crypto::ensure_keypair_on_disk()
-            .context("load persistent scheduler application signing key")?;
+        let (signing_public, signing_private) =
+            crypto::load_or_create_signing_keypair(&key_dir.join("signing"))
+                .context("load persistent scheduler application signing key")?;
         Ok(Self {
             transport_secret,
             signing_public,

@@ -14,8 +14,6 @@ use iroh_relay::server::{
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
-const MIN_AUTH_TOKEN_BYTES: usize = 32;
-const MAX_AUTH_TOKEN_BYTES: usize = 4 * 1024;
 const MAX_CERTIFICATE_CHAIN_BYTES: u64 = 1024 * 1024;
 const MAX_PRIVATE_KEY_BYTES: u64 = 64 * 1024;
 const MAX_CERTIFICATES: usize = 16;
@@ -25,10 +23,40 @@ pub const DEFAULT_RELAY_KEY_CACHE_CAPACITY: usize = 16_384;
 /// workload relay certificate, private key and access token.
 pub const WORKLOAD_RELAY_CREDENTIAL_DIR: &str = "workload-relay";
 
+/// Which tenants a relay admits.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum RelayTenantPolicy {
+    /// Relay for any tenant that presents a valid derived token.
+    ///
+    /// The default, because relaying is transport: what a workload may register
+    /// or tunnel is decided by its owner-signed credential, not by this.
+    #[default]
+    All,
+    /// Relay only for the listed namespace owners.
+    Only(std::collections::HashSet<String>),
+}
+
+impl RelayTenantPolicy {
+    fn admits(&self, owner_pubkey_b64: &str) -> bool {
+        // Mesh components are not tenants, and restricting which tenants a
+        // relay serves must not stop the proxy reaching its own relay.
+        if owner_pubkey_b64 == protocol::relay_token::MESH_COMPONENT_TENANT {
+            return true;
+        }
+        match self {
+            Self::All => true,
+            Self::Only(owners) => owners.contains(owner_pubkey_b64),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkloadRelayConfig {
     pub url: String,
-    pub auth_token: String,
+    /// Secret every proxy in the mesh shares, from which each tenant's relay
+    /// token is derived. It is never handed to a workload.
+    pub mesh_secret: String,
+    pub relay_tenants: RelayTenantPolicy,
     pub http_listen: SocketAddr,
     pub https_listen: SocketAddr,
     pub qad_listen: SocketAddr,
@@ -51,19 +79,7 @@ impl WorkloadRelayConfig {
             canonical.starts_with("https://"),
             "workload relay URL must use HTTPS"
         );
-        ensure!(
-            self.auth_token.len() >= MIN_AUTH_TOKEN_BYTES
-                && self.auth_token.len() <= MAX_AUTH_TOKEN_BYTES,
-            "workload relay auth token length is invalid"
-        );
-        ensure!(
-            self.auth_token.is_ascii()
-                && !self
-                    .auth_token
-                    .bytes()
-                    .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control()),
-            "workload relay auth token contains invalid characters"
-        );
+        protocol::relay_token::validate_mesh_secret(&self.mesh_secret)?;
         ensure!(
             !listeners_conflict(self.http_listen, self.https_listen),
             "workload relay HTTP and HTTPS listeners must differ"
@@ -85,12 +101,14 @@ impl WorkloadRelayConfig {
     pub fn relay_map(&self) -> Result<RelayMap> {
         self.validate()?;
         let parsed = RelayMap::try_from_iter([self.url.as_str()])?;
-        let relays = parsed.relays::<Vec<_>>().into_iter().map(|relay| {
-            relay
-                .as_ref()
-                .clone()
-                .with_auth_token(self.auth_token.clone())
-        });
+        let own_token = protocol::derive_tenant_relay_token(
+            &self.mesh_secret,
+            protocol::relay_token::MESH_COMPONENT_TENANT,
+        )?;
+        let relays = parsed
+            .relays::<Vec<_>>()
+            .into_iter()
+            .map(|relay| relay.as_ref().clone().with_auth_token(own_token.clone()));
         Ok(relays.collect())
     }
 
@@ -115,31 +133,41 @@ impl WorkloadRelayConfig {
 
 #[derive(Clone, Debug)]
 struct WorkloadRelayAccessControl {
-    token_hash: blake3::Hash,
+    mesh_secret: String,
+    tenants: RelayTenantPolicy,
 }
 
 impl WorkloadRelayAccessControl {
-    fn new(token: &str) -> Self {
+    fn new(mesh_secret: &str, tenants: RelayTenantPolicy) -> Self {
         Self {
-            token_hash: blake3::hash(token.as_bytes()),
+            mesh_secret: mesh_secret.to_string(),
+            tenants,
         }
+    }
+
+    /// The tenant a request proved, if it may relay here at all.
+    fn admitted_tenant(&self, request: &ClientRequest) -> Option<String> {
+        let token = request.auth_token()?;
+        let owner = protocol::tenant_from_relay_token(&self.mesh_secret, &token).ok()?;
+        self.tenants.admits(&owner).then_some(owner)
     }
 }
 
 impl AccessControl for WorkloadRelayAccessControl {
     async fn on_connect(&self, request: &ClientRequest) -> Access {
-        let allowed = request
-            .auth_token()
-            .is_some_and(|token| blake3::hash(token.as_bytes()) == self.token_hash);
-        if allowed {
-            Access::Allow
-        } else {
-            log::warn!(
-                "workload relay denied endpoint {}",
-                request.endpoint_id().fmt_short()
-            );
-            Access::Deny {
-                reason: Some("invalid workload relay credential".into()),
+        match self.admitted_tenant(request) {
+            Some(_owner) => Access::Allow,
+            None => {
+                // The reason is deliberately the same whether the token was
+                // invalid or the tenant simply is not admitted here, so the
+                // relay does not disclose which tenants it serves.
+                log::warn!(
+                    "workload relay denied endpoint {}",
+                    request.endpoint_id().fmt_short()
+                );
+                Access::Deny {
+                    reason: Some("invalid workload relay credential".into()),
+                }
             }
         }
     }
@@ -151,7 +179,10 @@ pub async fn start(config: &WorkloadRelayConfig) -> Result<Server> {
     let mut relay = RelayConfig::new(config.http_listen);
     relay.tls = Some(TlsConfig::new(config.https_listen, certificate));
     relay.key_cache_capacity = Some(config.key_cache_capacity);
-    relay.access = Arc::new(WorkloadRelayAccessControl::new(&config.auth_token));
+    relay.access = Arc::new(WorkloadRelayAccessControl::new(
+        &config.mesh_secret,
+        config.relay_tenants.clone(),
+    ));
 
     let mut server_config = ServerConfig::default();
     server_config.relay = Some(relay);
@@ -211,4 +242,36 @@ fn validate_regular_file(path: &Path, max_bytes: u64, private: bool) -> Result<(
 
 fn listeners_conflict(left: SocketAddr, right: SocketAddr) -> bool {
     left.port() != 0 && right.port() != 0 && left == right
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owner(seed: u8) -> String {
+        crypto::b64_encode(&[seed; 32])
+    }
+
+    #[test]
+    fn an_open_relay_admits_every_tenant() {
+        let policy = RelayTenantPolicy::All;
+        assert!(policy.admits(&owner(1)));
+        assert!(policy.admits(&owner(2)));
+    }
+
+    /// An operator restricting whose traffic a relay carries must actually
+    /// exclude everyone else, or the setting is decorative.
+    #[test]
+    fn a_restricted_relay_admits_only_its_listed_tenants() {
+        let policy = RelayTenantPolicy::Only(std::collections::HashSet::from([owner(1)]));
+        assert!(policy.admits(&owner(1)));
+        assert!(!policy.admits(&owner(2)));
+    }
+
+    /// Restricting tenants must not lock the proxy out of its own relay.
+    #[test]
+    fn a_restricted_relay_still_admits_mesh_components() {
+        let policy = RelayTenantPolicy::Only(std::collections::HashSet::from([owner(1)]));
+        assert!(policy.admits(protocol::relay_token::MESH_COMPONENT_TENANT));
+    }
 }

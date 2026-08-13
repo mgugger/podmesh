@@ -29,6 +29,7 @@ reqwest = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+axum-support = { workspace = true }
 hex = { workspace = true }
 podmesh-scheduler = { workspace = true }
 rand = { workspace = true }

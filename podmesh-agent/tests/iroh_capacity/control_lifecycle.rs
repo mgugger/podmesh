@@ -22,11 +22,8 @@ pub async fn exercise_control_lifecycle<T: ControlTransport>(
     offer: &protocol::CapacityOffer,
 ) -> Result<()> {
     let agent_kem = crypto::b64_decode(&offer.kem_pubkey)?;
-    let (owner_public, owner_private) = crypto::ensure_keypair_ephemeral()?;
-    let (response_public, response_private) =
-        crypto::keypair_manager::KeypairManager::generate_fresh_keypair(
-            crypto::keypair_manager::KeypairType::Kem,
-        )?;
+    let (owner_public, owner_private) = crypto::generate_signing_keypair();
+    let (response_public, response_private) = crypto::generate_kem_keypair();
     let namespace_id = crypto::b64_encode(&owner_public);
     let workload_id = protocol::workload_id(&owner_public, "iroh-control", 0);
     let admission = AdmissionRequest {
@@ -34,10 +31,12 @@ pub async fn exercise_control_lifecycle<T: ControlTransport>(
         request_id: "iroh-admission".into(),
         namespace_id: namespace_id.clone(),
         workload_id: workload_id.clone(),
+        target_node_id: offer.signing_pubkey.clone(),
         response_kem_pubkey: crypto::b64_encode(&response_public),
         cpu_milli: 500,
         memory_bytes: 512 * 1024 * 1024,
         storage_bytes: 4 * 1024 * 1024 * 1024,
+        issued_at_secs: now_secs(),
         expires_at_secs: now_secs() + 30,
         nonce: "iroh-admission-nonce".into(),
         owner_signature: String::new(),
@@ -59,6 +58,20 @@ pub async fn exercise_control_lifecycle<T: ControlTransport>(
         replica_count: 1,
         manifest: manifest.clone(),
         proxy_endpoints: vec![test_proxy_endpoint()?],
+        workload_credential_b64: protocol::workload_credential_to_b64(
+            &protocol::mint_workload_credential(
+                &owner_private,
+                &owner_public,
+                &protocol::WorkloadCredentialClaims {
+                    tenant_owner: namespace_id.clone(),
+                    manifest_id: protocol::route_id(&owner_public, "iroh-control"),
+                    issued_at_secs: now_secs(),
+                    expires_at_secs: now_secs() + 3600,
+                    token_id: "iroh-control-credential".into(),
+                },
+                now_secs(),
+            )?,
+        ),
         workload_relay_auth_token: "r".repeat(32),
         workload_relay_ca_certificates: Vec::new(),
     };
@@ -104,9 +117,11 @@ pub async fn exercise_control_lifecycle<T: ControlTransport>(
             request_id: nonce.into(),
             namespace_id: namespace_id.clone(),
             workload_id: workload_id.clone(),
+            target_node_id: offer.signing_pubkey.clone(),
             operation,
             log_tail: Some(10),
             response_kem_pubkey: crypto::b64_encode(&response_public),
+            issued_at_secs: now_secs(),
             expires_at_secs: now_secs() + 30,
             nonce: nonce.into(),
             owner_signature: String::new(),
@@ -129,7 +144,7 @@ pub async fn exercise_control_lifecycle<T: ControlTransport>(
 
 fn test_proxy_endpoint() -> Result<protocol::EndpointRecord> {
     let now = now_secs();
-    let (public, private) = crypto::ensure_keypair_ephemeral()?;
+    let (public, private) = crypto::generate_signing_keypair();
     protocol::EndpointRecord {
         version: protocol::ENDPOINT_RECORD_VERSION,
         endpoint_id: iroh::SecretKey::generate().public().as_bytes().to_vec(),

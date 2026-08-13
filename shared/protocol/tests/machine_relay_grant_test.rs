@@ -7,7 +7,7 @@ const NOW: u64 = 20_000;
 const RELAY: &str = "https://relay.example.test";
 
 fn signed_grant(role: MachineRole) -> (MachineRelayGrant, Vec<u8>) {
-    let (issuer_public, issuer_private) = crypto::ensure_keypair_ephemeral().unwrap();
+    let (issuer_public, issuer_private) = crypto::generate_signing_keypair();
     let grant = MachineRelayGrant {
         version: MACHINE_RELAY_GRANT_VERSION,
         subject_endpoint_id: vec![7; IROH_ENDPOINT_ID_BYTES],
@@ -70,20 +70,25 @@ fn rejects_wrong_subject_audience_and_issuer() {
     let (grant, issuer) = signed_grant(MachineRole::Agent);
     assert!(
         grant
-            .verify(&[issuer.clone()], &[8; IROH_ENDPOINT_ID_BYTES], RELAY, NOW)
+            .verify(
+                std::slice::from_ref(&issuer),
+                &[8; IROH_ENDPOINT_ID_BYTES],
+                RELAY,
+                NOW
+            )
             .is_err()
     );
     assert!(
         grant
             .verify(
-                &[issuer.clone()],
+                std::slice::from_ref(&issuer),
                 &[7; IROH_ENDPOINT_ID_BYTES],
                 "https://other-relay.example.test",
                 NOW,
             )
             .is_err()
     );
-    let (other_issuer, _) = crypto::ensure_keypair_ephemeral().unwrap();
+    let (other_issuer, _) = crypto::generate_signing_keypair();
     assert!(
         grant
             .verify(&[other_issuer], &[7; IROH_ENDPOINT_ID_BYTES], RELAY, NOW)
@@ -97,7 +102,12 @@ fn signature_binds_role_and_audience() {
     grant.role = MachineRole::Scheduler;
     assert!(
         grant
-            .verify(&[issuer.clone()], &[7; IROH_ENDPOINT_ID_BYTES], RELAY, NOW)
+            .verify(
+                std::slice::from_ref(&issuer),
+                &[7; IROH_ENDPOINT_ID_BYTES],
+                RELAY,
+                NOW
+            )
             .is_err()
     );
 

@@ -35,8 +35,9 @@ impl AgentAttachmentHello {
         self.signing_pubkey = crypto::b64_encode(signing_public);
         self.signature.clear();
         self.validate_unsigned(now_secs)?;
-        self.signature = crypto::b64_encode(&crypto::sign_data_with_key(
+        self.signature = crypto::b64_encode(&crypto::sign_domain(
             signing_private,
+            crypto::SignatureDomain::AgentAttachmentHello,
             &self.canonical_bytes()?,
         )?);
         self.validate(now_secs)?;
@@ -47,7 +48,12 @@ impl AgentAttachmentHello {
         self.validate(now_secs)?;
         let public = crypto::b64_decode(&self.signing_pubkey)?;
         let signature = crypto::b64_decode(&self.signature)?;
-        crypto::verify_envelope(&public, &self.canonical_bytes()?, &signature)
+        crypto::verify_domain(
+            &public,
+            crypto::SignatureDomain::AgentAttachmentHello,
+            &self.canonical_bytes()?,
+            &signature,
+        )
     }
 
     pub fn to_bytes(&self, now_secs: u64) -> Result<Vec<u8>> {
@@ -180,7 +186,7 @@ mod tests {
     #[test]
     fn attachment_signature_binds_agent_role() {
         let now = 1_000;
-        let (public, private) = crypto::ensure_keypair_ephemeral().unwrap();
+        let (public, private) = crypto::generate_signing_keypair();
         let endpoint = EndpointRecord {
             version: ENDPOINT_RECORD_VERSION,
             endpoint_id: vec![7; 32],

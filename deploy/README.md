@@ -152,18 +152,49 @@ more seconds, then read the troubleshooting section.
   `/podmesh/agent-control-relay/1`, then hands the owner-encrypted payload to the peer that does.
   The hop is taken at most once and the bytes are never touched, so the relaying scheduler learns
   nothing the first one did not already know.
-* **Proxies** each run their own relay with their own self-signed TLS. A sidecar carries exactly one
-  relay token, so proxy-2 and proxy-3 adopt proxy-1's token through
-  `PODMESH_WORKLOAD_RELAY_BOOTSTRAP_URL` instead of minting their own.
+* **Proxies** each run their own relay with their own self-signed TLS. Relay credentials are derived
+  per tenant from a mesh secret, so every proxy needs the same secret to validate them: proxy-2 and
+  proxy-3 adopt proxy-1's through `PODMESH_WORKLOAD_RELAY_BOOTSTRAP_URL` instead of minting their
+  own. Only proxy-1 serves it, over `GET /api/v1/workload_relay_mesh_secret`, and only on the pod
+  network — that endpoint hands a mesh-wide credential in cleartext to anyone who can reach it.
+  `podctl` uses the separate `GET /api/v1/workload_relay_bootstrap?owner=<key>`, which returns only
+  the asking tenant's derived token and never the secret. Set `--relay-tenants` to bound which
+  tenants a proxy will relay for; by default it relays for any of them, because relaying is
+  transport and what a workload may register or tunnel is decided by its owner-signed credential.
 
-Records are signed and expiring, so serving them over plain HTTP does not weaken the trust model: a
-tampered record simply fails verification. The relay bootstrap endpoint does hand out a live token,
-so only enable `--publish-relay-bootstrap` on a network you trust.
+These records are self-signed — the key that validates one is inside it — so a signature proves the
+record is internally consistent, not who sent it. Identity is pinned separately: a scheduler binds
+each peer URL to one endpoint id and signing key on first sight (`peer_pins.json` in its key
+directory) and refuses a later mismatch. Configure `PODMESH_SCHEDULER_PEER_PINS` to remove even that
+first-observation window.
+
+### What this local stack does not protect
+
+Worth knowing before you point anything real at it:
+
+* **Anyone can deploy.** The scheduler client API on `:3000`–`:3002` is unauthenticated. It is rate
+  limited per peer address (`--client-rate-limit-per-minute`, default 1200), which bounds abuse but
+  does not decide who may call.
+* **Ingress is plain HTTP** on `:8080`. There is no TLS termination.
+* **`POST /api/v1/proxy_grant` is unauthenticated.** A grant authenticates itself, so nobody can
+  forge authority for your owner key. It is rate limited per peer
+  (`--rest-rate-limit-per-minute`, default 600) so filling the grant store is not free.
+* **Agents drive the Podman socket**, which is equivalent to host control in the rootful manifest.
+  The pod security policy is what stands between a tenant manifest and your host: volumes of every
+  kind, host namespaces, host ports, added capabilities and privileged execution are all refused.
+* **All nine components share one state volume**, so they are not isolated from each other.
+* **Tenants share one workload network**, so one tenant's pod can reach another's by address. This
+  is by design: tenants are separated by owner identity at the proxy, not by topology. A per-tenant
+  bridge would not survive agents, proxies and schedulers running on different machines.
+* **Egress tunnels are not filtered by destination address.** A workload whose owner granted a
+  proxy can tunnel anywhere that proxy can reach, including its own loopback services and cloud
+  instance metadata. Authorisation is by tenant, not by address, so run proxies where that reach is
+  acceptable.
 
 ## Step 4 — Point `podctl` at the mesh
 
 This is the "kubectl config" of podmesh. `podctl` is a plain CLI with no Iroh endpoint of its own;
-it speaks HTTP to any scheduler and bootstraps its proxy endpoints, relay token, and relay CA
+it speaks HTTP to any scheduler and bootstraps its proxy endpoints, its tenant's relay token, and relay CA
 certificates from the proxy REST APIs.
 
 ```bash
@@ -175,13 +206,38 @@ Any of `:3000`, `:3001`, `:3002` works. Schedulers are stateless and hold no dur
 and one that does not hold an agent's attachment relays through the peer that does — so pointing
 `podctl` at `:3000`, which has no agents attached, exercises exactly that path.
 
-Owner keys live in `~/.podmesh/` and are created on first use. They are your tenant identity: they
-sign the workload specification, mint the Biscuit grants the proxies present to sidecars, and are
-the only keys that can later fetch status, read logs, or delete the workload. `podctl` also keeps a
-per-deployment receipt under `~/.podmesh/workloads/`, which is how it addresses replicas later.
+Owner keys live in `~/.podmesh/` (or `PODMESH_KEY_DIR`) and are created on first use. They are your
+tenant identity: they sign the workload specification, mint the Biscuit grants the proxies present to
+sidecars, and are the only keys that can later fetch status, read logs, or delete the workload.
+`podctl whoami` prints the public half. Losing them means losing every deployment made under them.
+
+`podctl` also keeps a per-deployment catalog under `~/.podmesh/workloads/`, written after each
+replica is confirmed. **It is the only handle on a running deployment** — the mesh keeps no
+owner-side index — so back it up if the deployments matter.
+
+### Tell `podctl` which agents it may trust
+
+A capacity offer is self-signed and names the key your workload is sealed to, so whoever answers a
+selection request chooses who can read it. `podctl` refuses to deploy until you say which agents are
+acceptable:
+
+```bash
+# Read each agent's signing key from its logs, or from a mesh you control.
+podman logs podmesh-agents-agent-1 2>&1 | grep 'signing key'
+```
+
+For this local trial, where the agents are yours, opt out explicitly instead:
+
+```bash
+export PODMESH_TRUST_ANY_AGENT=1   # or pass --trust-any-agent on each command
+```
+
+In a real mesh, list the trusted agents' base64 Ed25519 signing keys, one per line, in
+`~/.podmesh/trusted_agents`.
 
 If you prefer to wire things explicitly, unset `PODMESH_PROXY_URL` and supply
-`PODMESH_WORKLOAD_RELAY_AUTH_TOKEN` plus `PODMESH_WORKLOAD_RELAY_CA_CERTS`, with the proxy
+`PODMESH_WORKLOAD_RELAY_AUTH_TOKEN` — this tenant's derived token, not the mesh secret — plus
+`PODMESH_WORKLOAD_RELAY_CA_CERTS`, with the proxy
 `EndpointRecord`s in `PODMESH_PROXY_ENDPOINTS` or in the owner-controlled manifest annotation
 `podmesh.io/proxy-endpoints`. `PODMESH_PROXY_URL` wins whenever it is set, because it also tells
 `podctl` which proxies to grant.
@@ -191,7 +247,7 @@ If you prefer to wire things explicitly, unset `PODMESH_PROXY_URL` and supply
 This is the "kubectl apply" of podmesh.
 
 ```bash
-./target/debug/podctl apply -f deploy/demo_deployment.yml
+./target/debug/podctl --trust-any-agent apply -f deploy/demo_deployment.yml
 ```
 
 ```
@@ -277,16 +333,39 @@ QUIC, and from the sidecar to nginx on localhost inside the pod.
 Replica placement is a client decision; the scheduler never learns the replica count. Set
 `spec.replicas` to 3 (or use the `podmesh.io/replicas` annotation):
 
+Delete the single-replica deployment first: it shares the same workload name, so re-applying without
+deleting would place new replicas and leave the old one running under a catalog entry that has been
+overwritten.
+
 ```bash
+./target/debug/podctl delete -f deploy/demo_deployment.yml
+
 sed 's/replicas: 1/replicas: 3/' deploy/demo_deployment.yml > /tmp/demo3.yml
-./target/debug/podctl apply -f /tmp/demo3.yml
+./target/debug/podctl --trust-any-agent apply -f /tmp/demo3.yml
 ```
 
 `podctl` asks for one agent per replica, passing `?exclude=` with the agents it already picked, so
 each replica lands somewhere else:
 
 ```bash
-./target/debug/podctl get pods | grep -E 'agent_endpoint_id|replica_index'
+./target/debug/podctl -o json get pods | grep -E 'agent_endpoint_id|replica_index'
+```
+
+Ingress is spread across all three: the proxy holds one backend per replica and rotates between
+them, skipping any replica it cannot reach.
+
+To see what the mesh itself is running — including anything whose catalog entry was lost — ask the
+agents rather than the local catalog:
+
+```bash
+./target/debug/podctl list
+```
+
+```
+NAME        REPLICA  STATE     AGENT             ORPHANED
+my-nginx    0/3      deployed  95bcd79db5a8e6d3  no
+my-nginx    1/3      deployed  b33d1a6242ff906e  no
+my-nginx    2/3      deployed  dfd8eaeba764f461  no
 ```
 
 ```
@@ -312,15 +391,18 @@ podmesh-853b7f7d0b23ba67315293cdcce6212aac49f0871f3d9ac9608-pod
 
 ## Step 8 — Delete the workload
 
-Deletion is an owner-signed command sent to every replica. The local receipt is only dropped once
-all agents confirm, so a partial failure leaves the remaining replicas addressable.
+Deletion is an owner-signed command sent to every replica. Every replica is attempted, and the
+catalog entry is dropped only once all agents confirm — a replica that could not be deleted stays in
+the catalog so the command can be retried. `--force` drops the entry anyway.
 
 ```bash
 ./target/debug/podctl delete -f /tmp/demo3.yml
+# or, without the manifest, by deployment id or workload name:
+./target/debug/podctl delete my-nginx
 ```
 
 ```
-Deleted successfully
+Deleted 477185c50bd648ece5c827c1c2255f0e271f55d195c9112965d3c333b9f1e6f4
 ```
 
 ```bash

@@ -1,8 +1,3 @@
-use std::{
-    collections::{HashSet, VecDeque},
-    time::{SystemTime, UNIX_EPOCH},
-};
-
 use anyhow::{Context, Result, ensure};
 use futures::StreamExt;
 use iroh::{
@@ -20,6 +15,8 @@ use tokio::{sync::broadcast, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use super::ValidatedMachineConfig;
+use super::gossip_messages::{ReceivedGossip, SeenQueries, admit_announced_peer, answer_location};
+use super::gossip_publisher::{GossipPublisher, PeerJoiner};
 use super::{
     AgentAttachmentHandler, AgentControlRelayHandler, CapacityOfferHandler, MemberRegistry,
     PlacementHandler,
@@ -65,46 +62,40 @@ pub struct SchedulerGossip {
     control_relay: AgentControlRelayHandler,
 }
 
-#[derive(Clone)]
-pub struct GossipPublisher {
-    sender: GossipSender,
-    query_events: broadcast::Sender<CapacityQuery>,
-}
-
-/// Handle for dialing scheduler peers that were discovered after startup.
-#[derive(Clone)]
-pub struct PeerJoiner {
-    sender: GossipSender,
-}
-
-impl PeerJoiner {
-    pub async fn join_peers(&self, peers: Vec<EndpointId>) -> Result<()> {
-        self.sender
-            .join_peers(peers)
-            .await
-            .context("join discovered scheduler peers")
-    }
-}
-
-impl GossipPublisher {
-    pub async fn publish(&self, query: CapacityQuery) -> Result<()> {
-        let bytes = query.to_bytes(now_secs())?;
-        let _ = self.query_events.send(query);
-        self.sender
-            .broadcast(bytes.into())
-            .await
-            .context("broadcast capacity query")
-    }
+/// Everything the gossip runtime serves on, or shares with, the rest of the
+/// scheduler.
+///
+/// Grouped rather than passed one by one because these are all handles into the
+/// same running scheduler, and a long positional list invites mismatching two of
+/// them at a call site.
+pub struct SchedulerGossipServices {
+    pub endpoint: Endpoint,
+    pub attachments: AgentAttachmentHandler,
+    pub offers: CapacityOfferHandler,
+    pub placement: PlacementHandler,
+    /// Shared with the control relay, which resolves the queries answered here.
+    pub locations: super::LocationRegistry,
+    /// Extended as peers announce themselves, so the machine relay can admit
+    /// members it was never pinned to.
+    pub member_issuers: super::MemberIssuers,
+    pub lookup: iroh::address_lookup::memory::MemoryLookup,
 }
 
 impl SchedulerGossip {
     pub async fn start(
-        endpoint: Endpoint,
+        services: SchedulerGossipServices,
         config: &ValidatedMachineConfig,
-        attachment_handler: AgentAttachmentHandler,
-        offer_handler: CapacityOfferHandler,
-        placement_handler: PlacementHandler,
     ) -> Result<Self> {
+        let SchedulerGossipServices {
+            endpoint,
+            attachments: attachment_handler,
+            offers: offer_handler,
+            placement: placement_handler,
+            locations,
+            member_issuers,
+            lookup,
+        } = services;
+        let responder_endpoint = endpoint.clone();
         let gossip = Gossip::builder()
             .alpn(SCHEDULER_GOSSIP_ALPN)
             .max_message_size(MAX_CAPACITY_MESSAGE_BYTES)
@@ -118,6 +109,7 @@ impl SchedulerGossip {
         // created here and completed with `install` once startup finishes.
         let control_relay = AgentControlRelayHandler::new(
             members.clone(),
+            locations.clone(),
             crate::clientapi::MAX_CONCURRENT_CLIENT_RELAYS,
             crate::clientapi::CLIENT_RELAY_TIMEOUT,
         );
@@ -170,6 +162,13 @@ impl SchedulerGossip {
         let cancellation = CancellationToken::new();
         let receiver_cancellation = cancellation.clone();
         let receiver_members = members.clone();
+        let receiver_lookup = lookup.clone();
+        let receiver_issuers = member_issuers.clone();
+        let receiver_responder = super::LocationResponder::new(
+            responder_endpoint,
+            crate::clientapi::CLIENT_RELAY_TIMEOUT,
+        );
+        let receiver_forwarder = control_relay.forwarder_handle();
         let max_seen = config.max_seen_queries;
         let receiver_task = tokio::spawn(async move {
             let mut seen = SeenQueries::new(max_seen);
@@ -178,12 +177,34 @@ impl SchedulerGossip {
                     _ = receiver_cancellation.cancelled() => return Ok(()),
                     event = receiver.next() => match event {
                         Some(Ok(Event::Received(message))) => {
-                            match validate_received_query(&message.content, &receiver_members, &mut seen) {
-                                Ok(Some(query)) => {
-                                    let _ = event_tx.send(query);
+                            match super::gossip_messages::classify(
+                                &message.content,
+                                &receiver_members,
+                                &mut seen,
+                            ) {
+                                Ok(Some(ReceivedGossip::Capacity(query))) => {
+                                    let _ = event_tx.send(*query);
+                                }
+                                Ok(Some(ReceivedGossip::Locate(query))) => {
+                                    // Only the scheduler that holds the agent
+                                    // answers, so this costs the rest one
+                                    // membership check.
+                                    let responder = receiver_responder.clone();
+                                    let forwarder = receiver_forwarder.clone();
+                                    tokio::spawn(async move {
+                                        answer_location(responder, forwarder, *query).await;
+                                    });
+                                }
+                                Ok(Some(ReceivedGossip::Announcement(record))) => {
+                                    admit_announced_peer(
+                                        &receiver_members,
+                                        &receiver_issuers,
+                                        &receiver_lookup,
+                                        *record,
+                                    );
                                 }
                                 Ok(None) => {}
-                                Err(error) => log::warn!("scheduler gossip query rejected: {error}"),
+                                Err(error) => log::warn!("scheduler gossip message rejected: {error}"),
                             }
                         }
                         Some(Ok(Event::Lagged)) => {
@@ -262,88 +283,5 @@ impl SchedulerGossip {
             .await
             .context("join scheduler gossip receiver task")??;
         Ok(())
-    }
-}
-
-#[derive(Debug)]
-struct SeenQueries {
-    order: VecDeque<(Vec<u8>, String)>,
-    entries: HashSet<(Vec<u8>, String)>,
-    capacity: usize,
-}
-
-impl SeenQueries {
-    fn new(capacity: usize) -> Self {
-        Self {
-            order: VecDeque::with_capacity(capacity),
-            entries: HashSet::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    fn insert(&mut self, key: (Vec<u8>, String)) -> bool {
-        if self.entries.contains(&key) {
-            return false;
-        }
-        if self.entries.len() == self.capacity
-            && let Some(expired) = self.order.pop_front()
-        {
-            self.entries.remove(&expired);
-        }
-        self.order.push_back(key.clone());
-        self.entries.insert(key)
-    }
-}
-
-fn validate_received_query(
-    bytes: &[u8],
-    members: &MemberRegistry,
-    seen: &mut SeenQueries,
-) -> Result<Option<CapacityQuery>> {
-    ensure!(
-        !bytes.is_empty() && bytes.len() <= MAX_CAPACITY_MESSAGE_BYTES,
-        "capacity gossip message size is invalid"
-    );
-    let query = CapacityQuery::from_bytes(bytes, now_secs())?;
-    let endpoint_bytes: [u8; 32] = query
-        .reply_endpoint
-        .endpoint_id
-        .as_slice()
-        .try_into()
-        .context("capacity query reply EndpointId length is invalid")?;
-    let endpoint_id = EndpointId::from_bytes(&endpoint_bytes)
-        .context("capacity query reply EndpointId is invalid")?;
-    ensure!(
-        members.contains(&endpoint_id),
-        "capacity query reply endpoint is not an authorized scheduler"
-    );
-    let key = (
-        query.reply_endpoint.endpoint_id.clone(),
-        query.query_id.clone(),
-    );
-    Ok(seen.insert(key).then_some(query))
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn seen_query_cache_deduplicates_and_evicts_with_a_fixed_bound() {
-        let mut seen = SeenQueries::new(2);
-        assert!(seen.insert((vec![1], "one".into())));
-        assert!(!seen.insert((vec![1], "one".into())));
-        assert!(seen.insert((vec![2], "two".into())));
-        assert!(seen.insert((vec![3], "three".into())));
-        assert_eq!(seen.entries.len(), 2);
-        assert!(seen.insert((vec![1], "one".into())));
-        assert_eq!(seen.entries.len(), 2);
     }
 }

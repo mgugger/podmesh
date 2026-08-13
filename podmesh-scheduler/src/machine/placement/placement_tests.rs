@@ -14,8 +14,8 @@ use protocol::{
 
 use super::now_secs;
 use crate::machine::{
-    AttachmentManager, CapacityCoordinator, PlacementHandler, QueryManager, SchedulerGossip,
-    SchedulerIdentity, ValidatedMachineConfig,
+    AttachmentManager, CapacityCoordinator, LocationRegistry, PlacementHandler, QueryManager,
+    SchedulerGossip, SchedulerGossipServices, SchedulerIdentity, ValidatedMachineConfig,
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -48,11 +48,16 @@ async fn placement_stream_solicits_attached_agent_and_returns_direct_offer() -> 
     let queries = QueryManager::new(8, 8, Duration::from_secs(1));
     let placement = PlacementHandler::new(8, TEST_TIMEOUT);
     let gossip = SchedulerGossip::start(
-        scheduler.clone(),
+        SchedulerGossipServices {
+            endpoint: scheduler.clone(),
+            attachments: attachments.handler(),
+            offers: queries.offer_handler(),
+            placement: placement.clone(),
+            locations: LocationRegistry::new(),
+            member_issuers: crate::machine::MemberIssuers::new(),
+            lookup: MemoryLookup::new(),
+        },
         &config,
-        attachments.handler(),
-        queries.offer_handler(),
-        placement.clone(),
     )
     .await?;
     let (service, coordinator) = CapacityCoordinator::start(
@@ -149,7 +154,7 @@ async fn endpoint(secret: SecretKey, lookup: &MemoryLookup) -> Result<Endpoint> 
 }
 
 fn signed_hello(endpoint_id: EndpointId, now: u64) -> Result<AgentAttachmentHello> {
-    let (public, private) = crypto::ensure_keypair_ephemeral()?;
+    let (public, private) = crypto::generate_signing_keypair();
     let endpoint = signed_endpoint(endpoint_id, &public, &private, now)?;
     AgentAttachmentHello {
         version: SCHEDULER_MESH_PROTOCOL_VERSION,
@@ -165,7 +170,7 @@ fn signed_hello(endpoint_id: EndpointId, now: u64) -> Result<AgentAttachmentHell
 }
 
 fn signed_offer(query_id: &str, endpoint_id: EndpointId, now: u64) -> Result<CapacityOffer> {
-    let (public, private) = crypto::ensure_keypair_ephemeral()?;
+    let (public, private) = crypto::generate_signing_keypair();
     let endpoint = signed_endpoint(endpoint_id, &public, &private, now)?;
     CapacityOffer {
         version: CAPACITY_PROTOCOL_VERSION,

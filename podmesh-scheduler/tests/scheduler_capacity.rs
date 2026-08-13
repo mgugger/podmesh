@@ -6,8 +6,8 @@ use anyhow::{Context, Result, ensure};
 use common::{TEST_TIMEOUT, config, endpoint, now_secs, signed_query};
 use iroh::{EndpointAddr, SecretKey, address_lookup::memory::MemoryLookup};
 use podmesh_scheduler::machine::{
-    AttachmentManager, CapacityCriteria, PlacementHandler, QueryManager, SchedulerGossip,
-    SchedulerIdentity,
+    AttachmentManager, CapacityCriteria, LocationRegistry, MemberIssuers, PlacementHandler,
+    QueryManager, SchedulerGossip, SchedulerGossipServices, SchedulerIdentity,
 };
 use protocol::{
     AGENT_CAPACITY_ALPN, AgentAttachmentHello, CAPACITY_OFFER_ALPN, CAPACITY_PROTOCOL_VERSION,
@@ -28,11 +28,16 @@ async fn authenticated_agent_attachment_receives_queries_and_cleans_up() -> Resu
     let attachments = AttachmentManager::new(4, 4, TEST_TIMEOUT);
     let queries = QueryManager::new(4, 4, TEST_TIMEOUT);
     let gossip = SchedulerGossip::start(
-        scheduler.clone(),
+        SchedulerGossipServices {
+            endpoint: scheduler.clone(),
+            attachments: attachments.handler(),
+            offers: queries.offer_handler(),
+            placement: PlacementHandler::new(4, TEST_TIMEOUT),
+            locations: LocationRegistry::new(),
+            member_issuers: MemberIssuers::new(),
+            lookup: MemoryLookup::new(),
+        },
         &machine_config,
-        attachments.handler(),
-        queries.offer_handler(),
-        PlacementHandler::new(4, TEST_TIMEOUT),
     )
     .await?;
     let connection = agent.connect(scheduler.addr(), AGENT_CAPACITY_ALPN).await?;
@@ -86,11 +91,16 @@ async fn attachment_hello_cannot_name_another_endpoint() -> Result<()> {
     let attachments = AttachmentManager::new(4, 4, TEST_TIMEOUT);
     let queries = QueryManager::new(4, 4, TEST_TIMEOUT);
     let gossip = SchedulerGossip::start(
-        scheduler.clone(),
+        SchedulerGossipServices {
+            endpoint: scheduler.clone(),
+            attachments: attachments.handler(),
+            offers: queries.offer_handler(),
+            placement: PlacementHandler::new(4, TEST_TIMEOUT),
+            locations: LocationRegistry::new(),
+            member_issuers: MemberIssuers::new(),
+            lookup: MemoryLookup::new(),
+        },
         &machine_config,
-        attachments.handler(),
-        queries.offer_handler(),
-        PlacementHandler::new(4, TEST_TIMEOUT),
     )
     .await?;
 
@@ -125,11 +135,16 @@ async fn direct_signed_offer_reaches_pending_query() -> Result<()> {
     let attachments = AttachmentManager::new(4, 4, TEST_TIMEOUT);
     let queries = QueryManager::new(4, 4, Duration::from_secs(5));
     let gossip = SchedulerGossip::start(
-        scheduler.clone(),
+        SchedulerGossipServices {
+            endpoint: scheduler.clone(),
+            attachments: attachments.handler(),
+            offers: queries.offer_handler(),
+            placement: PlacementHandler::new(4, TEST_TIMEOUT),
+            locations: LocationRegistry::new(),
+            member_issuers: MemberIssuers::new(),
+            lookup: MemoryLookup::new(),
+        },
         &machine_config,
-        attachments.handler(),
-        queries.offer_handler(),
-        PlacementHandler::new(4, TEST_TIMEOUT),
     )
     .await?;
     let temp = tempfile::tempdir()?;
@@ -148,6 +163,7 @@ async fn direct_signed_offer_reaches_pending_query() -> Result<()> {
             },
             &identity,
             &reply_address,
+            1,
             now,
         )
         .await?;
@@ -173,7 +189,7 @@ async fn direct_signed_offer_reaches_pending_query() -> Result<()> {
 }
 
 fn signed_hello(endpoint_id: &[u8; 32], now: u64) -> Result<AgentAttachmentHello> {
-    let (public, private) = crypto::ensure_keypair_ephemeral()?;
+    let (public, private) = crypto::generate_signing_keypair();
     let endpoint = signed_endpoint(endpoint_id, &public, &private, now, 60)?;
     AgentAttachmentHello {
         version: SCHEDULER_MESH_PROTOCOL_VERSION,
@@ -189,7 +205,7 @@ fn signed_hello(endpoint_id: &[u8; 32], now: u64) -> Result<AgentAttachmentHello
 }
 
 fn signed_offer(query_id: &str, transport: &SecretKey, now: u64) -> Result<CapacityOffer> {
-    let (public, private) = crypto::ensure_keypair_ephemeral()?;
+    let (public, private) = crypto::generate_signing_keypair();
     let endpoint = signed_endpoint(transport.public().as_bytes(), &public, &private, now, 10)?;
     CapacityOffer {
         version: CAPACITY_PROTOCOL_VERSION,

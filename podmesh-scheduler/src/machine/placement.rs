@@ -60,7 +60,12 @@ impl PlacementHandler {
                         required_capabilities: request.required_capabilities.clone(),
                         excluded_endpoint_ids: request.excluded_endpoint_ids.clone(),
                     };
-                    match service.solicit(criteria).await {
+                    // A peer-relayed placement asks for the same breadth of
+                    // choice a direct client would get.
+                    match service
+                        .solicit(criteria, crate::clientapi::DEFAULT_TARGET_OFFERS)
+                        .await
+                    {
                         Ok(Some(offer)) => {
                             PlacementResponse::selected(request.request_id.clone(), offer)
                         }

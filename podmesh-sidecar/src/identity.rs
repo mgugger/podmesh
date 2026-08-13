@@ -1,8 +1,13 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
-use iroh::SecretKey;
+use anyhow::Result;
+use iroh_support::NodeIdentity;
 
+/// Where a sidecar's keys come from.
+///
+/// Each variant produces a distinct identity, so two sidecars in one process
+/// never share keys. Injected sidecars normally use `Ephemeral`: a pod is
+/// disposable and its endpoint identity does not need to outlive it.
 #[derive(Clone, Debug)]
 pub enum IdentitySource {
     Persistent(PathBuf),
@@ -14,19 +19,10 @@ impl IdentitySource {
         Self::Ephemeral
     }
 
-    pub fn load(&self) -> Result<SecretKey> {
+    pub fn load(&self) -> Result<NodeIdentity> {
         match self {
-            Self::Persistent(key_dir) => {
-                crypto::set_keypair_config(crypto::KeypairConfig {
-                    signing_mode: crypto::KeypairMode::Persistent,
-                    kem_mode: crypto::KeypairMode::Persistent,
-                    key_directory: Some(key_dir.join("application")),
-                });
-                crypto::ensure_keypair_on_disk().context("load sidecar application signing key")?;
-                crypto::ensure_kem_keypair_on_disk().context("load sidecar application KEM key")?;
-                iroh_support::load_or_initialize_iroh_secret(&key_dir.join("iroh"))
-            }
-            Self::Ephemeral => Ok(SecretKey::generate()),
+            Self::Persistent(key_dir) => NodeIdentity::load(key_dir),
+            Self::Ephemeral => Ok(NodeIdentity::ephemeral()),
         }
     }
 }

@@ -139,7 +139,7 @@ mod tests {
     const PROXY: &str = "3f2a9c1d4b5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8";
 
     fn grant_for(proxy: &str, lifetime: u64) -> (String, Vec<u8>, Vec<u8>) {
-        let (public, private) = crypto::ensure_keypair_ephemeral().unwrap();
+        let (public, private) = crypto::generate_signing_keypair();
         let owner_b64 = crypto::b64_encode(&public);
         let encoded = protocol::mint_proxy_grant(
             &private,

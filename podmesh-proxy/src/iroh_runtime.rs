@@ -1,5 +1,8 @@
+mod egress;
 mod handlers;
+mod tenant_gate;
 
+use crate::routes::RouteTarget;
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
@@ -14,7 +17,7 @@ use iroh::{
 use log::{debug, info, warn};
 use protocol::{
     DEFAULT_WORKLOAD_STREAM_TIMEOUT, ENDPOINT_RECORD_VERSION, EndpointRecord, ProxyHttpRequest,
-    ProxyHttpResponse, SidecarRoute, WORKLOAD_ALPN, WorkloadStreamKind, read_workload_frame,
+    ProxyHttpResponse, WORKLOAD_ALPN, WorkloadStreamKind, read_workload_frame,
     write_workload_frame,
 };
 use tokio::{
@@ -25,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{config::Config, relay, restapi::ProxyGrantStore};
 
-pub use handlers::evaluate_sidecar_registration;
+pub use handlers::MAX_REGISTERED_SIDECARS;
 
 const MAX_WORKLOAD_CONNECTIONS: usize = 4_096;
 const MAX_CONCURRENT_WORKLOAD_STREAMS: usize = 1_024;
@@ -35,20 +38,17 @@ const SIDECAR_REGISTRATION_TTL: Duration = Duration::from_secs(120);
 const ENDPOINT_RECORD_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const ENDPOINT_RECORD_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
-#[derive(Debug, Clone)]
-pub struct SidecarRouteEntry {
-    pub sidecar_peer_id: String,
-    pub routes: Vec<SidecarRoute>,
-    pub registered_at: u64,
-}
-
-pub type RoutingTable = Arc<RwLock<HashMap<String, SidecarRouteEntry>>>;
-
 pub(crate) struct RuntimeState {
     pub endpoint: Endpoint,
+    /// This proxy's own keys, used to sign handshakes and its endpoint record.
+    pub identity: iroh_support::NodeIdentity,
     pub connections: AsyncRwLock<HashMap<EndpointId, Connection>>,
-    pub routing_table: RoutingTable,
+    pub routes: Arc<crate::routes::RouteTable>,
     pub grant_store: ProxyGrantStore,
+    /// Tenancy each open connection proved, never what it claimed.
+    pub tenants: crate::tenant_sessions::TenantSessions,
+    /// Addresses published in place of the ones the endpoint bound.
+    pub advertise_addresses: Vec<String>,
     pub own_endpoint_record: Arc<RwLock<EndpointRecord>>,
     pub known_proxies: AsyncRwLock<HashMap<EndpointId, EndpointRecord>>,
     pub peer_tx: watch::Sender<Vec<String>>,
@@ -75,7 +75,7 @@ pub struct ProxyClient {
 }
 
 impl ProxyClient {
-    pub async fn forward(&self, mut request: ProxyHttpRequest) -> Result<ProxyHttpResponse> {
+    pub async fn forward(&self, request: ProxyHttpRequest) -> Result<ProxyHttpResponse> {
         let _permit = tokio::time::timeout(
             DEFAULT_WORKLOAD_STREAM_TIMEOUT,
             self.state.ingress_slots.clone().acquire_owned(),
@@ -83,25 +83,50 @@ impl ProxyClient {
         .await
         .context("timed out waiting for ingress stream capacity")?
         .context("ingress stream limiter closed")?;
-        let route = self
-            .state
-            .routing_table
-            .read()
-            .map_err(|_| anyhow!("routing table lock poisoned"))?
-            .get(&request.manifest_id)
-            .cloned()
-            .ok_or_else(|| {
-                anyhow!(
-                    "manifest {} has no registered sidecar route",
-                    request.manifest_id
-                )
-            })?;
         let host = extract_host_header(&request.headers);
-        request.target_port =
-            select_route_port(&route.routes, &request.path_and_query, host.as_deref())
-                .or_else(|| (request.target_port != 0).then_some(request.target_port))
-                .ok_or_else(|| anyhow!("no matching route for ingress request"))?;
-        let endpoint_id = parse_endpoint_id(&route.sidecar_peer_id)?;
+        // Every replica of the deployment is a candidate, rotated so
+        // consecutive requests spread across them.
+        let targets = self.state.routes.select(
+            &request.manifest_id,
+            &request.path_and_query,
+            host.as_deref(),
+        );
+        ensure!(
+            !targets.is_empty(),
+            "manifest {} has no registered sidecar route",
+            request.manifest_id
+        );
+
+        // Fall through to the next replica when one cannot be reached, so a
+        // replica that died between its last registration refresh and now does
+        // not blackhole the request.
+        let mut last_error = None;
+        for target in &targets {
+            let mut attempt = request.clone();
+            attempt.target_port = target.port;
+            match self.forward_to(&attempt, target).await {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    log::warn!(
+                        "ingress to replica {} of manifest {} failed: {error:#}",
+                        target.replica_index,
+                        request.manifest_id
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| anyhow!("no replica could serve manifest {}", request.manifest_id)))
+    }
+
+    /// Send one already-routed request to one replica.
+    async fn forward_to(
+        &self,
+        request: &ProxyHttpRequest,
+        target: &RouteTarget,
+    ) -> Result<ProxyHttpResponse> {
+        let endpoint_id = parse_endpoint_id(&target.sidecar_peer_id)?;
         let connection = self
             .state
             .connections
@@ -115,7 +140,7 @@ impl ProxyClient {
                 .await
                 .context("timed out opening ingress stream")?
                 .context("open ingress stream")?;
-        let payload = postcard::to_allocvec(&request).context("serialize ingress request")?;
+        let payload = postcard::to_allocvec(request).context("serialize ingress request")?;
         write_workload_frame(
             &mut send,
             WorkloadStreamKind::Ingress,
@@ -173,8 +198,8 @@ impl IrohNodeHandle {
         self.state.grant_store.clone()
     }
 
-    pub fn routing_table(&self) -> RoutingTable {
-        self.state.routing_table.clone()
+    pub fn routes(&self) -> Arc<crate::routes::RouteTable> {
+        self.state.routes.clone()
     }
 
     pub async fn shutdown(self) {
@@ -195,9 +220,9 @@ pub async fn spawn(config: &Config) -> Result<IrohNodeHandle> {
         Some(relay_config) => Some(relay::start(relay_config).await?),
         None => None,
     };
-    let secret = config.identity.load()?;
+    let identity = config.identity.load()?;
     let mut builder = Endpoint::builder(presets::Minimal)
-        .secret_key(secret)
+        .secret_key(identity.transport_secret().clone())
         .alpns(vec![WORKLOAD_ALPN.to_vec()])
         .bind_addr(config.iroh_bind_addr)?;
     if let Some(relay_config) = &config.workload_relay {
@@ -216,16 +241,21 @@ pub async fn spawn(config: &Config) -> Result<IrohNodeHandle> {
             return Err(error);
         }
     };
-    let endpoint_record = Arc::new(RwLock::new(signed_endpoint_record(&endpoint).await?));
+    let endpoint_record = Arc::new(RwLock::new(
+        signed_endpoint_record(&endpoint, &identity, &config.advertise_addresses).await?,
+    ));
     let endpoint_id = endpoint.id().to_string();
     let (peer_tx, peer_rx) = watch::channel(Vec::new());
     let (_network_ready_tx, network_ready_rx) = watch::channel(true);
     let cancellation = CancellationToken::new();
     let state = Arc::new(RuntimeState {
         endpoint: endpoint.clone(),
+        identity,
         connections: AsyncRwLock::new(HashMap::new()),
-        routing_table: Arc::new(RwLock::new(HashMap::new())),
+        routes: Arc::new(crate::routes::RouteTable::new()),
         grant_store: ProxyGrantStore::new(),
+        tenants: crate::tenant_sessions::TenantSessions::new(),
+        advertise_addresses: config.advertise_addresses.clone(),
         own_endpoint_record: endpoint_record.clone(),
         known_proxies: AsyncRwLock::new(
             config
@@ -280,7 +310,7 @@ async fn run(state: Arc<RuntimeState>) {
     loop {
         tokio::select! {
             _ = state.cancellation.cancelled() => break,
-            _ = prune.tick() => prune_stale_routes(&state.routing_table),
+            _ = prune.tick() => state.routes.prune(now_millis(), SIDECAR_REGISTRATION_TTL),
             _ = endpoint_refresh.tick() => {
                 if let Err(error) = refresh_endpoint_record(&state).await {
                     warn!("failed to refresh proxy EndpointRecord: {error}");
@@ -359,7 +389,9 @@ async fn announce_proxy(state: &RuntimeState, connection: &Connection) -> Result
 }
 
 async fn refresh_endpoint_record(state: &RuntimeState) -> Result<()> {
-    let refreshed = signed_endpoint_record(&state.endpoint).await?;
+    let refreshed =
+        signed_endpoint_record(&state.endpoint, &state.identity, &state.advertise_addresses)
+            .await?;
     {
         let mut record = state
             .own_endpoint_record
@@ -376,13 +408,13 @@ async fn refresh_endpoint_record(state: &RuntimeState) -> Result<()> {
         .collect::<Vec<_>>();
     let connections = state.connections.read().await;
     for proxy_id in proxy_ids {
-        if let Some(connection) = connections.get(&proxy_id).cloned() {
-            if let Err(error) = announce_proxy(state, &connection).await {
-                warn!(
-                    "failed to refresh proxy announcement endpoint={} error={error}",
-                    proxy_id.fmt_short()
-                );
-            }
+        if let Some(connection) = connections.get(&proxy_id).cloned()
+            && let Err(error) = announce_proxy(state, &connection).await
+        {
+            warn!(
+                "failed to refresh proxy announcement endpoint={} error={error}",
+                proxy_id.fmt_short()
+            );
         }
     }
     Ok(())
@@ -425,6 +457,8 @@ async fn register_connection(state: Arc<RuntimeState>, connection: Connection) {
             }
         }
     }
+    // Tenancy is proven per connection, so it must not outlive one.
+    state.tenants.forget(&remote);
     let mut connections = state.connections.write().await;
     if connections
         .get(&remote)
@@ -447,32 +481,37 @@ fn publish_peers(
     let _ = sender.send(peers);
 }
 
-fn prune_stale_routes(table: &RoutingTable) {
-    let now = now_millis();
-    if let Ok(mut routes) = table.write() {
-        routes.retain(|_, entry| {
-            now.saturating_sub(entry.registered_at)
-                <= u64::try_from(SIDECAR_REGISTRATION_TTL.as_millis()).unwrap_or(u64::MAX)
-        });
-    }
-}
-
-async fn signed_endpoint_record(endpoint: &Endpoint) -> Result<EndpointRecord> {
+/// The record sidecars and peer proxies dial this proxy with.
+///
+/// The addresses an endpoint discovers are the ones it bound, which in any
+/// deployment where the proxy is not on the caller's network — behind NAT, in a
+/// container, on another machine — are not reachable. `advertise_addresses`
+/// replaces them for exactly that case.
+async fn signed_endpoint_record(
+    endpoint: &Endpoint,
+    identity: &iroh_support::NodeIdentity,
+    advertise_addresses: &[String],
+) -> Result<EndpointRecord> {
     let now = now_secs()?;
     let expires = now.saturating_add(ENDPOINT_RECORD_LIFETIME.as_secs());
     let address = endpoint.addr();
-    let (signing_public, signing_private) = crypto::ensure_keypair_on_disk()?;
+    let direct_addresses: Vec<String> = if advertise_addresses.is_empty() {
+        address.ip_addrs().map(ToString::to_string).collect()
+    } else {
+        advertise_addresses.to_vec()
+    };
+    let (signing_public, signing_private) = (identity.signing_public(), identity.signing_private());
     EndpointRecord {
         version: ENDPOINT_RECORD_VERSION,
         endpoint_id: endpoint.id().as_bytes().to_vec(),
         relay_url: address.relay_urls().next().map(ToString::to_string),
-        direct_addresses: address.ip_addrs().map(ToString::to_string).collect(),
+        direct_addresses,
         signing_pubkey: String::new(),
         issued_at_secs: now,
         expires_at_secs: expires,
         signature: String::new(),
     }
-    .sign(&signing_public, &signing_private, now)
+    .sign(signing_public, signing_private, now)
 }
 
 fn parse_endpoint_id(value: &str) -> Result<EndpointId> {
@@ -486,15 +525,6 @@ fn parse_record_endpoint_id(record: &EndpointRecord) -> Result<EndpointId> {
         .try_into()
         .context("proxy EndpointRecord ID length is invalid")?;
     EndpointId::from_bytes(&bytes).context("proxy EndpointRecord ID is invalid")
-}
-
-fn select_route_port(routes: &[SidecarRoute], path: &str, _host: Option<&str>) -> Option<u16> {
-    let normalized = path.split('?').next().unwrap_or(path);
-    routes
-        .iter()
-        .filter(|route| normalized.starts_with(&route.path_prefix))
-        .max_by_key(|route| route.path_prefix.len())
-        .map(|route| route.port)
 }
 
 fn extract_host_header(headers: &[(String, String)]) -> Option<String> {

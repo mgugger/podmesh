@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+axum-support = { workspace = true }
 anyhow = { workspace = true }
+blake3 = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 crypto = { workspace = true }

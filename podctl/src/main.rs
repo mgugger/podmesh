@@ -1,5 +1,8 @@
 use clap::{Parser, Subcommand};
-use podctl::{apply_file, cert, delete_file, get_logs, get_pod, get_pods};
+use podctl::{
+    ClientOptions, OutputFormat, apply_file, cert, delete_deployment, delete_file, get_logs,
+    get_pod, get_pods, list_workloads, namespace_id,
+};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -8,6 +11,7 @@ mod convert;
 #[derive(Parser, Debug)]
 #[command(
     name = "podctl",
+    version,
     about = "podmesh CLI - manage workloads on podmesh cluster"
 )]
 struct Cli {
@@ -21,7 +25,16 @@ struct Cli {
         value_name = "FORMAT",
         default_value = "table"
     )]
-    output: String,
+    output: OutputFormat,
+    /// Deploy to whichever agent the mesh offers instead of consulting the
+    /// trusted agent list. The selected agent can read the workload in full,
+    /// so this hands that ability to whoever answers the selection request.
+    #[arg(
+        long = "trust-any-agent",
+        env = "PODMESH_TRUST_ANY_AGENT",
+        global = true
+    )]
+    trust_any_agent: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -34,12 +47,15 @@ enum Commands {
         #[arg(short = 'f', long = "file", value_name = "FILE")]
         file: PathBuf,
     },
-    /// Delete a configuration from the cluster
+    /// Delete a deployment, addressed by manifest file or by name/id
     Delete {
         /// Filename, e.g. -f ./pod.yaml
         #[arg(short = 'f', long = "file", value_name = "FILE")]
-        file: PathBuf,
-        /// Force deletion without confirmation
+        file: Option<PathBuf>,
+        /// Deployment id or workload name, when the manifest is unavailable
+        #[arg(value_name = "DEPLOYMENT")]
+        deployment: Option<String>,
+        /// Drop the local catalog entry even if some replicas could not be deleted
         #[arg(long = "force")]
         force: bool,
     },
@@ -50,7 +66,7 @@ enum Commands {
     },
     /// Get logs from a workload
     Logs {
-        /// Workload ID or name
+        /// Deployment id or workload name
         workload_id: String,
         /// Number of lines to show from the end (tail)
         #[arg(long = "tail", short = 'n')]
@@ -61,6 +77,14 @@ enum Commands {
         #[arg(short, long)]
         file: String,
     },
+    /// Ask the mesh which workloads it is running for this owner
+    ///
+    /// The local catalog only knows what this installation deployed. This asks
+    /// the agents, so it also finds workloads whose catalog entry was lost,
+    /// overwritten, or written on another machine.
+    List,
+    /// Print this installation's namespace (owner) identity
+    Whoami,
     /// Proxy grant management
     Cert {
         #[command(subcommand)]
@@ -73,7 +97,7 @@ enum GetResource {
     /// List all pods/workloads
     #[command(alias = "pod")]
     Pods {
-        /// Specific workload ID to get details for
+        /// Specific deployment id or workload name to get details for
         name: Option<String>,
     },
 }
@@ -81,36 +105,48 @@ enum GetResource {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
-    let cli = Cli::parse();
     let Cli {
         api_url,
-        output: _,
+        output,
+        trust_any_agent,
         command,
-    } = cli;
+    } = Cli::parse();
+    let options = ClientOptions {
+        api_base: api_url,
+        trust_any_agent,
+    };
 
     match command {
         Commands::Apply { file } => {
-            let workload_id = apply_file(file, api_url.as_deref()).await?;
+            let workload_id = apply_file(file, &options).await?;
             writeln!(std::io::stdout(), "Applied workload {workload_id}")?;
         }
-        Commands::Delete { file, force } => {
-            delete_file(file, force, api_url.as_deref()).await?;
-            writeln!(std::io::stdout(), "Deleted successfully")?;
+        Commands::Delete {
+            file,
+            deployment,
+            force,
+        } => {
+            let deployment_id = match (file, deployment) {
+                (Some(file), None) => delete_file(file, force, &options).await?,
+                (None, Some(deployment)) => delete_deployment(&deployment, force, &options).await?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("pass either --file or a deployment id, not both")
+                }
+                (None, None) => anyhow::bail!("pass --file or a deployment id to delete"),
+            };
+            writeln!(std::io::stdout(), "Deleted {deployment_id}")?;
         }
         Commands::Get { resource } => match resource {
-            GetResource::Pods {
-                name: Some(workload_id),
-            } => {
-                let response = get_pod(&workload_id, api_url.as_deref()).await?;
+            GetResource::Pods { name: Some(name) } => {
+                let response = get_pod(&name, &options).await?;
                 writeln!(std::io::stdout(), "{response}")?;
             }
             GetResource::Pods { name: None } => {
-                let response = get_pods(api_url.as_deref()).await?;
-                writeln!(std::io::stdout(), "{response}")?;
+                writeln!(std::io::stdout(), "{}", get_pods(output)?)?;
             }
         },
         Commands::Logs { workload_id, tail } => {
-            let logs = get_logs(&workload_id, tail, api_url.as_deref()).await?;
+            let logs = get_logs(&workload_id, tail, &options).await?;
             write!(std::io::stdout(), "{logs}")?;
         }
         Commands::Convert { file } => {
@@ -120,6 +156,16 @@ async fn main() -> anyhow::Result<()> {
                 writeln!(std::io::stderr(), "{w}")?;
             }
             write!(std::io::stdout(), "{output}")?;
+        }
+        Commands::List => {
+            writeln!(
+                std::io::stdout(),
+                "{}",
+                list_workloads(&options, output).await?
+            )?;
+        }
+        Commands::Whoami => {
+            writeln!(std::io::stdout(), "{}", namespace_id()?)?;
         }
         Commands::Cert { cmd } => {
             cert::handle_cert_command(cmd).await?;

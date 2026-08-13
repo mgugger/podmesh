@@ -5,6 +5,7 @@
 //! only way an owner reaches an agent. The scheduler answers placement from the
 //! mesh and then carries opaque owner-encrypted bytes to the selected agent.
 
+use iroh::address_lookup::memory::MemoryLookup;
 use std::{collections::HashSet, future::IntoFuture, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
@@ -17,8 +18,9 @@ use podmesh_agent::{
 use podmesh_scheduler::{
     clientapi::ClientApi,
     machine::{
-        AgentControlForwarder, AttachmentManager, CapacityCoordinator, PeerControlRelay,
-        PlacementHandler, QueryManager, SchedulerGossip, SchedulerIdentity, ValidatedMachineConfig,
+        AgentControlForwarder, AttachmentManager, CapacityCoordinator, LocationRegistry,
+        MemberIssuers, PeerControlRelay, PlacementHandler, QueryManager, SchedulerGossip,
+        SchedulerGossipServices, SchedulerIdentity, ValidatedMachineConfig,
     },
 };
 use protocol::AgentControlOperation;
@@ -49,6 +51,11 @@ impl ControlTransport for SchedulerHttpTransport {
             AgentControlOperation::Admission => "admission",
             AgentControlOperation::Deploy => "deploy",
             AgentControlOperation::Command => "command",
+            // Listing is broadcast to every agent rather than addressed to one,
+            // so it has no per-agent relay route.
+            AgentControlOperation::List => {
+                anyhow::bail!("list is not relayed to a single agent")
+            }
         };
         let response = self
             .client
@@ -100,11 +107,16 @@ async fn podctl_http_reaches_the_agent_through_the_scheduler() -> Result<()> {
         .with_relay_grant_issuer(scheduler_identity.clone(), RELAY_URL.into());
     let queries = QueryManager::new(8, 8, Duration::from_secs(2));
     let gossip = SchedulerGossip::start(
-        scheduler_endpoint.clone(),
+        SchedulerGossipServices {
+            endpoint: scheduler_endpoint.clone(),
+            attachments: attachments.handler(),
+            offers: queries.offer_handler(),
+            placement: PlacementHandler::new(8, TEST_TIMEOUT),
+            locations: LocationRegistry::new(),
+            member_issuers: MemberIssuers::new(),
+            lookup: MemoryLookup::new(),
+        },
         &scheduler_config,
-        attachments.handler(),
-        queries.offer_handler(),
-        PlacementHandler::new(8, TEST_TIMEOUT),
     )
     .await?;
     let (capacity, coordinator) = CapacityCoordinator::start(
@@ -118,7 +130,13 @@ async fn podctl_http_reaches_the_agent_through_the_scheduler() -> Result<()> {
     let forwarder = AgentControlForwarder::new(
         scheduler_endpoint.clone(),
         attachments.clone(),
-        PeerControlRelay::new(scheduler_endpoint.clone(), gossip.members(), TEST_TIMEOUT),
+        PeerControlRelay::new(
+            scheduler_endpoint.clone(),
+            gossip.members(),
+            LocationRegistry::new(),
+            scheduler_identity.clone(),
+            TEST_TIMEOUT,
+        ),
         TEST_TIMEOUT,
         MAX_CONCURRENT_RELAYS,
     );
@@ -128,13 +146,17 @@ async fn podctl_http_reaches_the_agent_through_the_scheduler() -> Result<()> {
     let http = tokio::spawn(
         axum::serve(
             listener,
-            ClientApi::new(
-                capacity,
-                forwarder,
-                scheduler_identity,
-                scheduler_endpoint.clone(),
-            )
-            .router(),
+            // The client API carries per-peer middleware, so it has to be
+            // served with connect info.
+            axum_support::with_connect_info(
+                ClientApi::new(
+                    capacity,
+                    forwarder,
+                    scheduler_identity,
+                    scheduler_endpoint.clone(),
+                )
+                .router(),
+            ),
         )
         .into_future(),
     );
@@ -146,6 +168,7 @@ async fn podctl_http_reaches_the_agent_through_the_scheduler() -> Result<()> {
         state_path: agent_temp.path().join("state.redb"),
         runtime: RuntimeKind::Mock,
         workload_network: "podmesh".into(),
+        max_reserved_capacity_percent: podmesh_agent::config::DEFAULT_MAX_RESERVED_CAPACITY_PERCENT,
         sidecar_image: "podmesh/sidecar:latest".into(),
         capacity_cpu_milli: 2_000,
         capacity_memory_bytes: 2 * 1024 * 1024 * 1024,

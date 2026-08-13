@@ -283,6 +283,10 @@ spec:
     - name: proxy-1
       image: podmesh/proxy:latest
       args:
+        # This is a single-host lab mesh: workloads legitimately reach the
+        # schedulers and each other on the pod network. Off by default in
+        # production, where it would let a workload tunnel to the proxy's own
+        # services and to cloud instance metadata.
         - "--enable-ingress"
         - "--key-dir"
         - "/var/lib/podmesh/proxy-1/keys"
@@ -318,6 +322,10 @@ spec:
     - name: proxy-2
       image: podmesh/proxy:latest
       args:
+        # This is a single-host lab mesh: workloads legitimately reach the
+        # schedulers and each other on the pod network. Off by default in
+        # production, where it would let a workload tunnel to the proxy's own
+        # services and to cloud instance metadata.
         - "--key-dir"
         - "/var/lib/podmesh/proxy-2/keys"
       env:
@@ -325,10 +333,11 @@ spec:
           value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
         - name: PODMESH_PROXY_IROH_BIND
           value: "0.0.0.0:4002"
-        - name: PODMESH_PROXY_PUBLISH_RELAY_BOOTSTRAP
-          value: "true"
         # A sidecar carries one relay token, so proxy-2 adopts proxy-1's
-        # instead of minting a token that would lock the others out.
+        # instead of minting a token that would lock the others out. It does
+        # not re-publish that token: the endpoint hands a live relay credential
+        # to anyone who can reach it, so exactly one proxy serves it and only
+        # on the pod network.
         - name: PODMESH_WORKLOAD_RELAY_BOOTSTRAP_URL
           value: "http://localhost:3010"
         - name: PODMESH_WORKLOAD_RELAY_URL
@@ -353,6 +362,10 @@ spec:
     - name: proxy-3
       image: podmesh/proxy:latest
       args:
+        # This is a single-host lab mesh: workloads legitimately reach the
+        # schedulers and each other on the pod network. Off by default in
+        # production, where it would let a workload tunnel to the proxy's own
+        # services and to cloud instance metadata.
         - "--key-dir"
         - "/var/lib/podmesh/proxy-3/keys"
       env:
@@ -360,8 +373,6 @@ spec:
           value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
         - name: PODMESH_PROXY_IROH_BIND
           value: "0.0.0.0:4003"
-        - name: PODMESH_PROXY_PUBLISH_RELAY_BOOTSTRAP
-          value: "true"
         - name: PODMESH_WORKLOAD_RELAY_BOOTSTRAP_URL
           value: "http://localhost:3010"
         - name: PODMESH_WORKLOAD_RELAY_URL

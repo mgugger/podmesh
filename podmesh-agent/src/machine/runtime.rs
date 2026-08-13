@@ -38,6 +38,7 @@ impl AgentMachine {
             )
             .spawn();
         let cancellation = CancellationToken::new();
+        let signing_pubkey = service.signing_pubkey_b64();
         let seen = Arc::new(Mutex::new(SeenQueries::new(validated.max_seen_queries)));
         let supervisor = spawn_attachments(
             endpoint.clone(),
@@ -46,7 +47,14 @@ impl AgentMachine {
             Arc::clone(&seen),
             cancellation.clone(),
         );
-        log::info!("agent Iroh endpoint started: {}", identity.endpoint_id());
+        // Owners have to list an agent's signing key before they will deploy to
+        // it, so the agent states it plainly on every start.
+        log::info!(
+            "agent Iroh endpoint started: endpoint_id={} signing key={} \
+             (add this signing key to a tenant's trusted_agents to allow deployments)",
+            identity.endpoint_id(),
+            signing_pubkey
+        );
         Ok(Self {
             endpoint,
             router,
@@ -93,21 +101,31 @@ fn spawn_attachments(
                 cancellation.clone(),
             ));
         }
-        loop {
-            tokio::select! {
-                _ = cancellation.cancelled() => {
+        // Every branch is terminal: either the agent was asked to stop, or an
+        // attachment ended, which is otherwise an error because attachments are
+        // supposed to reconnect internally rather than return.
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                Ok(())
+            }
+            result = tasks.join_next() => match result {
+                // A shutdown makes both branches ready at once, and `select!`
+                // chooses between ready branches at random, so arriving here
+                // does not mean the agent was not asked to stop. Reporting a
+                // clean shutdown as a failure would be a coin flip.
+                Some(Ok(Ok(()))) if cancellation.is_cancelled() => {
                     tasks.abort_all();
                     while tasks.join_next().await.is_some() {}
-                    return Ok(());
+                    Ok(())
                 }
-                result = tasks.join_next() => match result {
-                    Some(Ok(Ok(()))) => {
-                        anyhow::bail!("agent scheduler attachment stopped unexpectedly")
-                    }
-                    Some(Ok(Err(error))) => return Err(error),
-                    Some(Err(error)) => return Err(error).context("agent attachment task failed"),
-                    None => anyhow::bail!("agent has no scheduler attachment tasks"),
+                Some(Ok(Ok(()))) => {
+                    anyhow::bail!("agent scheduler attachment stopped unexpectedly")
                 }
+                Some(Ok(Err(error))) => Err(error),
+                Some(Err(error)) => Err(error).context("agent attachment task failed"),
+                None => anyhow::bail!("agent has no scheduler attachment tasks"),
             }
         }
     })

@@ -20,6 +20,7 @@ pub struct ProxySession {
 
 pub async fn connect(
     endpoint: &Endpoint,
+    identity: &iroh_support::NodeIdentity,
     config: &SidecarConfig,
     record: EndpointRecord,
     cancellation: &CancellationToken,
@@ -37,7 +38,7 @@ pub async fn connect(
         connection.remote_id() == expected,
         "connected proxy EndpointId does not match endpoint record"
     );
-    let verified = authenticate(endpoint.id(), config, &connection, cancellation).await?;
+    let verified = authenticate(endpoint.id(), identity, config, &connection, cancellation).await?;
     Ok(ProxySession {
         connection,
         record,
@@ -59,29 +60,30 @@ pub async fn register(
         .owner_public_key_b64
         .as_ref()
         .context("sidecar owner public key is required for registration")?;
-    let endpoint_id = local_endpoint.to_string();
-    let signed_data = format!("{}{}", config.manifest_id, endpoint_id);
-    let (signing_public, signing_private) = crypto::ensure_keypair_on_disk()?;
-    let signature = crypto::sign_data_with_key(&signing_private, signed_data.as_bytes())?;
-    let registration = SidecarRegistration {
-        manifest_id: config.manifest_id.clone(),
-        routes: config
+    // The routing key is derived from the owner key rather than chosen, so this
+    // registration can only ever claim routes for its own tenant. There is no
+    // sidecar-held signature: the sidecar's key is self-generated and would
+    // prove nothing, while the transport already authenticates the endpoint.
+    let registration = SidecarRegistration::new(
+        &crypto::b64_decode(owner).context("decode tenant owner key")?,
+        &config.workload_name,
+        config.replica_index,
+        config.replica_count,
+        config
             .routes
             .iter()
             .map(|route| SidecarRoute {
+                host: route.host.clone(),
                 path_prefix: route.path_prefix.clone(),
                 port: route.target_port,
             })
             .collect(),
-        sidecar_peer_id: endpoint_id,
-        owner_pubkey: owner.clone(),
-        sig: crypto::b64_encode(&signature),
-        sidecar_signing_pubkey: crypto::b64_encode(&signing_public),
-    };
+        &local_endpoint.to_string(),
+    );
     let response = request_response(
         &session.connection,
         WorkloadStreamKind::Registration,
-        &registration.to_bytes(),
+        &registration.to_bytes()?,
         cancellation,
     )
     .await?;
@@ -95,7 +97,7 @@ pub async fn register(
     log::info!(
         "sidecar registration acknowledged endpoint={} manifest={} routes={}",
         session.connection.remote_id().fmt_short(),
-        config.manifest_id,
+        registration.manifest_id,
         registration.routes.len()
     );
     Ok(())
@@ -130,13 +132,20 @@ pub async fn discover(
 
 async fn authenticate(
     local_endpoint: EndpointId,
+    identity: &iroh_support::NodeIdentity,
     config: &SidecarConfig,
     connection: &Connection,
     cancellation: &CancellationToken,
 ) -> Result<bool> {
+    // The owner key alone is public, so it is sent together with the credential
+    // that proves this pod was deployed by that owner for this routing key.
     let request = iroh_support::build_workload_handshake_request(
+        &identity.handshake(),
         local_endpoint,
+        connection.remote_id(),
         config.owner_public_key_b64.as_deref(),
+        Some(config.manifest_id.as_str()),
+        config.workload_credential_b64.as_deref(),
     )?;
     let response = request_response(
         connection,
@@ -145,10 +154,20 @@ async fn authenticate(
         cancellation,
     )
     .await?;
-    let verified = iroh_support::verify_workload_handshake(&response, connection.remote_id())?;
-    let Some(owner) = config.owner_public_key_b64.as_ref() else {
-        return Ok(false);
-    };
+    let verified = iroh_support::verify_workload_handshake(
+        &response,
+        local_endpoint,
+        connection.remote_id(),
+        protocol::machine::HandshakeRole::Response,
+    )?;
+    // Without an owner key there is nothing to check the proxy's grant against,
+    // so the session cannot be trusted with tenant traffic at all. This is a
+    // hard failure rather than an unverified session, because callers would
+    // otherwise have to remember to gate on `verified` everywhere.
+    let owner = config
+        .owner_public_key_b64
+        .as_ref()
+        .context("sidecar was injected without a tenant owner key")?;
     // The proxy proves it was authorized by this workload's owner. The endpoint
     // is taken from the authenticated transport rather than from the handshake,
     // so a grant leaked to a third party cannot be replayed by them.

@@ -50,8 +50,9 @@ impl MachineRelayGrant {
         self.issuer_pubkey = crypto::b64_encode(issuer_public);
         self.signature.clear();
         self.validate_unsigned(now_secs)?;
-        self.signature = crypto::b64_encode(&crypto::sign_data_with_key(
+        self.signature = crypto::b64_encode(&crypto::sign_domain(
             issuer_private,
+            crypto::SignatureDomain::MachineRelayGrant,
             &self.canonical_bytes()?,
         )?);
         self.validate(now_secs)?;
@@ -86,7 +87,12 @@ impl MachineRelayGrant {
             "relay grant issuer is not trusted"
         );
         let signature = crypto::b64_decode(&self.signature)?;
-        crypto::verify_envelope(&issuer_public, &self.canonical_bytes()?, &signature)
+        crypto::verify_domain(
+            &issuer_public,
+            crypto::SignatureDomain::MachineRelayGrant,
+            &self.canonical_bytes()?,
+            &signature,
+        )
     }
 
     pub fn to_bytes(&self, now_secs: u64) -> Result<Vec<u8>> {

@@ -100,6 +100,11 @@ impl AgentControlForwarder {
             .await
     }
 
+    /// Agents attached to this scheduler.
+    pub async fn attached_agents(&self) -> Vec<EndpointId> {
+        self.attachments.attached_agents().await
+    }
+
     /// Local-only delivery to an agent attached to this scheduler.
     ///
     /// The peer relay handler calls exactly this, never [`Self::forward`], so a

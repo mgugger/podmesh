@@ -1,304 +1,370 @@
-use anyhow::Context;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+//! The signed envelope every peer-to-peer message travels in.
+//!
+//! An envelope binds a payload to the sender, the *intended recipient*, a
+//! nonce and a timestamp, and covers all of it with one Ed25519 signature under
+//! the [`SignatureDomain::WorkloadHandshake`] domain. Binding the recipient is
+//! what stops a relay from taking an envelope addressed to one peer and
+//! presenting it to another; binding the payload type keeps a response from
+//! being replayed as a request.
+//!
+//! There is no unsigned mode. [`EnvelopeValidator`] is the only supported way to
+//! accept an envelope, and it refuses anything that is unsigned, misaddressed,
+//! replayed, or outside the clock-drift window.
 
-use super::util::opt_str;
+use std::time::Duration;
 
-fn serialize<T: Serialize>(value: &T) -> Vec<u8> {
-    postcard::to_allocvec(value).expect("envelope serialization should succeed")
-}
+use anyhow::{Context, Result, ensure};
+use crypto::SignatureDomain;
+use serde::{Deserialize, Serialize};
 
-fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, postcard::Error> {
-    postcard::from_bytes(bytes)
-}
+/// Maximum accepted difference between an envelope timestamp and local time.
+pub const MAX_ENVELOPE_DRIFT_MS: u64 = 90_000;
+/// How long a nonce is remembered, so a replay cannot outlive the drift window.
+pub const ENVELOPE_NONCE_WINDOW: Duration = Duration::from_secs(300);
+/// Largest envelope accepted from the wire.
+pub const MAX_ENVELOPE_BYTES: usize = 64 * 1024;
+/// The only signature algorithm this protocol admits.
+pub const ENVELOPE_SIGNATURE_ALGORITHM: &str = "ed25519";
+/// Envelope wire version. Consumers refuse anything else.
+pub const ENVELOPE_VERSION: u16 = 1;
 
+/// The envelope as it appears on the wire.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Envelope {
+    pub version: u16,
     #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
     pub payload_type: String,
     pub nonce: String,
-    pub ts: u64,
+    pub ts_millis: u64,
     pub alg: String,
-    pub sig: String,
-    pub pubkey: String,
-    pub peer_id: String,
-    pub kem_pubkey: String,
+    /// Endpoint id of the sender, as authenticated by the transport.
+    pub sender_id: String,
+    /// Endpoint id this envelope is addressed to. A receiver refuses an
+    /// envelope naming anybody else, so a captured envelope cannot be forwarded.
+    pub recipient_id: String,
+    pub sender_signing_pubkey: String,
+    pub sender_kem_pubkey: String,
+    pub signature: String,
 }
 
-impl Envelope {
-    pub fn payload(&self) -> Option<&[u8]> {
-        if self.payload.is_empty() {
-            None
-        } else {
-            Some(&self.payload)
-        }
-    }
-
-    pub fn payload_vec(&self) -> Vec<u8> {
-        self.payload.clone()
-    }
-
-    pub fn payload_type(&self) -> Option<&str> {
-        opt_str(&self.payload_type)
-    }
-
-    pub fn nonce(&self) -> Option<&str> {
-        opt_str(&self.nonce)
-    }
-
-    pub fn ts(&self) -> u64 {
-        self.ts
-    }
-
-    pub fn alg(&self) -> Option<&str> {
-        opt_str(&self.alg)
-    }
-
-    pub fn sig(&self) -> Option<&str> {
-        opt_str(&self.sig)
-    }
-
-    pub fn pubkey(&self) -> Option<&str> {
-        opt_str(&self.pubkey)
-    }
-
-    pub fn peer_id(&self) -> Option<&str> {
-        opt_str(&self.peer_id)
-    }
-
-    pub fn kem_pubkey(&self) -> Option<&str> {
-        opt_str(&self.kem_pubkey)
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        deserialize(bytes)
-    }
-}
-
-struct EnvelopeParams<'a> {
-    payload: &'a [u8],
-    payload_type: &'a str,
-    nonce: &'a str,
-    timestamp: u64,
-    algorithm: &'a str,
-    peer_id: &'a str,
-    signature: &'a str,
-    public_key: &'a str,
-    kem_public_key: Option<&'a str>,
-}
-
-fn base_envelope(params: EnvelopeParams<'_>) -> Envelope {
-    Envelope {
-        payload: params.payload.to_vec(),
-        payload_type: params.payload_type.to_string(),
-        nonce: params.nonce.to_string(),
-        ts: params.timestamp,
-        alg: params.algorithm.to_string(),
-        sig: params.signature.to_string(),
-        pubkey: params.public_key.to_string(),
-        peer_id: params.peer_id.to_string(),
-        kem_pubkey: params.kem_public_key.unwrap_or_default().to_string(),
-    }
-}
-
-pub fn build_envelope_canonical(
-    payload: &[u8],
-    payload_type: &str,
-    nonce: &str,
-    ts: u64,
-    alg: &str,
-    kem_pub: Option<&str>,
-) -> Vec<u8> {
-    serialize(&base_envelope(EnvelopeParams {
-        payload,
-        payload_type,
-        nonce,
-        timestamp: ts,
-        algorithm: alg,
-        peer_id: "",
-        signature: "",
-        public_key: "",
-        kem_public_key: kem_pub,
-    }))
-}
-
-pub struct SignedEnvelopeParams<'a> {
+/// Everything needed to produce a signed envelope.
+pub struct EnvelopeParts<'a> {
     pub payload: &'a [u8],
     pub payload_type: &'a str,
     pub nonce: &'a str,
-    pub timestamp: u64,
-    pub algorithm: &'a str,
-    pub signature_prefix: &'a str,
-    pub signature_b64: &'a str,
-    pub public_key_b64: &'a str,
-    pub peer_id: Option<&'a str>,
-    pub kem_public_key_b64: Option<&'a str>,
+    pub ts_millis: u64,
+    pub sender_id: &'a str,
+    pub recipient_id: &'a str,
+    pub sender_signing_pubkey: &'a [u8],
+    pub sender_kem_pubkey: Option<&'a [u8]>,
 }
 
-pub fn build_envelope_signed(params: SignedEnvelopeParams<'_>) -> Vec<u8> {
-    let signature = format!("{}:{}", params.signature_prefix, params.signature_b64);
-    serialize(&base_envelope(EnvelopeParams {
-        payload: params.payload,
-        payload_type: params.payload_type,
-        nonce: params.nonce,
-        timestamp: params.timestamp,
-        algorithm: params.algorithm,
-        peer_id: params.peer_id.unwrap_or_default(),
-        signature: &signature,
-        public_key: params.public_key_b64,
-        kem_public_key: params.kem_public_key_b64,
-    }))
+impl Envelope {
+    /// Bytes covered by the signature: the whole envelope with the signature
+    /// field blanked, so every other field is authenticated.
+    fn canonical_bytes(&self) -> Result<Vec<u8>> {
+        let unsigned = Self {
+            signature: String::new(),
+            ..self.clone()
+        };
+        postcard::to_allocvec(&unsigned).context("serialize envelope canonical form")
+    }
+
+    /// Build and sign an envelope.
+    pub fn seal(parts: EnvelopeParts<'_>, signing_private: &[u8]) -> Result<Self> {
+        let mut envelope = Self {
+            version: ENVELOPE_VERSION,
+            payload: parts.payload.to_vec(),
+            payload_type: parts.payload_type.to_string(),
+            nonce: parts.nonce.to_string(),
+            ts_millis: parts.ts_millis,
+            alg: ENVELOPE_SIGNATURE_ALGORITHM.to_string(),
+            sender_id: parts.sender_id.to_string(),
+            recipient_id: parts.recipient_id.to_string(),
+            sender_signing_pubkey: crypto::b64_encode(parts.sender_signing_pubkey),
+            sender_kem_pubkey: parts
+                .sender_kem_pubkey
+                .map(crypto::b64_encode)
+                .unwrap_or_default(),
+            signature: String::new(),
+        };
+        let canonical = envelope.canonical_bytes()?;
+        envelope.signature = crypto::b64_encode(&crypto::sign_domain(
+            signing_private,
+            SignatureDomain::WorkloadHandshake,
+            &canonical,
+        )?);
+        Ok(envelope)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let bytes = postcard::to_allocvec(self).context("serialize envelope")?;
+        ensure!(
+            bytes.len() <= MAX_ENVELOPE_BYTES,
+            "envelope is {} bytes, over the {MAX_ENVELOPE_BYTES} byte limit",
+            bytes.len()
+        );
+        Ok(bytes)
+    }
+
+    /// Decode without validating. Callers must run [`EnvelopeValidator::accept`]
+    /// before trusting any field.
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        ensure!(
+            bytes.len() <= MAX_ENVELOPE_BYTES,
+            "envelope is {} bytes, over the {MAX_ENVELOPE_BYTES} byte limit",
+            bytes.len()
+        );
+        postcard::from_bytes(bytes).context("decode envelope")
+    }
+
+    pub fn sender_signing_key(&self) -> Result<Vec<u8>> {
+        crypto::b64_decode(&self.sender_signing_pubkey).context("decode envelope signing key")
+    }
+
+    pub fn sender_kem_key(&self) -> Result<Option<Vec<u8>>> {
+        if self.sender_kem_pubkey.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            crypto::b64_decode(&self.sender_kem_pubkey).context("decode envelope KEM key")?,
+        ))
+    }
 }
 
-pub fn build_envelope_canonical_with_peer(
-    payload: &[u8],
-    payload_type: &str,
-    nonce: &str,
-    timestamp: u64,
-    algorithm: &str,
-    peer_id: &str,
-    kem_pub: Option<&str>,
-) -> Vec<u8> {
-    serialize(&base_envelope(EnvelopeParams {
-        payload,
-        payload_type,
-        nonce,
-        timestamp,
-        algorithm,
-        peer_id,
-        signature: "",
-        public_key: "",
-        kem_public_key: kem_pub,
-    }))
+/// The single entry point for accepting an envelope.
+///
+/// Every check is mandatory. There is deliberately no permissive mode: an
+/// envelope that cannot be attributed to a specific sender, addressed to this
+/// receiver, and shown to be fresh is refused.
+pub struct EnvelopeValidator {
+    /// Endpoint id of the receiver, taken from the authenticated transport.
+    local_id: String,
+    /// Endpoint id of the peer, taken from the authenticated transport.
+    remote_id: String,
+    now_millis: u64,
 }
 
-pub fn root_as_envelope(bytes: &[u8]) -> Result<Envelope, postcard::Error> {
-    deserialize(bytes)
+impl EnvelopeValidator {
+    pub fn new(local_id: &str, remote_id: &str, now_millis: u64) -> Self {
+        Self {
+            local_id: local_id.to_string(),
+            remote_id: remote_id.to_string(),
+            now_millis,
+        }
+    }
+
+    /// Decode and fully validate an envelope of the expected payload type.
+    pub fn accept(&self, bytes: &[u8], expected_payload_type: &str) -> Result<Envelope> {
+        let envelope = Envelope::decode(bytes)?;
+
+        ensure!(
+            envelope.version == ENVELOPE_VERSION,
+            "unsupported envelope version {}",
+            envelope.version
+        );
+        ensure!(
+            envelope.alg == ENVELOPE_SIGNATURE_ALGORITHM,
+            "unsupported envelope signature algorithm {:?}",
+            envelope.alg
+        );
+        ensure!(
+            envelope.payload_type == expected_payload_type,
+            "expected envelope payload type {expected_payload_type:?}, got {:?}",
+            envelope.payload_type
+        );
+        // The sender field must agree with the transport identity, so an
+        // envelope cannot claim to come from a peer other than the one that
+        // completed the QUIC handshake.
+        ensure!(
+            envelope.sender_id == self.remote_id,
+            "envelope sender does not match the authenticated transport"
+        );
+        // The recipient field must be us. Without this a relay could forward a
+        // valid envelope to a third party and impersonate the sender there.
+        ensure!(
+            envelope.recipient_id == self.local_id,
+            "envelope is addressed to another endpoint"
+        );
+        ensure!(
+            self.now_millis.abs_diff(envelope.ts_millis) <= MAX_ENVELOPE_DRIFT_MS,
+            "envelope timestamp is outside the accepted drift window"
+        );
+        ensure!(!envelope.nonce.is_empty(), "envelope nonce is missing");
+        ensure!(
+            !envelope.signature.is_empty(),
+            "envelope is unsigned and unsigned envelopes are never accepted"
+        );
+
+        let signing_key = envelope.sender_signing_key()?;
+        let signature =
+            crypto::b64_decode(&envelope.signature).context("decode envelope signature")?;
+        crypto::verify_domain(
+            &signing_key,
+            SignatureDomain::WorkloadHandshake,
+            &envelope.canonical_bytes()?,
+            &signature,
+        )
+        .context("verify envelope signature")?;
+
+        // Record the nonce only after the signature verifies, so an attacker
+        // cannot burn nonces on behalf of an honest peer.
+        crypto::nonce_helper::check_and_insert_nonce_for_peer(
+            &envelope.nonce,
+            ENVELOPE_NONCE_WINDOW,
+            &self.remote_id,
+        )
+        .context("envelope replay check")?;
+
+        Ok(envelope)
+    }
 }
 
-pub fn envelope_extract_sig_pub(envelope_bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-    let envelope = root_as_envelope(envelope_bytes).ok()?;
-    let sig_field = envelope.sig()?;
-    let sig_b64 = sig_field
-        .splitn(2, ':')
-        .nth(if sig_field.contains(':') { 1 } else { 0 })
-        .unwrap_or(sig_field);
-    let sig_bytes = crypto::b64_decode(sig_b64).ok()?;
-    let pub_bytes = crypto::b64_decode(envelope.pubkey()?).ok()?;
-    Some((sig_bytes, pub_bytes))
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-pub type LegacyEnvelopeParts = (Vec<u8>, Vec<u8>, Vec<u8>, String, String);
+    fn parts<'a>(
+        signing_public: &'a [u8],
+        sender: &'a str,
+        recipient: &'a str,
+        nonce: &'a str,
+        now: u64,
+    ) -> EnvelopeParts<'a> {
+        EnvelopeParts {
+            payload: b"payload",
+            payload_type: "handshake-request",
+            nonce,
+            ts_millis: now,
+            sender_id: sender,
+            recipient_id: recipient,
+            sender_signing_pubkey: signing_public,
+            sender_kem_pubkey: None,
+        }
+    }
 
-pub fn envelope_extract_sig_pub_legacy(buf: &[u8]) -> anyhow::Result<LegacyEnvelopeParts> {
-    let env =
-        root_as_envelope(buf).map_err(|e| anyhow::anyhow!("failed to parse envelope: {e}"))?;
+    #[test]
+    fn round_trip_accepts_a_well_formed_envelope() {
+        let (public, private) = crypto::generate_signing_keypair();
+        let now = 1_700_000_000_000;
+        let envelope =
+            Envelope::seal(parts(&public, "alice", "bob", "nonce-1", now), &private).unwrap();
+        let bytes = envelope.to_bytes().unwrap();
+        EnvelopeValidator::new("bob", "alice", now)
+            .accept(&bytes, "handshake-request")
+            .expect("envelope should verify");
+    }
 
-    let canonical = build_envelope_canonical(
-        env.payload().unwrap_or(&[]),
-        env.payload_type().unwrap_or(""),
-        env.nonce().unwrap_or(""),
-        env.ts(),
-        env.alg().unwrap_or(""),
-        env.kem_pubkey(),
-    );
+    #[test]
+    fn envelope_addressed_elsewhere_is_refused() {
+        let (public, private) = crypto::generate_signing_keypair();
+        let now = 1_700_000_000_000;
+        let envelope =
+            Envelope::seal(parts(&public, "alice", "bob", "nonce-2", now), &private).unwrap();
+        let bytes = envelope.to_bytes().unwrap();
+        let error = EnvelopeValidator::new("carol", "alice", now)
+            .accept(&bytes, "handshake-request")
+            .unwrap_err();
+        assert!(error.to_string().contains("addressed to another endpoint"));
+    }
 
-    let sig_field = env.sig().unwrap_or("").to_string();
-    let pubkey_field = env.pubkey().unwrap_or("").to_string();
+    #[test]
+    fn envelope_from_another_sender_is_refused() {
+        let (public, private) = crypto::generate_signing_keypair();
+        let now = 1_700_000_000_000;
+        let envelope =
+            Envelope::seal(parts(&public, "alice", "bob", "nonce-3", now), &private).unwrap();
+        let bytes = envelope.to_bytes().unwrap();
+        let error = EnvelopeValidator::new("bob", "mallory", now)
+            .accept(&bytes, "handshake-request")
+            .unwrap_err();
+        assert!(error.to_string().contains("authenticated transport"));
+    }
 
-    let sig_b64 = sig_field
-        .splitn(2, ':')
-        .nth(if sig_field.contains(':') { 1 } else { 0 })
-        .unwrap_or(&sig_field)
-        .to_string();
-    let sig_bytes = crypto::b64_decode(&sig_b64).context("failed to base64-decode signature")?;
-    let pub_bytes = crypto::b64_decode(&pubkey_field).context("failed to base64-decode pubkey")?;
+    #[test]
+    fn response_cannot_be_replayed_as_a_request() {
+        let (public, private) = crypto::generate_signing_keypair();
+        let now = 1_700_000_000_000;
+        let mut request = parts(&public, "alice", "bob", "nonce-4", now);
+        request.payload_type = "handshake-response";
+        let bytes = Envelope::seal(request, &private)
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let error = EnvelopeValidator::new("bob", "alice", now)
+            .accept(&bytes, "handshake-request")
+            .unwrap_err();
+        assert!(error.to_string().contains("payload type"));
+    }
 
-    Ok((canonical, sig_bytes, pub_bytes, sig_field, pubkey_field))
-}
+    #[test]
+    fn unsigned_envelope_is_refused() {
+        let (public, private) = crypto::generate_signing_keypair();
+        let now = 1_700_000_000_000;
+        let mut envelope =
+            Envelope::seal(parts(&public, "alice", "bob", "nonce-5", now), &private).unwrap();
+        envelope.signature = String::new();
+        let bytes = envelope.to_bytes().unwrap();
+        let error = EnvelopeValidator::new("bob", "alice", now)
+            .accept(&bytes, "handshake-request")
+            .unwrap_err();
+        assert!(error.to_string().contains("unsigned"));
+    }
 
-pub fn build_encrypted_envelope(
-    payload: &[u8],
-    payload_type: &str,
-    recipient_pubkey: &[u8],
-    sender_privkey: &[u8],
-    sender_pubkey: &str,
-) -> anyhow::Result<Vec<u8>> {
-    let encrypted_payload = crypto::encrypt_payload_for_recipient(recipient_pubkey, payload)?;
+    #[test]
+    fn tampered_payload_is_refused() {
+        let (public, private) = crypto::generate_signing_keypair();
+        let now = 1_700_000_000_000;
+        let mut envelope =
+            Envelope::seal(parts(&public, "alice", "bob", "nonce-6", now), &private).unwrap();
+        envelope.payload = b"other payload".to_vec();
+        let bytes = envelope.to_bytes().unwrap();
+        assert!(
+            EnvelopeValidator::new("bob", "alice", now)
+                .accept(&bytes, "handshake-request")
+                .is_err()
+        );
+    }
 
-    let (nonce, ts) = envelope_nonce_and_timestamp();
+    #[test]
+    fn timestamp_outside_the_drift_window_is_refused() {
+        let (public, private) = crypto::generate_signing_keypair();
+        let now = 1_700_000_000_000;
+        let envelope = Envelope::seal(
+            parts(
+                &public,
+                "alice",
+                "bob",
+                "nonce-7",
+                now - MAX_ENVELOPE_DRIFT_MS - 1,
+            ),
+            &private,
+        )
+        .unwrap();
+        let bytes = envelope.to_bytes().unwrap();
+        let error = EnvelopeValidator::new("bob", "alice", now)
+            .accept(&bytes, "handshake-request")
+            .unwrap_err();
+        assert!(error.to_string().contains("drift window"));
+    }
 
-    let canonical = build_envelope_canonical(
-        &encrypted_payload,
-        payload_type,
-        &nonce,
-        ts,
-        "ed25519",
-        None,
-    );
-
-    let sender_pubkey_bytes =
-        crypto::b64_decode(sender_pubkey).context("failed to decode sender public key")?;
-    let (sig_b64, pub_b64) =
-        crypto::sign_envelope(sender_privkey, &sender_pubkey_bytes, &canonical)?;
-
-    Ok(build_envelope_signed(SignedEnvelopeParams {
-        payload: &encrypted_payload,
-        payload_type,
-        nonce: &nonce,
-        timestamp: ts,
-        algorithm: "ed25519",
-        signature_prefix: "ed25519",
-        signature_b64: &sig_b64,
-        public_key_b64: &pub_b64,
-        peer_id: None,
-        kem_public_key_b64: None,
-    }))
-}
-
-pub fn build_encrypted_envelope_with_peer(
-    payload: &[u8],
-    payload_type: &str,
-    recipient_pubkey: &[u8],
-    sender_privkey: &[u8],
-    sender_pubkey: &str,
-    peer_id: &str,
-    sender_kem_pub_b64: Option<&str>,
-) -> anyhow::Result<Vec<u8>> {
-    let encrypted_payload = crypto::encrypt_payload_for_recipient(recipient_pubkey, payload)?;
-
-    let (nonce, ts) = envelope_nonce_and_timestamp();
-
-    let canonical = build_envelope_canonical_with_peer(
-        &encrypted_payload,
-        payload_type,
-        &nonce,
-        ts,
-        "ed25519",
-        peer_id,
-        sender_kem_pub_b64,
-    );
-
-    let sender_pubkey_bytes =
-        crypto::b64_decode(sender_pubkey).context("failed to decode sender public key")?;
-    let (sig_b64, pub_b64) =
-        crypto::sign_envelope(sender_privkey, &sender_pubkey_bytes, &canonical)?;
-
-    Ok(build_envelope_signed(SignedEnvelopeParams {
-        payload: &encrypted_payload,
-        payload_type,
-        nonce: &nonce,
-        timestamp: ts,
-        algorithm: "ed25519",
-        signature_prefix: "ed25519",
-        signature_b64: &sig_b64,
-        public_key_b64: &pub_b64,
-        peer_id: Some(peer_id),
-        kem_public_key_b64: sender_kem_pub_b64,
-    }))
-}
-
-fn envelope_nonce_and_timestamp() -> (String, u64) {
-    // Use cryptographically secure nonce generation from crypto crate
-    crypto::generate_nonce_and_timestamp()
+    #[test]
+    fn replayed_nonce_is_refused() {
+        let (public, private) = crypto::generate_signing_keypair();
+        let now = 1_700_000_000_000;
+        let bytes = Envelope::seal(
+            parts(&public, "replay-sender", "replay-receiver", "nonce-8", now),
+            &private,
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+        let validator = EnvelopeValidator::new("replay-receiver", "replay-sender", now);
+        validator.accept(&bytes, "handshake-request").unwrap();
+        let error = EnvelopeValidator::new("replay-receiver", "replay-sender", now)
+            .accept(&bytes, "handshake-request")
+            .unwrap_err();
+        assert!(error.to_string().contains("replay"));
+    }
 }

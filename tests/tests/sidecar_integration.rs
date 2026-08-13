@@ -18,11 +18,19 @@ use tokio::{
 };
 
 use podmesh_integration_tests::support::{
-    allocate_tcp_port, allocate_udp_port, fresh_tenant_owner, init_ephemeral_keys, init_tracing,
-    provision_proxy_cert,
+    allocate_tcp_port, allocate_udp_port, fresh_tenant_owner, init_tracing, provision_proxy_cert,
 };
 
-const DEMO_MANIFEST_ID: &str = "demo-nginx";
+const DEMO_WORKLOAD_NAME: &str = "demo-nginx";
+
+/// The routing key is derived from the tenant owner key, so every helper that
+/// builds or inspects the demo workload has to agree on that key.
+fn demo_manifest_id(owner_b64: &str) -> String {
+    protocol::route_id(
+        &crypto::b64_decode(owner_b64).expect("owner key"),
+        DEMO_WORKLOAD_NAME,
+    )
+}
 const DEMO_MANIFEST: &[u8] = include_bytes!("../sample_manifests/demo_deployment.yml");
 
 fn build_workload_config(
@@ -42,6 +50,8 @@ fn build_workload_config(
         rest_port,
         disable_rest_api: false,
         enable_ingress,
+        advertise_addresses: Vec::new(),
+        rest_rate_limit_per_minute: podmesh_proxy::restapi::DEFAULT_REST_RATE_LIMIT_PER_MINUTE,
         owner_pubkey: None,
     }
 }
@@ -50,7 +60,6 @@ fn build_workload_config(
 #[serial]
 async fn ingress_proxies_requests_via_sidecar() -> Result<()> {
     init_tracing();
-    init_ephemeral_keys();
     let (owner_b64, owner_sk, owner_pk) = fresh_tenant_owner();
     let mut handle = start_workload(Vec::new(), true).await?;
     let mut sidecar_shutdown: Option<oneshot::Sender<()>> = None;
@@ -74,9 +83,12 @@ async fn ingress_proxies_requests_via_sidecar() -> Result<()> {
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         sidecar_shutdown = Some(shutdown_tx);
-        let (mut sidecar_cfg, ingress_host, service_host) =
-            build_sidecar_config(vec![handle.endpoint_record.clone()], app_port)?;
-        sidecar_cfg.owner_public_key_b64 = Some(owner_b64.clone());
+        let (sidecar_cfg, ingress_host, service_host) = build_sidecar_config(
+            &owner_b64,
+            &owner_sk,
+            vec![handle.endpoint_record.clone()],
+            app_port,
+        )?;
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let provider_peer_id = handle.peer_id.clone();
 
@@ -132,7 +144,7 @@ async fn ingress_proxies_requests_via_sidecar() -> Result<()> {
 #[serial]
 async fn sidecar_discovers_explicit_egress_proxy() -> Result<()> {
     init_tracing();
-    init_ephemeral_keys();
+    let (owner_b64, owner_sk, owner_pk) = fresh_tenant_owner();
 
     // Start a workload node that acts as the proxy provider
     let mut handle = start_workload(Vec::new(), false).await?;
@@ -141,9 +153,20 @@ async fn sidecar_discovers_explicit_egress_proxy() -> Result<()> {
     let test_result: Result<()> = async {
         // Wait for proxy to be ready and announce itself
         wait_for_network_ready(handle.network_ready_rx(), Duration::from_secs(10)).await?;
+        // The sidecar refuses a proxy that cannot prove the owner authorised
+        // it, so even a discovery-only test has to provision a grant.
+        provision_proxy_cert(
+            handle.rest_port,
+            &owner_pk,
+            &owner_sk,
+            Duration::from_secs(10),
+        )
+        .await?;
 
         // Create sidecar with egress enabled
         let (mut sidecar_cfg, _, _) = build_sidecar_config_with_egress(
+            &owner_b64,
+            &owner_sk,
             vec![handle.endpoint_record.clone()],
             DEFAULT_SIDECAR_APP_PORT,
             true, // enable_egress
@@ -214,7 +237,6 @@ async fn sidecar_discovers_explicit_egress_proxy() -> Result<()> {
 #[serial]
 async fn sidecar_fetches_and_registers_with_additional_regional_proxy() -> Result<()> {
     init_tracing();
-    init_ephemeral_keys();
     let (owner_b64, owner_sk, owner_pk) = fresh_tenant_owner();
 
     let mut first = start_workload(Vec::new(), false).await?;
@@ -240,10 +262,11 @@ async fn sidecar_fetches_and_registers_with_additional_regional_proxy() -> Resul
         .await?;
 
         let (mut sidecar_cfg, _, _) = build_sidecar_config(
+            &owner_b64,
+            &owner_sk,
             vec![first.endpoint_record.clone()],
             DEFAULT_SIDECAR_APP_PORT,
         )?;
-        sidecar_cfg.owner_public_key_b64 = Some(owner_b64);
         sidecar_cfg.lookup_interval = Duration::from_secs(1);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -254,12 +277,13 @@ async fn sidecar_fetches_and_registers_with_additional_regional_proxy() -> Resul
                 .expect("sidecar run");
         });
 
-        let first_table = first.workload.routing_table_handle().unwrap();
-        let second_table = second.workload.routing_table_handle().unwrap();
+        let first_routes = first.workload.routes().unwrap();
+        let second_routes = second.workload.routes().unwrap();
         let registration_deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let first_registered = first_table.read().unwrap().contains_key(DEMO_MANIFEST_ID);
-            let second_registered = second_table.read().unwrap().contains_key(DEMO_MANIFEST_ID);
+            let manifest_id = demo_manifest_id(&owner_b64);
+            let first_registered = first_routes.contains(&manifest_id);
+            let second_registered = second_routes.contains(&manifest_id);
             if first_registered && second_registered {
                 break;
             }
@@ -298,7 +322,6 @@ async fn sidecar_fetches_and_registers_with_additional_regional_proxy() -> Resul
 #[serial]
 async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
     init_tracing();
-    init_ephemeral_keys();
     let (owner_b64, owner_sk, owner_pk) = fresh_tenant_owner();
 
     // Start target HTTP server
@@ -331,12 +354,13 @@ async fn egress_http_proxy_routes_traffic_through_tunnel() -> Result<()> {
         // Create sidecar with HTTP proxy enabled and tenant owner pubkey set so
         // it authenticates the explicitly configured proxy.
         let (mut sidecar_cfg, _, _) = build_sidecar_config_full(
+            &owner_b64,
+            &owner_sk,
             vec![handle.endpoint_record.clone()],
             DEFAULT_SIDECAR_APP_PORT,
             false,
             Some(http_proxy_port),
         )?;
-        sidecar_cfg.owner_public_key_b64 = Some(owner_b64.clone());
         sidecar_cfg.lookup_interval = Duration::from_secs(1);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -560,39 +584,60 @@ async fn wait_for_sidecar_peer_ready(
 }
 
 fn build_sidecar_config(
+    owner_b64: &str,
+    owner_sk: &[u8],
     bootstrap_peers: Vec<protocol::EndpointRecord>,
     app_port: u16,
 ) -> Result<(SidecarConfig, String, String)> {
-    build_sidecar_config_with_egress(bootstrap_peers, app_port, false)
+    build_sidecar_config_with_egress(owner_b64, owner_sk, bootstrap_peers, app_port, false)
 }
 
 fn build_sidecar_config_with_egress(
+    owner_b64: &str,
+    owner_sk: &[u8],
     bootstrap_peers: Vec<protocol::EndpointRecord>,
     app_port: u16,
     enable_egress: bool,
 ) -> Result<(SidecarConfig, String, String)> {
-    build_sidecar_config_full(bootstrap_peers, app_port, enable_egress, None)
+    build_sidecar_config_full(
+        owner_b64,
+        owner_sk,
+        bootstrap_peers,
+        app_port,
+        enable_egress,
+        None,
+    )
 }
 
 fn build_sidecar_config_full(
+    owner_b64: &str,
+    owner_sk: &[u8],
     bootstrap_peers: Vec<protocol::EndpointRecord>,
     app_port: u16,
     enable_egress: bool,
     http_proxy_port: Option<u16>,
 ) -> Result<(SidecarConfig, String, String)> {
-    let (routes, ingress_host, service_host) = demo_routes(app_port)?;
+    let (routes, ingress_host, service_host) = demo_routes(owner_b64, app_port)?;
     let cfg = SidecarConfig {
         identity: podmesh_sidecar::IdentitySource::ephemeral(),
         proxy_endpoints: bootstrap_peers,
+        workload_credential_b64: Some(podmesh_integration_tests::support::workload_credential(
+            owner_sk,
+            owner_b64,
+            DEMO_WORKLOAD_NAME,
+        )),
         workload_relay_auth_token: None,
         workload_relay_ca_certificates: Vec::new(),
         lookup_interval: Duration::from_secs(2),
         iroh_bind_addr: "127.0.0.1:0".parse()?,
-        manifest_id: DEMO_MANIFEST_ID.to_string(),
+        workload_name: DEMO_WORKLOAD_NAME.to_string(),
+        manifest_id: demo_manifest_id(owner_b64),
+        replica_index: 0,
+        replica_count: 1,
         ingress_host: ingress_host.clone(),
         app_port,
         routes,
-        owner_public_key_b64: None,
+        owner_public_key_b64: Some(owner_b64.to_string()),
         enable_egress,
         skip_egress_nft: false,
         http_proxy_port,
@@ -600,8 +645,8 @@ fn build_sidecar_config_full(
     Ok((cfg, ingress_host, service_host))
 }
 
-fn demo_routes(app_port: u16) -> Result<(Vec<SidecarRouteSpec>, String, String)> {
-    let extraction = extract_sidecar_routes(DEMO_MANIFEST, DEMO_MANIFEST_ID)?;
+fn demo_routes(owner_b64: &str, app_port: u16) -> Result<(Vec<SidecarRouteSpec>, String, String)> {
+    let extraction = extract_sidecar_routes(DEMO_MANIFEST, &demo_manifest_id(owner_b64))?;
     let mut routes = extraction.routes;
     for route in routes.iter_mut() {
         route.target_port = app_port;
@@ -642,7 +687,6 @@ fn demo_routes(app_port: u16) -> Result<(Vec<SidecarRouteSpec>, String, String)>
 #[serial]
 async fn sidecar_registers_with_tenant_signed_proxy_cert() -> Result<()> {
     init_tracing();
-    init_ephemeral_keys();
     let (owner_b64, owner_sk, owner_pk) = fresh_tenant_owner();
 
     let mut handle = start_workload(Vec::new(), false).await?;
@@ -698,9 +742,12 @@ async fn sidecar_registers_with_tenant_signed_proxy_cert() -> Result<()> {
         let app_body = "hello-from-tenant-bound-app".to_string();
         let app_server = spawn_test_app(app_port, app_body.clone()).await?;
 
-        let (mut sidecar_cfg, _, _) =
-            build_sidecar_config(vec![handle.endpoint_record.clone()], app_port)?;
-        sidecar_cfg.owner_public_key_b64 = Some(owner_b64.clone());
+        let (mut sidecar_cfg, _, _) = build_sidecar_config(
+            &owner_b64,
+            &owner_sk,
+            vec![handle.endpoint_record.clone()],
+            app_port,
+        )?;
         sidecar_cfg.lookup_interval = Duration::from_secs(1);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -736,12 +783,13 @@ async fn sidecar_registers_with_tenant_signed_proxy_cert() -> Result<()> {
         // Wait for the proxy's routing table to contain the sidecar registration.
         // This proves: handshake exchanged → cert verified by sidecar → registration sent →
         // proxy verified registration against its stored grant → routes stored.
-        let routing_table = handle.workload.routing_table_handle();
+        let routes = handle.workload.routes();
+        let manifest_id = demo_manifest_id(&owner_b64);
         let routing_deadline = Instant::now() + Duration::from_secs(20);
         let mut registered = false;
         while Instant::now() < routing_deadline {
-            if let Some(table) = routing_table.as_ref()
-                && table.read().unwrap().contains_key(DEMO_MANIFEST_ID)
+            if let Some(table) = routes.as_ref()
+                && table.contains(&manifest_id)
             {
                 registered = true;
                 break;
@@ -750,8 +798,7 @@ async fn sidecar_registers_with_tenant_signed_proxy_cert() -> Result<()> {
         }
         assert!(
             registered,
-            "proxy never received a verified SidecarRegistration for manifest {}",
-            DEMO_MANIFEST_ID
+            "proxy never received a verified SidecarRegistration for manifest {manifest_id}"
         );
 
         let _ = shutdown_tx.send(());
@@ -776,8 +823,7 @@ async fn sidecar_registers_with_tenant_signed_proxy_cert() -> Result<()> {
 #[serial]
 async fn sidecar_registration_blocked_when_proxy_has_no_tenant_cert() -> Result<()> {
     init_tracing();
-    init_ephemeral_keys();
-    let (owner_b64, _owner_sk, _owner_pk) = fresh_tenant_owner();
+    let (owner_b64, owner_sk, _owner_pk) = fresh_tenant_owner();
 
     let mut handle = start_workload(Vec::new(), false).await?;
     let test_result: Result<()> = async {
@@ -786,9 +832,12 @@ async fn sidecar_registration_blocked_when_proxy_has_no_tenant_cert() -> Result<
         // Intentionally do NOT call provision_proxy_cert.
 
         let app_port = allocate_tcp_port();
-        let (mut sidecar_cfg, _, _) =
-            build_sidecar_config(vec![handle.endpoint_record.clone()], app_port)?;
-        sidecar_cfg.owner_public_key_b64 = Some(owner_b64.clone());
+        let (mut sidecar_cfg, _, _) = build_sidecar_config(
+            &owner_b64,
+            &owner_sk,
+            vec![handle.endpoint_record.clone()],
+            app_port,
+        )?;
         sidecar_cfg.lookup_interval = Duration::from_secs(1);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -809,13 +858,196 @@ async fn sidecar_registration_blocked_when_proxy_has_no_tenant_cert() -> Result<
             }
         }
 
-        let routing_table = handle.workload.routing_table_handle();
-        if let Some(table) = routing_table.as_ref() {
-            let snap = table.read().unwrap();
+        if let Some(table) = handle.workload.routes().as_ref() {
             assert!(
-                snap.is_empty(),
-                "proxy unexpectedly accepted a registration without holding any tenant cert: {:?}",
-                snap.keys().collect::<Vec<_>>()
+                table.is_empty(),
+                "proxy unexpectedly accepted a registration without holding any tenant grant"
+            );
+        }
+
+        let _ = shutdown_tx.send(());
+        let _ = sidecar_task.await;
+        Ok(())
+    }
+    .await;
+
+    handle.workload.close().await;
+    test_result
+}
+
+/// Replicas exist to serve traffic. If the proxy kept only the most recent
+/// registration, every replica after the first would sit idle while one carried
+/// the whole deployment — N times the cost for 1x the throughput — and traffic
+/// would blackhole whenever that one replica died.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn ingress_balances_across_every_replica() -> Result<()> {
+    init_tracing();
+    let (owner_b64, owner_sk, owner_pk) = fresh_tenant_owner();
+    let mut handle = start_workload(Vec::new(), true).await?;
+    let mut shutdowns: Vec<oneshot::Sender<()>> = Vec::new();
+    let mut sidecars: Vec<JoinHandle<()>> = Vec::new();
+    let mut apps: Vec<JoinHandle<()>> = Vec::new();
+
+    const REPLICAS: u32 = 3;
+
+    let test_result: Result<()> = async {
+        wait_for_network_ready(handle.network_ready_rx(), Duration::from_secs(10)).await?;
+        provision_proxy_cert(
+            handle.rest_port,
+            &owner_pk,
+            &owner_sk,
+            Duration::from_secs(10),
+        )
+        .await?;
+
+        // Every replica answers with its own index, so the body identifies which
+        // one served the request.
+        let mut ingress_host = String::new();
+        for replica_index in 0..REPLICAS {
+            let app_port = allocate_tcp_port();
+            apps.push(spawn_test_app(app_port, format!("replica-{replica_index}")).await?);
+
+            let (mut cfg, host, _) = build_sidecar_config(
+                &owner_b64,
+                &owner_sk,
+                vec![handle.endpoint_record.clone()],
+                app_port,
+            )?;
+            cfg.replica_index = replica_index;
+            cfg.replica_count = REPLICAS;
+            ingress_host = host;
+
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            shutdowns.push(shutdown_tx);
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            let peer_id = handle.peer_id.clone();
+            sidecars.push(tokio::spawn(async move {
+                run_sidecar_with_shutdown(cfg, shutdown_rx, Some(event_tx))
+                    .await
+                    .expect("sidecar run");
+            }));
+            wait_for_sidecar_peer_ready(&mut event_rx, &peer_id, Duration::from_secs(20)).await?;
+        }
+
+        // Wait until the proxy holds a backend for every replica.
+        let manifest_id = demo_manifest_id(&owner_b64);
+        let routes = handle
+            .workload
+            .routes()
+            .ok_or_else(|| anyhow!("routing table unavailable"))?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while routes.backend_count(&manifest_id) < REPLICAS as usize {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "only {} of {REPLICAS} replicas registered",
+                routes.backend_count(&manifest_id)
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        let ingress_addr = handle
+            .workload
+            .ingress_address()
+            .ok_or_else(|| anyhow!("ingress listen address unavailable"))?;
+        let client = Client::new();
+        let url = format!("http://{ingress_addr}/hello");
+        wait_for_ingress_response(&client, &url, &ingress_host, Duration::from_secs(20)).await?;
+
+        // Enough requests that every replica must be hit if traffic rotates.
+        let mut served = std::collections::BTreeSet::new();
+        for _ in 0..(REPLICAS * 4) {
+            let body = client
+                .get(&url)
+                .header("Host", &ingress_host)
+                .send()
+                .await?
+                .text()
+                .await?;
+            served.insert(body);
+        }
+        assert_eq!(
+            served.len(),
+            REPLICAS as usize,
+            "every replica must serve traffic, saw only {served:?}"
+        );
+        Ok(())
+    }
+    .await;
+
+    for shutdown in shutdowns {
+        let _ = shutdown.send(());
+    }
+    for sidecar in sidecars {
+        let _ = sidecar.await;
+    }
+    for app in apps {
+        app.abort();
+    }
+    handle.workload.close().await;
+    test_result
+}
+
+/// A tenant's public key is public, so naming it must prove nothing.
+///
+/// Without an owner-signed credential an impostor could register under the
+/// victim's routing key on any proxy the victim granted, become a backend for
+/// the victim's hostname, and receive its ingress traffic. The credential is
+/// what makes the owner key unusable as an identity claim, so this test drives
+/// a sidecar that knows the victim's public key — as anyone may — but holds a
+/// credential minted with a different key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn a_sidecar_cannot_register_under_a_tenant_whose_key_it_does_not_hold() -> Result<()> {
+    init_tracing();
+    let (victim_b64, _victim_sk, victim_pk) = fresh_tenant_owner();
+    let (_impostor_b64, impostor_sk, _impostor_pk) = fresh_tenant_owner();
+
+    let mut handle = start_workload(Vec::new(), false).await?;
+    let test_result: Result<()> = async {
+        wait_for_network_ready(handle.network_ready_rx(), Duration::from_secs(10)).await?;
+        // The victim has granted this proxy, which is exactly the situation the
+        // impostor wants to exploit: the proxy will happily serve that tenant.
+        provision_proxy_cert(
+            handle.rest_port,
+            &victim_pk,
+            &_victim_sk,
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(|error| anyhow!("provision_proxy_cert failed: {error}"))?;
+
+        let app_port = allocate_tcp_port();
+        // Everything names the victim; only the credential is signed by another
+        // key, which is all an impostor could actually obtain.
+        let (mut sidecar_cfg, _, _) = build_sidecar_config(
+            &victim_b64,
+            &impostor_sk,
+            vec![handle.endpoint_record.clone()],
+            app_port,
+        )?;
+        sidecar_cfg.lookup_interval = Duration::from_secs(1);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let sidecar_task = tokio::spawn(async move {
+            let _ = run_sidecar_with_shutdown(sidecar_cfg, shutdown_rx, Some(event_tx)).await;
+        });
+
+        let drain_deadline = tokio::time::sleep(Duration::from_secs(10));
+        tokio::pin!(drain_deadline);
+        loop {
+            tokio::select! {
+                Some(_event) = event_rx.recv() => {}
+                _ = &mut drain_deadline => break,
+            }
+        }
+
+        let manifest_id = demo_manifest_id(&victim_b64);
+        if let Some(table) = handle.workload.routes().as_ref() {
+            assert!(
+                !table.contains(&manifest_id),
+                "a sidecar without the tenant's key registered under that tenant's routing key"
             );
         }
 

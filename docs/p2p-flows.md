@@ -17,6 +17,14 @@ reachable scheduler. The scheduler answers placement from the mesh and then rela
 already-encrypted control payload to the selected agent over `/podmesh/agent-control/1`. It moves
 opaque bytes it can neither read nor forge.
 
+An agent holds exactly one attachment, so the scheduler a client happens to reach usually is not the
+one holding it. That scheduler broadcasts a single signed location query on the gossip mesh and only
+the holder answers, directly, over the control relay protocol. The query carries no payload, names a
+reply endpoint that must belong to its own signer, and expires. The answer is cached with a bounded
+lifetime and forgotten as soon as a forward through it fails, so a burst of operations against one
+agent resolves once and a moved agent is noticed quickly. Locating an agent therefore costs one
+broadcast rather than one connection per scheduler, which is what allows the mesh to be large.
+
 Every scheduler supervises a machine `iroh-relay`. Machine grants admit only scheduler and agent
 EndpointIds. Relays forward encrypted QUIC packets and never receive workload plaintext or
 application keys.
@@ -37,9 +45,22 @@ agent attachment bootstrap over plain HTTP:
   add each verified peer to the gossip member allowlist and the relay trusted issuer set at
   runtime. Both registries are bounded. Start order therefore does not matter, and an unreachable
   peer is a normal transient condition rather than an error.
+- Schedulers also announce their own signed record on the gossip mesh at a fixed interval. A
+  scheduler that hears an announcement admits the announcer into its member allowlist, which is what
+  lets a mesh grow past the peer URLs configured on any single node. This is transitive but still
+  vouched for: an announcement can only be heard from a scheduler that some operator-configured
+  member already admitted. It grants membership only, never relay-issuer trust.
 
-The records are self-signed and self-expiring, so an attacker on the HTTP path can only cause a
-verification failure, never an impersonation.
+These records are self-signed: the key that validates one is carried inside it. Verifying a record
+therefore proves it is internally consistent and nothing more — whoever answers the URL picks the
+identity. HTTP discovery is safe only because identity is pinned separately:
+
+- A scheduler binds each peer URL to one endpoint id and signing key, configured up front or
+  remembered from the first observation. A later mismatch is refused and logged, so a party that can
+  answer a peer URL cannot substitute itself for an admitted scheduler, and cannot exhaust the member
+  or issuer registries by cycling identities.
+- An agent's bootstrap URLs only supply addresses; the scheduler still has to authenticate its Iroh
+  connection, and an agent answers capacity queries only over that authenticated attachment.
 
 ## Workload Plane
 
@@ -79,27 +100,59 @@ The application authorization behavior is unchanged:
 4. The sidecar verifies the grant's tenant owner against the owner key it was injected with, the
    proxy endpoint binding, the signature, and the expiry, allowing bounded clock skew.
 5. Only verified proxies receive sidecar registration, discovery, and egress streams.
-6. The proxy verifies sidecar registration signature, tenant owner, endpoint binding, and expiry.
+6. The proxy checks that the registration names the endpoint the transport authenticated, that its
+   routing key is derived from the owner key it presents, and that the proxy already holds a live
+   grant signed by that owner. Claiming a routing key therefore requires the tenant's private key.
 
-Grants are Biscuit tokens rather than opaque certificates so a proxy can later attenuate and
-delegate its authority without the owner reissuing. They authenticate only the proxy-to-sidecar
-relationship; external ingress clients never present one.
+Both handshake directions travel in a signed envelope that names the sender, the intended recipient,
+and the direction, so a captured handshake cannot be forwarded to a third peer and a response cannot
+be replayed as a request.
 
-Route registration remains the only ingress routing authority. Routes expire after 120 seconds and
-are refreshed every 30 seconds. Ingress fails closed when no live route or connection exists.
+Grants are Biscuit tokens rather than opaque certificates because that leaves room for attenuation
+and delegation later; nothing in this release mints or inspects an attenuated grant. They
+authenticate only the proxy-to-sidecar relationship; external ingress clients never present one.
+
+A sidecar proves which tenant it belongs to rather than asserting it. The owner's public key is
+public and a sidecar's transport key is generated inside the container, so neither identifies a
+tenant. `podctl` therefore mints an owner-signed workload credential at deploy time, naming the
+owner and the routing key, and seals it into the execution specification. The sidecar presents it
+during the handshake and the proxy verifies it against the owner key — which is also the credential's
+signing root, so naming a tenant is worthless without that tenant's private key. The proxy records
+the proven tenancy against the connection and checks registration, proxy discovery and egress
+against it, never against anything the caller repeats. Tenancy does not outlive the connection.
+
+The credential is bearer: whoever reads a pod's metadata may act as that workload. Binding it to the
+sidecar's transport key is impossible, because that key does not exist when the owner mints it.
+
+Route registration is the only ingress routing authority. A hostname serves a workload only if that
+workload claimed it, or under the canonical `<routing-key>.mesh.local` form; an unrecognised `Host`
+header resolves to nothing. A hostname claimed by one owner is never reassigned to another. Routes
+expire after 120 seconds and are refreshed every 30 seconds. Ingress fails closed when no live route
+or connection exists.
+
+Egress tunnels are authorised by tenant, not by destination: the connection must have proven an
+owner and that owner must hold a live grant for this proxy. Destinations are deliberately not
+filtered by address, because podmesh runs across machines whose application parts legitimately live
+on private networks. The consequence is that a tenant which granted a proxy can reach whatever that
+proxy can reach, including its own services and cloud instance metadata. A destination is resolved
+once and only the resolved addresses are dialled, so a name cannot resolve to one host for a check
+and another for the connection. Tunnels are bounded in bytes and in time.
 
 ## Deployment Data Boundary
 
 Podctl accepts base64 signed EndpointRecords from `podmesh.io/proxy-endpoints` or
-`PODMESH_PROXY_ENDPOINTS`. The workload relay token comes from
+`PODMESH_PROXY_ENDPOINTS`. This tenant's workload relay token comes from
 `PODMESH_WORKLOAD_RELAY_AUTH_TOKEN`; optional private CA certificates come from
 `PODMESH_WORKLOAD_RELAY_CA_CERTS` as base64 DER values.
 
 When those are not supplied, `PODMESH_PROXY_URL` bootstraps all three from the proxies' REST APIs
-via `GET /api/v1/workload_relay_bootstrap`. Every listed proxy must report the same relay token,
-because a sidecar is injected with exactly one; proxies achieve that by adopting a peer's token
-rather than each minting its own. Podctl also mints one owner-signed Biscuit grant per proxy and
-posts it to `POST /api/v1/proxy_grant` before deploying.
+via `GET /api/v1/workload_relay_bootstrap?owner=<key>`, which returns only the token derived for the
+tenant named in the request. Relay tokens are derived from a mesh secret the workload never receives,
+so one tenant's token does not admit another. Every listed proxy must derive the same token for a
+tenant; disagreement means they hold different mesh secrets. Proxies share a secret by adopting a
+peer's over the separate `GET /api/v1/workload_relay_mesh_secret`, which is proxy-to-proxy only.
+Podctl also mints one owner-signed Biscuit grant per proxy and posts it to
+`POST /api/v1/proxy_grant` before deploying, and one workload credential per deployment.
 
 Podctl puts these values only in the encrypted owner-signed execution specification. The selected
 agent injects them into sidecar metadata. They are not sent to the scheduler or the machine relay.

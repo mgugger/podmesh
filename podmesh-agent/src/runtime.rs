@@ -14,21 +14,38 @@ const MAX_LOGGED_CONTAINERS: usize = 16;
 
 #[async_trait]
 pub trait WorkloadRuntime: Send + Sync {
-    async fn deploy(&self, workload_id: &str, manifest: &[u8]) -> Result<String>;
+    async fn deploy(&self, deployment: WorkloadDeployment<'_>) -> Result<String>;
     async fn status(&self, runtime_id: &str) -> Result<String>;
     async fn logs(&self, runtime_id: &str, tail: u32) -> Result<String>;
     async fn delete(&self, runtime_id: &str) -> Result<()>;
 }
 
+/// One pod to run, and the tenant it belongs to.
+pub struct WorkloadDeployment<'a> {
+    pub workload_id: &'a str,
+    /// Base64 Ed25519 key of the namespace owner, recorded so a deployment can
+    /// be attributed to its tenant.
+    pub namespace_id: &'a str,
+    pub manifest: &'a [u8],
+}
+
 #[derive(Default)]
 pub struct MockRuntime {
     workloads: RwLock<HashMap<String, Vec<u8>>>,
+    /// Namespace each workload was deployed for, so tests can assert that pods
+    /// are placed per tenant.
+    tenants: RwLock<HashMap<String, String>>,
 }
 
 impl MockRuntime {
     /// Manifest the agent handed to the runtime, i.e. after sidecar injection.
     pub async fn deployed_manifest(&self, workload_id: &str) -> Option<Vec<u8>> {
         self.workloads.read().await.get(workload_id).cloned()
+    }
+
+    /// Namespace a workload was deployed for.
+    pub async fn deployed_namespace(&self, workload_id: &str) -> Option<String> {
+        self.tenants.read().await.get(workload_id).cloned()
     }
 
     /// Workload IDs currently held by this runtime.
@@ -41,12 +58,16 @@ impl MockRuntime {
 
 #[async_trait]
 impl WorkloadRuntime for MockRuntime {
-    async fn deploy(&self, workload_id: &str, manifest: &[u8]) -> Result<String> {
-        self.workloads
-            .write()
-            .await
-            .insert(workload_id.to_string(), manifest.to_vec());
-        Ok(workload_id.to_string())
+    async fn deploy(&self, deployment: WorkloadDeployment<'_>) -> Result<String> {
+        self.workloads.write().await.insert(
+            deployment.workload_id.to_string(),
+            deployment.manifest.to_vec(),
+        );
+        self.tenants.write().await.insert(
+            deployment.workload_id.to_string(),
+            deployment.namespace_id.to_string(),
+        );
+        Ok(deployment.workload_id.to_string())
     }
 
     async fn status(&self, runtime_id: &str) -> Result<String> {
@@ -109,13 +130,21 @@ impl PodmanRuntime {
             .context("parse workload manifest")?;
         let value = documents
             .iter()
+            // The same predicate sidecar injection uses. A looser one here
+            // would let a manifest whose first document is a spec-less `Pod`
+            // name any pod on the host, including another tenant's.
             .find(|document| {
-                document.get("kind").and_then(serde_yaml::Value::as_str) == Some("Pod")
-                    || document
+                let is_pod =
+                    document.get("kind").and_then(serde_yaml::Value::as_str) == Some("Pod");
+                if is_pod {
+                    document.get("spec").is_some()
+                } else {
+                    document
                         .get("spec")
                         .and_then(|spec| spec.get("template"))
                         .and_then(|template| template.get("spec"))
                         .is_some()
+                }
             })
             .ok_or_else(|| anyhow!("manifest does not contain a pod workload"))?;
         let name = value
@@ -140,12 +169,12 @@ impl PodmanRuntime {
 
 #[async_trait]
 impl WorkloadRuntime for PodmanRuntime {
-    async fn deploy(&self, _workload_id: &str, manifest: &[u8]) -> Result<String> {
-        let pod_name = Self::pod_name(manifest)?;
+    async fn deploy(&self, deployment: WorkloadDeployment<'_>) -> Result<String> {
+        let pod_name = Self::pod_name(deployment.manifest)?;
         let mut file = tempfile::NamedTempFile::new().context("create protected manifest file")?;
         file.as_file_mut()
             .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        std::io::Write::write_all(&mut file, manifest)?;
+        std::io::Write::write_all(&mut file, deployment.manifest)?;
         Self::output(
             Command::new("podman")
                 .arg("kube")

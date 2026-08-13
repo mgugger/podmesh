@@ -35,7 +35,8 @@ pub async fn run(
     event_tx: Option<mpsc::UnboundedSender<SidecarEvent>>,
 ) -> Result<()> {
     config.validate()?;
-    let endpoint = bind_endpoint(&config).await?;
+    let identity = Arc::new(config.identity.load()?);
+    let endpoint = bind_endpoint(&config, &identity).await?;
     let cancellation = CancellationToken::new();
     let http_client = Client::builder()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
@@ -77,6 +78,7 @@ pub async fn run(
                 if !sessions.contains_key(&id) && connecting.insert(id) {
                     spawn_connection_attempt(
                         endpoint.clone(),
+                        identity.clone(),
                         config.clone(),
                         record,
                         cancellation.clone(),
@@ -95,11 +97,12 @@ pub async fn run(
                         }
                         notify(&event_tx, SidecarEvent::Connected { peer_id: id.to_string() });
                         notify(&event_tx, SidecarEvent::ProxyPeerDiscovered { peer_id: id.to_string() });
-                        if session.verified
-                            && let Err(error) = connection::register(endpoint.id(), &config, &session, &cancellation).await
-                        {
+                        if let Err(error) = connection::register(endpoint.id(), &config, &session, &cancellation).await {
                             log::warn!("initial sidecar registration failed endpoint={} error={error}", id.fmt_short());
                         }
+                        // Only a verified session may carry tenant traffic: an
+                        // unverified proxy has not proved the owner authorised
+                        // it, so it must not be able to reach the application.
                         tokio::spawn(streams::serve_connection(
                             session.connection.clone(),
                             config.clone(),
@@ -122,6 +125,7 @@ pub async fn run(
                     if !sessions.contains_key(&id) && connecting.insert(id) {
                         spawn_connection_attempt(
                             endpoint.clone(),
+                            identity.clone(),
                             config.clone(),
                             record,
                             cancellation.clone(),
@@ -186,10 +190,12 @@ pub async fn run(
     Ok(())
 }
 
-async fn bind_endpoint(config: &SidecarConfig) -> Result<Endpoint> {
-    let secret = config.identity.load()?;
+async fn bind_endpoint(
+    config: &SidecarConfig,
+    identity: &iroh_support::NodeIdentity,
+) -> Result<Endpoint> {
     let mut builder = Endpoint::builder(presets::Minimal)
-        .secret_key(secret)
+        .secret_key(identity.transport_secret().clone())
         .bind_addr(config.iroh_bind_addr)?;
     let relay_urls = config
         .proxy_endpoints
@@ -227,6 +233,7 @@ async fn bind_endpoint(config: &SidecarConfig) -> Result<Endpoint> {
 
 fn spawn_connection_attempt(
     endpoint: Endpoint,
+    identity: Arc<iroh_support::NodeIdentity>,
     config: Arc<SidecarConfig>,
     record: EndpointRecord,
     cancellation: CancellationToken,
@@ -236,7 +243,8 @@ fn spawn_connection_attempt(
     tokio::spawn(async move {
         let result = match slots.acquire_owned().await {
             Ok(_permit) => {
-                connection::connect(&endpoint, &config, record.clone(), &cancellation).await
+                connection::connect(&endpoint, &identity, &config, record.clone(), &cancellation)
+                    .await
             }
             Err(_) => Err(anyhow::anyhow!("proxy connection limiter closed")),
         };

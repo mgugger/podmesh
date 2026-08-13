@@ -14,7 +14,11 @@ pub const DEFAULT_MAX_ATTACHED_AGENTS: usize = 10_000;
 pub const DEFAULT_MAX_OFFERS_PER_QUERY: usize = 256;
 pub const DEFAULT_MAX_AGENT_FANOUT: usize = 1_024;
 pub const MAX_MACHINE_RELAYS: usize = 16;
-pub const MAX_SCHEDULER_MEMBERS: usize = 256;
+/// Schedulers one mesh may hold.
+///
+/// Locating an agent costs one gossip broadcast rather than a probe per peer,
+/// so this bounds memory and gossip fan-out rather than per-request work.
+pub const MAX_SCHEDULER_MEMBERS: usize = 10_000;
 pub const MAX_SCHEDULER_BOOTSTRAPS: usize = 32;
 
 #[derive(Clone, Debug, Args)]
@@ -73,6 +77,20 @@ pub struct MachineConfig {
         value_delimiter = ','
     )]
     pub scheduler_peer_urls: Vec<String>,
+
+    /// Pin a peer scheduler's identity out of band, as
+    /// `<url>=<endpoint_id_hex>:<signing_pubkey_b64>`.
+    ///
+    /// A peer endpoint record is self-signed, so without a pin the first
+    /// party to answer a peer URL becomes that peer. Configuring the binding
+    /// removes even the first-observation window; otherwise the first
+    /// observation is remembered and later mismatches are refused.
+    #[arg(
+        long = "scheduler-peer-pin",
+        env = "PODMESH_SCHEDULER_PEER_PINS",
+        value_delimiter = ','
+    )]
+    pub scheduler_peer_pins: Vec<String>,
 
     #[arg(
         long = "capacity-query-timeout-secs",
@@ -214,6 +232,7 @@ mod tests {
     fn config(member: EndpointId) -> MachineConfig {
         MachineConfig {
             scheduler_peer_urls: Vec::new(),
+            scheduler_peer_pins: Vec::new(),
             key_dir: "/tmp/podmesh-scheduler-test".into(),
             bind_addr: DEFAULT_MACHINE_BIND.parse().unwrap(),
             relay_urls: vec!["https://relay.example.test".into()],

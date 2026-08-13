@@ -35,9 +35,19 @@ pub const MAX_AGENT_CONTROL_RELAY_FRAME_BYTES: usize =
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AgentControlRelayIntent {
     /// Cheap probe: does the peer currently hold this agent's attachment?
+    ///
+    /// Kept for a direct check against one known peer; finding an agent in a
+    /// large mesh goes over gossip instead, because probing every peer costs a
+    /// connection each.
     Locate,
     /// Deliver the carried payload to the agent and return its answer.
     Forward(AgentControlOperation),
+    /// "I hold this agent's attachment", answering a gossiped location query.
+    ///
+    /// Sent by the holder to the scheduler that asked, over the same protocol
+    /// in the opposite direction. The holder's identity comes from the
+    /// authenticated connection, so nothing here needs to carry it.
+    LocationAnswer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,16 +56,30 @@ pub struct AgentControlRelayRequest {
     #[serde(with = "serde_bytes")]
     pub agent_endpoint_id: Vec<u8>,
     pub intent: AgentControlRelayIntent,
+    /// Names the gossiped query a `LocationAnswer` belongs to. Empty otherwise.
+    pub query_id: String,
     #[serde(with = "serde_bytes")]
     pub encrypted_payload: Vec<u8>,
 }
 
 impl AgentControlRelayRequest {
+    /// Answer a gossiped location query for `agent_endpoint_id`.
+    pub fn location_answer(agent_endpoint_id: Vec<u8>, query_id: String) -> Self {
+        Self {
+            version: AGENT_CONTROL_RELAY_PROTOCOL_VERSION,
+            agent_endpoint_id,
+            intent: AgentControlRelayIntent::LocationAnswer,
+            query_id,
+            encrypted_payload: Vec::new(),
+        }
+    }
+
     pub fn locate(agent_endpoint_id: Vec<u8>) -> Self {
         Self {
             version: AGENT_CONTROL_RELAY_PROTOCOL_VERSION,
             agent_endpoint_id,
             intent: AgentControlRelayIntent::Locate,
+            query_id: String::new(),
             encrypted_payload: Vec::new(),
         }
     }
@@ -69,6 +93,7 @@ impl AgentControlRelayRequest {
             version: AGENT_CONTROL_RELAY_PROTOCOL_VERSION,
             agent_endpoint_id,
             intent: AgentControlRelayIntent::Forward(operation),
+            query_id: String::new(),
             encrypted_payload,
         }
     }
@@ -105,7 +130,22 @@ impl AgentControlRelayRequest {
                     && self.encrypted_payload.len() <= MAX_AGENT_CONTROL_PAYLOAD_BYTES,
                 "relayed agent control payload size is invalid"
             ),
+            AgentControlRelayIntent::LocationAnswer => {
+                ensure!(
+                    self.encrypted_payload.is_empty(),
+                    "a location answer cannot carry a payload"
+                );
+                ensure!(
+                    !self.query_id.is_empty() && self.query_id.len() <= 128,
+                    "a location answer must name the query it answers"
+                );
+            }
         }
+        ensure!(
+            matches!(self.intent, AgentControlRelayIntent::LocationAnswer)
+                || self.query_id.is_empty(),
+            "only a location answer carries a query id"
+        );
         Ok(())
     }
 }

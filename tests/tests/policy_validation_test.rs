@@ -65,9 +65,63 @@ fn test_authorized_sidecar_net_admin_allowed() {
 
     assert!(
         result.allowed,
-        "sidecar container with NET_ADMIN should be allowed: {:?}",
+        "the injected sidecar may hold NET_ADMIN: {:?}",
         result.violations
     );
+}
+
+/// The pod security policy is the only thing standing between a tenant manifest
+/// and the Podman socket the agent drives, so every escape route it covers gets
+/// an explicit test.
+#[test]
+fn host_escape_attempts_are_all_refused() {
+    let manifest = load_manifest("host_escape.yml").unwrap();
+    let result = validate_manifest(&manifest).expect("validation should succeed");
+
+    assert!(!result.allowed, "a host escape manifest must be refused");
+    for expected in [
+        "hostNetwork",
+        "hostPID",
+        "shareProcessNamespace",
+        "volume",
+        "privileged",
+        "allowPrivilegeEscalation",
+        "runAsUser",
+        "SYS_ADMIN",
+        "hostPort",
+    ] {
+        assert!(
+            result.violations.iter().any(|v| v.contains(expected)),
+            "expected a {expected} violation in {:?}",
+            result.violations
+        );
+    }
+}
+
+/// Volumes are refused wholesale for now, including the benign-looking kinds:
+/// admitting a subset needs per-tenant naming rules that do not exist yet.
+#[test]
+fn a_configmap_volume_is_refused_like_any_other() {
+    let manifest = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: with-config
+spec:
+  volumes:
+    - name: config
+      configMap:
+        name: settings
+  containers:
+    - name: app
+      image: nginx
+      volumeMounts:
+        - name: config
+          mountPath: /etc/settings
+"#;
+    let result = validate_manifest(manifest).expect("validation should succeed");
+    assert!(!result.allowed);
+    assert!(result.violations.iter().any(|v| v.contains("volume")));
 }
 
 #[test]

@@ -18,11 +18,9 @@ use std::process::{Command as StdCommand, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use podctl::{apply_file_with_proxy_urls, delete_file};
+use podctl::{ClientOptions, apply_file_with_proxy_urls, delete_file};
 use podmesh_agent::sidecar::workload_runtime_name;
-use podmesh_integration_tests::support::{
-    init_ephemeral_keys, init_tracing, reset_podman_stack_state,
-};
+use podmesh_integration_tests::support::{ClientKeyDir, init_tracing, reset_podman_stack_state};
 use reqwest::Client;
 use serde_json::Value;
 use serial_test::serial;
@@ -77,7 +75,6 @@ const PROXY_EGRESS_TUNNEL_PATTERN: &str = "egress tunnel";
 #[serial]
 async fn transparent_egress_routes_through_sidecar_and_proxy() -> Result<()> {
     init_tracing();
-    init_ephemeral_keys();
 
     anyhow::ensure!(
         is_podman_available().await,
@@ -117,10 +114,20 @@ async fn transparent_egress_routes_through_sidecar_and_proxy() -> Result<()> {
     wait_for_machine_health(&client, Duration::from_secs(120)).await?;
     wait_for_agent_registration(&client, Duration::from_secs(180)).await?;
 
+    // The client keeps its own key directory rather than the developer's real
+    // one, and accepts whichever agent this stack offers: the agents are part
+    // of the stack under test, so there is no separate identity to pin.
+    let key_dir = ClientKeyDir::with_trusted_agents(&[])?;
+    key_dir.activate();
+    let options = ClientOptions {
+        api_base: Some(MACHINE_API_URL.to_string()),
+        trust_any_agent: true,
+    };
+
     // Deploy the egress test workload
     let manifest_id = apply_file_with_proxy_urls(
         egress_test_manifest.clone(),
-        Some(MACHINE_API_URL),
+        &options,
         PODMESH_PROXY_API_URLS.to_string(),
     )
     .await
@@ -128,8 +135,8 @@ async fn transparent_egress_routes_through_sidecar_and_proxy() -> Result<()> {
     log::info!("podctl applied egress test manifest {manifest_id}");
     // `podctl` returns the deployment id, while the agent names the pod after
     // the per-replica workload id. Derive the latter to find the containers.
-    let (owner_public, _owner_private) =
-        crypto::ensure_keypair_on_disk().context("load namespace signing key")?;
+    let (owner_public, _owner_private) = crypto::load_or_create_signing_keypair(key_dir.path())
+        .context("load namespace signing key")?;
     let workload_id =
         protocol::workload_id(&owner_public, EGRESS_WORKLOAD_NAME, EGRESS_REPLICA_INDEX);
     workload_guard.set(workload_id.clone());
@@ -156,7 +163,7 @@ async fn transparent_egress_routes_through_sidecar_and_proxy() -> Result<()> {
     );
 
     // Cleanup
-    delete_file(egress_test_manifest.clone(), true, Some(MACHINE_API_URL))
+    delete_file(egress_test_manifest.clone(), true, &options)
         .await
         .context("podctl delete failed")?;
     wait_for_workload_teardown(&workload_id, Duration::from_secs(90)).await?;

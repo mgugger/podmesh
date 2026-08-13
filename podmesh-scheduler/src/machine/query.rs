@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use iroh::{EndpointAddr, EndpointId};
 use protocol::{CapacityOffer, CapacityQuery};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
 
 use super::{CapacityOfferHandler, SchedulerIdentity};
@@ -33,6 +33,10 @@ impl CapacityCriteria {
 pub struct BegunQuery {
     pub query: CapacityQuery,
     pub newly_created: bool,
+    /// How many offers make this query answerable without waiting further.
+    pub target_offers: usize,
+    /// Live count of offers collected for this query.
+    pub offers: watch::Receiver<usize>,
 }
 
 #[derive(Clone)]
@@ -53,6 +57,12 @@ struct PendingQuery {
     query: CapacityQuery,
     offers: HashMap<EndpointId, CapacityOffer>,
     completed: Option<Option<CapacityOffer>>,
+    /// Offers that make this query answerable. A query serving several waiters
+    /// keeps the greediest one's target, so coalescing never shortens the wait
+    /// somebody else asked for.
+    target_offers: usize,
+    /// Published on every accepted offer so waiters can stop early.
+    offer_count: watch::Sender<usize>,
 }
 
 impl QueryManager {
@@ -72,22 +82,36 @@ impl QueryManager {
         }
     }
 
+    /// Open a placement query, or join one already in flight for the same
+    /// criteria.
+    ///
+    /// `target_offers` is how many offers the caller considers enough to choose
+    /// from. Collecting every offer in a large mesh would mean waiting the full
+    /// query lifetime on every placement, so the caller states what "enough"
+    /// means for it and stops there.
     pub async fn begin(
         &self,
         criteria: CapacityCriteria,
         identity: &SchedulerIdentity,
         reply_address: &EndpointAddr,
+        target_offers: usize,
         now_secs: u64,
     ) -> Result<BegunQuery> {
         let criteria = criteria.normalized();
+        let target_offers = target_offers.clamp(1, self.max_offers_per_query);
         let mut state = self.inner.lock().await;
         cleanup_locked(&mut state, now_secs);
-        if let Some(query_id) = state.equivalent.get(&criteria)
-            && let Some(pending) = state.pending.get(query_id)
+        if let Some(query_id) = state.equivalent.get(&criteria).cloned()
+            && let Some(pending) = state.pending.get_mut(&query_id)
         {
+            // A joiner that wants more choice raises the bar for everyone
+            // waiting on this query; it never lowers it.
+            pending.target_offers = pending.target_offers.max(target_offers);
             return Ok(BegunQuery {
                 query: pending.query.clone(),
                 newly_created: false,
+                target_offers: pending.target_offers,
+                offers: pending.offer_count.subscribe(),
             });
         }
         ensure!(
@@ -117,6 +141,7 @@ impl QueryManager {
             identity.signing_private(),
             now_secs,
         )?;
+        let (offer_count, offers) = watch::channel(0);
         state
             .equivalent
             .insert(criteria.clone(), query.query_id.clone());
@@ -125,13 +150,17 @@ impl QueryManager {
             PendingQuery {
                 criteria,
                 query: query.clone(),
-                offers: HashMap::with_capacity(self.max_offers_per_query),
+                offers: HashMap::with_capacity(target_offers),
                 completed: None,
+                target_offers,
+                offer_count,
             },
         );
         Ok(BegunQuery {
             query,
             newly_created: true,
+            target_offers,
+            offers,
         })
     }
 
@@ -188,6 +217,9 @@ impl QueryManager {
             "capacity offer limit reached for query"
         );
         pending.offers.insert(authenticated_endpoint, offer);
+        // Publishing the count is what lets a waiter return as soon as it has
+        // enough to choose from, instead of sleeping out the query lifetime.
+        let _ = pending.offer_count.send(pending.offers.len());
         Ok(true)
     }
 

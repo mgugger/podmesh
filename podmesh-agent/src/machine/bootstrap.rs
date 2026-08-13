@@ -57,14 +57,28 @@ pub async fn resolve_scheduler_urls(urls: &[String]) -> Result<Vec<String>> {
             .with_context(|| format!("GET {base}/api/v1/endpoint_record failed"))?
             .error_for_status()
             .with_context(|| format!("scheduler {base} refused to publish its endpoint record"))?;
-        let body = response
-            .bytes()
+        // Refuse an oversized body before buffering it. `bytes()` would read
+        // the whole response into memory first, so a hostile bootstrap URL
+        // could exhaust the agent's memory during startup.
+        if let Some(length) = response.content_length() {
+            ensure!(
+                length <= MAX_BOOTSTRAP_RESPONSE_BYTES as u64,
+                "scheduler {base} announced an oversized endpoint record response"
+            );
+        }
+        let mut response = response;
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .with_context(|| format!("read endpoint record body from {base}"))?;
-        ensure!(
-            body.len() <= MAX_BOOTSTRAP_RESPONSE_BYTES,
-            "scheduler {base} returned an oversized endpoint record response"
-        );
+            .with_context(|| format!("read endpoint record body from {base}"))?
+        {
+            ensure!(
+                body.len() + chunk.len() <= MAX_BOOTSTRAP_RESPONSE_BYTES,
+                "scheduler {base} returned an oversized endpoint record response"
+            );
+            body.extend_from_slice(&chunk);
+        }
         let parsed: EndpointRecordResponse = serde_json::from_slice(&body)
             .with_context(|| format!("decode endpoint record response from {base}"))?;
         log::info!("bootstrapped scheduler endpoint record from {base}");

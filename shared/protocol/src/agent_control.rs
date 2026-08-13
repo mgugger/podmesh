@@ -11,6 +11,11 @@ pub enum AgentControlOperation {
     Admission,
     Deploy,
     Command,
+    /// Ask an agent which of this owner's workloads it is holding.
+    ///
+    /// Unlike `Command` this names no workload, because its whole purpose is to
+    /// find workloads the caller has lost track of.
+    List,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

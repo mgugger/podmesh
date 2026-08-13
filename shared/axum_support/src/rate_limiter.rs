@@ -1,11 +1,17 @@
-//! Simple IP-based rate limiter middleware for Axum.
+//! Per-IP token-bucket rate limiting for Axum servers.
 //!
-//! This module provides a token bucket rate limiter that tracks request counts
-//! per IP address and rejects requests that exceed the configured limit.
+//! This bounds how often a single peer can make a request that is cheap to send
+//! and expensive to serve. It is not access control: it does not say who may
+//! call an endpoint, only how fast anyone may.
+//!
+//! Requests are keyed by the peer address of the TCP connection, never by a
+//! forwarded-for header, because a header is chosen by the caller. Behind a
+//! reverse proxy every client therefore shares one bucket, so the limiter
+//! belongs on a directly-exposed listener.
 
 use axum::{
     body::Body,
-    extract::ConnectInfo,
+    extract::{ConnectInfo, State},
     http::{Request, StatusCode},
     middleware::Next,
     response::Response,
@@ -13,12 +19,16 @@ use axum::{
 use log::{debug, warn};
 use lru::LruCache;
 use parking_lot::Mutex;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
 /// Maximum number of IP addresses to track in the rate limiter cache.
+///
+/// The cache is LRU, so a peer that rotates addresses evicts other peers'
+/// buckets rather than growing memory without bound. Eviction hands the evicted
+/// address a fresh bucket, which is the accepted cost of per-IP limiting.
 const MAX_TRACKED_IPS: usize = 10_000;
 
 /// Token bucket entry for a single IP address.
@@ -57,7 +67,7 @@ impl TokenBucket {
 
 /// Rate limiter state shared across all request handlers.
 pub struct RateLimiterState {
-    buckets: Mutex<LruCache<String, TokenBucket>>,
+    buckets: Mutex<LruCache<IpAddr, TokenBucket>>,
     max_tokens: f64,
     refill_rate: f64, // tokens per second
 }
@@ -68,7 +78,7 @@ impl RateLimiterState {
     /// # Arguments
     /// * `requests_per_minute` - Maximum requests allowed per minute per IP
     pub fn new(requests_per_minute: u32) -> Self {
-        let max_tokens = requests_per_minute as f64;
+        let max_tokens = f64::from(requests_per_minute.max(1));
         let refill_rate = max_tokens / 60.0; // Convert to per-second rate
 
         Self {
@@ -80,110 +90,142 @@ impl RateLimiterState {
         }
     }
 
-    /// Check if a request from the given IP should be allowed.
-    pub fn check(&self, ip: &str) -> bool {
+    /// Check if a request from the given address should be allowed.
+    pub fn check(&self, ip: IpAddr) -> bool {
         let mut buckets = self.buckets.lock();
 
-        if let Some(bucket) = buckets.get_mut(ip) {
+        if let Some(bucket) = buckets.get_mut(&ip) {
             bucket.try_consume(self.refill_rate, self.max_tokens)
         } else {
-            // New IP - create bucket with full tokens minus one for this request
+            // New address: start from a full bucket and spend one token on this
+            // request.
             let mut bucket = TokenBucket::new(self.max_tokens);
-            bucket.tokens -= 1.0; // Consume token for this request
-            buckets.put(ip.to_string(), bucket);
+            bucket.tokens -= 1.0;
+            buckets.put(ip, bucket);
             true
         }
     }
 }
 
-/// Axum middleware that applies rate limiting based on client IP address.
+/// Axum middleware that applies rate limiting based on the peer address.
 ///
-/// # Arguments
-/// * `state` - Shared rate limiter state
-/// * `request` - Incoming HTTP request
-/// * `next` - Next middleware/handler in the chain
+/// The limiter is a typed piece of middleware state rather than something read
+/// out of request extensions, so a server cannot be wired up in a way that
+/// silently serves every request unlimited.
 pub async fn rate_limit_middleware(
+    State(limiter): State<Arc<RateLimiterState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    // Get the rate limiter from request extensions
-    let rate_limiter = request.extensions().get::<Arc<RateLimiterState>>().cloned();
-
-    if let Some(limiter) = rate_limiter {
-        let ip = addr.ip().to_string();
-
-        if !limiter.check(&ip) {
-            warn!(
-                "rate_limiter: rejecting request from {} - rate limit exceeded",
-                ip
-            );
-            return Err(StatusCode::TOO_MANY_REQUESTS);
-        }
-
-        debug!("rate_limiter: allowing request from {}", ip);
+    let ip = addr.ip();
+    if !limiter.check(ip) {
+        warn!("rate_limiter: rejecting request from {ip} - rate limit exceeded");
+        return Err(StatusCode::TOO_MANY_REQUESTS);
     }
-
+    debug!("rate_limiter: allowing request from {ip}");
     Ok(next.run(request).await)
 }
 
-/// Create a rate limiter layer for use with Axum routers.
+/// Create the shared state for [`rate_limit_middleware`].
 ///
 /// # Arguments
 /// * `requests_per_minute` - Maximum requests allowed per minute per IP
 ///
 /// # Example
-/// ```ignore
-/// let app = Router::new()
-///     .route("/api", get(handler))
-///     .layer(rate_limiter_layer(100));
 /// ```
+/// use axum::{Router, middleware, routing::get};
+/// use axum_support::{create_rate_limiter, rate_limit_middleware};
+///
+/// let app: Router = Router::new()
+///     .route("/api", get(|| async { "ok" }))
+///     .layer(middleware::from_fn_with_state(
+///         create_rate_limiter(600),
+///         rate_limit_middleware,
+///     ));
+/// ```
+///
+/// The middleware identifies callers by the peer address of the connection, so
+/// the server must be run with
+/// `into_make_service_with_connect_info::<std::net::SocketAddr>()`. The helpers
+/// in this crate already do that.
 pub fn create_rate_limiter(requests_per_minute: u32) -> Arc<RateLimiterState> {
     Arc::new(RateLimiterState::new(requests_per_minute))
+}
+
+/// Apply per-IP rate limiting to `router`, or leave it untouched when
+/// `requests_per_minute` is zero.
+///
+/// Zero means "no limit" so an operator can turn the limiter off for a
+/// deployment where every caller shares one source address, without the call
+/// site growing a conditional.
+pub fn with_rate_limit(router: axum::Router, requests_per_minute: u32) -> axum::Router {
+    if requests_per_minute == 0 {
+        log::warn!("rate_limiter: disabled by configuration; this listener will not be throttled");
+        return router;
+    }
+    router.layer(axum::middleware::from_fn_with_state(
+        create_rate_limiter(requests_per_minute),
+        rate_limit_middleware,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_rate_limiter_allows_requests_under_limit() {
-        let limiter = RateLimiterState::new(10); // 10 per minute
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::from([192, 168, 1, last])
+    }
 
-        // Should allow first 10 requests immediately
-        for i in 0..10 {
-            assert!(
-                limiter.check("192.168.1.1"),
-                "Request {} should be allowed",
-                i
-            );
+    #[test]
+    fn requests_under_the_limit_are_allowed() {
+        let limiter = RateLimiterState::new(10);
+        for attempt in 0..10 {
+            assert!(limiter.check(ip(1)), "request {attempt} should be allowed");
         }
     }
 
     #[test]
-    fn test_rate_limiter_blocks_excess_requests() {
-        let limiter = RateLimiterState::new(5); // 5 per minute
-
-        // Exhaust the bucket
+    fn excess_requests_are_blocked() {
+        let limiter = RateLimiterState::new(5);
         for _ in 0..5 {
-            assert!(limiter.check("192.168.1.2"));
+            assert!(limiter.check(ip(2)));
         }
-
-        // 6th request should be blocked
-        assert!(!limiter.check("192.168.1.2"));
+        assert!(!limiter.check(ip(2)));
     }
 
     #[test]
-    fn test_rate_limiter_tracks_ips_separately() {
-        let limiter = RateLimiterState::new(2); // 2 per minute
+    fn addresses_are_tracked_separately() {
+        let limiter = RateLimiterState::new(2);
+        assert!(limiter.check(ip(3)));
+        assert!(limiter.check(ip(3)));
+        assert!(!limiter.check(ip(3)));
 
-        // Exhaust IP 1's bucket
-        assert!(limiter.check("192.168.1.1"));
-        assert!(limiter.check("192.168.1.1"));
-        assert!(!limiter.check("192.168.1.1")); // Blocked
+        // A different peer still has its own budget.
+        assert!(limiter.check(ip(4)));
+    }
 
-        // IP 2 should still have tokens
-        assert!(limiter.check("192.168.1.2"));
-        assert!(limiter.check("192.168.1.2"));
+    #[test]
+    fn a_bucket_refills_over_time() {
+        // 60 per minute is one per second, so a bucket drained now regains a
+        // token shortly afterwards.
+        let limiter = RateLimiterState::new(60);
+        for _ in 0..60 {
+            assert!(limiter.check(ip(5)));
+        }
+        assert!(!limiter.check(ip(5)));
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        assert!(
+            limiter.check(ip(5)),
+            "the bucket must refill rather than latch closed"
+        );
+    }
+
+    #[test]
+    fn a_zero_limit_is_treated_as_one_rather_than_dividing_by_nothing() {
+        let limiter = RateLimiterState::new(0);
+        assert!(limiter.check(ip(6)));
+        assert!(!limiter.check(ip(6)));
     }
 }

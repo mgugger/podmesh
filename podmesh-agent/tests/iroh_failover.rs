@@ -1,3 +1,4 @@
+use iroh::address_lookup::memory::MemoryLookup;
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
@@ -8,8 +9,9 @@ use podmesh_agent::{
     runtime::MockRuntime,
 };
 use podmesh_scheduler::machine::{
-    AttachmentManager, CapacityCoordinator, CapacityCriteria, PlacementHandler, QueryManager,
-    SchedulerGossip, SchedulerIdentity, ValidatedMachineConfig,
+    AttachmentManager, CapacityCoordinator, CapacityCriteria, LocationRegistry, MemberIssuers,
+    PlacementHandler, QueryManager, SchedulerGossip, SchedulerGossipServices, SchedulerIdentity,
+    ValidatedMachineConfig,
 };
 use tokio::time::timeout;
 
@@ -42,13 +44,16 @@ async fn surviving_scheduler_continues_capacity_after_peer_loss() -> Result<()> 
     first.shutdown().await?;
     let offer = second
         .capacity
-        .solicit(CapacityCriteria {
-            cpu_milli: 500,
-            memory_bytes: 512 * 1024 * 1024,
-            storage_bytes: 1024 * 1024 * 1024,
-            required_capabilities: vec!["multi-workload".into()],
-            excluded_endpoint_ids: Vec::new(),
-        })
+        .solicit(
+            CapacityCriteria {
+                cpu_milli: 500,
+                memory_bytes: 512 * 1024 * 1024,
+                storage_bytes: 1024 * 1024 * 1024,
+                required_capabilities: vec!["multi-workload".into()],
+                excluded_endpoint_ids: Vec::new(),
+            },
+            1,
+        )
         .await?
         .context("surviving scheduler received no offer")?;
     offer.verify(now_secs())?;
@@ -84,11 +89,16 @@ async fn scheduler_node() -> Result<SchedulerNode> {
         .with_relay_grant_issuer(identity.clone(), RELAY_URL.into());
     let queries = QueryManager::new(8, 8, Duration::from_secs(1));
     let gossip = SchedulerGossip::start(
-        endpoint.clone(),
+        SchedulerGossipServices {
+            endpoint: endpoint.clone(),
+            attachments: attachments.handler(),
+            offers: queries.offer_handler(),
+            placement: PlacementHandler::new(8, TEST_TIMEOUT),
+            locations: LocationRegistry::new(),
+            member_issuers: MemberIssuers::new(),
+            lookup: MemoryLookup::new(),
+        },
         &config,
-        attachments.handler(),
-        queries.offer_handler(),
-        PlacementHandler::new(8, TEST_TIMEOUT),
     )
     .await?;
     let (capacity, coordinator) = CapacityCoordinator::start(
@@ -125,6 +135,7 @@ fn agent_config(root: &std::path::Path, records: &[protocol::EndpointRecord]) ->
         state_path: root.join("state.redb"),
         runtime: RuntimeKind::Mock,
         workload_network: "podmesh".into(),
+        max_reserved_capacity_percent: podmesh_agent::config::DEFAULT_MAX_RESERVED_CAPACITY_PERCENT,
         sidecar_image: "podmesh/sidecar:latest".into(),
         capacity_cpu_milli: 2_000,
         capacity_memory_bytes: 2 * 1024 * 1024 * 1024,

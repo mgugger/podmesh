@@ -24,7 +24,7 @@ use iroh::EndpointId;
 /// Hard bound on the converged member set. Matches the configured member limit
 /// so background discovery can never grow the allowlist past what an operator
 /// could have written down by hand.
-pub const MAX_CONVERGED_MEMBERS: usize = super::config::MAX_SCHEDULER_MEMBERS;
+pub(crate) const MAX_CONVERGED_MEMBERS: usize = super::config::MAX_SCHEDULER_MEMBERS;
 
 /// Hard bound on converged relay issuer keys, matching the relay's own limit.
 pub const MAX_CONVERGED_ISSUERS: usize = crate::relay::MAX_TRUSTED_RELAY_ISSUERS;

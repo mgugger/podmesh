@@ -5,7 +5,7 @@ use super::*;
 const NOW: u64 = 1_000;
 
 fn endpoint_record(endpoint_id: EndpointId) -> String {
-    let (public, private) = crypto::ensure_keypair_ephemeral().unwrap();
+    let (public, private) = crypto::generate_signing_keypair();
     let record = EndpointRecord {
         version: ENDPOINT_RECORD_VERSION,
         endpoint_id: endpoint_id.as_bytes().to_vec(),
@@ -52,7 +52,7 @@ fn missing_duplicate_and_unreachable_schedulers_fail_closed() {
     let bytes = crypto::b64_decode(&endpoint_record(iroh::SecretKey::generate().public())).unwrap();
     let mut record = EndpointRecord::from_bytes(&bytes, NOW).unwrap();
     record.direct_addresses.clear();
-    let (public, private) = crypto::ensure_keypair_ephemeral().unwrap();
+    let (public, private) = crypto::generate_signing_keypair();
     record = record.sign(&public, &private, NOW).unwrap();
     let mut unreachable = config();
     unreachable.scheduler_endpoints = vec![crypto::b64_encode(&record.to_bytes(NOW).unwrap())];

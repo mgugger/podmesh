@@ -1,0 +1,33 @@
+# Everything an escape attempt needs, all of which the policy must refuse.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: host-escape
+spec:
+  hostNetwork: true
+  hostPID: true
+  shareProcessNamespace: true
+  volumes:
+    - name: host-root
+      hostPath:
+        path: /
+  initContainers:
+    - name: setup
+      image: docker.io/library/busybox
+      securityContext:
+        privileged: true
+  containers:
+    - name: app
+      image: docker.io/library/nginx
+      securityContext:
+        runAsUser: 0
+        allowPrivilegeEscalation: true
+        capabilities:
+          add:
+            - SYS_ADMIN
+      ports:
+        - containerPort: 80
+          hostPort: 8080
+      volumeMounts:
+        - name: host-root
+          mountPath: /host

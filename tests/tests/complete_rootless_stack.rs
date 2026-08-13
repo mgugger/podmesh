@@ -6,11 +6,9 @@ use std::process::{Command as StdCommand, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use podctl::{apply_file_with_proxy_urls, delete_file};
+use podctl::{ClientOptions, apply_file_with_proxy_urls, delete_file};
 use podmesh_agent::sidecar::workload_runtime_name;
-use podmesh_integration_tests::support::{
-    init_ephemeral_keys, init_tracing, reset_podman_stack_state,
-};
+use podmesh_integration_tests::support::{ClientKeyDir, init_tracing, reset_podman_stack_state};
 use protocol::MESH_DOMAIN_SUFFIX;
 use reqwest::Client;
 use serde_json::Value;
@@ -27,8 +25,10 @@ const PODMESH_PROXY_URL: &str = "http://127.0.0.1:8080/";
 /// these and mints an owner-signed grant for each.
 const PODMESH_PROXY_API_URLS: &str =
     "http://127.0.0.1:3010,http://127.0.0.1:3011,http://127.0.0.1:3012";
-const EXPECTED_BODY_SUBSTRING: &str = "Welcome to Podmesh";
-const EXPECTED_CONTAINERS: [&str; 2] = ["my-nginx", "sidecar"];
+/// The stock nginx index page, since the sample manifest no longer mounts a
+/// ConfigMap: volumes are refused by the pod security policy.
+const EXPECTED_BODY_SUBSTRING: &str = "Welcome to nginx";
+const EXPECTED_CONTAINERS: [&str; 2] = ["my-nginx", "podmesh-sidecar"];
 /// Workload name declared by the sample manifest, used to derive the same
 /// per-replica workload id the agent names its pod after.
 const SAMPLE_WORKLOAD_NAME: &str = "my-nginx";
@@ -51,7 +51,6 @@ const REQUIRED_IMAGES: [&str; 4] = [
 #[serial]
 async fn complete_rootless_stack_serves_ingress() -> Result<()> {
     init_tracing();
-    init_ephemeral_keys();
 
     anyhow::ensure!(
         is_podman_available().await,
@@ -89,9 +88,19 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
     wait_for_machine_health(&client, Duration::from_secs(120)).await?;
     wait_for_agent_registration(&client, Duration::from_secs(180)).await?;
 
+    // The client keeps its own key directory rather than the developer's real
+    // one, and accepts whichever agent this stack offers: the agents are part
+    // of the stack under test, so there is no separate identity to pin.
+    let key_dir = ClientKeyDir::with_trusted_agents(&[])?;
+    key_dir.activate();
+    let options = ClientOptions {
+        api_base: Some(MACHINE_API_URL.to_string()),
+        trust_any_agent: true,
+    };
+
     let manifest_id = apply_file_with_proxy_urls(
         sample_manifest.clone(),
-        Some(MACHINE_API_URL),
+        &options,
         PODMESH_PROXY_API_URLS.to_string(),
     )
     .await
@@ -99,8 +108,8 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
     log::info!("podctl applied manifest {manifest_id}");
     // `podctl` returns the deployment id, while the agent names the pod after
     // the per-replica workload id. Derive the latter to find the containers.
-    let (owner_public, _owner_private) =
-        crypto::ensure_keypair_on_disk().context("load namespace signing key")?;
+    let (owner_public, _owner_private) = crypto::load_or_create_signing_keypair(key_dir.path())
+        .context("load namespace signing key")?;
     let workload_id =
         protocol::workload_id(&owner_public, SAMPLE_WORKLOAD_NAME, SAMPLE_REPLICA_INDEX);
     workload_guard.set(workload_id.clone());
@@ -111,7 +120,7 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
     // Give workload state time to settle before attempting delete.
     sleep(Duration::from_secs(10)).await;
 
-    delete_file(sample_manifest.clone(), true, Some(MACHINE_API_URL))
+    delete_file(sample_manifest.clone(), true, &options)
         .await
         .context("podctl delete failed")?;
     wait_for_workload_teardown(&workload_id, Duration::from_secs(90)).await?;

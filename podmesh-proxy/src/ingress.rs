@@ -27,13 +27,18 @@ pub struct IngressServer {
 }
 
 impl IngressServer {
-    pub fn spawn(host: String, port: u16, sidecar: SidecarClient) -> Result<Self> {
+    pub fn spawn(
+        host: String,
+        port: u16,
+        sidecar: SidecarClient,
+        routes: Option<Arc<crate::routes::RouteTable>>,
+    ) -> Result<Self> {
         let addr = parse_socket_addr(&host, port)?;
         let std_listener = StdTcpListener::bind(addr)?;
         std_listener.set_nonblocking(true)?;
         let listener = TcpListener::from_std(std_listener)?;
 
-        let state = IngressState { sidecar };
+        let state = IngressState { sidecar, routes };
         let app = Router::new().fallback(any(ingress_entry)).with_state(state);
         let join = spawn_tcp_listener(listener, app, "workload-ingress");
 
@@ -57,6 +62,7 @@ impl IngressServer {
 #[derive(Clone)]
 pub struct IngressState {
     sidecar: SidecarClient,
+    routes: Option<Arc<crate::routes::RouteTable>>,
 }
 
 async fn ingress_entry(
@@ -72,9 +78,9 @@ async fn ingress_entry(
         return status_response(StatusCode::BAD_REQUEST, "missing host header");
     };
 
-    let Some(app_id) = manifest_id_from_host(&host) else {
-        warn!("unable to derive manifest id from host host={}", host);
-        return status_response(StatusCode::BAD_REQUEST, "invalid host header");
+    let Some(app_id) = state.resolve(&host) else {
+        warn!("no workload claims host={host}");
+        return status_response(StatusCode::NOT_FOUND, "no workload serves this host");
     };
 
     let method = request.method().to_string();
@@ -116,20 +122,32 @@ fn parse_host(value: &HeaderValue) -> Option<String> {
     Some(host_part.trim_end_matches('.').to_lowercase())
 }
 
-fn manifest_id_from_host(host: &str) -> Option<String> {
-    if host.is_empty() {
-        return None;
+impl IngressState {
+    /// Map a request hostname to the routing key that serves it.
+    ///
+    /// Only two things resolve: a hostname a workload actually claimed, and the
+    /// canonical `<routing-key>.mesh.local` form. Treating an unrecognised Host
+    /// header as a routing key — as an earlier version did — would let any
+    /// client address any workload just by naming it.
+    fn resolve(&self, host: &str) -> Option<String> {
+        let routes = self.routes.as_ref()?;
+        if let Some(manifest_id) = routes.resolve_host(host) {
+            return Some(manifest_id);
+        }
+        let canonical = canonical_routing_key(host)?;
+        routes.contains(&canonical).then_some(canonical)
     }
-    let suffix = format!(".{}", MESH_DOMAIN_SUFFIX);
-    if let Some(stripped) = host.strip_suffix(&suffix) {
-        return stripped
-            .trim_matches('.')
-            .rsplit('.')
-            .next()
-            .filter(|segment| !segment.is_empty())
-            .map(|segment| segment.to_string());
-    }
-    Some(host.to_string())
+}
+
+/// Extract the routing key from `<routing-key>.mesh.local`.
+///
+/// The key is a 32-byte blake3 digest in hex, so anything else is rejected
+/// outright rather than passed through as a routing key.
+fn canonical_routing_key(host: &str) -> Option<String> {
+    let suffix = format!(".{MESH_DOMAIN_SUFFIX}");
+    let label = host.strip_suffix(&suffix)?.rsplit('.').next()?;
+    (label.len() == 64 && label.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| label.to_ascii_lowercase())
 }
 
 fn status_response(code: StatusCode, body: &str) -> Response<Body> {

@@ -39,11 +39,37 @@ struct Args {
     iroh_bind_addr: SocketAddr,
     #[arg(long = "workload-relay-url", env = "PODMESH_WORKLOAD_RELAY_URL")]
     workload_relay_url: Option<String>,
+    /// Secret every proxy in the mesh shares, from which per-tenant relay
+    /// tokens are derived. Generated on first start when omitted.
     #[arg(
-        long = "workload-relay-auth-token",
-        env = "PODMESH_WORKLOAD_RELAY_AUTH_TOKEN"
+        long = "workload-relay-mesh-secret",
+        env = "PODMESH_WORKLOAD_RELAY_MESH_SECRET"
     )]
-    workload_relay_auth_token: Option<String>,
+    workload_relay_mesh_secret: Option<String>,
+
+    /// Addresses sidecars should dial instead of the ones this proxy bound.
+    ///
+    /// Required whenever the proxy is not on the caller's network — behind NAT,
+    /// in a container, or simply on another machine — because a bound address
+    /// is then not reachable by anyone who needs it.
+    #[arg(
+        long = "advertise-address",
+        env = "PODMESH_PROXY_ADVERTISE_ADDRESSES",
+        value_delimiter = ','
+    )]
+    advertise_addresses: Vec<String>,
+
+    /// Namespace owners this proxy will relay for, or every tenant when empty.
+    ///
+    /// Relaying is transport: what a workload may register or tunnel is decided
+    /// by its owner-signed credential, so an open relay is a reasonable default
+    /// and this exists for operators who want to bound whose traffic they carry.
+    #[arg(
+        long = "relay-tenants",
+        env = "PODMESH_PROXY_RELAY_TENANTS",
+        value_delimiter = ','
+    )]
+    relay_tenants: Vec<String>,
     #[arg(
         long = "workload-relay-http-listen",
         env = "PODMESH_WORKLOAD_RELAY_HTTP_LISTEN",
@@ -113,6 +139,19 @@ struct Args {
     )]
     publish_relay_bootstrap: bool,
 
+    /// Requests per minute a single peer address may make against the REST API.
+    ///
+    /// The grant endpoint is unauthenticated by design, so this is what keeps
+    /// submitting grants from being a free way to wedge the bounded grant store.
+    /// Zero disables throttling, which is only appropriate where every caller
+    /// shares one source address.
+    #[arg(
+        long = "rest-rate-limit-per-minute",
+        env = "PODMESH_PROXY_REST_RATE_LIMIT",
+        default_value_t = podmesh_proxy::restapi::DEFAULT_REST_RATE_LIMIT_PER_MINUTE
+    )]
+    rest_rate_limit_per_minute: u32,
+
     /// REST URL of a peer proxy to adopt the workload relay token from.
     ///
     /// Ignored when an explicit token is configured. The peer must be started
@@ -141,7 +180,9 @@ async fn run() -> Result<()> {
         init_identity,
         iroh_bind_addr,
         workload_relay_url,
-        workload_relay_auth_token,
+        workload_relay_mesh_secret,
+        relay_tenants,
+        advertise_addresses,
         workload_relay_http_listen,
         workload_relay_https_listen,
         workload_relay_qad_listen,
@@ -155,6 +196,7 @@ async fn run() -> Result<()> {
         enable_ingress,
         owner_pubkey,
         publish_relay_bootstrap,
+        rest_rate_limit_per_minute,
         workload_relay_bootstrap_url,
     } = Args::parse();
 
@@ -162,7 +204,7 @@ async fn run() -> Result<()> {
         let identity = IdentitySource::Persistent(key_dir.clone()).load()?;
         info!(
             "proxy identity initialized endpoint_id={} key_dir={}",
-            identity.public(),
+            identity.endpoint_id(),
             key_dir.display()
         );
         return Ok(());
@@ -193,19 +235,29 @@ async fn run() -> Result<()> {
         workload_relay_tls_private_key,
     )
     .context("provision workload relay TLS material")?;
-    let token_override = match workload_relay_auth_token {
-        Some(token) => Some(token),
+    let secret_override = match workload_relay_mesh_secret {
+        Some(secret) => Some(secret),
         None => match workload_relay_bootstrap_url.as_deref() {
-            Some(peer) => Some(fetch_peer_relay_token(peer).await?),
+            Some(peer) => Some(fetch_peer_relay_mesh_secret(peer).await?),
             None => None,
         },
     };
-    let relay_auth_token =
-        iroh_support::ensure_relay_auth_token(&relay_credential_dir, token_override)
-            .context("provision workload relay auth token")?;
+    let relay_mesh_secret =
+        iroh_support::ensure_relay_mesh_secret(&relay_credential_dir, secret_override)
+            .context("provision workload relay mesh secret")?;
+    let relay_tenant_policy = if relay_tenants.is_empty() {
+        podmesh_proxy::relay::RelayTenantPolicy::All
+    } else {
+        log::info!(
+            "workload relay restricted to {} configured tenants",
+            relay_tenants.len()
+        );
+        podmesh_proxy::relay::RelayTenantPolicy::Only(relay_tenants.into_iter().collect())
+    };
     let workload_relay = WorkloadRelayConfig {
         url: relay_url,
-        auth_token: relay_auth_token,
+        mesh_secret: relay_mesh_secret,
+        relay_tenants: relay_tenant_policy,
         http_listen: workload_relay_http_listen,
         https_listen: workload_relay_https_listen,
         qad_listen: workload_relay_qad_listen,
@@ -226,6 +278,8 @@ async fn run() -> Result<()> {
         rest_port,
         disable_rest_api,
         enable_ingress,
+        advertise_addresses,
+        rest_rate_limit_per_minute,
         owner_pubkey,
     };
     cfg.apply_defaults();
@@ -273,16 +327,18 @@ const MAX_RELAY_BOOTSTRAP_RESPONSE_BYTES: usize = 16 * 1024;
 
 #[derive(serde::Deserialize)]
 struct RelayBootstrapResponse {
-    auth_token: String,
+    mesh_secret: String,
 }
 
-/// Adopts a peer proxy's workload relay token.
+/// Adopts a peer proxy's workload relay mesh secret.
 ///
-/// A sidecar carries exactly one relay token, so every proxy relay it needs to
-/// reach must accept that token. Fetching it from a peer keeps a multi-proxy
-/// deployment free of hand-copied secrets while leaving the token itself as the
-/// only credential the relay ever accepts.
-async fn fetch_peer_relay_token(peer_url: &str) -> Result<String> {
+/// A tenant's relay token is derived from the mesh secret, so every proxy that
+/// must validate that tenant's token needs the same secret. Fetching it from a
+/// peer keeps a multi-proxy deployment free of hand-copied secrets.
+///
+/// This is a proxy-to-proxy endpoint. Tenants never receive the secret, only the
+/// token derived for them.
+async fn fetch_peer_relay_mesh_secret(peer_url: &str) -> Result<String> {
     let base = peer_url.trim().trim_end_matches('/');
     anyhow::ensure!(!base.is_empty(), "empty workload relay bootstrap URL");
     let client = reqwest::Client::builder()
@@ -290,13 +346,13 @@ async fn fetch_peer_relay_token(peer_url: &str) -> Result<String> {
         .build()
         .context("build relay bootstrap HTTP client")?;
     let response = client
-        .get(format!("{base}/api/v1/workload_relay_bootstrap"))
+        .get(format!("{base}/api/v1/workload_relay_mesh_secret"))
         .send()
         .await
-        .with_context(|| format!("GET {base}/api/v1/workload_relay_bootstrap failed"))?
+        .with_context(|| format!("GET {base}/api/v1/workload_relay_mesh_secret failed"))?
         .error_for_status()
         .with_context(|| {
-            format!("proxy {base} refused to publish its relay token; start it with --publish-relay-bootstrap")
+            format!("proxy {base} refused to publish its relay mesh secret; start it with --publish-relay-bootstrap")
         })?;
     let body = response
         .bytes()
@@ -308,6 +364,6 @@ async fn fetch_peer_relay_token(peer_url: &str) -> Result<String> {
     );
     let parsed: RelayBootstrapResponse = serde_json::from_slice(&body)
         .with_context(|| format!("decode relay bootstrap response from {base}"))?;
-    info!("adopted workload relay token published by {base}");
-    Ok(parsed.auth_token)
+    info!("adopted workload relay mesh secret published by {base}");
+    Ok(parsed.mesh_secret)
 }

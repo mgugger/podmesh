@@ -8,7 +8,9 @@ spec:
       image: docker.io/library/nginx
       ports:
         - containerPort: 80
-    - name: sidecar
+    # Only the container podmesh injects may hold NET_ADMIN. The name is exact:
+    # a tenant container called "sidecar" gets no exemption.
+    - name: podmesh-sidecar
       image: localhost/podmesh/sidecar:latest
       securityContext:
         capabilities:

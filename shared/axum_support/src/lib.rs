@@ -10,7 +10,21 @@ use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 
 pub mod rate_limiter;
-pub use rate_limiter::{RateLimiterState, create_rate_limiter, rate_limit_middleware};
+pub use rate_limiter::{
+    RateLimiterState, create_rate_limiter, rate_limit_middleware, with_rate_limit,
+};
+
+/// Turn a router into a service that carries the peer address.
+///
+/// Any router with per-peer middleware must be served this way. Without it the
+/// `ConnectInfo` extractor has nothing to read and every affected route answers
+/// 500, so call sites use this instead of handing a bare `Router` to
+/// `axum::serve`.
+pub fn with_connect_info(
+    router: Router,
+) -> axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr> {
+    router.into_make_service_with_connect_info::<SocketAddr>()
+}
 
 /// Spawn a TCP axum server by binding to the provided address inside the task.
 /// This version supports ConnectInfo<SocketAddr> for rate limiting middleware.
@@ -35,12 +49,7 @@ pub fn spawn_tcp_server(
                 );
                 // Use into_make_service_with_connect_info to provide ConnectInfo<SocketAddr>
                 // for rate limiting middleware
-                if let Err(err) = axum::serve(
-                    listener,
-                    router.into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .await
-                {
+                if let Err(err) = axum::serve(listener, with_connect_info(router)).await {
                     warn!(
                         target: "axum_support",
                         "axum tcp server stopped (label={}, err={})",
@@ -83,12 +92,7 @@ pub fn spawn_tcp_listener(
         );
         // Use into_make_service_with_connect_info to provide ConnectInfo<SocketAddr>
         // for rate limiting middleware
-        if let Err(err) = axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        {
+        if let Err(err) = axum::serve(listener, with_connect_info(router)).await {
             warn!(
                 target: "axum_support",
                 "axum tcp server stopped (label={}, err={})",

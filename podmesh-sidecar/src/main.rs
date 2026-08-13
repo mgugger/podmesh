@@ -2,7 +2,7 @@ use std::{fs, io::ErrorKind, net::SocketAddr, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use log::{error, warn};
+use log::error;
 
 use podmesh_sidecar::{
     DEFAULT_SIDECAR_APP_PORT, SidecarConfig, manifest_routes::extract_sidecar_routes, run_sidecar,
@@ -67,31 +67,30 @@ impl TryFrom<Args> for SidecarConfig {
                 anyhow::anyhow!("sidecar metadata missing at {}", args.metadata_path)
             })?
         };
-        metadata
-            .validate()
-            .context("validate sidecar proxy peers")?;
+        metadata.validate().context("validate sidecar metadata")?;
 
         let manifest_bytes = crypto::b64_decode(&metadata.manifest_b64)
             .context("failed to decode manifest payload from metadata")?;
 
-        let extraction = extract_sidecar_routes(&manifest_bytes, &metadata.manifest_id)
-            .with_context(|| {
-                format!(
-                    "failed to extract routes for manifest {}",
-                    metadata.manifest_id
-                )
-            })?;
+        // The routing key is not the sidecar's to invent: it is derived from
+        // the owner key and workload name and validated above, so a sidecar
+        // cannot register under another tenant's key.
+        let manifest_id = metadata.manifest_id.clone();
+        let extraction = extract_sidecar_routes(&manifest_bytes, &manifest_id)
+            .with_context(|| format!("failed to extract routes for manifest {manifest_id}"))?;
 
         let mut routes = extraction.routes;
-        let (manifest_id, ingress_host, derived_from_ingress) =
-            derive_manifest_identity(&routes, &metadata.manifest_id);
-        if !derived_from_ingress {
-            warn!(
-                "no ingress host detected; using fallback manifest id metadata_manifest={} manifest={}",
-                metadata.manifest_id, manifest_id
-            );
-        }
-        update_service_route_hosts(&mut routes, &manifest_id);
+        // Every workload is always reachable under its own routing key, whether
+        // or not the manifest declares an Ingress.
+        let ingress_host = format!("{manifest_id}.{MESH_DOMAIN_SUFFIX}");
+        routes.push(SidecarRouteSpec {
+            host: ingress_host.clone(),
+            path_prefix: "/".to_string(),
+            target_port: DEFAULT_SIDECAR_APP_PORT,
+            service_name: metadata.workload_name.clone(),
+            service_port: DEFAULT_SIDECAR_APP_PORT.to_string(),
+            source: SidecarRouteKind::Ingress,
+        });
 
         Ok(Self {
             identity: podmesh_sidecar::IdentitySource::ephemeral(),
@@ -100,11 +99,15 @@ impl TryFrom<Args> for SidecarConfig {
             workload_relay_ca_certificates: metadata.workload_relay_ca_certificates.clone(),
             lookup_interval: Duration::from_secs(args.lookup_interval_secs.max(1)),
             iroh_bind_addr: args.iroh_bind_addr,
+            workload_name: metadata.workload_name.clone(),
+            replica_index: metadata.replica_index,
+            replica_count: metadata.replica_count,
             manifest_id,
             ingress_host,
             app_port: DEFAULT_SIDECAR_APP_PORT,
             routes,
-            owner_public_key_b64: metadata.owner_public_key_b64.clone(),
+            owner_public_key_b64: Some(metadata.owner_public_key_b64.clone()),
+            workload_credential_b64: Some(metadata.workload_credential_b64.clone()),
             enable_egress: args.enable_egress,
             skip_egress_nft: args.skip_egress_nft,
             http_proxy_port: args.http_proxy_port,
@@ -158,72 +161,5 @@ fn load_metadata(path: &str) -> Result<Option<SidecarMetadata>> {
             metadata_path.display(),
             err
         )),
-    }
-}
-
-fn derive_manifest_identity(
-    routes: &[SidecarRouteSpec],
-    metadata_manifest_id: &str,
-) -> (String, String, bool) {
-    if let Some((manifest_id, host)) = routes
-        .iter()
-        .filter(|route| matches!(route.source, SidecarRouteKind::Ingress))
-        .filter_map(|route| manifest_id_from_host(&route.host).map(|id| (id, route.host.clone())))
-        .next()
-    {
-        return (manifest_id, host, true);
-    }
-
-    let manifest_id = sanitize_manifest_id(metadata_manifest_id);
-    let ingress_host = format!("{}.{}", manifest_id, MESH_DOMAIN_SUFFIX);
-    (manifest_id, ingress_host, false)
-}
-
-fn manifest_id_from_host(host: &str) -> Option<String> {
-    let suffix = format!(".{}", MESH_DOMAIN_SUFFIX);
-    let normalized = host.trim().trim_end_matches('.').to_lowercase();
-    if let Some(without_suffix) = normalized.strip_suffix(&suffix) {
-        let trimmed = without_suffix.trim_matches('.');
-        return trimmed
-            .rsplit('.')
-            .next()
-            .map(String::from)
-            .filter(|segment| !segment.is_empty());
-    }
-    (!normalized.is_empty()).then_some(normalized)
-}
-
-fn sanitize_manifest_id(value: &str) -> String {
-    let mut slug = String::new();
-    let mut last_dash = false;
-
-    for ch in value.chars() {
-        let lower = ch.to_ascii_lowercase();
-        if lower.is_ascii_alphanumeric() || lower == '-' {
-            slug.push(lower);
-            last_dash = lower == '-';
-        } else if !last_dash && !slug.is_empty() {
-            slug.push('-');
-            last_dash = true;
-        }
-    }
-
-    let trimmed = slug.trim_matches('-');
-    if trimmed.is_empty() {
-        "workload".into()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn update_service_route_hosts(routes: &mut [SidecarRouteSpec], manifest_id: &str) {
-    for route in routes.iter_mut() {
-        if matches!(route.source, SidecarRouteKind::Service) {
-            route.host = format!(
-                "{}.{}.{}",
-                route.service_name, manifest_id, MESH_DOMAIN_SUFFIX
-            )
-            .to_lowercase();
-        }
     }
 }

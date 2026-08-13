@@ -6,7 +6,39 @@ on:
   pull_request:
     branches: [ main ]
 
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-lint-
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
   build-and-test:
     runs-on: ubuntu-latest
 
@@ -34,29 +66,51 @@ jobs:
       - name: Cargo test (without Podman)
         run: cargo test --workspace --locked
 
-      # - name: Install dependencies
-      #   run: |
-      #     sudo apt-get update
-      #     sudo apt-get -y install podman
+  # The Podman suite plays the shipped deploy manifests and drives podctl
+  # against real containers. It is the only coverage of the manifests and of the
+  # agent's Podman driver, so it runs on every change rather than by hand.
+  podman-e2e:
+    runs-on: ubuntu-latest
 
-      # - name: Start Podman service
-      #   run: |
-      #     export XDG_RUNTIME_DIR=/run/user/1000
-      #     sudo mkdir -p $XDG_RUNTIME_DIR
-      #     sudo chown -R $USER:$USER $XDG_RUNTIME_DIR
-      #     mkdir -p $XDG_RUNTIME_DIR/podman
-      #     podman system service --time=0 unix:///run/user/1000/podman/podman.sock &
-      #     echo "PODMAN_HOST=unix:///run/user/1000/podman/podman.sock" >> $GITHUB_ENV
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      # - name: Build Containers
-      #   run: ./deploy/build_containers.sh
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
-      # - name: Cargo test (with podman)
-      #   env:
-      #     PODMAN_HOST: ${{ env.PODMAN_HOST }}
-      #   run: cargo test --workspace --locked --features podman-tests
+      - name: Cache Cargo build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-podman-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-podman-
 
-      # - name: Cargo test (ignored tests)
-      #   env:
-      #     PODMAN_HOST: ${{ env.PODMAN_HOST }}
-      #   run: cargo test -- --ignored
+      - name: Install Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install podman
+
+      - name: Start the rootless Podman service
+        run: |
+          systemctl --user start podman.socket || \
+            (podman system service --time=0 "unix://${XDG_RUNTIME_DIR}/podman/podman.sock" &)
+          for _ in $(seq 1 30); do
+            podman info >/dev/null 2>&1 && break
+            sleep 1
+          done
+          podman info >/dev/null
+          echo "CONTAINER_HOST=unix://${XDG_RUNTIME_DIR}/podman/podman.sock" >> "$GITHUB_ENV"
+
+      - name: Create the podmesh network
+        run: podman network create podmesh || true
+
+      - name: Build container images
+        run: ./deploy/build_containers.sh
+
+      - name: Cargo test (with Podman)
+        run: cargo test --workspace --locked --features podman-tests

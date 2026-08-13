@@ -8,7 +8,13 @@ use rustls_pki_types::CertificateDer;
 
 const TEST_ALPN: &[u8] = b"/podmesh/workload-relay-test/1";
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
-const AUTH_TOKEN: &str = "test-workload-relay-auth-token-0001";
+const MESH_SECRET: &str = "test-workload-relay-mesh-secret-0001";
+
+/// A tenant whose relay token this test derives, standing in for a namespace
+/// owner key.
+fn test_tenant() -> String {
+    crypto::b64_encode(&[9u8; 32])
+}
 
 #[tokio::test]
 async fn authenticated_endpoints_exchange_over_proxy_relay() -> Result<()> {
@@ -23,7 +29,8 @@ async fn authenticated_endpoints_exchange_over_proxy_relay() -> Result<()> {
 
     let config = WorkloadRelayConfig {
         url: "https://localhost:443".into(),
-        auth_token: AUTH_TOKEN.into(),
+        mesh_secret: MESH_SECRET.into(),
+        relay_tenants: podmesh_proxy::relay::RelayTenantPolicy::All,
         http_listen: "127.0.0.1:0".parse()?,
         https_listen: "127.0.0.1:0".parse()?,
         qad_listen: "127.0.0.1:0".parse()?,
@@ -37,9 +44,10 @@ async fn authenticated_endpoints_exchange_over_proxy_relay() -> Result<()> {
         .https_addr()
         .context("relay server did not bind HTTPS")?;
     let relay_url = format!("https://localhost:{}", https_address.port()).parse()?;
-    let relay_map = iroh::RelayMap::from_iter([
-        iroh::RelayConfig::new(relay_url, None).with_auth_token(AUTH_TOKEN)
-    ]);
+    let relay_map =
+        iroh::RelayMap::from_iter([iroh::RelayConfig::new(relay_url, None).with_auth_token(
+            protocol::derive_tenant_relay_token(MESH_SECRET, &test_tenant())?,
+        )]);
     let tls = CaTlsConfig::custom_roots([CertificateDer::from(certificate_der)]);
 
     let server_endpoint = endpoint(relay_map.clone(), tls.clone(), true).await?;
@@ -80,11 +88,16 @@ async fn authenticated_endpoints_exchange_over_proxy_relay() -> Result<()> {
     connection.close(0u8.into(), b"relay exchange complete");
     server_task.await??;
 
+    // A token derived for another tenant must be refused: scoping is the whole
+    // reason the credential is no longer one mesh-wide secret.
+    let other_tenant = crypto::b64_encode(&[3u8; 32]);
+    let foreign_token = protocol::derive_tenant_relay_token(MESH_SECRET, &other_tenant)?;
+    let stolen_token = foreign_token.replace(&other_tenant, &test_tenant());
     let invalid_map = iroh::RelayMap::from_iter([iroh::RelayConfig::new(
         relay_map.urls::<Vec<_>>().into_iter().next().unwrap(),
         None,
     )
-    .with_auth_token("wrong-workload-relay-token-000000")]);
+    .with_auth_token(stolen_token)]);
     let invalid_endpoint = endpoint(invalid_map, tls, false).await?;
     assert!(
         tokio::time::timeout(Duration::from_secs(1), invalid_endpoint.online())

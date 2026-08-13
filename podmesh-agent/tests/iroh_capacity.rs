@@ -1,3 +1,4 @@
+use iroh::address_lookup::memory::MemoryLookup;
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
@@ -9,8 +10,9 @@ use podmesh_agent::{
     runtime::MockRuntime,
 };
 use podmesh_scheduler::machine::{
-    AttachmentManager, CapacityCoordinator, CapacityCriteria, PlacementHandler, QueryManager,
-    SchedulerGossip, SchedulerIdentity, ValidatedMachineConfig,
+    AttachmentManager, CapacityCoordinator, CapacityCriteria, LocationRegistry, MemberIssuers,
+    PlacementHandler, QueryManager, SchedulerGossip, SchedulerGossipServices, SchedulerIdentity,
+    ValidatedMachineConfig,
 };
 use protocol::{AGENT_CONTROL_ALPN, AgentControlResponse, MAX_AGENT_CONTROL_FRAME_BYTES};
 use tokio::time::timeout;
@@ -105,11 +107,16 @@ async fn agent_attaches_receives_live_query_and_returns_signed_offer() -> Result
         .with_relay_grant_issuer(scheduler_identity.clone(), RELAY_URL.into());
     let queries = QueryManager::new(8, 8, Duration::from_secs(1));
     let gossip = SchedulerGossip::start(
-        scheduler_endpoint.clone(),
+        SchedulerGossipServices {
+            endpoint: scheduler_endpoint.clone(),
+            attachments: attachments.handler(),
+            offers: queries.offer_handler(),
+            placement: PlacementHandler::new(8, TEST_TIMEOUT),
+            locations: LocationRegistry::new(),
+            member_issuers: MemberIssuers::new(),
+            lookup: MemoryLookup::new(),
+        },
         &scheduler_config,
-        attachments.handler(),
-        queries.offer_handler(),
-        PlacementHandler::new(8, TEST_TIMEOUT),
     )
     .await?;
     let (capacity, coordinator) = CapacityCoordinator::start(
@@ -128,6 +135,7 @@ async fn agent_attaches_receives_live_query_and_returns_signed_offer() -> Result
         state_path: agent_temp.path().join("state.redb"),
         runtime: RuntimeKind::Mock,
         workload_network: "podmesh".into(),
+        max_reserved_capacity_percent: podmesh_agent::config::DEFAULT_MAX_RESERVED_CAPACITY_PERCENT,
         sidecar_image: "podmesh/sidecar:latest".into(),
         capacity_cpu_milli: 2_000,
         capacity_memory_bytes: 2 * 1024 * 1024 * 1024,
@@ -165,13 +173,16 @@ async fn agent_attaches_receives_live_query_and_returns_signed_offer() -> Result
     .context("agent did not attach to scheduler")?;
 
     let offer = capacity
-        .solicit(CapacityCriteria {
-            cpu_milli: 500,
-            memory_bytes: 512 * 1024 * 1024,
-            storage_bytes: 1024 * 1024 * 1024,
-            required_capabilities: vec!["multi-workload".into()],
-            excluded_endpoint_ids: Vec::new(),
-        })
+        .solicit(
+            CapacityCriteria {
+                cpu_milli: 500,
+                memory_bytes: 512 * 1024 * 1024,
+                storage_bytes: 1024 * 1024 * 1024,
+                required_capabilities: vec!["multi-workload".into()],
+                excluded_endpoint_ids: Vec::new(),
+            },
+            1,
+        )
         .await?
         .context("attached agent returned no capacity offer")?;
     offer.verify(now_secs())?;

@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+hex = { workspace = true }
+futures = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

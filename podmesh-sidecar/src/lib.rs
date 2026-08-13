@@ -34,11 +34,19 @@ pub struct SidecarConfig {
     pub workload_relay_ca_certificates: Vec<Vec<u8>>,
     pub lookup_interval: Duration,
     pub iroh_bind_addr: SocketAddr,
+    /// Workload name as written in the manifest. Together with the owner key
+    /// it derives the routing key the proxy indexes this workload under.
+    pub workload_name: String,
     pub manifest_id: String,
+    /// Which replica of the deployment this sidecar serves.
+    pub replica_index: u32,
+    pub replica_count: u32,
     pub ingress_host: String,
     pub app_port: u16,
     pub routes: Vec<SidecarRouteSpec>,
     pub owner_public_key_b64: Option<String>,
+    /// Owner-signed proof of tenancy, presented during the proxy handshake.
+    pub workload_credential_b64: Option<String>,
     pub enable_egress: bool,
     pub skip_egress_nft: bool,
     pub http_proxy_port: Option<u16>,
@@ -87,10 +95,26 @@ impl SidecarConfig {
                 "invalid workload relay CA certificate size"
             );
         }
-        ensure!(!self.manifest_id.is_empty(), "sidecar manifest ID is empty");
-        if let Some(owner) = &self.owner_public_key_b64 {
-            ensure!(!owner.is_empty(), "sidecar owner public key is empty");
-        }
+        ensure!(
+            !self.workload_name.is_empty() && self.workload_name.len() <= 253,
+            "sidecar workload name is invalid"
+        );
+        ensure!(
+            self.replica_count >= 1 && self.replica_index < self.replica_count,
+            "sidecar replica identity is invalid"
+        );
+        // Without the owner key the sidecar cannot verify a proxy grant, and a
+        // sidecar that cannot verify grants would serve tenant traffic to any
+        // proxy it can reach.
+        let owner = self
+            .owner_public_key_b64
+            .as_ref()
+            .context("sidecar owner public key is required")?;
+        ensure!(
+            crypto::b64_decode(owner)?.len() == crypto::ED25519_PUBLIC_KEY_SIZE,
+            "sidecar owner public key must decode to {} bytes",
+            crypto::ED25519_PUBLIC_KEY_SIZE
+        );
         Ok(())
     }
 }
@@ -157,7 +181,54 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let (public, private) = crypto::ensure_keypair_ephemeral().unwrap();
+        let (public, private) = crypto::generate_signing_keypair();
+        let endpoint = EndpointRecord {
+            version: protocol::ENDPOINT_RECORD_VERSION,
+            endpoint_id: iroh::SecretKey::generate().public().as_bytes().to_vec(),
+            relay_url: None,
+            direct_addresses: vec!["127.0.0.1:4002".into()],
+            signing_pubkey: String::new(),
+            issued_at_secs: now,
+            expires_at_secs: now + 60,
+            signature: String::new(),
+        }
+        .sign(&public, &private, now)
+        .unwrap();
+        let owner = [3u8; crypto::ED25519_PUBLIC_KEY_SIZE];
+        let config = SidecarConfig {
+            identity: IdentitySource::ephemeral(),
+            proxy_endpoints: vec![endpoint],
+            workload_relay_auth_token: None,
+            workload_relay_ca_certificates: Vec::new(),
+            lookup_interval: Duration::from_secs(1),
+            iroh_bind_addr: "127.0.0.1:0".parse().unwrap(),
+            workload_name: "egress-only".into(),
+            replica_index: 0,
+            replica_count: 1,
+            manifest_id: protocol::route_id(&owner, "egress-only"),
+            ingress_host: "egress-only.mesh.local".into(),
+            app_port: DEFAULT_SIDECAR_APP_PORT,
+            routes: Vec::new(),
+            owner_public_key_b64: Some(crypto::b64_encode(&owner)),
+            workload_credential_b64: None,
+            enable_egress: true,
+            skip_egress_nft: true,
+            http_proxy_port: None,
+        };
+
+        config.validate().unwrap();
+    }
+
+    /// A sidecar without the owner key cannot verify the Biscuit a proxy
+    /// presents, so it must refuse to start rather than serve tenant traffic to
+    /// whichever proxy happens to reach it.
+    #[test]
+    fn a_sidecar_without_an_owner_key_is_refused() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let (public, private) = crypto::generate_signing_keypair();
         let endpoint = EndpointRecord {
             version: protocol::ENDPOINT_RECORD_VERSION,
             endpoint_id: iroh::SecretKey::generate().public().as_bytes().to_vec(),
@@ -177,16 +248,21 @@ mod tests {
             workload_relay_ca_certificates: Vec::new(),
             lookup_interval: Duration::from_secs(1),
             iroh_bind_addr: "127.0.0.1:0".parse().unwrap(),
-            manifest_id: "egress-only".into(),
-            ingress_host: "egress-only.mesh.local".into(),
+            workload_name: "unowned".into(),
+            replica_index: 0,
+            replica_count: 1,
+            manifest_id: protocol::route_id(&[0u8; 32], "unowned"),
+            workload_credential_b64: None,
+            ingress_host: "unowned.mesh.local".into(),
             app_port: DEFAULT_SIDECAR_APP_PORT,
             routes: Vec::new(),
-            owner_public_key_b64: Some("owner".into()),
-            enable_egress: true,
+            owner_public_key_b64: None,
+            enable_egress: false,
             skip_egress_nft: true,
             http_proxy_port: None,
         };
 
-        config.validate().unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("owner public key is required"));
     }
 }

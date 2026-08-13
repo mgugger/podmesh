@@ -50,7 +50,7 @@ fn provision_relay_credentials(
     Ok(())
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -62,6 +62,20 @@ fn now_secs() -> u64 {
 pub struct Config {
     #[arg(long, env = "PODMESH_SCHEDULER_LISTEN", default_value = "0.0.0.0:3000")]
     pub listen: String,
+
+    /// Requests per minute a single peer address may make against the client
+    /// API.
+    ///
+    /// The API is unauthenticated by design, so this is what keeps a single
+    /// caller from enumerating the fleet or occupying placement capacity. Zero
+    /// disables throttling, which is only appropriate where every caller shares
+    /// one source address.
+    #[arg(
+        long = "client-rate-limit-per-minute",
+        env = "PODMESH_SCHEDULER_CLIENT_RATE_LIMIT",
+        default_value_t = clientapi::DEFAULT_CLIENT_RATE_LIMIT_PER_MINUTE
+    )]
+    pub client_rate_limit_per_minute: u32,
 
     #[command(flatten)]
     pub relay: MachineRelayConfig,
@@ -89,7 +103,18 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     );
     let relay_access = relay::MachineRelayAccessControl::from_config(&config.relay)?;
     let relay_issuers = relay_access.issuers();
+    // Announced schedulers bind their signing key to their endpoint here, which
+    // is what lets a scheduler behind NAT reach a peer's relay without being
+    // pinned by that peer's operator.
+    let member_issuers = relay_access.member_issuers();
     let peer_urls = config.machine.scheduler_peer_urls.clone();
+    let configured_pins = config
+        .machine
+        .scheduler_peer_pins
+        .iter()
+        .map(|value| machine::parse_pin_argument(value))
+        .collect::<anyhow::Result<Vec<_>>>()
+        .context("parse configured scheduler peer pins")?;
     let mut relay_server = relay::start(config.relay, relay_access).await?;
     let machine_endpoint = match identity.bind_endpoint(&machine_config, now_secs()).await {
         Ok(endpoint) => endpoint,
@@ -113,12 +138,18 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         machine_config.max_pending_queries,
         machine_config.query_timeout,
     );
+    let locations = machine::LocationRegistry::new();
     let mut scheduler_gossip = match machine::SchedulerGossip::start(
-        machine_endpoint.clone(),
+        machine::SchedulerGossipServices {
+            endpoint: machine_endpoint.clone(),
+            attachments: attachments.handler(),
+            offers: queries.offer_handler(),
+            placement: placement.clone(),
+            locations: locations.clone(),
+            member_issuers,
+            lookup: identity.peer_lookup(),
+        },
         &machine_config,
-        attachments.handler(),
-        queries.offer_handler(),
-        placement.clone(),
     )
     .await
     {
@@ -142,8 +173,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let peer_control_relay = machine::PeerControlRelay::new(
         machine_endpoint.clone(),
         scheduler_gossip.members(),
+        locations,
+        api_identity.clone(),
         clientapi::CLIENT_RELAY_TIMEOUT,
     );
+    // Locating an agent goes over gossip, which only exists once the router is
+    // accepting, so the publisher is handed over after startup.
+    peer_control_relay.install_publisher(scheduler_gossip.publisher())?;
     let forwarder = machine::AgentControlForwarder::new(
         machine_endpoint.clone(),
         attachments,
@@ -168,14 +204,26 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let cancellation = CancellationToken::new();
     let http_cancellation = cancellation.clone();
-    if !peer_urls.is_empty() {
+    // Started unconditionally: even a scheduler with no configured peers must
+    // announce itself, or a mesh it was dialled into cannot learn its address.
+    {
+        let pins = std::sync::Arc::new(
+            machine::PeerPins::load(&config.machine.key_dir, configured_pins)
+                .context("load scheduler peer pins")?,
+        );
         tokio::spawn(machine::run_peer_discovery(
-            peer_urls,
-            machine_endpoint.id(),
-            scheduler_gossip.members(),
-            relay_issuers,
-            scheduler_gossip.peer_joiner(),
-            api_identity.peer_lookup(),
+            machine::PeerDiscovery {
+                peer_urls,
+                local_endpoint: machine_endpoint.id(),
+                members: scheduler_gossip.members(),
+                issuers: relay_issuers,
+                joiner: scheduler_gossip.peer_joiner(),
+                lookup: api_identity.peer_lookup(),
+                pins,
+                publisher: scheduler_gossip.publisher(),
+                identity: api_identity.clone(),
+                endpoint: machine_endpoint.clone(),
+            },
             cancellation.clone(),
         ));
     }
@@ -185,8 +233,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         api_identity,
         machine_endpoint.clone(),
     )
+    .with_rate_limit(config.client_rate_limit_per_minute)
     .router();
-    let http_server = axum::serve(listener, client_api)
+    // The rate limiter keys on the peer address, so the service has to be built
+    // with connect info; without it every limited route would answer 500.
+    let http_server = axum::serve(listener, axum_support::with_connect_info(client_api))
         .with_graceful_shutdown(async move { http_cancellation.cancelled().await })
         .into_future();
     tokio::pin!(http_server);

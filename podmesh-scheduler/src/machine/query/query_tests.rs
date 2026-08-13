@@ -23,7 +23,7 @@ fn reply_address(identity: &SchedulerIdentity) -> EndpointAddr {
 }
 
 fn signed_offer(query_id: &str, transport: &SecretKey, available_cpu_milli: u32) -> CapacityOffer {
-    let (public, private) = crypto::ensure_keypair_ephemeral().unwrap();
+    let (public, private) = crypto::generate_signing_keypair();
     let endpoint = EndpointRecord {
         version: ENDPOINT_RECORD_VERSION,
         endpoint_id: transport.public().as_bytes().to_vec(),
@@ -60,11 +60,11 @@ async fn equivalent_queries_coalesce_and_complete_idempotently() {
     let manager = QueryManager::new(2, 4, Duration::from_secs(5));
     let address = reply_address(&identity);
     let first = manager
-        .begin(criteria(), &identity, &address, NOW)
+        .begin(criteria(), &identity, &address, 1, NOW)
         .await
         .unwrap();
     let second = manager
-        .begin(criteria(), &identity, &address, NOW)
+        .begin(criteria(), &identity, &address, 1, NOW)
         .await
         .unwrap();
     assert!(first.newly_created);
@@ -92,7 +92,7 @@ async fn offers_are_transport_bound_deduplicated_and_selected_deterministically(
     let identity = SchedulerIdentity::ephemeral().unwrap();
     let manager = QueryManager::new(2, 4, Duration::from_secs(5));
     let begun = manager
-        .begin(criteria(), &identity, &reply_address(&identity), NOW)
+        .begin(criteria(), &identity, &reply_address(&identity), 1, NOW)
         .await
         .unwrap();
     let larger = SecretKey::generate();
@@ -136,7 +136,7 @@ async fn pending_bounds_exclusions_and_deadlines_fail_closed() {
     let mut requested = criteria();
     requested.excluded_endpoint_ids = vec![excluded.public().as_bytes().to_vec()];
     let begun = manager
-        .begin(requested, &identity, &address, NOW)
+        .begin(requested, &identity, &address, 1, NOW)
         .await
         .unwrap();
     assert!(
@@ -153,7 +153,7 @@ async fn pending_bounds_exclusions_and_deadlines_fail_closed() {
     different.cpu_milli = 750;
     assert!(
         manager
-            .begin(different, &identity, &address, NOW)
+            .begin(different, &identity, &address, 1, NOW)
             .await
             .is_err()
     );
@@ -176,7 +176,7 @@ async fn empty_query_returns_no_offer_and_restart_has_no_pending_state() {
     let identity = SchedulerIdentity::ephemeral().unwrap();
     let manager = QueryManager::new(2, 2, Duration::from_secs(5));
     let begun = manager
-        .begin(criteria(), &identity, &reply_address(&identity), NOW)
+        .begin(criteria(), &identity, &reply_address(&identity), 1, NOW)
         .await
         .unwrap();
     assert_eq!(manager.finish(&begun.query.query_id, NOW).await, None);
@@ -185,8 +185,88 @@ async fn empty_query_returns_no_offer_and_restart_has_no_pending_state() {
     let restarted = QueryManager::new(2, 2, Duration::from_secs(5));
     assert_eq!(restarted.pending_len().await, 0);
     let retried = restarted
-        .begin(criteria(), &identity, &reply_address(&identity), NOW + 1)
+        .begin(criteria(), &identity, &reply_address(&identity), 1, NOW + 1)
         .await
         .unwrap();
     assert_ne!(retried.query.query_id, begun.query.query_id);
+}
+
+/// Waiting for every agent in the mesh would make every placement cost the full
+/// query lifetime, and a deployment pays that once per replica. The offer count
+/// is what lets a waiter stop early, so it has to be published as offers land.
+#[tokio::test]
+async fn the_offer_count_is_published_as_offers_arrive() {
+    let identity = SchedulerIdentity::ephemeral().unwrap();
+    let manager = QueryManager::new(4, 8, Duration::from_secs(5));
+    let address = reply_address(&identity);
+    let begun = manager
+        .begin(criteria(), &identity, &address, 2, NOW)
+        .await
+        .unwrap();
+    let mut offers = begun.offers.clone();
+    assert_eq!(*offers.borrow_and_update(), 0);
+
+    for (index, expected) in [(1u8, 1usize), (2, 2)] {
+        let transport = SecretKey::from_bytes(&[index; 32]);
+        manager
+            .submit_offer(
+                signed_offer(&begun.query.query_id, &transport, 700),
+                transport.public(),
+                NOW,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *offers.borrow_and_update(),
+            expected,
+            "a waiter must see the count so it can stop as soon as it has enough"
+        );
+    }
+}
+
+/// A query serving several waiters keeps the greediest target, so joining a
+/// query never shortens the wait somebody else asked for.
+#[tokio::test]
+async fn coalescing_keeps_the_greediest_offer_target() {
+    let identity = SchedulerIdentity::ephemeral().unwrap();
+    let manager = QueryManager::new(4, 8, Duration::from_secs(5));
+    let address = reply_address(&identity);
+
+    let modest = manager
+        .begin(criteria(), &identity, &address, 1, NOW)
+        .await
+        .unwrap();
+    assert_eq!(modest.target_offers, 1);
+
+    let greedy = manager
+        .begin(criteria(), &identity, &address, 5, NOW)
+        .await
+        .unwrap();
+    assert!(
+        !greedy.newly_created,
+        "the second caller must join the query"
+    );
+    assert_eq!(greedy.target_offers, 5);
+
+    // Joining again with a smaller appetite must not lower the bar.
+    let modest_again = manager
+        .begin(criteria(), &identity, &address, 1, NOW)
+        .await
+        .unwrap();
+    assert_eq!(modest_again.target_offers, 5);
+}
+
+/// The target is clamped to what the query could ever collect, so a client
+/// cannot ask for more offers than the query is allowed to hold and thereby
+/// force the wait to run to expiry.
+#[tokio::test]
+async fn the_offer_target_is_clamped_to_the_query_capacity() {
+    let identity = SchedulerIdentity::ephemeral().unwrap();
+    let manager = QueryManager::new(4, 3, Duration::from_secs(5));
+    let address = reply_address(&identity);
+    let begun = manager
+        .begin(criteria(), &identity, &address, usize::MAX, NOW)
+        .await
+        .unwrap();
+    assert_eq!(begun.target_offers, 3);
 }

@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use iroh::SecretKey;
+use iroh_support::NodeIdentity;
 use protocol::EndpointRecord;
 
 use crate::relay::WorkloadRelayConfig;
@@ -23,19 +23,10 @@ impl IdentitySource {
         Self::Ephemeral
     }
 
-    pub fn load(&self) -> Result<SecretKey> {
+    pub fn load(&self) -> Result<NodeIdentity> {
         match self {
-            Self::Persistent(key_dir) => {
-                crypto::set_keypair_config(crypto::KeypairConfig {
-                    signing_mode: crypto::KeypairMode::Persistent,
-                    kem_mode: crypto::KeypairMode::Persistent,
-                    key_directory: Some(key_dir.join("application")),
-                });
-                crypto::ensure_keypair_on_disk().context("load proxy application signing key")?;
-                crypto::ensure_kem_keypair_on_disk().context("load proxy application KEM key")?;
-                iroh_support::load_or_initialize_iroh_secret(&key_dir.join("iroh"))
-            }
-            Self::Ephemeral => Ok(SecretKey::generate()),
+            Self::Persistent(key_dir) => NodeIdentity::load(key_dir),
+            Self::Ephemeral => Ok(NodeIdentity::ephemeral()),
         }
     }
 }
@@ -57,6 +48,15 @@ pub struct Config {
     pub disable_rest_api: bool,
     pub enable_ingress: bool,
     pub owner_pubkey: Option<String>,
+    /// Addresses to publish instead of the ones the endpoint bound locally.
+    ///
+    /// A proxy usually binds a private or container-local address, which is
+    /// useless to a sidecar on another machine. When set, these replace the
+    /// discovered direct addresses in the record sidecars dial.
+    pub advertise_addresses: Vec<String>,
+    /// Requests per minute a single peer address may make against the REST API.
+    /// Zero disables throttling.
+    pub rest_rate_limit_per_minute: u32,
 }
 
 impl Config {

@@ -21,7 +21,7 @@ fn signed_endpoint(public: &[u8], private: &[u8], endpoint_byte: u8) -> Endpoint
 }
 
 fn signed_query() -> CapacityQuery {
-    let (public, private) = crypto::ensure_keypair_ephemeral().unwrap();
+    let (public, private) = crypto::generate_signing_keypair();
     CapacityQuery {
         version: CAPACITY_PROTOCOL_VERSION,
         query_id: "query-1".into(),
@@ -42,7 +42,7 @@ fn signed_query() -> CapacityQuery {
 }
 
 fn signed_offer() -> CapacityOffer {
-    let (public, private) = crypto::ensure_keypair_ephemeral().unwrap();
+    let (public, private) = crypto::generate_signing_keypair();
     CapacityOffer {
         version: CAPACITY_PROTOCOL_VERSION,
         query_id: "query-1".into(),
@@ -88,8 +88,8 @@ fn signatures_cover_resource_and_transport_identity() {
 
 #[test]
 fn signer_must_match_nested_endpoint_record() {
-    let (endpoint_public, endpoint_private) = crypto::ensure_keypair_ephemeral().unwrap();
-    let (other_public, other_private) = crypto::ensure_keypair_ephemeral().unwrap();
+    let (endpoint_public, endpoint_private) = crypto::generate_signing_keypair();
+    let (other_public, other_private) = crypto::generate_signing_keypair();
     let query = CapacityQuery {
         version: CAPACITY_PROTOCOL_VERSION,
         query_id: "query-2".into(),
