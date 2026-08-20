@@ -19,7 +19,8 @@ use super::gossip_messages::{ReceivedGossip, SeenQueries, admit_announced_peer, 
 use super::gossip_publisher::{GossipPublisher, PeerJoiner};
 use super::{
     AgentAttachmentHandler, AgentControlRelayHandler, CapacityOfferHandler, MemberRegistry,
-    PlacementHandler,
+    PlacementHandler, ReconciliationRegistry, ReconciliationResponder,
+    ReconciliationResponseHandler, ReconciliationService, SchedulerIdentity,
 };
 
 pub const SCHEDULER_GOSSIP_ALPN: &[u8] = b"/podmesh/scheduler-gossip/1";
@@ -60,6 +61,8 @@ pub struct SchedulerGossip {
     cancellation: CancellationToken,
     members: MemberRegistry,
     control_relay: AgentControlRelayHandler,
+    reconciliation_registry: ReconciliationRegistry,
+    reconciliation_responder: std::sync::Arc<tokio::sync::OnceCell<ReconciliationResponder>>,
 }
 
 /// Everything the gossip runtime serves on, or shares with, the rest of the
@@ -113,6 +116,12 @@ impl SchedulerGossip {
             crate::clientapi::MAX_CONCURRENT_CLIENT_RELAYS,
             crate::clientapi::CLIENT_RELAY_TIMEOUT,
         );
+        let reconciliation_registry = ReconciliationRegistry::new(config.max_pending_queries);
+        let reconciliation_handler = ReconciliationResponseHandler::new(
+            members.clone(),
+            reconciliation_registry.clone(),
+            config.query_timeout,
+        );
         let router = Router::builder(endpoint)
             .accept(
                 SCHEDULER_GOSSIP_ALPN,
@@ -125,6 +134,10 @@ impl SchedulerGossip {
             .accept(protocol::CAPACITY_OFFER_ALPN, offer_handler)
             .accept(protocol::SCHEDULER_PLACEMENT_ALPN, placement_handler)
             .accept(protocol::AGENT_CONTROL_RELAY_ALPN, control_relay.clone())
+            .accept(
+                protocol::SCHEDULER_RECONCILIATION_ALPN,
+                reconciliation_handler,
+            )
             .spawn();
         // Subscription must not depend on a peer being up. A scheduler that
         // cannot reach its bootstrap peers still serves clients and attached
@@ -165,10 +178,13 @@ impl SchedulerGossip {
         let receiver_lookup = lookup.clone();
         let receiver_issuers = member_issuers.clone();
         let receiver_responder = super::LocationResponder::new(
-            responder_endpoint,
+            responder_endpoint.clone(),
             crate::clientapi::CLIENT_RELAY_TIMEOUT,
         );
         let receiver_forwarder = control_relay.forwarder_handle();
+        let reconciliation_responder =
+            std::sync::Arc::new(tokio::sync::OnceCell::<ReconciliationResponder>::new());
+        let receiver_reconciliation_responder = reconciliation_responder.clone();
         let max_seen = config.max_seen_queries;
         let receiver_task = tokio::spawn(async move {
             let mut seen = SeenQueries::new(max_seen);
@@ -203,6 +219,19 @@ impl SchedulerGossip {
                                         *record,
                                     );
                                 }
+                                Ok(Some(ReceivedGossip::Reconcile(query))) => {
+                                    if let Some(responder) =
+                                        receiver_reconciliation_responder.get().cloned()
+                                    {
+                                        tokio::spawn(async move {
+                                            if let Err(error) = responder.answer_remote(*query).await {
+                                                log::warn!(
+                                                    "answering scheduler reconciliation failed: {error:#}"
+                                                );
+                                            }
+                                        });
+                                    }
+                                }
                                 Ok(None) => {}
                                 Err(error) => log::warn!("scheduler gossip message rejected: {error}"),
                             }
@@ -230,6 +259,8 @@ impl SchedulerGossip {
             cancellation,
             members,
             control_relay,
+            reconciliation_registry,
+            reconciliation_responder,
         })
     }
 
@@ -243,6 +274,38 @@ impl SchedulerGossip {
     /// forwarder it delivers through.
     pub fn control_relay(&self) -> AgentControlRelayHandler {
         self.control_relay.clone()
+    }
+
+    pub fn reconciliation_registry(&self) -> ReconciliationRegistry {
+        self.reconciliation_registry.clone()
+    }
+
+    pub fn install_reconciliation(
+        &self,
+        identity: SchedulerIdentity,
+        endpoint: Endpoint,
+        timeout: std::time::Duration,
+    ) -> Result<ReconciliationService> {
+        let forwarder = self.control_relay.forwarder_handle();
+        let responder = ReconciliationResponder::new(
+            identity.clone(),
+            endpoint.clone(),
+            self.reconciliation_registry.clone(),
+            forwarder.clone(),
+            timeout,
+        );
+        self.reconciliation_responder
+            .set(responder)
+            .map_err(|_| anyhow::anyhow!("scheduler reconciliation already installed"))?;
+        Ok(ReconciliationService::new(
+            identity,
+            endpoint,
+            self.members.clone(),
+            self.publisher(),
+            self.reconciliation_registry.clone(),
+            forwarder,
+            timeout,
+        ))
     }
 
     /// Dials newly discovered peers into the gossip mesh.

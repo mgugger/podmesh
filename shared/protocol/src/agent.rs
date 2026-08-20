@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::EndpointRecord;
+
 pub const AGENT_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_ENCRYPTED_CAPSULE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_WRAPPED_KEY_BYTES: usize = 4 * 1024;
@@ -368,6 +370,170 @@ impl DeploymentGrant {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateRequest {
+    pub version: u16,
+    pub request_id: String,
+    pub namespace_id: String,
+    pub workload_id: String,
+    pub target_node_id: String,
+    pub response_kem_pubkey: String,
+    pub expected_revision_id: String,
+    pub requested_revision_id: String,
+    /// Replace the execution spec even when the application revision is
+    /// unchanged, so expiring service-mesh authority can be renewed.
+    pub refresh_service_mesh: bool,
+    pub cpu_milli: u32,
+    pub memory_bytes: u64,
+    pub storage_bytes: u64,
+    pub grant: DeploymentGrant,
+    pub issued_at_secs: u64,
+    pub expires_at_secs: u64,
+    pub nonce: String,
+    pub owner_signature: String,
+}
+
+impl UpdateRequest {
+    fn canonical_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        canonical(&Self {
+            owner_signature: String::new(),
+            ..self.clone()
+        })
+    }
+
+    pub fn sign(mut self, owner_private: &[u8]) -> anyhow::Result<Self> {
+        self.owner_signature.clear();
+        self.owner_signature = crypto::b64_encode(&crypto::sign_domain(
+            owner_private,
+            crypto::SignatureDomain::UpdateRequest,
+            &self.canonical_bytes()?,
+        )?);
+        Ok(self)
+    }
+
+    pub fn verify(&self, now_secs: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.version == AGENT_PROTOCOL_VERSION,
+            "unsupported update request version"
+        );
+        let owner = decode_fixed(&self.namespace_id, 32, "namespace_id")?;
+        decode_fixed(&self.target_node_id, 32, "target_node_id")?;
+        decode_fixed(&self.response_kem_pubkey, 32, "response_kem_pubkey")?;
+        validate_hex_id(&self.workload_id, "workload_id")?;
+        validate_hex_id(&self.expected_revision_id, "expected_revision_id")?;
+        validate_hex_id(&self.requested_revision_id, "requested_revision_id")?;
+        anyhow::ensure!(
+            !self.request_id.is_empty() && self.request_id.len() <= 128,
+            "invalid request_id"
+        );
+        anyhow::ensure!(
+            !self.nonce.is_empty() && self.nonce.len() <= 128,
+            "invalid nonce"
+        );
+        anyhow::ensure!(
+            self.cpu_milli > 0 && self.memory_bytes > 0 && self.storage_bytes > 0,
+            "update resources must be non-zero"
+        );
+        self.grant.verify(now_secs)?;
+        anyhow::ensure!(
+            self.grant.namespace_id == self.namespace_id
+                && self.grant.workload_id == self.workload_id
+                && self.grant.target_node_id == self.target_node_id
+                && self.grant.response_kem_pubkey == self.response_kem_pubkey
+                && self.grant.revision_id == self.requested_revision_id,
+            "update grant binding mismatch"
+        );
+        validate_validity_window(
+            self.issued_at_secs,
+            self.expires_at_secs,
+            now_secs,
+            "update request",
+        )?;
+        let signature = decode_fixed(&self.owner_signature, 64, "owner_signature")?;
+        crypto::verify_domain(
+            &owner,
+            crypto::SignatureDomain::UpdateRequest,
+            &self.canonical_bytes()?,
+            &signature,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateOutcome {
+    Applied,
+    AlreadyActive,
+    Conflict,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateResponse {
+    pub version: u16,
+    pub request_id: String,
+    pub expected_revision_id: String,
+    pub requested_revision_id: String,
+    pub receipt: DeploymentReceipt,
+    pub outcome: UpdateOutcome,
+    pub reason: String,
+    pub responded_at_secs: u64,
+    pub signature: String,
+}
+
+impl UpdateResponse {
+    fn canonical_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        canonical(&Self {
+            signature: String::new(),
+            ..self.clone()
+        })
+    }
+
+    pub fn sign(mut self, signing_public: &[u8], signing_private: &[u8]) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.receipt.agent_node_id == crypto::b64_encode(signing_public),
+            "update response receipt signer mismatch"
+        );
+        self.signature.clear();
+        self.signature = crypto::b64_encode(&crypto::sign_domain(
+            signing_private,
+            crypto::SignatureDomain::UpdateResponse,
+            &self.canonical_bytes()?,
+        )?);
+        Ok(self)
+    }
+
+    pub fn verify(&self, now_secs: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.version == AGENT_PROTOCOL_VERSION,
+            "unsupported update response version"
+        );
+        validate_hex_id(&self.expected_revision_id, "expected_revision_id")?;
+        validate_hex_id(&self.requested_revision_id, "requested_revision_id")?;
+        self.receipt.verify()?;
+        anyhow::ensure!(
+            !self.request_id.is_empty() && self.request_id.len() <= 128,
+            "invalid request_id"
+        );
+        anyhow::ensure!(
+            self.reason.len() <= 1_024,
+            "update response field length is invalid"
+        );
+        anyhow::ensure!(
+            self.responded_at_secs <= now_secs.saturating_add(MAX_AGENT_CLOCK_SKEW_SECS),
+            "update response was issued too far in the future"
+        );
+        let signature = decode_fixed(&self.signature, 64, "signature")?;
+        let agent = crypto::b64_decode(&self.receipt.agent_node_id)?;
+        crypto::verify_domain(
+            &agent,
+            crypto::SignatureDomain::UpdateResponse,
+            &self.canonical_bytes()?,
+            &signature,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeploymentReceipt {
     pub version: u16,
     pub namespace_id: String,
@@ -590,6 +756,55 @@ mod tests {
         1_700_000_000
     }
 
+    fn signed_update() -> (UpdateRequest, Vec<u8>, Vec<u8>) {
+        let (owner_public, owner_private) = crypto::generate_signing_keypair();
+        let (agent_public, _) = crypto::generate_signing_keypair();
+        let workload = workload_id(&owner_public, "demo", 0);
+        let requested_revision = revision_id(b"requested");
+        let grant = DeploymentGrant {
+            version: AGENT_PROTOCOL_VERSION,
+            namespace_id: crypto::b64_encode(&owner_public),
+            workload_id: workload.clone(),
+            revision_id: requested_revision.clone(),
+            target_node_id: crypto::b64_encode(&agent_public),
+            response_kem_pubkey: crypto::b64_encode(&[8; 32]),
+            reservation_id: "update-request".into(),
+            capsule: EncryptedWorkloadCapsule {
+                ciphertext: vec![1],
+                nonce: vec![2; 24],
+                wrapped_dek: vec![3],
+            },
+            issued_at_secs: now(),
+            expires_at_secs: now() + 30,
+            nonce: "inner-update".into(),
+            owner_signature: String::new(),
+        }
+        .sign(&owner_private)
+        .unwrap();
+        let update = UpdateRequest {
+            version: AGENT_PROTOCOL_VERSION,
+            request_id: "update-request".into(),
+            namespace_id: crypto::b64_encode(&owner_public),
+            workload_id: workload,
+            target_node_id: crypto::b64_encode(&agent_public),
+            response_kem_pubkey: crypto::b64_encode(&[8; 32]),
+            expected_revision_id: revision_id(b"expected"),
+            requested_revision_id: requested_revision,
+            refresh_service_mesh: false,
+            cpu_milli: 100,
+            memory_bytes: 1024,
+            storage_bytes: 2048,
+            grant,
+            issued_at_secs: now(),
+            expires_at_secs: now() + 30,
+            nonce: "outer-update".into(),
+            owner_signature: String::new(),
+        }
+        .sign(&owner_private)
+        .unwrap();
+        (update, owner_public, agent_public)
+    }
+
     #[test]
     fn deployment_grant_rejects_tampered_capsule() {
         let (owner_public, owner_private) = crypto::generate_signing_keypair();
@@ -649,6 +864,97 @@ mod tests {
             deployment_id(&[1; 32], "demo"),
             deployment_id(&[2; 32], "demo")
         );
+    }
+
+    #[test]
+    fn update_request_binds_target_revisions_and_freshness() {
+        let (update, _, _) = signed_update();
+        update.verify(now()).unwrap();
+        for mutate in [
+            |value: &mut UpdateRequest| value.target_node_id = crypto::b64_encode(&[9; 32]),
+            |value: &mut UpdateRequest| value.expected_revision_id = revision_id(b"stale"),
+            |value: &mut UpdateRequest| value.requested_revision_id = revision_id(b"substitute"),
+            |value: &mut UpdateRequest| value.response_kem_pubkey = crypto::b64_encode(&[7; 32]),
+        ] {
+            let mut tampered = update.clone();
+            mutate(&mut tampered);
+            assert!(tampered.verify(now()).is_err());
+        }
+        assert!(
+            update
+                .verify(now() + MAX_AGENT_MESSAGE_LIFETIME_SECS + 100)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn update_request_rejects_oversized_capsules_and_cross_operation_signatures() {
+        let (mut update, owner_public, _) = signed_update();
+        update.grant.capsule.ciphertext = vec![0; MAX_ENCRYPTED_CAPSULE_BYTES + 1];
+        assert!(update.verify(now()).is_err());
+
+        let signature = crypto::b64_decode(&update.owner_signature).unwrap();
+        assert!(
+            crypto::verify_domain(
+                &owner_public,
+                crypto::SignatureDomain::DeploymentGrant,
+                &update.canonical_bytes().unwrap(),
+                &signature,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn update_response_signature_prevents_receipt_substitution() {
+        let (update, _, agent_public) = signed_update();
+        let (_, agent_private) = crypto::generate_signing_keypair();
+        let receipt = DeploymentReceipt {
+            version: AGENT_PROTOCOL_VERSION,
+            namespace_id: update.namespace_id.clone(),
+            workload_id: update.workload_id.clone(),
+            revision_id: update.requested_revision_id.clone(),
+            agent_node_id: String::new(),
+            runtime_id: "pod-demo".into(),
+            accepted_at_secs: now(),
+            signature: String::new(),
+        }
+        .sign(&agent_public, &agent_private)
+        .unwrap();
+        assert!(
+            receipt.verify().is_err(),
+            "mismatched keypair must be rejected"
+        );
+
+        let (agent_public, agent_private) = crypto::generate_signing_keypair();
+        let receipt = DeploymentReceipt {
+            version: AGENT_PROTOCOL_VERSION,
+            namespace_id: update.namespace_id.clone(),
+            workload_id: update.workload_id.clone(),
+            revision_id: update.requested_revision_id.clone(),
+            agent_node_id: String::new(),
+            runtime_id: "pod-demo".into(),
+            accepted_at_secs: now(),
+            signature: String::new(),
+        }
+        .sign(&agent_public, &agent_private)
+        .unwrap();
+        let mut response = UpdateResponse {
+            version: AGENT_PROTOCOL_VERSION,
+            request_id: update.request_id,
+            expected_revision_id: update.expected_revision_id,
+            requested_revision_id: update.requested_revision_id,
+            receipt,
+            outcome: UpdateOutcome::Applied,
+            reason: String::new(),
+            responded_at_secs: now(),
+            signature: String::new(),
+        }
+        .sign(&agent_public, &agent_private)
+        .unwrap();
+        response.verify(now()).unwrap();
+        response.receipt.runtime_id = "substituted".into();
+        assert!(response.verify(now()).is_err());
     }
 }
 
@@ -754,6 +1060,8 @@ pub struct WorkloadSummary {
     /// Runtime state as the agent's runtime reports it.
     pub state: String,
     pub deploying_since_secs: u64,
+    /// Fresh agent-signed proof of the current accepted revision.
+    pub receipt: DeploymentReceipt,
 }
 
 /// An agent's answer to [`WorkloadListRequest`].
@@ -762,6 +1070,8 @@ pub struct WorkloadListResponse {
     pub version: u16,
     pub request_id: String,
     pub agent_node_id: String,
+    pub agent_endpoint: EndpointRecord,
+    pub agent_kem_pubkey: String,
     pub workloads: Vec<WorkloadSummary>,
     pub responded_at_secs: u64,
     pub signature: String,
@@ -791,6 +1101,12 @@ impl WorkloadListResponse {
             "unsupported workload list response version"
         );
         let agent = decode_fixed(&self.agent_node_id, 32, "agent_node_id")?;
+        decode_fixed(&self.agent_kem_pubkey, 32, "agent_kem_pubkey")?;
+        self.agent_endpoint.verify(self.responded_at_secs)?;
+        anyhow::ensure!(
+            self.agent_endpoint.signing_pubkey == self.agent_node_id,
+            "workload list endpoint does not belong to the responding agent"
+        );
         anyhow::ensure!(
             self.workloads.len() <= MAX_LISTED_WORKLOADS,
             "workload list response exceeds {MAX_LISTED_WORKLOADS} entries"
@@ -801,6 +1117,13 @@ impl WorkloadListResponse {
             anyhow::ensure!(
                 workload.state.len() <= 128 && workload.workload_name.len() <= 253,
                 "workload summary field exceeds its bound"
+            );
+            workload.receipt.verify()?;
+            anyhow::ensure!(
+                workload.receipt.workload_id == workload.workload_id
+                    && workload.receipt.revision_id == workload.revision_id
+                    && workload.receipt.agent_node_id == self.agent_node_id,
+                "workload summary receipt does not match the reported placement"
             );
         }
         let signature = decode_fixed(&self.signature, 64, "signature")?;

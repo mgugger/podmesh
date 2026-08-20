@@ -120,6 +120,35 @@ impl AgentControlForwarder {
             .clone()
             .try_acquire_owned()
             .map_err(|_| ForwardError::Busy)?;
+        self.forward_attached_with_permit(agent, operation, encrypted_payload)
+            .await
+    }
+
+    /// Local-only delivery that waits for bounded relay capacity.
+    ///
+    /// Reconciliation uses this path because temporary client load must not be
+    /// misreported as an unreachable agent.
+    pub async fn forward_attached_wait(
+        &self,
+        agent: EndpointId,
+        operation: AgentControlOperation,
+        encrypted_payload: Vec<u8>,
+    ) -> Result<Vec<u8>, ForwardError> {
+        let _permit =
+            tokio::time::timeout(self.operation_timeout, self.permits.clone().acquire_owned())
+                .await
+                .map_err(|_| ForwardError::Busy)?
+                .map_err(|_| ForwardError::Unavailable)?;
+        self.forward_attached_with_permit(agent, operation, encrypted_payload)
+            .await
+    }
+
+    async fn forward_attached_with_permit(
+        &self,
+        agent: EndpointId,
+        operation: AgentControlOperation,
+        encrypted_payload: Vec<u8>,
+    ) -> Result<Vec<u8>, ForwardError> {
         let address = self
             .attachments
             .agent_addr(agent)

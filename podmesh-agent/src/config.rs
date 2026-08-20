@@ -13,6 +13,9 @@ pub const DEFAULT_WORKLOAD_NETWORK: &str = "podmesh";
 /// admissions drive advertised capacity to zero. Half leaves room for real
 /// placements while still allowing a burst of concurrent deployments.
 pub const DEFAULT_MAX_RESERVED_CAPACITY_PERCENT: u32 = 50;
+pub const DEFAULT_MAX_CONCURRENT_RUNTIME_OPERATIONS: usize = 8;
+pub const DEFAULT_RUNTIME_OPERATION_TIMEOUT_SECS: u64 = 120;
+pub const MAX_CONCURRENT_RUNTIME_OPERATIONS: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum RuntimeKind {
@@ -66,6 +69,20 @@ pub struct Config {
 
     #[arg(long, default_value_t = DEFAULT_MAX_WORKLOADS)]
     pub max_workloads: usize,
+
+    #[arg(
+        long,
+        env = "PODMESH_AGENT_MAX_RUNTIME_OPERATIONS",
+        default_value_t = DEFAULT_MAX_CONCURRENT_RUNTIME_OPERATIONS
+    )]
+    pub max_concurrent_runtime_operations: usize,
+
+    #[arg(
+        long,
+        env = "PODMESH_AGENT_RUNTIME_TIMEOUT_SECS",
+        default_value_t = DEFAULT_RUNTIME_OPERATION_TIMEOUT_SECS
+    )]
+    pub runtime_operation_timeout_secs: u64,
 
     #[command(flatten)]
     pub machine: crate::machine::MachineConfig,

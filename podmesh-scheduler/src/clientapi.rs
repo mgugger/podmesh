@@ -16,8 +16,6 @@
 
 use std::time::Duration;
 
-use futures::StreamExt;
-
 use axum::{
     Json, Router,
     body::Bytes,
@@ -27,18 +25,19 @@ use axum::{
 };
 use protocol::{
     AgentControlOperation, MAX_AGENT_CONTROL_PAYLOAD_BYTES,
-    capacity::MAX_CAPACITY_EXCLUDED_ENDPOINTS,
+    capacity::{
+        MAX_CAPACITY_CAPABILITIES, MAX_CAPACITY_CAPABILITY_LEN, MAX_CAPACITY_EXCLUDED_ENDPOINTS,
+    },
 };
 
 use crate::machine::{
-    AgentControlForwarder, CapacityCriteria, CapacityService, ForwardError, SchedulerIdentity,
+    AgentControlForwarder, CapacityCriteria, CapacityService, ForwardError, ReconciliationService,
+    SchedulerIdentity,
 };
 
-/// Placement solicited by `podctl` currently ignores per-workload resource
-/// requirements; the agent re-validates every reservation during admission.
-const PLACEMENT_PROBE_CPU_MILLI: u32 = 1;
-const PLACEMENT_PROBE_MEMORY_BYTES: u64 = 1;
-const PLACEMENT_PROBE_STORAGE_BYTES: u64 = 1;
+const MAX_PLACEMENT_CPU_MILLI: u32 = 1_000_000;
+const MAX_PLACEMENT_MEMORY_BYTES: u64 = 1024 * 1024 * 1024 * 1024 * 1024;
+const MAX_PLACEMENT_STORAGE_BYTES: u64 = 1024 * 1024 * 1024 * 1024 * 1024;
 
 /// Upper bound on a relayed owner payload, matched to the agent control frame.
 const MAX_CLIENT_BODY_BYTES: usize = MAX_AGENT_CONTROL_PAYLOAD_BYTES;
@@ -70,9 +69,6 @@ pub const MAX_TARGET_OFFERS: usize = 64;
 /// into unbounded fan-out on a very large scheduler.
 pub const MAX_LIST_BROADCAST_AGENTS: usize = 2_048;
 
-/// Agents contacted at once during a list broadcast.
-const MAX_CONCURRENT_LIST_PROBES: usize = 32;
-
 /// Lifetime stamped on the `EndpointRecord` served over HTTP. Bootstrapping
 /// peers must re-fetch after this expires, which keeps a stale address from
 /// being pinned forever.
@@ -85,6 +81,7 @@ pub struct ClientApi {
     forwarder: AgentControlForwarder,
     identity: SchedulerIdentity,
     endpoint: iroh::Endpoint,
+    reconciliation: Option<ReconciliationService>,
     rate_limit_per_minute: u32,
 }
 
@@ -100,8 +97,14 @@ impl ClientApi {
             forwarder,
             identity,
             endpoint,
+            reconciliation: None,
             rate_limit_per_minute: DEFAULT_CLIENT_RATE_LIMIT_PER_MINUTE,
         }
+    }
+
+    pub fn with_reconciliation(mut self, reconciliation: ReconciliationService) -> Self {
+        self.reconciliation = Some(reconciliation);
+        self
     }
 
     /// Override the per-peer request budget. Zero disables throttling, which is
@@ -124,6 +127,7 @@ impl ClientApi {
             .route("/api/v1/agents/select", get(select_agent))
             .route("/api/v1/agents/{agent}/admission", post(post_admission))
             .route("/api/v1/agents/{agent}/deploy", post(post_deploy))
+            .route("/api/v1/agents/{agent}/update", post(post_update))
             .route("/api/v1/agents/{agent}/command", post(post_command))
             .route("/api/v1/workloads/list", post(post_workload_list))
             .layer(DefaultBodyLimit::max(MAX_CLIENT_BODY_BYTES))
@@ -202,17 +206,24 @@ struct SelectQuery {
     /// whole mesh to answer.
     #[serde(default)]
     candidates: Option<usize>,
+    cpu_milli: u32,
+    memory_bytes: u64,
+    storage_bytes: u64,
+    /// Comma-separated capabilities every offered agent must advertise.
+    #[serde(default)]
+    capabilities: Option<String>,
 }
 
 async fn select_agent(
     State(api): State<ClientApi>,
     Query(query): Query<SelectQuery>,
 ) -> ApiResult<Json<protocol::CapacityOffer>> {
+    validate_placement_resources(query.cpu_milli, query.memory_bytes, query.storage_bytes)?;
     let criteria = CapacityCriteria {
-        cpu_milli: PLACEMENT_PROBE_CPU_MILLI,
-        memory_bytes: PLACEMENT_PROBE_MEMORY_BYTES,
-        storage_bytes: PLACEMENT_PROBE_STORAGE_BYTES,
-        required_capabilities: Vec::new(),
+        cpu_milli: query.cpu_milli,
+        memory_bytes: query.memory_bytes,
+        storage_bytes: query.storage_bytes,
+        required_capabilities: parse_capabilities(query.capabilities.as_deref())?,
         excluded_endpoint_ids: parse_exclusions(query.exclude.as_deref())?,
     };
     let target_offers = query
@@ -233,6 +244,60 @@ async fn select_agent(
             ))
         }
     }
+}
+
+fn validate_placement_resources(
+    cpu_milli: u32,
+    memory_bytes: u64,
+    storage_bytes: u64,
+) -> ApiResult<()> {
+    if cpu_milli == 0
+        || cpu_milli > MAX_PLACEMENT_CPU_MILLI
+        || memory_bytes == 0
+        || memory_bytes > MAX_PLACEMENT_MEMORY_BYTES
+        || storage_bytes == 0
+        || storage_bytes > MAX_PLACEMENT_STORAGE_BYTES
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "placement resources are outside supported bounds".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_capabilities(raw: Option<&str>) -> ApiResult<Vec<String>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let mut capabilities = Vec::new();
+    for capability in raw.split(',').map(str::trim) {
+        if capability.is_empty()
+            || capability.len() > MAX_CAPACITY_CAPABILITY_LEN
+            || !capability
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "placement capability is invalid".to_string(),
+            ));
+        }
+        if capabilities.len() >= MAX_CAPACITY_CAPABILITIES {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("at most {MAX_CAPACITY_CAPABILITIES} capabilities are accepted"),
+            ));
+        }
+        if capabilities.iter().any(|existing| existing == capability) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "placement capabilities must be unique".to_string(),
+            ));
+        }
+        capabilities.push(capability.to_string());
+    }
+    Ok(capabilities)
 }
 
 fn parse_exclusions(raw: Option<&str>) -> ApiResult<Vec<Vec<u8>>> {
@@ -268,6 +333,14 @@ async fn post_deploy(
     relay(api, agent, AgentControlOperation::Deploy, body).await
 }
 
+async fn post_update(
+    State(api): State<ClientApi>,
+    Path(agent): Path<String>,
+    body: Bytes,
+) -> ApiResult<Vec<u8>> {
+    relay(api, agent, AgentControlOperation::Update, body).await
+}
+
 async fn post_command(
     State(api): State<ClientApi>,
     Path(agent): Path<String>,
@@ -293,7 +366,10 @@ struct WorkloadListReply {
     answered: Vec<WorkloadListEntry>,
     /// Agents that did not answer, so a caller knows its view is partial rather
     /// than concluding a workload is gone.
-    unreachable: Vec<String>,
+    unreachable_agents: Vec<String>,
+    /// Schedulers in the admitted mesh that did not complete before the
+    /// request deadline. Their agents, if any, are outside this view.
+    unreachable_schedulers: Vec<String>,
 }
 
 /// Broadcast an owner-signed list request to every attached agent.
@@ -325,42 +401,42 @@ async fn post_workload_list(
         )
     })?;
 
-    let attached = api.forwarder.attached_agents().await;
-    let mut answered = Vec::new();
-    let mut unreachable = Vec::new();
-
-    let mut probes = futures::stream::iter(
-        attached
-            .into_iter()
-            .take(MAX_LIST_BROADCAST_AGENTS)
-            .map(|agent| {
-                let api = api.clone();
-                let payload = body.to_vec();
-                async move {
-                    let answer: Option<Vec<u8>> = api
-                        .forwarder
-                        .forward(agent, AgentControlOperation::List, payload)
-                        .await
-                        .ok();
-                    (agent, answer)
-                }
-            }),
-    )
-    .buffer_unordered(MAX_CONCURRENT_LIST_PROBES);
-
-    while let Some((agent, answer)) = probes.next().await {
-        let agent_endpoint_id = hex::encode(agent.as_bytes());
-        match answer {
-            Some(response) => answered.push(WorkloadListEntry {
-                agent_endpoint_id,
-                response_b64: crypto::b64_encode(&response),
-            }),
-            None => unreachable.push(agent_endpoint_id),
-        }
-    }
+    let reconciliation = api.reconciliation.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workload reconciliation is not initialized".to_string(),
+        )
+    })?;
+    let outcome = reconciliation
+        .reconcile(body.to_vec())
+        .await
+        .map_err(|error| {
+            log::warn!("mesh-wide workload reconciliation failed: {error:#}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "workload reconciliation failed".to_string(),
+            )
+        })?;
+    let answered = outcome
+        .answers
+        .into_iter()
+        .map(|answer| WorkloadListEntry {
+            agent_endpoint_id: hex::encode(answer.agent_endpoint_id.as_bytes()),
+            response_b64: crypto::b64_encode(&answer.sealed_response),
+        })
+        .collect();
     Ok(Json(WorkloadListReply {
         answered,
-        unreachable,
+        unreachable_agents: outcome
+            .unreachable_agents
+            .into_iter()
+            .map(|endpoint| hex::encode(endpoint.as_bytes()))
+            .collect(),
+        unreachable_schedulers: outcome
+            .unreachable_schedulers
+            .into_iter()
+            .map(|endpoint| hex::encode(endpoint.as_bytes()))
+            .collect(),
     }))
 }
 

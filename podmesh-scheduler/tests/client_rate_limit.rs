@@ -103,6 +103,11 @@ async fn selection_is_throttled_per_peer() -> Result<()> {
     for _ in 0..(TEST_RATE_LIMIT + 4) {
         let status = client
             .get(format!("{base}/api/v1/agents/select"))
+            .query(&[
+                ("cpu_milli", "1"),
+                ("memory_bytes", "1"),
+                ("storage_bytes", "1"),
+            ])
             .send()
             .await
             .context("send selection request")?
@@ -155,6 +160,11 @@ async fn health_and_ready_are_never_throttled() -> Result<()> {
     for _ in 0..(TEST_RATE_LIMIT + 6) {
         let _ = client
             .get(format!("{base}/api/v1/agents/select"))
+            .query(&[
+                ("cpu_milli", "1"),
+                ("memory_bytes", "1"),
+                ("storage_bytes", "1"),
+            ])
             .send()
             .await;
     }

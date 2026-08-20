@@ -141,6 +141,10 @@ async fn agent_attaches_receives_live_query_and_returns_signed_offer() -> Result
         capacity_memory_bytes: 2 * 1024 * 1024 * 1024,
         capacity_storage_bytes: 10 * 1024 * 1024 * 1024,
         max_workloads: 8,
+        max_concurrent_runtime_operations:
+            podmesh_agent::config::DEFAULT_MAX_CONCURRENT_RUNTIME_OPERATIONS,
+        runtime_operation_timeout_secs:
+            podmesh_agent::config::DEFAULT_RUNTIME_OPERATION_TIMEOUT_SECS,
         machine: MachineConfig {
             bind_addr: "127.0.0.1:0".parse()?,
             scheduler_endpoints: vec![crypto::b64_encode(&scheduler_record.to_bytes(now_secs())?)],

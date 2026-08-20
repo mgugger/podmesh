@@ -15,6 +15,12 @@ mod offer_handler;
 pub mod peer_pins;
 mod placement;
 mod query;
+mod reconciliation;
+mod reconciliation_handler;
+mod reconciliation_responder;
+mod reconciliation_service;
+#[cfg(test)]
+mod reconciliation_tests;
 mod relay_handler;
 
 pub use attachments::{AgentAttachmentHandler, AttachmentManager};
@@ -33,4 +39,10 @@ pub use offer_handler::CapacityOfferHandler;
 pub use peer_pins::{PeerPin, PeerPins, parse_pin_argument};
 pub use placement::PlacementHandler;
 pub use query::{BegunQuery, CapacityCriteria, QueryManager};
+pub use reconciliation::{
+    MAX_RECONCILIATION_AGENTS, ReconciliationAnswer, ReconciliationOutcome, ReconciliationRegistry,
+};
+pub use reconciliation_handler::ReconciliationResponseHandler;
+pub use reconciliation_responder::ReconciliationResponder;
+pub use reconciliation_service::ReconciliationService;
 pub use relay_handler::AgentControlRelayHandler;

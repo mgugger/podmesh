@@ -187,4 +187,22 @@ mod tests {
         store.accept(&owner, encoded, PROXY, NOW).unwrap();
         assert_eq!(store.len(), 1);
     }
+
+    #[test]
+    fn a_rejected_renewal_preserves_the_existing_unexpired_grant() {
+        let store = ProxyGrantStore::new();
+        let (owner, _, encoded) = grant_for(PROXY, 3600);
+        store.accept(&owner, encoded, PROXY, NOW).unwrap();
+
+        let (_, _, wrong_proxy_grant) = grant_for(
+            "aa2a9c1d4b5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8",
+            7200,
+        );
+        assert!(
+            store
+                .accept(&owner, wrong_proxy_grant, PROXY, NOW + 10)
+                .is_err()
+        );
+        assert!(store.holds_live_grant(&owner, PROXY, NOW + 20));
+    }
 }

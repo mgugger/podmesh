@@ -56,10 +56,8 @@ struct PendingQuery {
     criteria: CapacityCriteria,
     query: CapacityQuery,
     offers: HashMap<EndpointId, CapacityOffer>,
-    completed: Option<Option<CapacityOffer>>,
-    /// Offers that make this query answerable. A query serving several waiters
-    /// keeps the greediest one's target, so coalescing never shortens the wait
-    /// somebody else asked for.
+    selected: HashSet<EndpointId>,
+    /// Offers that make this query answerable for all current waiters.
     target_offers: usize,
     /// Published on every accepted offer so waiters can stop early.
     offer_count: watch::Sender<usize>,
@@ -104,9 +102,13 @@ impl QueryManager {
         if let Some(query_id) = state.equivalent.get(&criteria).cloned()
             && let Some(pending) = state.pending.get_mut(&query_id)
         {
-            // A joiner that wants more choice raises the bar for everyone
-            // waiting on this query; it never lowers it.
-            pending.target_offers = pending.target_offers.max(target_offers);
+            // Each joined caller needs its own selectable offer. Aggregating
+            // demand keeps equivalent requests coalesced without forcing them
+            // all onto one cached winner.
+            pending.target_offers = pending
+                .target_offers
+                .saturating_add(target_offers)
+                .min(self.max_offers_per_query);
             return Ok(BegunQuery {
                 query: pending.query.clone(),
                 newly_created: false,
@@ -151,7 +153,7 @@ impl QueryManager {
                 criteria,
                 query: query.clone(),
                 offers: HashMap::with_capacity(target_offers),
-                completed: None,
+                selected: HashSet::with_capacity(target_offers),
                 target_offers,
                 offer_count,
             },
@@ -226,13 +228,16 @@ impl QueryManager {
     pub async fn finish(&self, query_id: &str, now_secs: u64) -> Option<CapacityOffer> {
         let mut state = self.inner.lock().await;
         let pending = state.pending.get_mut(query_id)?;
-        if let Some(selected) = &pending.completed {
-            return selected.clone();
-        }
-        let selected = deterministic_select(pending.offers.values().cloned(), &pending.criteria)
-            .filter(|offer| offer.expires_at_secs >= now_secs);
-        pending.completed = Some(selected.clone());
-        selected
+        let selected_endpoint = pending
+            .offers
+            .iter()
+            .filter(|(endpoint, offer)| {
+                offer.expires_at_secs >= now_secs && !pending.selected.contains(*endpoint)
+            })
+            .min_by(|(_, left), (_, right)| compare_offers(left, right, &pending.criteria))
+            .map(|(endpoint, _)| *endpoint)?;
+        pending.selected.insert(selected_endpoint);
+        pending.offers.get(&selected_endpoint).cloned()
     }
 
     pub async fn abort(&self, query_id: &str) {
@@ -269,38 +274,37 @@ fn cleanup_locked(state: &mut QueryState, now_secs: u64) {
     }
 }
 
-fn deterministic_select(
-    offers: impl Iterator<Item = CapacityOffer>,
+fn compare_offers(
+    left: &CapacityOffer,
+    right: &CapacityOffer,
     criteria: &CapacityCriteria,
-) -> Option<CapacityOffer> {
-    offers.min_by(|left, right| {
-        left.available_cpu_milli
-            .saturating_sub(criteria.cpu_milli)
-            .cmp(&right.available_cpu_milli.saturating_sub(criteria.cpu_milli))
-            .then_with(|| {
-                left.available_memory_bytes
-                    .saturating_sub(criteria.memory_bytes)
-                    .cmp(
-                        &right
-                            .available_memory_bytes
-                            .saturating_sub(criteria.memory_bytes),
-                    )
-            })
-            .then_with(|| {
-                left.available_storage_bytes
-                    .saturating_sub(criteria.storage_bytes)
-                    .cmp(
-                        &right
-                            .available_storage_bytes
-                            .saturating_sub(criteria.storage_bytes),
-                    )
-            })
-            .then_with(|| {
-                left.agent_endpoint
-                    .endpoint_id
-                    .cmp(&right.agent_endpoint.endpoint_id)
-            })
-    })
+) -> std::cmp::Ordering {
+    left.available_cpu_milli
+        .saturating_sub(criteria.cpu_milli)
+        .cmp(&right.available_cpu_milli.saturating_sub(criteria.cpu_milli))
+        .then_with(|| {
+            left.available_memory_bytes
+                .saturating_sub(criteria.memory_bytes)
+                .cmp(
+                    &right
+                        .available_memory_bytes
+                        .saturating_sub(criteria.memory_bytes),
+                )
+        })
+        .then_with(|| {
+            left.available_storage_bytes
+                .saturating_sub(criteria.storage_bytes)
+                .cmp(
+                    &right
+                        .available_storage_bytes
+                        .saturating_sub(criteria.storage_bytes),
+                )
+        })
+        .then_with(|| {
+            left.agent_endpoint
+                .endpoint_id
+                .cmp(&right.agent_endpoint.endpoint_id)
+        })
 }
 
 #[cfg(test)]

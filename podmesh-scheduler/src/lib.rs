@@ -190,6 +190,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     scheduler_gossip
         .control_relay()
         .install(forwarder.clone())?;
+    let reconciliation = scheduler_gossip.install_reconciliation(
+        api_identity.clone(),
+        machine_endpoint.clone(),
+        machine_config.query_timeout,
+    )?;
     log::info!(
         "stateless scheduler listening on {}",
         listener.local_addr()?
@@ -233,6 +238,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         api_identity,
         machine_endpoint.clone(),
     )
+    .with_reconciliation(reconciliation)
     .with_rate_limit(config.client_rate_limit_per_minute)
     .router();
     // The rate limiter keys on the peer address, so the service has to be built

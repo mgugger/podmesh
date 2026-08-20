@@ -12,6 +12,9 @@ use anyhow::{Context, Result, anyhow};
 use log::{debug, info};
 use serde_json::Value as JsonValue;
 
+const SUPPORTED_POD_KINDS: [&str; 2] = ["Pod", "Deployment"];
+const SUPPORTED_AUXILIARY_KINDS: [&str; 2] = ["Service", "Ingress"];
+
 /// Default CPU limit to inject when manifest omits resources.limits.cpu
 pub const DEFAULT_CPU_LIMIT: &str = "100m";
 /// Default memory limit to inject when manifest omits resources.limits.memory
@@ -231,6 +234,10 @@ impl PolicyEngine {
 
         let mut all_violations = Vec::new();
         let mut all_allowed = true;
+        validate_document_shape(&docs, &mut all_violations);
+        if !all_violations.is_empty() {
+            all_allowed = false;
+        }
 
         // Validate each document
         for (idx, doc) in docs.iter().enumerate() {
@@ -309,6 +316,62 @@ impl PolicyEngine {
     }
 }
 
+fn validate_document_shape(documents: &[serde_yaml::Value], violations: &mut Vec<String>) {
+    let mut pod_documents = 0usize;
+    for (index, document) in documents.iter().enumerate() {
+        let Some(kind) = document.get("kind").and_then(serde_yaml::Value::as_str) else {
+            violations.push(format!("document {index}: kind is required"));
+            continue;
+        };
+        if SUPPORTED_POD_KINDS.contains(&kind) {
+            pod_documents = pod_documents.saturating_add(1);
+            let Some(spec) = pod_spec(document, kind) else {
+                violations.push(format!(
+                    "document {index}: {kind} does not contain a pod specification"
+                ));
+                continue;
+            };
+            if spec
+                .get("ephemeralContainers")
+                .and_then(serde_yaml::Value::as_sequence)
+                .is_some_and(|containers| !containers.is_empty())
+            {
+                violations.push(format!(
+                    "document {index}: ephemeralContainers are not supported"
+                ));
+            }
+            if kind == "Deployment"
+                && let Some(replicas) = document.get("spec").and_then(|value| value.get("replicas"))
+                && replicas.as_u64() != Some(1)
+            {
+                violations.push(format!(
+                    "document {index}: Deployment spec.replicas must be exactly 1"
+                ));
+            }
+        } else if !SUPPORTED_AUXILIARY_KINDS.contains(&kind) {
+            violations.push(format!(
+                "document {index}: manifest kind {kind} is not supported"
+            ));
+        }
+    }
+    if pod_documents != 1 {
+        violations.push(format!(
+            "manifest must contain exactly one Pod or Deployment document, found {pod_documents}"
+        ));
+    }
+}
+
+fn pod_spec<'a>(document: &'a serde_yaml::Value, kind: &str) -> Option<&'a serde_yaml::Value> {
+    match kind {
+        "Pod" => document.get("spec"),
+        "Deployment" => document
+            .get("spec")
+            .and_then(|spec| spec.get("template"))
+            .and_then(|template| template.get("spec")),
+        _ => None,
+    }
+}
+
 /// Mutate a manifest to inject default resource limits where missing.
 fn mutate_manifest_defaults(manifest_yaml: &str) -> Result<String> {
     let mut docs = crate::manifest_yaml::parse_yaml_documents_from_str(manifest_yaml)
@@ -352,9 +415,7 @@ fn containers_mut<'a>(
 
     let spec = match kind {
         "Pod" => doc.get_mut("spec")?,
-        "Deployment" | "ReplicaSet" | "DaemonSet" | "StatefulSet" | "Job" => {
-            doc.get_mut("spec")?.get_mut("template")?.get_mut("spec")?
-        }
+        "Deployment" => doc.get_mut("spec")?.get_mut("template")?.get_mut("spec")?,
         _ => return None,
     };
 
@@ -784,5 +845,131 @@ spec:
 "#;
         let result = validate_manifest(deployment).expect("validation should succeed");
         assert!(result.allowed, "valid deployment should be allowed");
+    }
+
+    #[test]
+    fn supported_auxiliary_documents_are_allowed() {
+        let manifest = format!(
+            r#"{VALID_POD}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test
+spec:
+  selector:
+    app: test
+  ports:
+  - port: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: test
+spec:
+  rules: []
+"#
+        );
+        let result = validate_manifest(&manifest).expect("validation should succeed");
+        assert!(result.allowed, "violations: {:?}", result.violations);
+    }
+
+    #[test]
+    fn unsupported_manifest_kind_is_rejected() {
+        let manifest = r#"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: unsupported
+spec:
+  template:
+    spec:
+      containers:
+      - name: app
+        image: busybox:latest
+"#;
+        let result = validate_manifest(manifest).expect("validation should succeed");
+        assert!(!result.allowed);
+        assert!(
+            result
+                .violations
+                .iter()
+                .any(|violation| violation.contains("Job is not supported")),
+            "violations: {:?}",
+            result.violations
+        );
+    }
+
+    #[test]
+    fn multiple_pod_bearing_documents_are_rejected() {
+        let manifest = format!("{VALID_POD}\n---\n{VALID_POD}");
+        let result = validate_manifest(&manifest).expect("validation should succeed");
+        assert!(!result.allowed);
+        assert!(
+            result
+                .violations
+                .iter()
+                .any(|violation| violation.contains("found 2")),
+            "violations: {:?}",
+            result.violations
+        );
+    }
+
+    #[test]
+    fn deployment_replica_count_must_be_one() {
+        for replicas in ["0", "2", "\"1\""] {
+            let manifest = format!(
+                r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: invalid-replicas
+spec:
+  replicas: {replicas}
+  template:
+    spec:
+      containers:
+      - name: app
+        image: nginx:latest
+"#
+            );
+            let result = validate_manifest(&manifest).expect("validation should succeed");
+            assert!(!result.allowed, "replicas={replicas}");
+            assert!(
+                result
+                    .violations
+                    .iter()
+                    .any(|violation| violation.contains("replicas must be exactly 1")),
+                "replicas={replicas}, violations: {:?}",
+                result.violations
+            );
+        }
+    }
+
+    #[test]
+    fn ephemeral_containers_are_rejected() {
+        let manifest = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ephemeral
+spec:
+  containers:
+  - name: app
+    image: nginx:latest
+  ephemeralContainers:
+  - name: debugger
+    image: busybox:latest
+"#;
+        let result = validate_manifest(manifest).expect("validation should succeed");
+        assert!(!result.allowed);
+        assert!(
+            result
+                .violations
+                .iter()
+                .any(|violation| violation.contains("ephemeralContainers")),
+            "violations: {:?}",
+            result.violations
+        );
     }
 }

@@ -3,10 +3,16 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use podctl::{ClientOptions, apply_file_with_proxy_urls, delete_file};
+use podctl::{
+    ClientOptions, apply_file_with_proxy_urls, delete_file, discover_workloads, get_logs, get_pod,
+};
 use podmesh_agent::sidecar::workload_runtime_name;
 use podmesh_integration_tests::support::{ClientKeyDir, init_tracing, reset_podman_stack_state};
 use protocol::MESH_DOMAIN_SUFFIX;
@@ -38,6 +44,7 @@ const PODMESH_NETWORK: &str = "podmesh";
 /// `GET /api/v1/agents/select` gossips a capacity query and waits for offers,
 /// which takes several seconds, so probes must outlast a full solicitation.
 const HTTP_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const UPDATE_TRAFFIC_PROBE_RETRIES: usize = 3;
 const ROOTLESS_PODMAN_SOCKET: &str = "/run/user/1000/podman/podman.sock";
 const ROOTFUL_PODMAN_SOCKET: &str = "/run/podman/podman.sock";
 const REQUIRED_IMAGES: [&str; 4] = [
@@ -97,6 +104,7 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
         api_base: Some(MACHINE_API_URL.to_string()),
         trust_any_agent: true,
     };
+    wait_for_complete_reconciliation(&options, Duration::from_secs(180)).await?;
 
     let manifest_id = apply_file_with_proxy_urls(
         sample_manifest.clone(),
@@ -117,13 +125,158 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
     wait_for_workload_containers(&workload_id, Duration::from_secs(180)).await?;
     wait_for_podmesh_proxy_response(&client, Duration::from_secs(120)).await?;
 
-    // Give workload state time to settle before attempting delete.
-    sleep(Duration::from_secs(10)).await;
+    let status = get_pod(&manifest_id, &options)
+        .await
+        .context("podctl status failed")?;
+    anyhow::ensure!(
+        serde_json::from_str::<Vec<Value>>(&status)?.len() == 1,
+        "single-replica status did not return exactly one result"
+    );
+    let logs = get_logs(&manifest_id, Some(20), &options)
+        .await
+        .context("podctl logs failed")?;
+    anyhow::ensure!(
+        serde_json::from_str::<Vec<Value>>(&logs)?.len() == 1,
+        "single-replica logs did not return exactly one result"
+    );
 
-    delete_file(sample_manifest.clone(), true, &options)
+    let updated_manifest = tempfile::NamedTempFile::new()?.into_temp_path();
+    let source = std::fs::read_to_string(&sample_manifest)?;
+    let updated = source.replacen(
+        "  template:\n    metadata:\n      labels:",
+        "  template:\n    metadata:\n      annotations:\n        podmesh.io/test-revision: \"2\"\n      labels:",
+        1,
+    );
+    std::fs::write(&updated_manifest, updated)?;
+    apply_file_with_proxy_urls(
+        updated_manifest.to_path_buf(),
+        &options,
+        PODMESH_PROXY_API_URLS.to_string(),
+    )
+    .await
+    .context("podctl update failed")?;
+    wait_for_workload_containers(&workload_id, Duration::from_secs(180)).await?;
+    wait_for_podmesh_proxy_response(&client, Duration::from_secs(120)).await?;
+
+    std::fs::remove_dir_all(podctl::catalog::catalog_dir(key_dir.path())?)?;
+    let discovery = discover_workloads(&options)
+        .await
+        .context("mesh-wide reconciliation failed")?;
+    anyhow::ensure!(
+        discovery.workloads.len() == 1
+            && discovery.unreachable_agents.is_empty()
+            && discovery.unreachable_schedulers.is_empty(),
+        "reconciliation did not rebuild a complete single-replica view"
+    );
+    get_pod(&manifest_id, &options)
+        .await
+        .context("status after reconciliation failed")?;
+
+    delete_file(updated_manifest.to_path_buf(), true, &options)
         .await
         .context("podctl delete failed")?;
     wait_for_workload_teardown(&workload_id, Duration::from_secs(90)).await?;
+    workload_guard.disarm();
+
+    let replica_manifest = tempfile::NamedTempFile::new()?.into_temp_path();
+    let source = std::fs::read_to_string(&sample_manifest)?;
+    std::fs::write(
+        &replica_manifest,
+        source.replacen("  replicas: 1", "  replicas: 3", 1),
+    )?;
+    let replica_deployment_id = apply_file_with_proxy_urls(
+        replica_manifest.to_path_buf(),
+        &options,
+        PODMESH_PROXY_API_URLS.to_string(),
+    )
+    .await
+    .context("three-replica apply failed")?;
+    let replica_ids = (0..3)
+        .map(|index| protocol::workload_id(&owner_public, SAMPLE_WORKLOAD_NAME, index))
+        .collect::<Vec<_>>();
+    for workload_id in &replica_ids {
+        workload_guard.set(workload_id.clone());
+        wait_for_workload_containers(workload_id, Duration::from_secs(180)).await?;
+    }
+    let catalog = podctl::catalog::load(key_dir.path(), &replica_deployment_id)?;
+    anyhow::ensure!(
+        catalog.replicas.len() == 3
+            && catalog
+                .replicas
+                .iter()
+                .map(|replica| &replica.agent_endpoint_id)
+                .collect::<HashSet<_>>()
+                .len()
+                == 3,
+        "replicas were not placed on three distinct agents"
+    );
+    wait_for_podmesh_proxy_response(&client, Duration::from_secs(120)).await?;
+    sleep(Duration::from_secs(5)).await;
+
+    let replica_update = tempfile::NamedTempFile::new()?.into_temp_path();
+    let updated = std::fs::read_to_string(&replica_manifest)?.replacen(
+        "  template:\n    metadata:\n      labels:",
+        "  template:\n    metadata:\n      annotations:\n        podmesh.io/test-revision: \"3\"\n      labels:",
+        1,
+    );
+    std::fs::write(&replica_update, updated)?;
+    let stop_traffic = Arc::new(AtomicBool::new(false));
+    let successful_requests = Arc::new(AtomicUsize::new(0));
+    let failed_requests = Arc::new(AtomicUsize::new(0));
+    let traffic_task = {
+        let client = client.clone();
+        let stop_traffic = stop_traffic.clone();
+        let successful_requests = successful_requests.clone();
+        let failed_requests = failed_requests.clone();
+        tokio::spawn(async move {
+            while !stop_traffic.load(Ordering::SeqCst) {
+                let mut served = false;
+                for _ in 0..UPDATE_TRAFFIC_PROBE_RETRIES {
+                    match client
+                        .get(PODMESH_PROXY_URL)
+                        .header("host", format!("demo-nginx.{MESH_DOMAIN_SUFFIX}"))
+                        .send()
+                        .await
+                    {
+                        Ok(response) if response.status().is_success() => {
+                            served = true;
+                            break;
+                        }
+                        _ => sleep(Duration::from_millis(50)).await,
+                    }
+                }
+                if served {
+                    successful_requests.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    failed_requests.fetch_add(1, Ordering::SeqCst);
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
+    let update_result = apply_file_with_proxy_urls(
+        replica_update.to_path_buf(),
+        &options,
+        PODMESH_PROXY_API_URLS.to_string(),
+    )
+    .await;
+    stop_traffic.store(true, Ordering::SeqCst);
+    traffic_task.await?;
+    update_result.context("three-replica sequential update failed")?;
+    anyhow::ensure!(
+        successful_requests.load(Ordering::SeqCst) > 0
+            && failed_requests.load(Ordering::SeqCst) == 0,
+        "shared ingress did not remain continuously available during sequential update: successes={}, failures={}",
+        successful_requests.load(Ordering::SeqCst),
+        failed_requests.load(Ordering::SeqCst)
+    );
+    wait_for_podmesh_proxy_response(&client, Duration::from_secs(120)).await?;
+    delete_file(replica_update.to_path_buf(), true, &options)
+        .await
+        .context("three-replica delete failed")?;
+    for workload_id in &replica_ids {
+        wait_for_workload_teardown(workload_id, Duration::from_secs(90)).await?;
+    }
     workload_guard.disarm();
 
     stack_guard.shutdown().await?;
@@ -249,22 +402,24 @@ impl Drop for PodmanKubeGuard {
 
 #[derive(Default)]
 struct WorkloadGuard {
-    workload_name: Option<String>,
+    workload_names: Vec<String>,
 }
 
 impl WorkloadGuard {
     fn set(&mut self, workload_name: String) {
-        self.workload_name = Some(workload_name);
+        if !self.workload_names.contains(&workload_name) {
+            self.workload_names.push(workload_name);
+        }
     }
 
     fn disarm(&mut self) {
-        self.workload_name = None;
+        self.workload_names.clear();
     }
 }
 
 impl Drop for WorkloadGuard {
     fn drop(&mut self) {
-        if let Some(workload_name) = self.workload_name.take() {
+        for workload_name in self.workload_names.drain(..) {
             let pod_name = format!("{}-pod", workload_runtime_name(&workload_name));
             let _ = StdCommand::new("podman")
                 .arg("pod")
@@ -298,7 +453,9 @@ async fn wait_for_machine_health(client: &Client, timeout: Duration) -> Result<(
 }
 
 async fn wait_for_agent_registration(client: &Client, timeout: Duration) -> Result<()> {
-    let url = format!("{MACHINE_API_URL}/api/v1/agents/select");
+    let url = format!(
+        "{MACHINE_API_URL}/api/v1/agents/select?cpu_milli=1&memory_bytes=1&storage_bytes=1"
+    );
     let deadline = Instant::now() + timeout;
     let mut last_err: Option<anyhow::Error> = None;
 
@@ -317,6 +474,34 @@ async fn wait_for_agent_registration(client: &Client, timeout: Duration) -> Resu
     }
 
     Err(last_err.unwrap_or_else(|| anyhow!("scheduler never reported an available agent")))
+}
+
+async fn wait_for_complete_reconciliation(
+    options: &ClientOptions,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match discover_workloads(options).await {
+            Ok(report)
+                if report.unreachable_agents.is_empty()
+                    && report.unreachable_schedulers.is_empty() =>
+            {
+                return Ok(());
+            }
+            Ok(report) => {
+                last_error = Some(anyhow!(
+                    "mesh view remains partial: unreachable schedulers={:?}, agents={:?}",
+                    report.unreachable_schedulers,
+                    report.unreachable_agents
+                ));
+            }
+            Err(error) => last_error = Some(error),
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("mesh reconciliation did not become complete")))
 }
 
 async fn wait_for_workload_containers(workload_name: &str, timeout: Duration) -> Result<()> {

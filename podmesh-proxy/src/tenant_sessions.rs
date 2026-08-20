@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use iroh::EndpointId;
 
 /// What a connection proved about itself.
@@ -22,6 +22,8 @@ pub struct ProvenTenant {
     pub owner_pubkey: String,
     /// Routing key the credential was issued for.
     pub manifest_id: String,
+    /// Owner-signed credential rechecked for every authorization decision.
+    pub credential: Vec<u8>,
 }
 
 /// Proven tenancy per open connection.
@@ -58,6 +60,21 @@ impl TenantSessions {
         self.inner.read().ok()?.get(endpoint).cloned()
     }
 
+    /// Return a tenant only while its owner-signed workload credential remains live.
+    pub fn proven_live(&self, endpoint: &EndpointId, now_secs: u64) -> Result<ProvenTenant> {
+        let tenant = self
+            .proven(endpoint)
+            .context("operation on a connection that proved no tenant")?;
+        protocol::verify_workload_credential(
+            &tenant.credential,
+            &tenant.owner_pubkey,
+            &tenant.manifest_id,
+            now_secs,
+        )
+        .context("workload credential is no longer valid")?;
+        Ok(tenant)
+    }
+
     /// Forget a closed connection.
     pub fn forget(&self, endpoint: &EndpointId) {
         if let Ok(mut sessions) = self.inner.write() {
@@ -70,6 +87,8 @@ impl TenantSessions {
 mod tests {
     use super::*;
 
+    const NOW: u64 = 1_700_000_000;
+
     fn endpoint(seed: u8) -> EndpointId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
@@ -78,6 +97,31 @@ mod tests {
         ProvenTenant {
             owner_pubkey: owner.into(),
             manifest_id: "manifest".into(),
+            credential: vec![1, 2, 3],
+        }
+    }
+
+    fn live_tenant(lifetime_secs: u64) -> ProvenTenant {
+        let (public, private) = crypto::generate_signing_keypair();
+        let owner = crypto::b64_encode(&public);
+        let manifest_id = protocol::route_id(&public, "workload");
+        let credential = protocol::mint_workload_credential(
+            &private,
+            &public,
+            &protocol::WorkloadCredentialClaims {
+                tenant_owner: owner.clone(),
+                manifest_id: manifest_id.clone(),
+                issued_at_secs: NOW,
+                expires_at_secs: NOW + lifetime_secs,
+                token_id: "tenant-session-test".into(),
+            },
+            NOW,
+        )
+        .unwrap();
+        ProvenTenant {
+            owner_pubkey: owner,
+            manifest_id,
+            credential,
         }
     }
 
@@ -112,5 +156,13 @@ mod tests {
         sessions.prove(endpoint(1), tenant("owner-a")).unwrap();
         sessions.forget(&endpoint(1));
         assert!(sessions.proven(&endpoint(1)).is_none());
+    }
+
+    #[test]
+    fn an_open_connection_is_refused_after_its_workload_credential_expires() {
+        let sessions = TenantSessions::new();
+        sessions.prove(endpoint(1), live_tenant(10)).unwrap();
+        assert!(sessions.proven_live(&endpoint(1), NOW + 10).is_ok());
+        assert!(sessions.proven_live(&endpoint(1), NOW + 11).is_err());
     }
 }

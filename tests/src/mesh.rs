@@ -10,8 +10,7 @@
 //! Tests drive this harness through the scheduler's client HTTP API, the same
 //! surface `podctl` uses.
 
-use iroh::address_lookup::memory::MemoryLookup;
-use std::{collections::HashSet, future::IntoFuture, sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use podmesh_agent::{
@@ -20,23 +19,16 @@ use podmesh_agent::{
     machine::{AgentMachine, MachineConfig},
     runtime::MockRuntime,
 };
-use podmesh_scheduler::{
-    clientapi::ClientApi,
-    machine::{
-        AgentControlForwarder, AttachmentManager, CapacityCoordinator, LocationRegistry,
-        PeerControlRelay, PlacementHandler, QueryManager, SchedulerGossip, SchedulerGossipServices,
-        SchedulerIdentity, ValidatedMachineConfig,
-    },
-};
+use podmesh_scheduler::machine::SchedulerIdentity;
 use tokio::time::timeout;
+
+use crate::scheduler_node::{TestScheduler, config as scheduler_config};
 
 /// Generous but bounded: every wait in this harness must fail loudly instead of
 /// hanging a test run.
 pub const MESH_TIMEOUT: Duration = Duration::from_secs(30);
 const RELAY_URL: &str = "https://relay.example.test/";
-const MAX_CONCURRENT_RELAYS: usize = 16;
 const MAX_ATTACHED_AGENTS: usize = 16;
-const MAX_AGENT_FANOUT: usize = 16;
 /// Query lifetime used by the harness. Exposed so a test can assert that
 /// placement finishes well inside it rather than sleeping to expiry.
 pub const MESH_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
@@ -45,7 +37,7 @@ const AGENT_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const AGENT_STORAGE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const AGENT_MAX_WORKLOADS: usize = 16;
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -72,10 +64,7 @@ pub struct TestMesh {
     /// Base URL of the scheduler's client HTTP API.
     pub api_base: String,
     pub agents: Vec<TestAgent>,
-    _gossip: SchedulerGossip,
-    _coordinator: CapacityCoordinator,
-    _http: tokio::task::JoinHandle<std::io::Result<()>>,
-    _temp: tempfile::TempDir,
+    _schedulers: Vec<TestScheduler>,
 }
 
 impl TestMesh {
@@ -88,74 +77,11 @@ impl TestMesh {
         );
         let temp = tempfile::tempdir()?;
         let identity = SchedulerIdentity::load(temp.path())?;
-        let config = ValidatedMachineConfig {
-            bind_addr: "127.0.0.1:0".parse()?,
-            relay_urls: vec![RELAY_URL.into()],
-            relay_ca_certificates: Vec::new(),
-            scheduler_members: HashSet::from([identity.endpoint_id()]),
-            scheduler_bootstraps: Vec::new(),
-            query_timeout: MESH_QUERY_TIMEOUT,
-            max_pending_queries: MAX_ATTACHED_AGENTS,
-            max_seen_queries: 64,
-            max_attached_agents: MAX_ATTACHED_AGENTS,
-            max_offers_per_query: MAX_ATTACHED_AGENTS,
-            max_agent_fanout: MAX_AGENT_FANOUT,
-        };
+        let config = scheduler_config(HashSet::from([identity.endpoint_id()]), Vec::new())?;
         let endpoint = identity.bind_endpoint(&config, now_secs()).await?;
-        let record = identity.endpoint_record(&endpoint.addr(), now_secs(), now_secs() + 300)?;
-        let attachments =
-            AttachmentManager::new(MAX_ATTACHED_AGENTS, MAX_AGENT_FANOUT, MESH_TIMEOUT)
-                .with_relay_grant_issuer(identity.clone(), RELAY_URL.into());
-        let queries =
-            QueryManager::new(MAX_ATTACHED_AGENTS, MAX_ATTACHED_AGENTS, MESH_QUERY_TIMEOUT);
-        let gossip = SchedulerGossip::start(
-            SchedulerGossipServices {
-                endpoint: endpoint.clone(),
-                attachments: attachments.handler(),
-                offers: queries.offer_handler(),
-                placement: PlacementHandler::new(MAX_ATTACHED_AGENTS, MESH_TIMEOUT),
-                locations: LocationRegistry::new(),
-                member_issuers: podmesh_scheduler::machine::MemberIssuers::new(),
-                lookup: MemoryLookup::new(),
-            },
-            &config,
-        )
-        .await?;
-        let (capacity, coordinator) = CapacityCoordinator::start(
-            identity.clone(),
-            endpoint.clone(),
-            queries,
-            attachments.clone(),
-            &gossip,
-            &config,
-        );
-        let forwarder = AgentControlForwarder::new(
-            endpoint.clone(),
-            attachments.clone(),
-            PeerControlRelay::new(
-                endpoint.clone(),
-                gossip.members(),
-                LocationRegistry::new(),
-                identity.clone(),
-                MESH_TIMEOUT,
-            ),
-            MESH_TIMEOUT,
-            MAX_CONCURRENT_RELAYS,
-        );
-        gossip.control_relay().install(forwarder.clone())?;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let api_base = format!("http://{}", listener.local_addr()?);
-        let http = tokio::spawn(
-            axum::serve(
-                listener,
-                // The client API carries per-peer middleware, so it has to be
-                // served with connect info.
-                axum_support::with_connect_info(
-                    ClientApi::new(capacity, forwarder, identity, endpoint.clone()).router(),
-                ),
-            )
-            .into_future(),
-        );
+        let scheduler = TestScheduler::start(temp, identity, endpoint, config).await?;
+        let record = scheduler.record()?;
+        let api_base = scheduler.api_base.clone();
 
         let scheduler_endpoint = crypto::b64_encode(&record.to_bytes(now_secs())?);
         let mut agents = Vec::with_capacity(agent_count);
@@ -163,7 +89,7 @@ impl TestMesh {
             agents.push(start_agent(&scheduler_endpoint).await?);
         }
         timeout(MESH_TIMEOUT, async {
-            while attachments.len().await != agent_count {
+            while scheduler.attachments.len().await != agent_count {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -173,11 +99,71 @@ impl TestMesh {
         Ok(Self {
             api_base,
             agents,
-            _gossip: gossip,
-            _coordinator: coordinator,
-            _http: http,
-            _temp: temp,
+            _schedulers: vec![scheduler],
         })
+    }
+
+    /// Starts two schedulers, attaches all agents to one, and exposes the HTTP
+    /// API of the other. This proves placement, reconciliation, and lifecycle
+    /// relay do not depend on local attachments.
+    pub async fn start_remote_entry(agent_count: usize) -> Result<Self> {
+        anyhow::ensure!(
+            (1..=MAX_ATTACHED_AGENTS).contains(&agent_count),
+            "agent_count must be between 1 and {MAX_ATTACHED_AGENTS}"
+        );
+        let holder_temp = tempfile::tempdir()?;
+        let entry_temp = tempfile::tempdir()?;
+        let holder_identity = SchedulerIdentity::load(holder_temp.path())?;
+        let entry_identity = SchedulerIdentity::load(entry_temp.path())?;
+        let members = HashSet::from([holder_identity.endpoint_id(), entry_identity.endpoint_id()]);
+        let holder_config = scheduler_config(members.clone(), Vec::new())?;
+        let entry_config = scheduler_config(members, vec![holder_identity.endpoint_id()])?;
+        let holder_endpoint = holder_identity
+            .bind_endpoint(&holder_config, now_secs())
+            .await?;
+        let entry_endpoint = entry_identity
+            .bind_endpoint(&entry_config, now_secs())
+            .await?;
+        holder_identity
+            .peer_lookup()
+            .set_endpoint_info(entry_endpoint.addr());
+        entry_identity
+            .peer_lookup()
+            .set_endpoint_info(holder_endpoint.addr());
+        let holder =
+            TestScheduler::start(holder_temp, holder_identity, holder_endpoint, holder_config)
+                .await?;
+        let entry =
+            TestScheduler::start(entry_temp, entry_identity, entry_endpoint, entry_config).await?;
+        let scheduler_endpoint = crypto::b64_encode(&holder.record()?.to_bytes(now_secs())?);
+        let mut agents = Vec::with_capacity(agent_count);
+        for _ in 0..agent_count {
+            agents.push(start_agent(&scheduler_endpoint).await?);
+        }
+        timeout(MESH_TIMEOUT, async {
+            while holder.attachments.len().await != agent_count {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .with_context(|| format!("only some of the {agent_count} agents attached"))?;
+        Ok(Self {
+            api_base: entry.api_base.clone(),
+            agents,
+            _schedulers: vec![entry, holder],
+        })
+    }
+
+    pub async fn restart_entry_scheduler(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self._schedulers.len() == 2,
+            "entry restart requires the two-scheduler harness"
+        );
+        let entry = self._schedulers.remove(0);
+        let entry = entry.restart().await?;
+        self.api_base = entry.api_base.clone();
+        self._schedulers.insert(0, entry);
+        Ok(())
     }
 
     /// The agent addressed by this lowercase hex EndpointId.
@@ -219,6 +205,10 @@ async fn start_agent(scheduler_endpoint: &str) -> Result<TestAgent> {
         capacity_memory_bytes: AGENT_MEMORY_BYTES,
         capacity_storage_bytes: AGENT_STORAGE_BYTES,
         max_workloads: AGENT_MAX_WORKLOADS,
+        max_concurrent_runtime_operations:
+            podmesh_agent::config::DEFAULT_MAX_CONCURRENT_RUNTIME_OPERATIONS,
+        runtime_operation_timeout_secs:
+            podmesh_agent::config::DEFAULT_RUNTIME_OPERATION_TIMEOUT_SECS,
         machine: MachineConfig {
             bind_addr: "127.0.0.1:0".parse()?,
             scheduler_endpoints: vec![scheduler_endpoint.to_string()],

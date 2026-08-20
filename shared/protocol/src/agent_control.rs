@@ -10,6 +10,7 @@ pub const MAX_AGENT_CONTROL_FRAME_BYTES: usize = MAX_AGENT_CONTROL_PAYLOAD_BYTES
 pub enum AgentControlOperation {
     Admission,
     Deploy,
+    Update,
     Command,
     /// Ask an agent which of this owner's workloads it is holding.
     ///

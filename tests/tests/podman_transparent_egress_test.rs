@@ -345,7 +345,9 @@ async fn wait_for_machine_health(client: &Client, timeout: Duration) -> Result<(
 }
 
 async fn wait_for_agent_registration(client: &Client, timeout: Duration) -> Result<()> {
-    let url = format!("{MACHINE_API_URL}/api/v1/agents/select");
+    let url = format!(
+        "{MACHINE_API_URL}/api/v1/agents/select?cpu_milli=1&memory_bytes=1&storage_bytes=1"
+    );
     let deadline = Instant::now() + timeout;
     let mut last_err: Option<anyhow::Error> = None;
 

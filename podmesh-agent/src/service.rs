@@ -1,7 +1,9 @@
 use crate::{
     config::Config,
     runtime::WorkloadRuntime,
-    store::{AgentStore, StoredWorkload},
+    store::{
+        AgentStore, STORED_WORKLOAD_VERSION, StoredWorkload, StoredWorkloadPhase, WorkloadStore,
+    },
 };
 use anyhow::{Context, Result, anyhow};
 use axum::{Router, routing::get};
@@ -9,14 +11,16 @@ use protocol::{
     AGENT_PROTOCOL_VERSION, AdmissionRequest, AgentAttachmentHello, CAPACITY_PROTOCOL_VERSION,
     CapacityOffer, CapacityQuery, DeploymentGrant, DeploymentReceipt, ENDPOINT_RECORD_VERSION,
     EndpointRecord, ExecutionSpec, MachineRole, Reservation, SCHEDULER_MESH_PROTOCOL_VERSION,
-    WorkloadCommand, WorkloadCommandResponse, WorkloadListRequest, WorkloadOperation,
+    UpdateOutcome, UpdateRequest, UpdateResponse, WorkloadCommand, WorkloadCommandResponse,
+    WorkloadListRequest, WorkloadOperation,
 };
 use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    collections::{HashMap, HashSet, VecDeque},
+    future::Future,
+    sync::{Arc, RwLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 const RESERVATION_TTL_SECS: u64 = 30;
 /// Outstanding reservations one namespace may hold on this agent at once.
@@ -87,15 +91,27 @@ struct Inner {
     kem_public: Vec<u8>,
     kem_private: Vec<u8>,
     runtime: Arc<dyn WorkloadRuntime>,
-    store: AgentStore,
+    runtime_operations: Semaphore,
+    runtime_operation_timeout: Duration,
+    store: Arc<dyn WorkloadStore>,
     state: Mutex<WorkloadState>,
     replay: Mutex<ReplayCache>,
+    current_endpoint_address: RwLock<Option<iroh::EndpointAddr>>,
+    service_mesh_required: bool,
+}
+
+struct BuildOptions {
+    store: Arc<dyn WorkloadStore>,
+    service_mesh_required: bool,
 }
 
 #[derive(Default)]
 struct WorkloadState {
     active: HashMap<String, StoredWorkload>,
     reservations: HashMap<String, Reservation>,
+    /// Records that could not be decoded. Their resource usage is unknown, so
+    /// the agent keeps them durable and refuses new placement until repaired.
+    quarantined: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -166,6 +182,20 @@ impl WorkloadState {
         )
     }
 
+    fn usage_without(&self, workload_id: &str) -> ResourceUsage {
+        let mut usage = self.reserved_usage();
+        for (id, workload) in &self.active {
+            if id != workload_id {
+                usage.add(
+                    workload.cpu_milli,
+                    workload.memory_bytes,
+                    workload.storage_bytes,
+                );
+            }
+        }
+        usage
+    }
+
     /// Outstanding reservations held by one namespace.
     fn reservations_for(&self, namespace_id: &str) -> usize {
         self.reservations
@@ -176,6 +206,7 @@ impl WorkloadState {
 
     fn contains_workload(&self, workload_id: &str) -> bool {
         self.active.contains_key(workload_id)
+            || self.quarantined.contains(workload_id)
             || self
                 .reservations
                 .values()
@@ -189,12 +220,86 @@ impl AgentService {
             config.max_workloads > 0 && config.max_workloads <= MAX_CONFIGURED_WORKLOADS,
             "max_workloads must be between 1 and {MAX_CONFIGURED_WORKLOADS}"
         );
+        anyhow::ensure!(
+            (1..=crate::config::MAX_CONCURRENT_RUNTIME_OPERATIONS)
+                .contains(&config.max_concurrent_runtime_operations),
+            "max_concurrent_runtime_operations must be between 1 and {}",
+            crate::config::MAX_CONCURRENT_RUNTIME_OPERATIONS
+        );
+        anyhow::ensure!(
+            config.runtime_operation_timeout_secs > 0,
+            "runtime_operation_timeout_secs must be non-zero"
+        );
         let (signing_public, signing_private) =
             crypto::load_or_create_signing_keypair(&config.key_dir)
                 .context("load agent signing key")?;
         let (kem_public, kem_private) =
             crypto::load_or_create_kem_keypair(&config.key_dir).context("load agent KEM key")?;
-        let store = AgentStore::open(&config.state_path, kem_public.clone(), kem_private.clone())?;
+        let store = Arc::new(AgentStore::open(
+            &config.state_path,
+            kem_public.clone(),
+            kem_private.clone(),
+        )?);
+        Self::build(
+            config,
+            runtime,
+            signing_public,
+            signing_private,
+            kem_public,
+            kem_private,
+            BuildOptions {
+                store,
+                service_mesh_required: true,
+            },
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn new_test_without_service_mesh(
+        config: Config,
+        runtime: Arc<dyn WorkloadRuntime>,
+    ) -> Result<Self> {
+        let (signing_public, signing_private) =
+            crypto::load_or_create_signing_keypair(&config.key_dir)
+                .context("load agent signing key")?;
+        let (kem_public, kem_private) =
+            crypto::load_or_create_kem_keypair(&config.key_dir).context("load agent KEM key")?;
+        let store = Arc::new(AgentStore::open(
+            &config.state_path,
+            kem_public.clone(),
+            kem_private.clone(),
+        )?);
+        Self::build(
+            config,
+            runtime,
+            signing_public,
+            signing_private,
+            kem_public,
+            kem_private,
+            BuildOptions {
+                store,
+                service_mesh_required: false,
+            },
+        )
+        .await
+    }
+
+    async fn build(
+        config: Config,
+        runtime: Arc<dyn WorkloadRuntime>,
+        signing_public: Vec<u8>,
+        signing_private: Vec<u8>,
+        kem_public: Vec<u8>,
+        kem_private: Vec<u8>,
+        options: BuildOptions,
+    ) -> Result<Self> {
+        let BuildOptions {
+            store,
+            service_mesh_required,
+        } = options;
+        let runtime_operations = Semaphore::new(config.max_concurrent_runtime_operations);
+        let runtime_operation_timeout = Duration::from_secs(config.runtime_operation_timeout_secs);
         let service = Self {
             inner: Arc::new(Inner {
                 config,
@@ -203,9 +308,13 @@ impl AgentService {
                 kem_public,
                 kem_private,
                 runtime,
+                runtime_operations,
+                runtime_operation_timeout,
                 store,
                 state: Mutex::new(WorkloadState::default()),
                 replay: Mutex::new(ReplayCache::default()),
+                current_endpoint_address: RwLock::new(None),
+                service_mesh_required,
             }),
         };
         service.restore().await?;
@@ -227,6 +336,12 @@ impl AgentService {
     ) -> Result<AgentAttachmentHello> {
         let expires_at = now + protocol::scheduler_mesh::MAX_AGENT_ATTACHMENT_LIFETIME_SECS;
         let agent_endpoint = self.signed_endpoint_record(endpoint_address, now, expires_at)?;
+        *self
+            .inner
+            .current_endpoint_address
+            .write()
+            .map_err(|_| anyhow!("agent endpoint record lock is poisoned"))? =
+            Some(endpoint_address.clone());
         AgentAttachmentHello {
             version: SCHEDULER_MESH_PROTOCOL_VERSION,
             role: MachineRole::Agent,
@@ -281,7 +396,8 @@ impl AgentService {
             .config
             .capacity_storage_bytes
             .saturating_sub(usage.storage_bytes);
-        let can_satisfy = workload_slots < self.inner.config.max_workloads
+        let can_satisfy = state.quarantined.is_empty()
+            && workload_slots < self.inner.config.max_workloads
             && available_cpu >= u64::from(query.cpu_milli)
             && available_memory >= query.memory_bytes
             && available_storage >= query.storage_bytes;
@@ -368,6 +484,24 @@ impl AgentService {
         crypto::encrypt_payload_for_recipient(&recipient, &plaintext)
     }
 
+    async fn runtime_operation<T>(
+        &self,
+        operation: &'static str,
+        future: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        tokio::time::timeout(self.inner.runtime_operation_timeout, async {
+            let _permit = self
+                .inner
+                .runtime_operations
+                .acquire()
+                .await
+                .map_err(|_| anyhow!("runtime operation semaphore closed"))?;
+            future.await
+        })
+        .await
+        .map_err(|_| anyhow!("{operation} runtime operation timed out"))?
+    }
+
     /// Most capacity that may be held by reservations that have not deployed.
     ///
     /// Expressed as a share of total capacity so it scales with the agent.
@@ -399,6 +533,12 @@ impl AgentService {
         crypto::b64_encode(&self.inner.signing_public)
     }
 
+    pub(crate) fn control_dispatch_timeout(&self) -> Duration {
+        self.inner
+            .runtime_operation_timeout
+            .saturating_add(Duration::from_secs(5))
+    }
+
     pub(crate) async fn admit(&self, request: AdmissionRequest) -> Result<Vec<u8>> {
         let now = now_secs();
         request.verify(now)?;
@@ -421,7 +561,12 @@ impl AgentService {
             .reservations
             .retain(|_, value| value.expires_at_secs >= now);
         let duplicate = state.contains_workload(&request.workload_id);
-        let count_available = state.active.len().saturating_add(state.reservations.len())
+        let state_reliable = state.quarantined.is_empty();
+        let count_available = state
+            .active
+            .len()
+            .saturating_add(state.reservations.len())
+            .saturating_add(state.quarantined.len())
             < self.inner.config.max_workloads;
         let reservation_available = state.reservations.len() < MAX_RESERVATIONS
             && state.reservations_for(&request.namespace_id) < MAX_RESERVATIONS_PER_NAMESPACE;
@@ -461,7 +606,8 @@ impl AgentService {
                 reserved_ceiling.storage_bytes,
             );
 
-        let accepted = !duplicate
+        let accepted = state_reliable
+            && !duplicate
             && count_available
             && reservation_available
             && capacity_ok
@@ -477,7 +623,9 @@ impl AgentService {
             memory_bytes: request.memory_bytes,
             storage_bytes: request.storage_bytes,
             accepted,
-            reason: if duplicate {
+            reason: if !state_reliable {
+                "agent workload state requires repair".into()
+            } else if duplicate {
                 "workload is already active or reserved".into()
             } else if !count_available {
                 "agent workload limit reached".into()
@@ -529,6 +677,70 @@ impl AgentService {
         Ok(spec)
     }
 
+    fn runtime_manifest(
+        &self,
+        workload_id: &str,
+        namespace_id: &str,
+        execution: &ExecutionSpec,
+    ) -> Result<(Vec<u8>, protocol::ManifestResources)> {
+        let manifest = if self.inner.service_mesh_required {
+            crate::sidecar::inject(
+                &execution.manifest,
+                crate::sidecar::SidecarInjection {
+                    workload_id,
+                    workload_name: &execution.workload_name,
+                    replica_index: execution.replica_index,
+                    replica_count: execution.replica_count,
+                    namespace_id,
+                    sidecar_image: &self.inner.config.sidecar_image,
+                    proxy_endpoints: &execution.proxy_endpoints,
+                    workload_credential_b64: &execution.workload_credential_b64,
+                    workload_relay_auth_token: &execution.workload_relay_auth_token,
+                    workload_relay_ca_certificates: &execution.workload_relay_ca_certificates,
+                },
+            )?
+        } else {
+            execution.manifest.clone()
+        };
+        protocol::validate_and_measure_manifest(&manifest)
+    }
+
+    fn receipt(&self, stored: &StoredWorkload, now: u64) -> Result<DeploymentReceipt> {
+        DeploymentReceipt {
+            version: AGENT_PROTOCOL_VERSION,
+            namespace_id: stored.grant.namespace_id.clone(),
+            workload_id: stored.grant.workload_id.clone(),
+            revision_id: stored.grant.revision_id.clone(),
+            agent_node_id: String::new(),
+            runtime_id: stored.runtime_id.clone(),
+            accepted_at_secs: now,
+            signature: String::new(),
+        }
+        .sign(&self.inner.signing_public, &self.inner.signing_private)
+    }
+
+    fn update_response(
+        &self,
+        request: &UpdateRequest,
+        stored: &StoredWorkload,
+        outcome: UpdateOutcome,
+        reason: String,
+        now: u64,
+    ) -> Result<UpdateResponse> {
+        UpdateResponse {
+            version: AGENT_PROTOCOL_VERSION,
+            request_id: request.request_id.clone(),
+            expected_revision_id: request.expected_revision_id.clone(),
+            requested_revision_id: request.requested_revision_id.clone(),
+            receipt: self.receipt(stored, now)?,
+            outcome,
+            reason,
+            responded_at_secs: now,
+            signature: String::new(),
+        }
+        .sign(&self.inner.signing_public, &self.inner.signing_private)
+    }
+
     pub(crate) async fn deploy(&self, grant: DeploymentGrant) -> Result<Vec<u8>> {
         let now = now_secs();
         grant.verify(now)?;
@@ -543,6 +755,11 @@ impl AgentService {
             grant.expires_at_secs,
         )
         .await?;
+        let execution = self.decode_execution(&grant)?;
+        // Reject unsupported or multi-pod runtime shapes before consuming the
+        // reservation. A custom signed client must not bypass podctl's
+        // normalization and turn one reservation into multiple runtime pods.
+        protocol::validate_and_measure_manifest(&execution.manifest)?;
         let mut state = self.inner.state.lock().await;
         // Consume and bind the reservation *before* consulting the active set.
         // Checking `active` first would leave the reservation intact only when
@@ -563,23 +780,8 @@ impl AgentService {
             !state.active.contains_key(&grant.workload_id),
             "workload is already active"
         );
-        let execution = self.decode_execution(&grant)?;
-        let manifest = crate::sidecar::inject(
-            &execution.manifest,
-            crate::sidecar::SidecarInjection {
-                workload_id: &grant.workload_id,
-                workload_name: &execution.workload_name,
-                replica_index: execution.replica_index,
-                replica_count: execution.replica_count,
-                namespace_id: &grant.namespace_id,
-                sidecar_image: &self.inner.config.sidecar_image,
-                proxy_endpoints: &execution.proxy_endpoints,
-                workload_credential_b64: &execution.workload_credential_b64,
-                workload_relay_auth_token: &execution.workload_relay_auth_token,
-                workload_relay_ca_certificates: &execution.workload_relay_ca_certificates,
-            },
-        )?;
-        let (manifest, measured) = protocol::validate_and_measure_manifest(&manifest)?;
+        let (manifest, measured) =
+            self.runtime_manifest(&grant.workload_id, &grant.namespace_id, &execution)?;
         anyhow::ensure!(
             measured.cpu_milli <= reservation.cpu_milli
                 && measured.memory_bytes <= reservation.memory_bytes
@@ -587,6 +789,8 @@ impl AgentService {
             "workload resource limits exceed signed reservation"
         );
         let mut stored = StoredWorkload {
+            version: STORED_WORKLOAD_VERSION,
+            phase: StoredWorkloadPhase::Active,
             grant: grant.clone(),
             runtime_id: String::new(),
             deleting: false,
@@ -603,37 +807,59 @@ impl AgentService {
             .insert(grant.workload_id.clone(), stored.clone());
         drop(state);
         let runtime_id = match self
-            .inner
-            .runtime
-            .deploy(crate::runtime::WorkloadDeployment {
-                workload_id: &grant.workload_id,
-                namespace_id: &grant.namespace_id,
-                manifest: &manifest,
-            })
+            .runtime_operation(
+                "deploy",
+                self.inner
+                    .runtime
+                    .deploy(crate::runtime::WorkloadDeployment {
+                        workload_id: &grant.workload_id,
+                        namespace_id: &grant.namespace_id,
+                        manifest: &manifest,
+                    }),
+            )
             .await
         {
             Ok(runtime_id) => runtime_id,
             Err(error) => {
-                self.inner.store.remove(&grant.workload_id)?;
                 self.inner
                     .state
                     .lock()
                     .await
                     .active
                     .remove(&grant.workload_id);
+                if let Err(cleanup_error) = self.inner.store.remove(&grant.workload_id) {
+                    log::error!(
+                        "deploy failed for {}; removing pending state also failed: {cleanup_error:#}",
+                        grant.workload_id
+                    );
+                }
                 return Err(error);
             }
         };
         stored.runtime_id = runtime_id.clone();
         if let Err(error) = self.inner.store.save(&stored) {
-            let _ = self.inner.runtime.delete(&runtime_id).await;
-            self.inner.store.remove(&grant.workload_id)?;
             self.inner
                 .state
                 .lock()
                 .await
                 .active
                 .remove(&grant.workload_id);
+            if let Err(cleanup_error) = self
+                .runtime_operation("deploy cleanup", self.inner.runtime.delete(&runtime_id))
+                .await
+            {
+                log::error!(
+                    "deploy persistence failed for {}; deleting runtime {} also failed: {cleanup_error:#}",
+                    grant.workload_id,
+                    runtime_id
+                );
+            }
+            if let Err(cleanup_error) = self.inner.store.remove(&grant.workload_id) {
+                log::error!(
+                    "deploy persistence failed for {}; removing pending state also failed: {cleanup_error:#}",
+                    grant.workload_id
+                );
+            }
             return Err(error);
         }
         self.inner
@@ -654,6 +880,184 @@ impl AgentService {
         }
         .sign(&self.inner.signing_public, &self.inner.signing_private)?;
         self.encrypt(&receipt, &grant.response_kem_pubkey)
+    }
+
+    pub(crate) async fn update(&self, request: UpdateRequest) -> Result<Vec<u8>> {
+        let now = now_secs();
+        request.verify(now)?;
+        anyhow::ensure!(
+            request.target_node_id == crypto::b64_encode(&self.inner.signing_public),
+            "update target mismatch"
+        );
+        self.check_replay(
+            "update",
+            &request.namespace_id,
+            &request.nonce,
+            request.expires_at_secs,
+        )
+        .await?;
+
+        let execution = self.decode_execution(&request.grant)?;
+        protocol::validate_and_measure_manifest(&execution.manifest)?;
+        let (manifest, measured) =
+            self.runtime_manifest(&request.workload_id, &request.namespace_id, &execution)?;
+        anyhow::ensure!(
+            measured.cpu_milli <= request.cpu_milli
+                && measured.memory_bytes <= request.memory_bytes
+                && measured.storage_bytes <= request.storage_bytes,
+            "updated workload resource limits exceed signed request"
+        );
+
+        let mut state = self.inner.state.lock().await;
+        let active = state
+            .active
+            .get(&request.workload_id)
+            .filter(|stored| stored.grant.namespace_id == request.namespace_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("workload not found"))?;
+        if active.grant.revision_id == request.requested_revision_id
+            && !request.refresh_service_mesh
+        {
+            let response = self.update_response(
+                &request,
+                &active,
+                UpdateOutcome::AlreadyActive,
+                String::new(),
+                now,
+            )?;
+            drop(state);
+            return self.encrypt(&response, &request.response_kem_pubkey);
+        }
+        anyhow::ensure!(
+            execution.workload_name == active.workload_name
+                && execution.replica_index == active.replica_index
+                && execution.replica_count == active.replica_count,
+            "update cannot change workload identity or replica count"
+        );
+        if active.grant.revision_id != request.expected_revision_id
+            || !matches!(active.phase, StoredWorkloadPhase::Active)
+        {
+            let response = self.update_response(
+                &request,
+                &active,
+                UpdateOutcome::Conflict,
+                "stored revision does not match expected revision".to_string(),
+                now,
+            )?;
+            drop(state);
+            return self.encrypt(&response, &request.response_kem_pubkey);
+        }
+        anyhow::ensure!(
+            state
+                .usage_without(&request.workload_id)
+                .plus(
+                    request.cpu_milli,
+                    request.memory_bytes,
+                    request.storage_bytes,
+                )
+                .fits_within(
+                    u64::from(self.inner.config.capacity_cpu_milli),
+                    self.inner.config.capacity_memory_bytes,
+                    self.inner.config.capacity_storage_bytes,
+                ),
+            "updated workload exceeds agent capacity"
+        );
+        let mut transitioning = active.clone();
+        transitioning.cpu_milli = request.cpu_milli;
+        transitioning.memory_bytes = request.memory_bytes;
+        transitioning.storage_bytes = request.storage_bytes;
+        transitioning.phase = StoredWorkloadPhase::Updating {
+            previous_grant: Box::new(active.grant.clone()),
+            previous_runtime_id: active.runtime_id.clone(),
+            request: Box::new(request.clone()),
+        };
+        self.inner.store.save(&transitioning)?;
+        state
+            .active
+            .insert(request.workload_id.clone(), transitioning.clone());
+        drop(state);
+
+        let runtime_result = self
+            .runtime_operation(
+                "update",
+                self.inner
+                    .runtime
+                    .deploy(crate::runtime::WorkloadDeployment {
+                        workload_id: &request.workload_id,
+                        namespace_id: &request.namespace_id,
+                        manifest: &manifest,
+                    }),
+            )
+            .await;
+        let runtime_id = match runtime_result {
+            Ok(runtime_id) => runtime_id,
+            Err(error) => {
+                let rollback = async {
+                    let previous = self.decode_execution(&active.grant)?;
+                    let (previous_manifest, _) = self.runtime_manifest(
+                        &active.grant.workload_id,
+                        &active.grant.namespace_id,
+                        &previous,
+                    )?;
+                    self.runtime_operation(
+                        "update rollback",
+                        self.inner
+                            .runtime
+                            .deploy(crate::runtime::WorkloadDeployment {
+                                workload_id: &active.grant.workload_id,
+                                namespace_id: &active.grant.namespace_id,
+                                manifest: &previous_manifest,
+                            }),
+                    )
+                    .await?;
+                    self.inner.store.save(&active)?;
+                    self.inner
+                        .state
+                        .lock()
+                        .await
+                        .active
+                        .insert(active.grant.workload_id.clone(), active.clone());
+                    Result::<()>::Ok(())
+                }
+                .await;
+                if let Err(cleanup_error) = rollback {
+                    log::error!(
+                        "update failed for {}; rollback also failed: {cleanup_error:#}",
+                        request.workload_id
+                    );
+                }
+                return Err(error);
+            }
+        };
+
+        let updated = StoredWorkload {
+            version: STORED_WORKLOAD_VERSION,
+            phase: StoredWorkloadPhase::Active,
+            grant: request.grant.clone(),
+            runtime_id,
+            deleting: false,
+            cpu_milli: request.cpu_milli,
+            memory_bytes: request.memory_bytes,
+            storage_bytes: request.storage_bytes,
+            workload_name: execution.workload_name,
+            replica_index: execution.replica_index,
+            replica_count: execution.replica_count,
+        };
+        self.inner.store.save(&updated)?;
+        self.inner
+            .state
+            .lock()
+            .await
+            .active
+            .insert(request.workload_id.clone(), updated.clone());
+        let response = self.update_response(
+            &request,
+            &updated,
+            UpdateOutcome::Applied,
+            String::new(),
+            now,
+        )?;
+        self.encrypt(&response, &request.response_kem_pubkey)
     }
 
     /// Report the workloads this agent holds for the signing owner.
@@ -685,27 +1089,46 @@ impl AgentService {
             .active
             .values()
             .filter(|stored| stored.grant.namespace_id == request.namespace_id)
-            .map(|stored| protocol::WorkloadSummary {
-                workload_id: stored.grant.workload_id.clone(),
-                workload_name: stored.workload_name.clone(),
-                revision_id: stored.grant.revision_id.clone(),
-                replica_index: stored.replica_index,
-                replica_count: stored.replica_count,
-                state: if stored.deleting {
-                    "deleting".into()
-                } else if stored.runtime_id.is_empty() {
-                    "starting".into()
-                } else {
-                    "deployed".into()
-                },
-                deploying_since_secs: stored.grant.issued_at_secs,
+            .map(|stored| {
+                Ok(protocol::WorkloadSummary {
+                    workload_id: stored.grant.workload_id.clone(),
+                    workload_name: stored.workload_name.clone(),
+                    revision_id: stored.grant.revision_id.clone(),
+                    replica_index: stored.replica_index,
+                    replica_count: stored.replica_count,
+                    state: if stored.deleting {
+                        "deleting".into()
+                    } else if matches!(stored.phase, StoredWorkloadPhase::Updating { .. }) {
+                        "updating".into()
+                    } else if stored.runtime_id.is_empty() {
+                        "starting".into()
+                    } else {
+                        "deployed".into()
+                    },
+                    deploying_since_secs: stored.grant.issued_at_secs,
+                    receipt: self.receipt(stored, now)?,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
+        let endpoint_address = self
+            .inner
+            .current_endpoint_address
+            .read()
+            .map_err(|_| anyhow!("agent endpoint record lock is poisoned"))?
+            .clone()
+            .context("agent has no active scheduler attachment record")?;
+        let agent_endpoint = self.signed_endpoint_record(
+            &endpoint_address,
+            now,
+            now + protocol::scheduler_mesh::MAX_AGENT_ATTACHMENT_LIFETIME_SECS,
+        )?;
 
         let response = protocol::WorkloadListResponse {
             version: AGENT_PROTOCOL_VERSION,
             request_id: request.request_id,
             agent_node_id: String::new(),
+            agent_endpoint,
+            agent_kem_pubkey: crypto::b64_encode(&self.inner.kem_public),
             workloads,
             responded_at_secs: now,
             signature: String::new(),
@@ -750,13 +1173,24 @@ impl AgentService {
             })?;
         let result = match command.operation {
             _ if active.deleting => Err(anyhow!("workload is deleting")),
-            _ if active.runtime_id.is_empty() => Err(anyhow!("workload is starting")),
-            WorkloadOperation::Status => self.inner.runtime.status(&active.runtime_id).await,
-            WorkloadOperation::Logs => {
-                self.inner
-                    .runtime
-                    .logs(&active.runtime_id, command.log_tail.unwrap_or(100))
+            _ if matches!(active.phase, StoredWorkloadPhase::Updating { .. }) => {
+                Err(anyhow!("workload is updating"))
+            }
+            WorkloadOperation::Status | WorkloadOperation::Logs if active.runtime_id.is_empty() => {
+                Err(anyhow!("workload is starting"))
+            }
+            WorkloadOperation::Status => {
+                self.runtime_operation("status", self.inner.runtime.status(&active.runtime_id))
                     .await
+            }
+            WorkloadOperation::Logs => {
+                self.runtime_operation(
+                    "logs",
+                    self.inner
+                        .runtime
+                        .logs(&active.runtime_id, command.log_tail.unwrap_or(100)),
+                )
+                .await
             }
             WorkloadOperation::Delete => {
                 let deleting = {
@@ -782,7 +1216,13 @@ impl AgentService {
                     }
                     return Err(error);
                 }
-                match self.inner.runtime.delete(&active.runtime_id).await {
+                let runtime_delete = if active.runtime_id.is_empty() {
+                    Ok(())
+                } else {
+                    self.runtime_operation("delete", self.inner.runtime.delete(&active.runtime_id))
+                        .await
+                };
+                match runtime_delete {
                     Ok(()) => {
                         self.inner.store.remove(&command.workload_id)?;
                         self.inner
@@ -838,8 +1278,19 @@ impl AgentService {
             "persisted workload count exceeds configured maximum"
         );
         let mut active = HashMap::with_capacity(workloads.len());
-        for stored in workloads {
-            let workload_id = stored.grant.workload_id.clone();
+        let mut quarantined = HashSet::new();
+        for (workload_id, loaded) in workloads {
+            let stored = match loaded {
+                Ok(stored) => stored,
+                Err(error) => {
+                    log::error!(
+                        "workload {workload_id} could not be read and was quarantined: {error:#}"
+                    );
+                    quarantined.insert(workload_id);
+                    continue;
+                }
+            };
+            let retained = stored.clone();
             match self.restore_one(stored).await {
                 Ok(Some(restored)) => {
                     if active.insert(workload_id.clone(), restored).is_some() {
@@ -849,11 +1300,9 @@ impl AgentService {
                 Ok(None) => {}
                 Err(error) => {
                     log::error!(
-                        "workload {workload_id} could not be restored and was dropped: {error:#}"
+                        "workload {workload_id} could not be restored; retaining its state and reservation: {error:#}"
                     );
-                    if let Err(error) = self.inner.store.remove(&workload_id) {
-                        log::error!("removing unrestorable workload {workload_id}: {error:#}");
-                    }
+                    active.insert(workload_id, retained);
                 }
             }
         }
@@ -863,6 +1312,7 @@ impl AgentService {
             // whose agent restarted has no capacity held for it, and letting it
             // deploy afterwards would also make the grant replayable.
             reservations: HashMap::new(),
+            quarantined,
         };
         let usage = restored.usage();
         anyhow::ensure!(
@@ -881,13 +1331,59 @@ impl AgentService {
         let workload_id = stored.grant.workload_id.clone();
         if stored.deleting {
             if !stored.runtime_id.is_empty() {
-                self.inner.runtime.delete(&stored.runtime_id).await?;
+                self.runtime_operation(
+                    "reconciliation delete",
+                    self.inner.runtime.delete(&stored.runtime_id),
+                )
+                .await?;
             }
             self.inner.store.remove(&workload_id)?;
             return Ok(None);
         }
+        if let StoredWorkloadPhase::Updating { request, .. } = stored.phase.clone() {
+            let request = *request;
+            let execution = self
+                .decode_execution(&request.grant)
+                .context("decrypt interrupted update for restart")?;
+            let (manifest, measured) =
+                self.runtime_manifest(&workload_id, &request.namespace_id, &execution)?;
+            anyhow::ensure!(
+                measured.cpu_milli <= request.cpu_milli
+                    && measured.memory_bytes <= request.memory_bytes
+                    && measured.storage_bytes <= request.storage_bytes,
+                "interrupted update exceeds signed resource limits"
+            );
+            stored.runtime_id = self
+                .runtime_operation(
+                    "update reconciliation",
+                    self.inner
+                        .runtime
+                        .deploy(crate::runtime::WorkloadDeployment {
+                            workload_id: &workload_id,
+                            namespace_id: &request.namespace_id,
+                            manifest: &manifest,
+                        }),
+                )
+                .await?;
+            stored.grant = request.grant;
+            stored.phase = StoredWorkloadPhase::Active;
+            stored.cpu_milli = request.cpu_milli;
+            stored.memory_bytes = request.memory_bytes;
+            stored.storage_bytes = request.storage_bytes;
+            stored.workload_name = execution.workload_name;
+            stored.replica_index = execution.replica_index;
+            stored.replica_count = execution.replica_count;
+            self.inner.store.save(&stored)?;
+            return Ok(Some(stored));
+        }
         if !stored.runtime_id.is_empty()
-            && self.inner.runtime.status(&stored.runtime_id).await.is_ok()
+            && self
+                .runtime_operation(
+                    "reconciliation status",
+                    self.inner.runtime.status(&stored.runtime_id),
+                )
+                .await
+                .is_ok()
         {
             return Ok(Some(stored));
         }
@@ -895,22 +1391,8 @@ impl AgentService {
         let execution = self
             .decode_execution(&stored.grant)
             .context("decrypt persisted workload for restart")?;
-        let manifest = crate::sidecar::inject(
-            &execution.manifest,
-            crate::sidecar::SidecarInjection {
-                workload_id: &workload_id,
-                workload_name: &execution.workload_name,
-                replica_index: execution.replica_index,
-                replica_count: execution.replica_count,
-                namespace_id: &stored.grant.namespace_id,
-                sidecar_image: &self.inner.config.sidecar_image,
-                proxy_endpoints: &execution.proxy_endpoints,
-                workload_credential_b64: &execution.workload_credential_b64,
-                workload_relay_auth_token: &execution.workload_relay_auth_token,
-                workload_relay_ca_certificates: &execution.workload_relay_ca_certificates,
-            },
-        )?;
-        let (manifest, measured) = protocol::validate_and_measure_manifest(&manifest)?;
+        let (manifest, measured) =
+            self.runtime_manifest(&workload_id, &stored.grant.namespace_id, &execution)?;
         anyhow::ensure!(
             measured.cpu_milli <= stored.cpu_milli
                 && measured.memory_bytes <= stored.memory_bytes
@@ -918,15 +1400,32 @@ impl AgentService {
             "persisted workload resource limits exceed reservation"
         );
         stored.runtime_id = self
-            .inner
-            .runtime
-            .deploy(crate::runtime::WorkloadDeployment {
-                workload_id: &workload_id,
-                namespace_id: &stored.grant.namespace_id,
-                manifest: &manifest,
-            })
+            .runtime_operation(
+                "reconciliation deploy",
+                self.inner
+                    .runtime
+                    .deploy(crate::runtime::WorkloadDeployment {
+                        workload_id: &workload_id,
+                        namespace_id: &stored.grant.namespace_id,
+                        manifest: &manifest,
+                    }),
+            )
             .await?;
-        self.inner.store.save(&stored)?;
+        if let Err(error) = self.inner.store.save(&stored) {
+            if let Err(cleanup_error) = self
+                .runtime_operation(
+                    "reconciliation cleanup",
+                    self.inner.runtime.delete(&stored.runtime_id),
+                )
+                .await
+            {
+                log::error!(
+                    "reconciliation persistence failed for {workload_id}; deleting runtime {} also failed: {cleanup_error:#}",
+                    stored.runtime_id
+                );
+            }
+            return Err(error);
+        }
         Ok(Some(stored))
     }
 }
@@ -981,11 +1480,55 @@ mod tests {
     const TEST_STORAGE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
     struct TestWorkload {
+        name: String,
         workload_id: String,
         owner_public: Vec<u8>,
         owner_private: Vec<u8>,
         response_public: Vec<u8>,
         response_private: Vec<u8>,
+    }
+
+    struct FaultStore {
+        inner: AgentStore,
+        saves_before_failure: std::sync::Mutex<Option<usize>>,
+    }
+
+    impl FaultStore {
+        fn new(inner: AgentStore) -> Self {
+            Self {
+                inner,
+                saves_before_failure: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn fail_after_successful_saves(&self, count: usize) {
+            *self.saves_before_failure.lock().unwrap() = Some(count);
+        }
+
+        fn clear_failure(&self) {
+            *self.saves_before_failure.lock().unwrap() = None;
+        }
+    }
+
+    impl WorkloadStore for FaultStore {
+        fn load_all(&self) -> Result<Vec<(String, Result<StoredWorkload>)>> {
+            self.inner.load_all()
+        }
+
+        fn save(&self, workload: &StoredWorkload) -> Result<()> {
+            let mut remaining = self.saves_before_failure.lock().unwrap();
+            if let Some(value) = remaining.as_mut() {
+                if *value == 0 {
+                    return Err(anyhow!("injected workload-store save failure"));
+                }
+                *value -= 1;
+            }
+            self.inner.save(workload)
+        }
+
+        fn remove(&self, workload_id: &str) -> Result<()> {
+            self.inner.remove(workload_id)
+        }
     }
 
     fn signed_admission(
@@ -1140,12 +1683,425 @@ mod tests {
         receipt.verify().unwrap();
 
         TestWorkload {
+            name: name.to_string(),
             workload_id,
             owner_public,
             owner_private,
             response_public,
             response_private,
         }
+    }
+
+    fn test_update_request(
+        service: &AgentService,
+        workload: &TestWorkload,
+        image_tag: &str,
+        expected_revision_id: String,
+        refresh_service_mesh: bool,
+        nonce: &str,
+    ) -> UpdateRequest {
+        let manifest = format!(
+            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: {}\nspec:\n  containers:\n    - name: app\n      image: nginx:{image_tag}\n",
+            workload.name
+        )
+        .into_bytes();
+        let execution = ExecutionSpec {
+            workload_name: workload.name.clone(),
+            replica_index: 0,
+            replica_count: 1,
+            manifest: manifest.clone(),
+            proxy_endpoints: test_proxy_endpoints(),
+            workload_credential_b64: test_workload_credential(
+                &workload.owner_public,
+                &workload.owner_private,
+                &workload.name,
+            ),
+            workload_relay_auth_token: "r".repeat(32),
+            workload_relay_ca_certificates: Vec::new(),
+        };
+        let mut dek = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut dek);
+        let (ciphertext, capsule_nonce) =
+            crypto::encrypt_payload_with_key(&dek, &postcard::to_allocvec(&execution).unwrap())
+                .unwrap();
+        let requested_revision_id = protocol::revision_id(&manifest);
+        let issued_at_secs = now_secs();
+        let grant = DeploymentGrant {
+            version: AGENT_PROTOCOL_VERSION,
+            namespace_id: crypto::b64_encode(&workload.owner_public),
+            workload_id: workload.workload_id.clone(),
+            revision_id: requested_revision_id.clone(),
+            target_node_id: service.signing_pubkey_b64(),
+            response_kem_pubkey: crypto::b64_encode(&workload.response_public),
+            reservation_id: format!("update-{nonce}"),
+            capsule: protocol::EncryptedWorkloadCapsule {
+                ciphertext,
+                nonce: capsule_nonce.to_vec(),
+                wrapped_dek: crypto::encrypt_payload_for_recipient(&service.inner.kem_public, &dek)
+                    .unwrap(),
+            },
+            issued_at_secs,
+            expires_at_secs: issued_at_secs + 30,
+            nonce: format!("grant-{nonce}"),
+            owner_signature: String::new(),
+        }
+        .sign(&workload.owner_private)
+        .unwrap();
+        UpdateRequest {
+            version: AGENT_PROTOCOL_VERSION,
+            request_id: format!("request-{nonce}"),
+            namespace_id: crypto::b64_encode(&workload.owner_public),
+            workload_id: workload.workload_id.clone(),
+            target_node_id: service.signing_pubkey_b64(),
+            response_kem_pubkey: crypto::b64_encode(&workload.response_public),
+            expected_revision_id,
+            requested_revision_id,
+            refresh_service_mesh,
+            cpu_milli: 700,
+            memory_bytes: TEST_MEMORY_BYTES,
+            storage_bytes: TEST_STORAGE_BYTES,
+            grant,
+            issued_at_secs,
+            expires_at_secs: issued_at_secs + 30,
+            nonce: nonce.to_string(),
+            owner_signature: String::new(),
+        }
+        .sign(&workload.owner_private)
+        .unwrap()
+    }
+
+    async fn update_test_workload(
+        service: &AgentService,
+        workload: &TestWorkload,
+        image_tag: &str,
+        expected_revision_id: String,
+        refresh_service_mesh: bool,
+        nonce: &str,
+    ) -> UpdateResponse {
+        let request = test_update_request(
+            service,
+            workload,
+            image_tag,
+            expected_revision_id,
+            refresh_service_mesh,
+            nonce,
+        );
+        let response = service.update(request).await.unwrap();
+        postcard::from_bytes(
+            &crypto::decrypt_payload_from_recipient_blob(&response, &workload.response_private)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn update_is_compare_and_swap_idempotent_and_capacity_neutral() {
+        let (service, _temp, runtime) = test_service_with_runtime(1_000, 1).await;
+        let workload = deploy_test_workload(&service, "updated", 500).await;
+        let initial_revision = service
+            .inner
+            .state
+            .lock()
+            .await
+            .active
+            .get(&workload.workload_id)
+            .unwrap()
+            .grant
+            .revision_id
+            .clone();
+
+        let applied = update_test_workload(
+            &service,
+            &workload,
+            "v2",
+            initial_revision.clone(),
+            false,
+            "update-v2",
+        )
+        .await;
+        applied.verify(now_secs()).unwrap();
+        assert_eq!(applied.outcome, UpdateOutcome::Applied);
+        let requested_revision = applied.receipt.revision_id.clone();
+        let deployed = runtime
+            .deployed_manifest(&workload.workload_id)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(deployed).unwrap().contains("nginx:v2"));
+
+        let idempotent = update_test_workload(
+            &service,
+            &workload,
+            "v2",
+            initial_revision.clone(),
+            false,
+            "update-v2-again",
+        )
+        .await;
+        assert_eq!(idempotent.outcome, UpdateOutcome::AlreadyActive);
+        assert_eq!(idempotent.receipt.revision_id, requested_revision);
+
+        let refreshed = update_test_workload(
+            &service,
+            &workload,
+            "v2",
+            requested_revision.clone(),
+            true,
+            "refresh-v2",
+        )
+        .await;
+        assert_eq!(refreshed.outcome, UpdateOutcome::Applied);
+        assert_eq!(refreshed.receipt.revision_id, requested_revision);
+
+        let stale = update_test_workload(
+            &service,
+            &workload,
+            "v3",
+            initial_revision,
+            false,
+            "stale-v3",
+        )
+        .await;
+        assert_eq!(stale.outcome, UpdateOutcome::Conflict);
+        assert_eq!(stale.receipt.revision_id, requested_revision);
+        let deployed = runtime
+            .deployed_manifest(&workload.workload_id)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(deployed).unwrap().contains("nginx:v2"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn runtime_failure_rolls_update_back_to_the_confirmed_revision() {
+        let (service, _temp, runtime) = test_service_with_runtime(1_000, 1).await;
+        let workload = deploy_test_workload(&service, "runtime-rollback", 500).await;
+        let initial_revision = service
+            .inner
+            .state
+            .lock()
+            .await
+            .active
+            .get(&workload.workload_id)
+            .unwrap()
+            .grant
+            .revision_id
+            .clone();
+        runtime.fail_next_deploys(1);
+        let request = test_update_request(
+            &service,
+            &workload,
+            "v2",
+            initial_revision.clone(),
+            false,
+            "runtime-failure",
+        );
+        let error = service.update(request).await.unwrap_err();
+        assert!(error.to_string().contains("injected mock runtime"));
+        let stored = service
+            .inner
+            .state
+            .lock()
+            .await
+            .active
+            .get(&workload.workload_id)
+            .unwrap()
+            .clone();
+        assert!(matches!(stored.phase, StoredWorkloadPhase::Active));
+        assert_eq!(stored.grant.revision_id, initial_revision);
+        let deployed = runtime
+            .deployed_manifest(&workload.workload_id)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8(deployed).unwrap().contains("nginx:v2"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn service_mesh_bypass_exists_only_on_the_explicit_test_constructor() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::default());
+        let service = AgentService::new_test_without_service_mesh(
+            test_config(temp.path(), 1_000, 1),
+            runtime.clone(),
+        )
+        .await
+        .unwrap();
+        let workload = deploy_test_workload(&service, "unmeshed-test-only", 500).await;
+        let manifest = runtime
+            .deployed_manifest(&workload.workload_id)
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8(manifest)
+                .unwrap()
+                .contains("podmesh-sidecar")
+        );
+
+        let (production, _production_temp, production_runtime) =
+            test_service_with_runtime(1_000, 1).await;
+        let production_workload =
+            deploy_test_workload(&production, "meshed-production-default", 500).await;
+        let manifest = production_runtime
+            .deployed_manifest(&production_workload.workload_id)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(manifest)
+                .unwrap()
+                .contains("podmesh-sidecar")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn runtime_status_concurrency_never_exceeds_the_configured_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::default());
+        runtime.set_status_delay(Duration::from_millis(100));
+        let mut config = test_config(temp.path(), 1_000, 1);
+        config.max_concurrent_runtime_operations = 2;
+        let service = AgentService::new(config, runtime.clone()).await.unwrap();
+        let workload = Arc::new(deploy_test_workload(&service, "runtime-limit", 500).await);
+
+        let mut commands = tokio::task::JoinSet::new();
+        for index in 0..8 {
+            let service = service.clone();
+            let workload = workload.clone();
+            commands.spawn(async move {
+                command_test_workload(
+                    &service,
+                    &workload,
+                    WorkloadOperation::Status,
+                    &format!("runtime-limit-{index}"),
+                )
+                .await
+            });
+        }
+        while let Some(result) = commands.join_next().await {
+            assert!(result.unwrap().ok);
+        }
+        assert_eq!(runtime.max_concurrent_status_calls(), 2);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn restart_completes_update_after_final_persistence_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = test_config(temp.path(), 1_000, 1);
+        let runtime = Arc::new(MockRuntime::default());
+        let (signing_public, signing_private) =
+            crypto::load_or_create_signing_keypair(&config.key_dir).unwrap();
+        let (kem_public, kem_private) =
+            crypto::load_or_create_kem_keypair(&config.key_dir).unwrap();
+        let fault_store = Arc::new(FaultStore::new(
+            AgentStore::open(&config.state_path, kem_public.clone(), kem_private.clone()).unwrap(),
+        ));
+        let service = AgentService::build(
+            config.clone(),
+            runtime.clone(),
+            signing_public.clone(),
+            signing_private.clone(),
+            kem_public.clone(),
+            kem_private.clone(),
+            BuildOptions {
+                store: fault_store.clone(),
+                service_mesh_required: true,
+            },
+        )
+        .await
+        .unwrap();
+        let workload = deploy_test_workload(&service, "persisted-transition", 500).await;
+        let initial_revision = service
+            .inner
+            .state
+            .lock()
+            .await
+            .active
+            .get(&workload.workload_id)
+            .unwrap()
+            .grant
+            .revision_id
+            .clone();
+        let request = test_update_request(
+            &service,
+            &workload,
+            "v2",
+            initial_revision.clone(),
+            false,
+            "persistence-failure",
+        );
+        let requested_revision = request.requested_revision_id.clone();
+        fault_store.fail_after_successful_saves(1);
+        let error = service.update(request).await.unwrap_err();
+        assert!(error.to_string().contains("injected workload-store"));
+        assert!(matches!(
+            service
+                .inner
+                .state
+                .lock()
+                .await
+                .active
+                .get(&workload.workload_id)
+                .unwrap()
+                .phase,
+            StoredWorkloadPhase::Updating { .. }
+        ));
+
+        fault_store.clear_failure();
+        let restarted = AgentService::build(
+            config.clone(),
+            runtime.clone(),
+            signing_public.clone(),
+            signing_private.clone(),
+            kem_public.clone(),
+            kem_private.clone(),
+            BuildOptions {
+                store: fault_store.clone(),
+                service_mesh_required: true,
+            },
+        )
+        .await
+        .unwrap();
+        let restored = restarted
+            .inner
+            .state
+            .lock()
+            .await
+            .active
+            .get(&workload.workload_id)
+            .unwrap()
+            .clone();
+        assert!(matches!(restored.phase, StoredWorkloadPhase::Active));
+        assert_eq!(restored.grant.revision_id, requested_revision);
+
+        let restarted_again = AgentService::build(
+            config,
+            runtime,
+            signing_public,
+            signing_private,
+            kem_public,
+            kem_private,
+            BuildOptions {
+                store: fault_store,
+                service_mesh_required: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            restarted_again
+                .inner
+                .state
+                .lock()
+                .await
+                .active
+                .get(&workload.workload_id)
+                .unwrap()
+                .grant
+                .revision_id,
+            requested_revision
+        );
     }
 
     async fn command_test_workload(
@@ -1198,6 +2154,10 @@ mod tests {
                 capacity_memory_bytes: 1024,
                 capacity_storage_bytes: 1024,
                 max_workloads: 4,
+                max_concurrent_runtime_operations:
+                    crate::config::DEFAULT_MAX_CONCURRENT_RUNTIME_OPERATIONS,
+                runtime_operation_timeout_secs:
+                    crate::config::DEFAULT_RUNTIME_OPERATION_TIMEOUT_SECS,
                 machine: crate::machine::MachineConfig::default(),
             },
             Arc::new(MockRuntime::default()),
@@ -1254,25 +2214,36 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let runtime = Arc::new(MockRuntime::default());
         let service = AgentService::new(
-            Config {
-                listen: "127.0.0.1:0".into(),
-                key_dir: temp.path().join("keys"),
-                state_path: temp.path().join("state.redb"),
-                runtime: RuntimeKind::Mock,
-                workload_network: "podmesh".into(),
-                max_reserved_capacity_percent: crate::config::DEFAULT_MAX_RESERVED_CAPACITY_PERCENT,
-                sidecar_image: "podmesh/sidecar:latest".into(),
-                capacity_cpu_milli,
-                capacity_memory_bytes: 16 * TEST_MEMORY_BYTES,
-                capacity_storage_bytes: 16 * TEST_STORAGE_BYTES,
-                max_workloads,
-                machine: crate::machine::MachineConfig::default(),
-            },
+            test_config(temp.path(), capacity_cpu_milli, max_workloads),
             runtime.clone(),
         )
         .await
         .unwrap();
         (service, temp, runtime)
+    }
+
+    fn test_config(
+        path: &std::path::Path,
+        capacity_cpu_milli: u32,
+        max_workloads: usize,
+    ) -> Config {
+        Config {
+            listen: "127.0.0.1:0".into(),
+            key_dir: path.join("keys"),
+            state_path: path.join("state.redb"),
+            runtime: RuntimeKind::Mock,
+            workload_network: "podmesh".into(),
+            max_reserved_capacity_percent: crate::config::DEFAULT_MAX_RESERVED_CAPACITY_PERCENT,
+            sidecar_image: "podmesh/sidecar:latest".into(),
+            capacity_cpu_milli,
+            capacity_memory_bytes: 16 * TEST_MEMORY_BYTES,
+            capacity_storage_bytes: 16 * TEST_STORAGE_BYTES,
+            max_workloads,
+            max_concurrent_runtime_operations:
+                crate::config::DEFAULT_MAX_CONCURRENT_RUNTIME_OPERATIONS,
+            runtime_operation_timeout_secs: crate::config::DEFAULT_RUNTIME_OPERATION_TIMEOUT_SECS,
+            machine: crate::machine::MachineConfig::default(),
+        }
     }
 
     /// The spec requires that a non-owner lifecycle command is refused *and*
@@ -1526,6 +2497,9 @@ mod tests {
             capacity_memory_bytes: 8 * TEST_MEMORY_BYTES,
             capacity_storage_bytes: 8 * TEST_STORAGE_BYTES,
             max_workloads: 8,
+            max_concurrent_runtime_operations:
+                crate::config::DEFAULT_MAX_CONCURRENT_RUNTIME_OPERATIONS,
+            runtime_operation_timeout_secs: crate::config::DEFAULT_RUNTIME_OPERATION_TIMEOUT_SECS,
             machine: crate::machine::MachineConfig::default(),
         };
         let runtime = Arc::new(MockRuntime::default());
@@ -1551,8 +2525,8 @@ mod tests {
         let state = restarted.inner.state.lock().await;
         assert!(state.active.contains_key(&healthy.workload_id));
         assert!(
-            !state.active.contains_key(&broken.workload_id),
-            "the unrestorable record must be dropped, not retained"
+            state.active.contains_key(&broken.workload_id),
+            "the unrestorable record must retain its resource reservation and owner delete path"
         );
     }
 
@@ -1572,6 +2546,9 @@ mod tests {
             capacity_memory_bytes: 2 * TEST_MEMORY_BYTES,
             capacity_storage_bytes: 2 * TEST_STORAGE_BYTES,
             max_workloads: 2,
+            max_concurrent_runtime_operations:
+                crate::config::DEFAULT_MAX_CONCURRENT_RUNTIME_OPERATIONS,
+            runtime_operation_timeout_secs: crate::config::DEFAULT_RUNTIME_OPERATION_TIMEOUT_SECS,
             machine: crate::machine::MachineConfig::default(),
         };
         let service = AgentService::new(config.clone(), Arc::new(MockRuntime::default()))
@@ -1650,6 +2627,10 @@ mod tests {
                 capacity_memory_bytes: 2 * TEST_MEMORY_BYTES,
                 capacity_storage_bytes: 2 * TEST_STORAGE_BYTES,
                 max_workloads: 5,
+                max_concurrent_runtime_operations:
+                    crate::config::DEFAULT_MAX_CONCURRENT_RUNTIME_OPERATIONS,
+                runtime_operation_timeout_secs:
+                    crate::config::DEFAULT_RUNTIME_OPERATION_TIMEOUT_SECS,
                 machine: crate::machine::MachineConfig::default(),
             },
             Arc::new(MockRuntime::default()),
@@ -1708,6 +2689,10 @@ mod tests {
                 capacity_memory_bytes: 1_000,
                 capacity_storage_bytes: 1_000,
                 max_workloads: 4,
+                max_concurrent_runtime_operations:
+                    crate::config::DEFAULT_MAX_CONCURRENT_RUNTIME_OPERATIONS,
+                runtime_operation_timeout_secs:
+                    crate::config::DEFAULT_RUNTIME_OPERATION_TIMEOUT_SECS,
                 machine: crate::machine::MachineConfig::default(),
             },
             Arc::new(MockRuntime::default()),
@@ -1818,6 +2803,10 @@ mod tests {
                 capacity_memory_bytes: 1_000,
                 capacity_storage_bytes: 1_000,
                 max_workloads: 4,
+                max_concurrent_runtime_operations:
+                    crate::config::DEFAULT_MAX_CONCURRENT_RUNTIME_OPERATIONS,
+                runtime_operation_timeout_secs:
+                    crate::config::DEFAULT_RUNTIME_OPERATION_TIMEOUT_SECS,
                 machine: crate::machine::MachineConfig::default(),
             },
             Arc::new(MockRuntime::default()),
@@ -1886,6 +2875,10 @@ mod tests {
                 capacity_memory_bytes: 1_000,
                 capacity_storage_bytes: 1_000,
                 max_workloads: 4,
+                max_concurrent_runtime_operations:
+                    crate::config::DEFAULT_MAX_CONCURRENT_RUNTIME_OPERATIONS,
+                runtime_operation_timeout_secs:
+                    crate::config::DEFAULT_RUNTIME_OPERATION_TIMEOUT_SECS,
                 machine: crate::machine::MachineConfig::default(),
             },
             Arc::new(MockRuntime::default()),

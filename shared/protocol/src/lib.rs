@@ -2,9 +2,9 @@ pub mod agent;
 pub use agent::{
     AGENT_PROTOCOL_VERSION, AdmissionRequest, DeploymentGrant, DeploymentReceipt,
     EncryptedWorkloadCapsule, ExecutionSpec, MAX_WORKLOAD_LIST_REQUEST_BYTES,
-    MAX_WORKLOAD_REPLICAS, Reservation, WorkloadCommand, WorkloadCommandResponse,
-    WorkloadListRequest, WorkloadListResponse, WorkloadOperation, WorkloadSummary, deployment_id,
-    revision_id, workload_id,
+    MAX_WORKLOAD_REPLICAS, Reservation, UpdateOutcome, UpdateRequest, UpdateResponse,
+    WorkloadCommand, WorkloadCommandResponse, WorkloadListRequest, WorkloadListResponse,
+    WorkloadOperation, WorkloadSummary, deployment_id, revision_id, workload_id,
 };
 pub mod agent_control;
 pub use agent_control::{
@@ -61,6 +61,14 @@ pub mod scheduler_gossip;
 pub use scheduler_gossip::{
     AgentLocationQuery, MAX_LOCATION_QUERY_LIFETIME_SECS, SCHEDULER_GOSSIP_PROTOCOL_VERSION,
     SchedulerGossipMessage,
+};
+pub mod reconciliation;
+#[cfg(test)]
+mod reconciliation_tests;
+pub use reconciliation::{
+    MAX_RECONCILIATION_LIFETIME_SECS, MAX_RECONCILIATION_RESPONSE_BYTES,
+    RECONCILIATION_PROTOCOL_VERSION, ReconciliationEvent, SCHEDULER_RECONCILIATION_ALPN,
+    SchedulerReconciliationQuery, SchedulerReconciliationResponse,
 };
 pub mod scheduler_mesh;
 pub use scheduler_mesh::{

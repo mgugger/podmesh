@@ -7,7 +7,7 @@ use iroh::{
 };
 use protocol::{
     AdmissionRequest, AgentControlOperation, AgentControlRequest, AgentControlResponse,
-    DeploymentGrant, MAX_AGENT_CONTROL_FRAME_BYTES, WorkloadCommand,
+    DeploymentGrant, MAX_AGENT_CONTROL_FRAME_BYTES, UpdateRequest, WorkloadCommand,
 };
 
 use crate::AgentService;
@@ -16,13 +16,16 @@ use crate::AgentService;
 pub struct AgentControlHandler {
     service: AgentService,
     operation_timeout: Duration,
+    dispatch_timeout: Duration,
 }
 
 impl AgentControlHandler {
     pub fn new(service: AgentService, operation_timeout: Duration) -> Self {
+        let dispatch_timeout = service.control_dispatch_timeout();
         Self {
             service,
             operation_timeout,
+            dispatch_timeout,
         }
     }
 
@@ -39,7 +42,10 @@ impl AgentControlHandler {
         .await
         .context("agent control request read timed out")?
         .context("read agent control request")?;
-        let response = match self.dispatch(&bytes).await {
+        let response = match tokio::time::timeout(self.dispatch_timeout, self.dispatch(&bytes))
+            .await
+            .context("agent control dispatch timed out")?
+        {
             Ok(encrypted_payload) => AgentControlResponse::success(encrypted_payload),
             Err(error) => {
                 log::warn!(
@@ -49,9 +55,13 @@ impl AgentControlHandler {
                 AgentControlResponse::rejected()
             }
         };
-        send.write_all(&response.to_bytes()?)
-            .await
-            .context("write agent control response")?;
+        tokio::time::timeout(
+            self.operation_timeout,
+            send.write_all(&response.to_bytes()?),
+        )
+        .await
+        .context("agent control response write timed out")?
+        .context("write agent control response")?;
         send.finish().context("finish agent control response")?;
         let _ = tokio::time::timeout(self.operation_timeout, connection.closed()).await;
         Ok(())
@@ -71,6 +81,12 @@ impl AgentControlHandler {
                     .service
                     .decrypt::<DeploymentGrant>(&request.encrypted_payload)?;
                 self.service.deploy(grant).await
+            }
+            AgentControlOperation::Update => {
+                let request = self
+                    .service
+                    .decrypt::<UpdateRequest>(&request.encrypted_payload)?;
+                self.service.update(request).await
             }
             AgentControlOperation::Command => {
                 let command = self

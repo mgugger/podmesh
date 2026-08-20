@@ -81,6 +81,19 @@ async fn mesh_with_client(agent_count: usize) -> Result<(TestMesh, ClientKeyDir,
     Ok((mesh, key_dir, options))
 }
 
+async fn remote_mesh_with_client(
+    agent_count: usize,
+) -> Result<(TestMesh, ClientKeyDir, ClientOptions)> {
+    support::init_tracing();
+    let mesh = timeout(MESH_TIMEOUT, TestMesh::start_remote_entry(agent_count))
+        .await
+        .context("multi-scheduler mesh start timed out")??;
+    let key_dir = ClientKeyDir::with_trusted_agents(&mesh.trusted_agent_keys())?;
+    key_dir.activate();
+    let options = ClientOptions::with_api_base(Some(&mesh.api_base));
+    Ok((mesh, key_dir, options))
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -499,5 +512,72 @@ async fn listing_finds_workloads_the_local_catalog_lost() -> Result<()> {
         report.workloads.iter().all(|w| w.orphaned),
         "workloads the catalog no longer knows about must be flagged as orphaned"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn remote_reconciliation_rebuilds_catalog_and_survives_entry_restart() -> Result<()> {
+    let (mut mesh, key_dir, mut options) = remote_mesh_with_client(2).await?;
+    let (_dir, path) = manifest("remote-reconcile", 2)?;
+    let deployment_id = timeout(TEST_TIMEOUT, apply(&path, &options))
+        .await
+        .context("remote apply timed out")??;
+    assert_eq!(mesh.total_deployed_workloads().await, 2);
+
+    std::fs::remove_dir_all(podctl::catalog::catalog_dir(key_dir.path())?)?;
+    let report = timeout(TEST_TIMEOUT, podctl::discover_workloads(&options))
+        .await
+        .context("remote reconciliation timed out")??;
+    assert_eq!(report.workloads.len(), 2);
+    assert!(report.unreachable_agents.is_empty());
+    assert!(report.unreachable_schedulers.is_empty());
+    assert_eq!(
+        podctl::catalog::load(key_dir.path(), &deployment_id)?
+            .replicas
+            .len(),
+        2
+    );
+
+    let status = timeout(TEST_TIMEOUT, podctl::get_pod(&deployment_id, &options))
+        .await
+        .context("reconciled status timed out")??;
+    assert_eq!(
+        serde_json::from_str::<Vec<serde_json::Value>>(&status)?.len(),
+        2
+    );
+    let logs = timeout(
+        TEST_TIMEOUT,
+        podctl::get_logs(&deployment_id, Some(10), &options),
+    )
+    .await
+    .context("reconciled logs timed out")??;
+    assert_eq!(
+        serde_json::from_str::<Vec<serde_json::Value>>(&logs)?.len(),
+        2
+    );
+
+    let updated = std::fs::read_to_string(&path)?.replace("nginx:alpine", "nginx:1.27");
+    std::fs::write(&path, updated)?;
+    timeout(TEST_TIMEOUT, apply(&path, &options))
+        .await
+        .context("reconciled update timed out")??;
+
+    mesh.restart_entry_scheduler().await?;
+    options = ClientOptions::with_api_base(Some(&mesh.api_base));
+    std::fs::remove_dir_all(podctl::catalog::catalog_dir(key_dir.path())?)?;
+    let report = timeout(TEST_TIMEOUT, podctl::discover_workloads(&options))
+        .await
+        .context("post-restart reconciliation timed out")??;
+    assert_eq!(report.workloads.len(), 2);
+    assert!(report.unreachable_schedulers.is_empty());
+
+    timeout(
+        TEST_TIMEOUT,
+        podctl::delete_deployment(&deployment_id, false, &options),
+    )
+    .await
+    .context("reconciled delete timed out")??;
+    assert_eq!(mesh.total_deployed_workloads().await, 0);
     Ok(())
 }

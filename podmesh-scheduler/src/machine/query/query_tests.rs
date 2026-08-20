@@ -55,7 +55,7 @@ fn signed_offer(query_id: &str, transport: &SecretKey, available_cpu_milli: u32)
 }
 
 #[tokio::test]
-async fn equivalent_queries_coalesce_and_complete_idempotently() {
+async fn equivalent_queries_coalesce_but_receive_distinct_offers() {
     let identity = SchedulerIdentity::ephemeral().unwrap();
     let manager = QueryManager::new(2, 4, Duration::from_secs(5));
     let address = reply_address(&identity);
@@ -71,19 +71,23 @@ async fn equivalent_queries_coalesce_and_complete_idempotently() {
     assert!(!second.newly_created);
     assert_eq!(first.query.query_id, second.query.query_id);
 
-    let transport = SecretKey::generate();
-    manager
-        .submit_offer(
-            signed_offer(&first.query.query_id, &transport, 700),
-            transport.public(),
-            NOW,
-        )
-        .await
-        .unwrap();
-    let selected = manager.finish(&first.query.query_id, NOW).await.unwrap();
-    assert_eq!(
-        manager.finish(&second.query.query_id, NOW).await,
-        Some(selected)
+    let first_transport = SecretKey::generate();
+    let second_transport = SecretKey::generate();
+    for (transport, available) in [(&first_transport, 700), (&second_transport, 800)] {
+        manager
+            .submit_offer(
+                signed_offer(&first.query.query_id, transport, available),
+                transport.public(),
+                NOW,
+            )
+            .await
+            .unwrap();
+    }
+    let first_selected = manager.finish(&first.query.query_id, NOW).await.unwrap();
+    let second_selected = manager.finish(&second.query.query_id, NOW).await.unwrap();
+    assert_ne!(
+        first_selected.agent_endpoint.endpoint_id,
+        second_selected.agent_endpoint.endpoint_id
     );
 }
 
@@ -224,10 +228,9 @@ async fn the_offer_count_is_published_as_offers_arrive() {
     }
 }
 
-/// A query serving several waiters keeps the greediest target, so joining a
-/// query never shortens the wait somebody else asked for.
+/// A query serving several waiters collects enough offers for each caller.
 #[tokio::test]
-async fn coalescing_keeps_the_greediest_offer_target() {
+async fn coalescing_aggregates_offer_demand() {
     let identity = SchedulerIdentity::ephemeral().unwrap();
     let manager = QueryManager::new(4, 8, Duration::from_secs(5));
     let address = reply_address(&identity);
@@ -246,14 +249,14 @@ async fn coalescing_keeps_the_greediest_offer_target() {
         !greedy.newly_created,
         "the second caller must join the query"
     );
-    assert_eq!(greedy.target_offers, 5);
+    assert_eq!(greedy.target_offers, 6);
 
-    // Joining again with a smaller appetite must not lower the bar.
+    // Every joined caller adds its own demand.
     let modest_again = manager
         .begin(criteria(), &identity, &address, 1, NOW)
         .await
         .unwrap();
-    assert_eq!(modest_again.target_offers, 5);
+    assert_eq!(modest_again.target_offers, 7);
 }
 
 /// The target is clamped to what the query could ever collect, so a client

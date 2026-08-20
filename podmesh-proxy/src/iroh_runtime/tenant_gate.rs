@@ -29,28 +29,29 @@ pub(super) fn prove_tenant(
     let encoded = handshake
         .workload_credential_b64()
         .context("workload handshake did not include an owner-signed credential")?;
-    protocol::verify_workload_credential(
-        &protocol::workload_credential_from_b64(encoded)?,
-        owner,
-        manifest_id,
-        now_secs()?,
-    )
-    .context("verify workload credential")?;
+    let credential = protocol::workload_credential_from_b64(encoded)?;
+    protocol::verify_workload_credential(&credential, owner, manifest_id, now_secs()?)
+        .context("verify workload credential")?;
     state.tenants.prove(
         remote,
         crate::tenant_sessions::ProvenTenant {
             owner_pubkey: owner.to_string(),
             manifest_id: manifest_id.to_string(),
+            credential,
         },
     )
 }
 
+pub(super) fn live_tenant(
+    state: &RuntimeState,
+    remote: EndpointId,
+) -> Result<crate::tenant_sessions::ProvenTenant> {
+    state.tenants.proven_live(&remote, now_secs()?)
+}
+
 /// Decide whether this connection may open an egress tunnel.
 pub(super) fn authorize_egress(state: &RuntimeState, remote: EndpointId) -> Result<()> {
-    let proven = state
-        .tenants
-        .proven(&remote)
-        .context("egress on a connection that proved no tenant")?;
+    let proven = live_tenant(state, remote)?;
     ensure!(
         state.grant_store.holds_live_grant(
             &proven.owner_pubkey,

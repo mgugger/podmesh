@@ -1,6 +1,14 @@
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use std::{collections::HashMap, os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    os::unix::fs::PermissionsExt,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{process::Command, sync::RwLock, time::timeout};
 
 const RUNTIME_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
@@ -35,6 +43,11 @@ pub struct MockRuntime {
     /// Namespace each workload was deployed for, so tests can assert that pods
     /// are placed per tenant.
     tenants: RwLock<HashMap<String, String>>,
+    deploy_calls: AtomicUsize,
+    fail_deploys: AtomicUsize,
+    status_delay_millis: AtomicUsize,
+    active_status_calls: AtomicUsize,
+    max_active_status_calls: AtomicUsize,
 }
 
 impl MockRuntime {
@@ -54,11 +67,40 @@ impl MockRuntime {
         ids.sort();
         ids
     }
+
+    pub fn deploy_count(&self) -> usize {
+        self.deploy_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn fail_next_deploys(&self, count: usize) {
+        self.fail_deploys.store(count, Ordering::SeqCst);
+    }
+
+    pub fn set_status_delay(&self, delay: Duration) {
+        self.status_delay_millis.store(
+            usize::try_from(delay.as_millis()).unwrap_or(usize::MAX),
+            Ordering::SeqCst,
+        );
+    }
+
+    pub fn max_concurrent_status_calls(&self) -> usize {
+        self.max_active_status_calls.load(Ordering::SeqCst)
+    }
 }
 
 #[async_trait]
 impl WorkloadRuntime for MockRuntime {
     async fn deploy(&self, deployment: WorkloadDeployment<'_>) -> Result<String> {
+        self.deploy_calls.fetch_add(1, Ordering::SeqCst);
+        if self
+            .fail_deploys
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(anyhow!("injected mock runtime deploy failure"));
+        }
         self.workloads.write().await.insert(
             deployment.workload_id.to_string(),
             deployment.manifest.to_vec(),
@@ -71,7 +113,19 @@ impl WorkloadRuntime for MockRuntime {
     }
 
     async fn status(&self, runtime_id: &str) -> Result<String> {
-        if self.workloads.read().await.contains_key(runtime_id) {
+        let active = self.active_status_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active_status_calls
+            .fetch_max(active, Ordering::SeqCst);
+        let delay = self.status_delay_millis.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(
+                u64::try_from(delay).unwrap_or(u64::MAX),
+            ))
+            .await;
+        }
+        let exists = self.workloads.read().await.contains_key(runtime_id);
+        self.active_status_calls.fetch_sub(1, Ordering::SeqCst);
+        if exists {
             Ok("running".into())
         } else {
             Err(anyhow!("workload not found"))
@@ -109,6 +163,7 @@ impl PodmanRuntime {
     }
 
     async fn output(command: &mut Command) -> Result<String> {
+        command.kill_on_drop(true);
         let output = timeout(RUNTIME_COMMAND_TIMEOUT, command.output())
             .await
             .map_err(|_| anyhow!("runtime command timed out"))??;

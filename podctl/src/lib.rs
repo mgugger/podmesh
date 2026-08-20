@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, anyhow};
 use protocol::{
     AGENT_PROTOCOL_VERSION, AdmissionRequest, CapacityOffer, DeploymentGrant, DeploymentReceipt,
-    EncryptedWorkloadCapsule, ExecutionSpec, Reservation, WorkloadCommand, WorkloadCommandResponse,
-    WorkloadOperation,
+    EncryptedWorkloadCapsule, ExecutionSpec, Reservation, UpdateOutcome, UpdateRequest,
+    UpdateResponse, WorkloadCommand, WorkloadCommandResponse, WorkloadOperation,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,7 @@ pub mod catalog;
 pub mod cert;
 pub mod trust;
 
-use catalog::{DeploymentCatalog, ReplicaPlacement};
+use catalog::{DeploymentCatalog, ReplicaPlacement, ReplicaUpdateState};
 pub use trust::AgentTrust;
 
 /// Overrides the key and catalog directory. Every component in a test, and any
@@ -77,6 +77,39 @@ const PROXY_GRANT_TTL_DAYS: u64 = 30;
 /// Matched to the proxy grant, because both are re-minted by the same deploy
 /// and a pod outliving its credential would silently lose ingress.
 const WORKLOAD_CREDENTIAL_TTL_SECS: u64 = PROXY_GRANT_TTL_DAYS * 24 * 60 * 60;
+const SERVICE_MESH_RENEWAL_WINDOW_SECS: u64 = 24 * 60 * 60;
+const MAX_ADMISSION_CAPACITY_RETRIES: usize = 3;
+
+#[derive(Debug)]
+struct AdmissionCapacityRefusal {
+    reason: String,
+}
+
+impl std::fmt::Display for AdmissionCapacityRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "agent rejected workload capacity: {}",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for AdmissionCapacityRefusal {}
+
+fn is_capacity_refusal(reason: &str) -> bool {
+    matches!(
+        reason,
+        "agent workload limit reached"
+            | "agent reservation limit reached"
+            | "insufficient capacity"
+            | "pending reservation limit reached; retry once admissions settle"
+    )
+}
+
+fn service_mesh_renewal_due(placement: &ReplicaPlacement, now: u64) -> bool {
+    placement.service_mesh_expires_at_secs <= now.saturating_add(SERVICE_MESH_RENEWAL_WINDOW_SECS)
+}
 
 /// Response body of the proxy's `GET /api/v1/workload_relay_bootstrap`.
 ///
@@ -195,10 +228,20 @@ async fn grant_proxies(proxy_urls: &str, owner_public: &[u8], owner_private: &[u
         !urls.is_empty() && urls.len() <= MAX_BOOTSTRAP_PROXIES,
         "{PROXY_URL_ENV_VAR} must list between 1 and {MAX_BOOTSTRAP_PROXIES} proxy URLs"
     );
+    let mut failures = Vec::new();
     for url in urls {
-        crate::cert::grant_proxy_async(url, owner_public, owner_private, PROXY_GRANT_TTL_DAYS)
-            .await
-            .with_context(|| format!("grant proxy {url} authority for this namespace"))?;
+        if let Err(error) =
+            crate::cert::grant_proxy_async(url, owner_public, owner_private, PROXY_GRANT_TTL_DAYS)
+                .await
+        {
+            failures.push(format!("{url}: {error:#}"));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(anyhow!(
+            "proxy grant renewal failed while existing unexpired grants remain usable: {}",
+            failures.join("; ")
+        ));
     }
     Ok(())
 }
@@ -267,24 +310,28 @@ async fn select_agent(
     scheduler_url: &str,
     exclude: &[String],
     remaining_replicas: u32,
+    resources: &protocol::ManifestResources,
     trust: &AgentTrust,
 ) -> Result<CapacityOffer> {
-    let mut url = format!(
+    let mut url = reqwest::Url::parse(&format!(
         "{}/api/v1/agents/select",
         scheduler_url.trim_end_matches('/')
-    );
+    ))
+    .context("invalid scheduler URL")?;
     // Ask for as many candidates as there are replicas still to place, so the
     // mesh has room to spread them. The scheduler answers as soon as it has
     // that many rather than waiting out the query lifetime.
-    let mut separator = '?';
-    if !exclude.is_empty() {
-        url.push(separator);
-        url.push_str("exclude=");
-        url.push_str(&exclude.join(","));
-        separator = '&';
+    {
+        let mut query = url.query_pairs_mut();
+        if !exclude.is_empty() {
+            query.append_pair("exclude", &exclude.join(","));
+        }
+        query.append_pair("candidates", &remaining_replicas.max(1).to_string());
+        query.append_pair("cpu_milli", &resources.cpu_milli.to_string());
+        query.append_pair("memory_bytes", &resources.memory_bytes.to_string());
+        query.append_pair("storage_bytes", &resources.storage_bytes.to_string());
+        query.append_pair("capabilities", "multi-workload");
     }
-    url.push(separator);
-    url.push_str(&format!("candidates={}", remaining_replicas.max(1)));
     let offer = http_client()?
         .get(url)
         .send()
@@ -404,6 +451,39 @@ async fn apply_file_internal(
     // the owner identity has to be known before one can be requested.
     let (owner_public, owner_private) = owner_keys(&key_dir)?;
     let namespace_id = crypto::b64_encode(&owner_public);
+    let deployment_id = protocol::deployment_id(&owner_public, &workload_name);
+    let mut existing_catalog = catalog::load_if_exists(&key_dir, &deployment_id)?;
+    if existing_catalog.is_none() {
+        let reconciliation = reconcile_workloads(options).await?;
+        existing_catalog = catalog::load_if_exists(&key_dir, &deployment_id)?;
+        if existing_catalog.is_none()
+            && (!reconciliation.unreachable_agents.is_empty()
+                || !reconciliation.unreachable_schedulers.is_empty())
+        {
+            anyhow::bail!(
+                "cannot safely create deployment while workload reconciliation is partial"
+            );
+        }
+    }
+    if let Some(existing) = &existing_catalog {
+        anyhow::ensure!(
+            existing.replica_count == replica_count,
+            "scaling an existing deployment is not supported in the MVP (recorded {}, requested {})",
+            existing.replica_count,
+            replica_count
+        );
+    }
+    let (manifest, resources) = protocol::validate_and_measure_manifest(&manifest)?;
+    let resources = resources.with_default_sidecar()?;
+    let revision_id = protocol::revision_id(&manifest);
+    if existing_catalog.as_ref().is_some_and(|catalog| {
+        catalog.replicas.len() == replica_count as usize
+            && catalog.replicas.iter().all(|replica| {
+                replica.revision_id == revision_id && !service_mesh_renewal_due(replica, now_secs())
+            })
+    }) {
+        return Ok(deployment_id);
+    }
     let annotations = protocol::PodmeshAnnotations::from_manifest_yaml(
         std::str::from_utf8(&manifest).context("manifest is not UTF-8")?,
     )?;
@@ -449,8 +529,6 @@ async fn apply_file_internal(
         !proxy_endpoints.is_empty(),
         "initial proxy EndpointRecords are required in podmesh.io/proxy-endpoints or PODMESH_PROXY_ENDPOINTS"
     );
-    let (manifest, resources) = protocol::validate_and_measure_manifest(&manifest)?;
-    let resources = resources.with_default_sidecar()?;
     let (response_kem_public, response_kem_private) = response_keys(&key_dir)?;
     // The owner authorizes each proxy explicitly. Without a grant a proxy will
     // not answer this tenant's sidecars, so it is provisioned as part of the
@@ -458,9 +536,62 @@ async fn apply_file_internal(
     if let Some(proxy_urls) = proxy_urls.as_deref() {
         grant_proxies(proxy_urls, &owner_public, &owner_private).await?;
     }
-    let deployment_id = protocol::deployment_id(&owner_public, &workload_name);
-    let revision_id = protocol::revision_id(&manifest);
     let api_base = resolve_api_base(options.api_base());
+
+    let mut catalog = if let Some(mut catalog) = existing_catalog {
+        let mut failures = Vec::new();
+        for placement_index in 0..catalog.replicas.len() {
+            if catalog.replicas[placement_index].revision_id == revision_id
+                && !service_mesh_renewal_due(&catalog.replicas[placement_index], now_secs())
+            {
+                catalog.replicas[placement_index].update_state = ReplicaUpdateState::Active;
+                continue;
+            }
+            catalog.replicas[placement_index].update_state = ReplicaUpdateState::Updating {
+                requested_revision_id: revision_id.clone(),
+            };
+            catalog::save(&key_dir, &catalog)?;
+            let placement = catalog.replicas[placement_index].clone();
+            match update_replica(
+                ReplicaRequest {
+                    api_base: &api_base,
+                    namespace_id: &namespace_id,
+                    workload_name: &workload_name,
+                    manifest: &manifest,
+                    revision_id: &revision_id,
+                    replica_index: placement.replica_index,
+                    replica_count,
+                    proxy_endpoints: &proxy_endpoints,
+                    workload_relay_auth_token: &workload_relay_auth_token,
+                    workload_relay_ca_certificates: &workload_relay_ca_certificates,
+                    resources: &resources,
+                },
+                &placement,
+                (&owner_public, &owner_private),
+                (&response_kem_public, &response_kem_private),
+            )
+            .await
+            {
+                Ok(updated) => {
+                    catalog.replicas[placement_index] = updated;
+                    catalog::save(&key_dir, &catalog)?;
+                }
+                Err(error) => failures.push(format!(
+                    "replica {} on {}: {error:#}",
+                    placement.replica_index, placement.agent_endpoint_id
+                )),
+            }
+        }
+        if !failures.is_empty() {
+            return Err(anyhow!(
+                "deployment update was only partially successful: {}",
+                failures.join("; ")
+            ));
+        }
+        catalog
+    } else {
+        DeploymentCatalog::new(deployment_id.clone(), workload_name.clone(), replica_count)
+    };
 
     // `podctl` places the replicas itself: for every replica it asks a
     // scheduler for one agent, excluding the agents this deployment already
@@ -470,51 +601,96 @@ async fn apply_file_internal(
     // A deployment that fails on its third replica still leaves the first two
     // running, and those replicas are only reachable if their placement was
     // already recorded.
-    let mut catalog = DeploymentCatalog::new(deployment_id.clone(), workload_name.clone());
-    let mut occupied_agents = Vec::with_capacity(replica_count as usize);
+    let mut occupied_agents: Vec<String> = catalog
+        .replicas
+        .iter()
+        .map(|replica| replica.agent_endpoint_id.clone())
+        .collect();
     for replica_index in 0..replica_count {
-        let agent = select_agent(
-            &api_base,
-            &occupied_agents,
-            replica_count.saturating_sub(replica_index),
-            &trust,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "no agent available for replica {} of {replica_count}; \
-                     each replica needs its own agent",
-                replica_index + 1
+        if catalog
+            .replicas
+            .iter()
+            .any(|replica| replica.replica_index == replica_index)
+        {
+            continue;
+        }
+        let mut excluded_agents = occupied_agents.clone();
+        let mut capacity_refusals = Vec::new();
+        let (agent_endpoint_id, placement) = loop {
+            let agent = select_agent(
+                &api_base,
+                &excluded_agents,
+                replica_count.saturating_sub(replica_index),
+                &resources,
+                &trust,
             )
-        })?;
-        let agent_endpoint_id = agent_endpoint_id(&agent)?;
-        anyhow::ensure!(
-            !occupied_agents.contains(&agent_endpoint_id),
-            "scheduler offered agent {agent_endpoint_id} twice; replicas must not share a host"
-        );
-        let placement = deploy_replica(
-            ReplicaRequest {
-                api_base: &api_base,
-                namespace_id: &namespace_id,
-                workload_name: &workload_name,
-                manifest: &manifest,
-                revision_id: &revision_id,
-                replica_index,
-                replica_count,
-                proxy_endpoints: &proxy_endpoints,
-                workload_relay_auth_token: &workload_relay_auth_token,
-                workload_relay_ca_certificates: &workload_relay_ca_certificates,
-                resources: &resources,
-            },
-            &agent,
-            &agent_endpoint_id,
-            (&owner_public, &owner_private),
-            (&response_kem_public, &response_kem_private),
-        )
-        .await
-        .with_context(|| format!("deploying replica {replica_index} to {agent_endpoint_id}"))?;
+            .await
+            .with_context(|| {
+                if capacity_refusals.is_empty() {
+                    format!(
+                        "no agent available for replica {} of {replica_count}; \
+                         each replica needs its own agent",
+                        replica_index + 1
+                    )
+                } else {
+                    format!(
+                        "no replacement agent available for replica {} of {replica_count} after capacity refusals from {}",
+                        replica_index + 1,
+                        capacity_refusals.join(", ")
+                    )
+                }
+            })?;
+            let agent_endpoint_id = agent_endpoint_id(&agent)?;
+            anyhow::ensure!(
+                !excluded_agents.contains(&agent_endpoint_id),
+                "scheduler offered excluded agent {agent_endpoint_id}"
+            );
+            let result = deploy_replica(
+                ReplicaRequest {
+                    api_base: &api_base,
+                    namespace_id: &namespace_id,
+                    workload_name: &workload_name,
+                    manifest: &manifest,
+                    revision_id: &revision_id,
+                    replica_index,
+                    replica_count,
+                    proxy_endpoints: &proxy_endpoints,
+                    workload_relay_auth_token: &workload_relay_auth_token,
+                    workload_relay_ca_certificates: &workload_relay_ca_certificates,
+                    resources: &resources,
+                },
+                &agent,
+                &agent_endpoint_id,
+                (&owner_public, &owner_private),
+                (&response_kem_public, &response_kem_private),
+            )
+            .await;
+            match result {
+                Ok(placement) => break (agent_endpoint_id, placement),
+                Err(error) => {
+                    let Some(refusal) = error.downcast_ref::<AdmissionCapacityRefusal>() else {
+                        return Err(error).with_context(|| {
+                            format!("deploying replica {replica_index} to {agent_endpoint_id}")
+                        });
+                    };
+                    capacity_refusals.push(format!("{agent_endpoint_id} ({})", refusal.reason));
+                    excluded_agents.push(agent_endpoint_id);
+                    if capacity_refusals.len() > MAX_ADMISSION_CAPACITY_RETRIES {
+                        return Err(anyhow!(
+                            "replica {} exhausted {} admission capacity retries: {}",
+                            replica_index + 1,
+                            MAX_ADMISSION_CAPACITY_RETRIES,
+                            capacity_refusals.join(", ")
+                        ));
+                    }
+                }
+            }
+        };
         occupied_agents.push(agent_endpoint_id);
         catalog.replicas.push(placement);
+        catalog
+            .replicas
+            .sort_by_key(|placement| placement.replica_index);
         catalog::save(&key_dir, &catalog)?;
     }
 
@@ -534,6 +710,134 @@ struct ReplicaRequest<'a> {
     workload_relay_auth_token: &'a str,
     workload_relay_ca_certificates: &'a [Vec<u8>],
     resources: &'a protocol::ManifestResources,
+}
+
+async fn update_replica(
+    request: ReplicaRequest<'_>,
+    placement: &ReplicaPlacement,
+    owner_keys: (&[u8], &[u8]),
+    response_kem_keys: (&[u8], &[u8]),
+) -> Result<ReplicaPlacement> {
+    let (owner_public, owner_private) = owner_keys;
+    let (response_kem_public, response_kem_private) = response_kem_keys;
+    let workload_id =
+        protocol::workload_id(owner_public, request.workload_name, request.replica_index);
+    anyhow::ensure!(
+        workload_id == placement.receipt.workload_id,
+        "catalog workload identity does not match requested update"
+    );
+
+    let now = now_secs();
+    let workload_credential = protocol::mint_workload_credential(
+        owner_private,
+        owner_public,
+        &protocol::WorkloadCredentialClaims {
+            tenant_owner: request.namespace_id.to_string(),
+            manifest_id: protocol::route_id(owner_public, request.workload_name),
+            issued_at_secs: now,
+            expires_at_secs: now + WORKLOAD_CREDENTIAL_TTL_SECS,
+            token_id: uuid::Uuid::new_v4().to_string(),
+        },
+        now,
+    )?;
+    let execution = ExecutionSpec {
+        workload_name: request.workload_name.to_string(),
+        replica_index: request.replica_index,
+        replica_count: request.replica_count,
+        manifest: request.manifest.to_vec(),
+        proxy_endpoints: request.proxy_endpoints.to_vec(),
+        workload_credential_b64: protocol::workload_credential_to_b64(&workload_credential),
+        workload_relay_auth_token: request.workload_relay_auth_token.to_string(),
+        workload_relay_ca_certificates: request.workload_relay_ca_certificates.to_vec(),
+    };
+    let execution_bytes = postcard::to_allocvec(&execution)?;
+    let mut dek = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut dek);
+    let (ciphertext, nonce) = crypto::encrypt_payload_with_key(&dek, &execution_bytes)?;
+    let agent_kem = crypto::b64_decode(&placement.agent_kem_pubkey)?;
+    let issued_at_secs = now_secs();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let grant = DeploymentGrant {
+        version: AGENT_PROTOCOL_VERSION,
+        namespace_id: request.namespace_id.to_string(),
+        workload_id: workload_id.clone(),
+        revision_id: request.revision_id.to_string(),
+        target_node_id: placement.agent_signing_pubkey.clone(),
+        response_kem_pubkey: crypto::b64_encode(response_kem_public),
+        reservation_id: request_id.clone(),
+        capsule: EncryptedWorkloadCapsule {
+            ciphertext,
+            nonce: nonce.to_vec(),
+            wrapped_dek: crypto::encrypt_payload_for_recipient(&agent_kem, &dek)?,
+        },
+        issued_at_secs,
+        expires_at_secs: issued_at_secs + REQUEST_TTL_SECS,
+        nonce: uuid::Uuid::new_v4().to_string(),
+        owner_signature: String::new(),
+    }
+    .sign(owner_private)?;
+    let update = UpdateRequest {
+        version: AGENT_PROTOCOL_VERSION,
+        request_id,
+        namespace_id: request.namespace_id.to_string(),
+        workload_id: workload_id.clone(),
+        target_node_id: placement.agent_signing_pubkey.clone(),
+        response_kem_pubkey: crypto::b64_encode(response_kem_public),
+        expected_revision_id: placement.revision_id.clone(),
+        requested_revision_id: request.revision_id.to_string(),
+        refresh_service_mesh: placement.revision_id == request.revision_id,
+        cpu_milli: request.resources.cpu_milli,
+        memory_bytes: request.resources.memory_bytes,
+        storage_bytes: request.resources.storage_bytes,
+        grant,
+        issued_at_secs,
+        expires_at_secs: issued_at_secs + REQUEST_TTL_SECS,
+        nonce: uuid::Uuid::new_v4().to_string(),
+        owner_signature: String::new(),
+    }
+    .sign(owner_private)?;
+    let response_body = post_encrypted(
+        request.api_base,
+        &placement.agent_endpoint_id,
+        "update",
+        encrypt_for(&update, &placement.agent_kem_pubkey)?,
+    )
+    .await?;
+    let response: UpdateResponse = decrypt_from(&response_body, response_kem_private)?;
+    response.verify(now_secs())?;
+    anyhow::ensure!(
+        response.request_id == update.request_id
+            && response.expected_revision_id == update.expected_revision_id
+            && response.requested_revision_id == update.requested_revision_id
+            && response.receipt.namespace_id == request.namespace_id
+            && response.receipt.workload_id == workload_id
+            && response.receipt.agent_node_id == placement.agent_signing_pubkey,
+        "update response binding mismatch"
+    );
+    match response.outcome {
+        UpdateOutcome::Applied | UpdateOutcome::AlreadyActive => {
+            anyhow::ensure!(
+                response.receipt.revision_id == request.revision_id,
+                "update response confirmed an unexpected revision"
+            );
+        }
+        UpdateOutcome::Conflict => {
+            return Err(anyhow!(
+                "revision conflict: agent reports active revision {}",
+                response.receipt.revision_id
+            ));
+        }
+        UpdateOutcome::Rejected => {
+            return Err(anyhow!("agent rejected update: {}", response.reason));
+        }
+    }
+    let mut updated = placement.clone();
+    updated.revision_id = response.receipt.revision_id.clone();
+    updated.receipt = response.receipt;
+    updated.api_base = request.api_base.to_string();
+    updated.service_mesh_expires_at_secs = now + WORKLOAD_CREDENTIAL_TTL_SECS;
+    updated.update_state = ReplicaUpdateState::Active;
+    Ok(updated)
 }
 
 /// Admits and deploys a single replica onto one already-selected agent.
@@ -575,11 +879,15 @@ async fn deploy_replica(
     .await?;
     let reservation: Reservation = decrypt_from(&reservation_body, response_kem_private)?;
     reservation.verify(now_secs())?;
-    anyhow::ensure!(
-        reservation.accepted,
-        "agent rejected workload: {}",
-        reservation.reason
-    );
+    if !reservation.accepted {
+        if is_capacity_refusal(&reservation.reason) {
+            return Err(AdmissionCapacityRefusal {
+                reason: reservation.reason,
+            }
+            .into());
+        }
+        return Err(anyhow!("agent rejected workload: {}", reservation.reason));
+    }
     anyhow::ensure!(
         reservation.agent_node_id == agent.signing_pubkey
             && reservation.request_id == admission.request_id
@@ -658,11 +966,15 @@ async fn deploy_replica(
     );
     Ok(ReplicaPlacement {
         replica_index: request.replica_index,
+        revision_id: receipt.revision_id.clone(),
         receipt,
         api_base: request.api_base.to_string(),
         agent_endpoint_id: agent_endpoint_id.to_string(),
+        agent_endpoint: agent.agent_endpoint.clone(),
         agent_kem_pubkey: agent.kem_pubkey.clone(),
         agent_signing_pubkey: agent.signing_pubkey.clone(),
+        service_mesh_expires_at_secs: now + WORKLOAD_CREDENTIAL_TTL_SECS,
+        update_state: ReplicaUpdateState::Active,
     })
 }
 
@@ -910,6 +1222,8 @@ pub struct DiscoveryReport {
     pub workloads: Vec<DiscoveredWorkload>,
     /// Agents that did not answer, so a caller knows the view is partial.
     pub unreachable_agents: Vec<String>,
+    /// Schedulers that did not complete the mesh-wide query.
+    pub unreachable_schedulers: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -921,7 +1235,8 @@ struct WorkloadListEntry {
 #[derive(serde::Deserialize)]
 struct WorkloadListReply {
     answered: Vec<WorkloadListEntry>,
-    unreachable: Vec<String>,
+    unreachable_agents: Vec<String>,
+    unreachable_schedulers: Vec<String>,
 }
 
 /// Ask the mesh which workloads it is running for this owner.
@@ -931,6 +1246,10 @@ struct WorkloadListReply {
 /// another machine leaves workloads running with nothing to point at them. This
 /// asks the agents instead, and marks anything the catalog does not know about.
 pub async fn discover_workloads(options: &ClientOptions) -> Result<DiscoveryReport> {
+    reconcile_workloads(options).await
+}
+
+async fn reconcile_workloads(options: &ClientOptions) -> Result<DiscoveryReport> {
     let key_dir = key_dir()?;
     let (owner_public, owner_private) = owner_keys(&key_dir)?;
     let (response_kem_public, response_kem_private) = response_keys(&key_dir)?;
@@ -975,6 +1294,8 @@ pub async fn discover_workloads(options: &ClientOptions) -> Result<DiscoveryRepo
         .collect();
 
     let mut workloads = Vec::new();
+    let mut recovered = std::collections::HashMap::<String, catalog::DeploymentCatalog>::new();
+    let mut placements = std::collections::HashSet::<(String, u32)>::new();
     for entry in reply.answered {
         let sealed = crypto::b64_decode(&entry.response_b64)?;
         let response: protocol::WorkloadListResponse =
@@ -1000,7 +1321,68 @@ pub async fn discover_workloads(options: &ClientOptions) -> Result<DiscoveryRepo
             "agent {} answered a different list request",
             entry.agent_endpoint_id
         );
+        anyhow::ensure!(
+            hex::encode(&response.agent_endpoint.endpoint_id) == entry.agent_endpoint_id,
+            "agent answer identity does not match authenticated scheduler attachment"
+        );
         for workload in response.workloads {
+            anyhow::ensure!(
+                workload.receipt.namespace_id == request.namespace_id,
+                "agent returned a receipt for a different namespace"
+            );
+            let expected_workload_id = protocol::workload_id(
+                &owner_public,
+                &workload.workload_name,
+                workload.replica_index,
+            );
+            anyhow::ensure!(
+                workload.workload_id == expected_workload_id,
+                "agent returned a workload with an invalid stable identity"
+            );
+            anyhow::ensure!(
+                placements.insert((workload.workload_id.clone(), workload.replica_index)),
+                "multiple agents claim the same workload replica"
+            );
+            let deployment_id = protocol::deployment_id(&owner_public, &workload.workload_name);
+            let recovered_catalog = if let Some(catalog) = recovered.get_mut(&deployment_id) {
+                catalog
+            } else {
+                let catalog =
+                    catalog::load_if_exists(&key_dir, &deployment_id)?.unwrap_or_else(|| {
+                        catalog::DeploymentCatalog::new(
+                            deployment_id.clone(),
+                            workload.workload_name.clone(),
+                            workload.replica_count,
+                        )
+                    });
+                recovered.entry(deployment_id.clone()).or_insert(catalog)
+            };
+            anyhow::ensure!(
+                recovered_catalog.workload_name == workload.workload_name
+                    && recovered_catalog.replica_count == workload.replica_count,
+                "agents disagree about deployment identity or replica count"
+            );
+            let placement = catalog::ReplicaPlacement {
+                replica_index: workload.replica_index,
+                revision_id: workload.revision_id.clone(),
+                receipt: workload.receipt.clone(),
+                api_base: api_base.clone(),
+                agent_endpoint_id: entry.agent_endpoint_id.clone(),
+                agent_endpoint: response.agent_endpoint.clone(),
+                agent_kem_pubkey: response.agent_kem_pubkey.clone(),
+                agent_signing_pubkey: response.agent_node_id.clone(),
+                service_mesh_expires_at_secs: 0,
+                update_state: catalog::ReplicaUpdateState::Active,
+            };
+            if let Some(existing) = recovered_catalog
+                .replicas
+                .iter_mut()
+                .find(|existing| existing.replica_index == workload.replica_index)
+            {
+                *existing = placement;
+            } else {
+                recovered_catalog.replicas.push(placement);
+            }
             workloads.push(DiscoveredWorkload {
                 agent_endpoint_id: entry.agent_endpoint_id.clone(),
                 agent_node_id: response.agent_node_id.clone(),
@@ -1013,6 +1395,12 @@ pub async fn discover_workloads(options: &ClientOptions) -> Result<DiscoveryRepo
             });
         }
     }
+    for recovered_catalog in recovered.values_mut() {
+        recovered_catalog
+            .replicas
+            .sort_by_key(|placement| placement.replica_index);
+        catalog::save(&key_dir, recovered_catalog)?;
+    }
     workloads.sort_by(|left, right| {
         left.workload_name
             .cmp(&right.workload_name)
@@ -1020,7 +1408,8 @@ pub async fn discover_workloads(options: &ClientOptions) -> Result<DiscoveryRepo
     });
     Ok(DiscoveryReport {
         workloads,
-        unreachable_agents: reply.unreachable,
+        unreachable_agents: reply.unreachable_agents,
+        unreachable_schedulers: reply.unreachable_schedulers,
     })
 }
 
@@ -1046,6 +1435,12 @@ pub async fn list_workloads(options: &ClientOptions, format: OutputFormat) -> Re
                 out.push_str(&format!(
                     "\n{} agent(s) did not answer; this view may be incomplete\n",
                     report.unreachable_agents.len()
+                ));
+            }
+            if !report.unreachable_schedulers.is_empty() {
+                out.push_str(&format!(
+                    "\n{} scheduler(s) did not answer; this view may be incomplete\n",
+                    report.unreachable_schedulers.len()
                 ));
             }
             Ok(out)

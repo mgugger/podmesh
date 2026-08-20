@@ -54,6 +54,18 @@ impl GossipPublisher {
             .context("broadcast agent location query")
     }
 
+    pub async fn publish_reconciliation(
+        &self,
+        query: protocol::SchedulerReconciliationQuery,
+    ) -> Result<()> {
+        query.verify(crate::now_secs())?;
+        let bytes = protocol::SchedulerGossipMessage::Reconcile(Box::new(query)).to_bytes()?;
+        self.sender
+            .broadcast(bytes.into())
+            .await
+            .context("broadcast reconciliation query")
+    }
+
     /// Announce this scheduler so peers beyond the configured bootstrap URLs
     /// learn how to reach it.
     pub async fn publish_announcement(&self, record: protocol::EndpointRecord) -> Result<()> {

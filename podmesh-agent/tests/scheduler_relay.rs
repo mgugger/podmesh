@@ -50,6 +50,7 @@ impl ControlTransport for SchedulerHttpTransport {
         let path = match operation {
             AgentControlOperation::Admission => "admission",
             AgentControlOperation::Deploy => "deploy",
+            AgentControlOperation::Update => "update",
             AgentControlOperation::Command => "command",
             // Listing is broadcast to every agent rather than addressed to one,
             // so it has no per-agent relay route.
@@ -174,6 +175,10 @@ async fn podctl_http_reaches_the_agent_through_the_scheduler() -> Result<()> {
         capacity_memory_bytes: 2 * 1024 * 1024 * 1024,
         capacity_storage_bytes: 10 * 1024 * 1024 * 1024,
         max_workloads: 8,
+        max_concurrent_runtime_operations:
+            podmesh_agent::config::DEFAULT_MAX_CONCURRENT_RUNTIME_OPERATIONS,
+        runtime_operation_timeout_secs:
+            podmesh_agent::config::DEFAULT_RUNTIME_OPERATION_TIMEOUT_SECS,
         machine: MachineConfig {
             bind_addr: "127.0.0.1:0".parse()?,
             scheduler_endpoints: vec![crypto::b64_encode(&scheduler_record.to_bytes(now_secs())?)],
@@ -205,6 +210,11 @@ async fn podctl_http_reaches_the_agent_through_the_scheduler() -> Result<()> {
     let client = reqwest::Client::builder().timeout(TEST_TIMEOUT).build()?;
     let offer = client
         .get(format!("{api_base}/api/v1/agents/select"))
+        .query(&[
+            ("cpu_milli", "1"),
+            ("memory_bytes", "1"),
+            ("storage_bytes", "1"),
+        ])
         .send()
         .await?
         .error_for_status()?

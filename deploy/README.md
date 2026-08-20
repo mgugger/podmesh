@@ -106,7 +106,7 @@ across the mesh, waits out the offer window, and returns one signed `CapacityOff
 for p in 3000 3001 3002; do
   printf "select@%s " $p
   curl -s --max-time 20 -o /dev/null -w "http=%{http_code} time=%{time_total}\n" \
-    http://127.0.0.1:$p/api/v1/agents/select
+    "http://127.0.0.1:$p/api/v1/agents/select?cpu_milli=100&memory_bytes=134217728&storage_bytes=1073741824&capabilities=multi-workload"
 done
 ```
 
@@ -259,6 +259,10 @@ Behind that single line, `podctl` mints a short-lived owner-signed Biscuit grant
 against each agent — all as encrypted, owner-signed payloads that the scheduler relays but cannot
 read.
 
+Re-applying the unchanged file is idempotent. Changing the image or configuration updates replicas
+sequentially on their existing agents and records each successful revision immediately. Changing
+`spec.replicas` for an existing deployment is refused; scaling is outside the MVP.
+
 The agent injects a sidecar and hands the pod to Podman:
 
 ```bash
@@ -333,9 +337,8 @@ QUIC, and from the sidecar to nginx on localhost inside the pod.
 Replica placement is a client decision; the scheduler never learns the replica count. Set
 `spec.replicas` to 3 (or use the `podmesh.io/replicas` annotation):
 
-Delete the single-replica deployment first: it shares the same workload name, so re-applying without
-deleting would place new replicas and leave the old one running under a catalog entry that has been
-overwritten.
+Delete the single-replica deployment first, or use a different workload name. Re-applying the same
+deployment with a different replica count is rejected rather than silently changing placement.
 
 ```bash
 ./target/debug/podctl delete -f deploy/demo_deployment.yml
@@ -360,6 +363,11 @@ agents rather than the local catalog:
 ```bash
 ./target/debug/podctl list
 ```
+
+The scheduler you contact does not need to hold any agent attachments. It gossips the reconciliation
+request across the scheduler mesh, and `podctl` rebuilds verified catalog placements from the
+owner-sealed agent answers. If any scheduler or agent is unreachable, the output says the view is
+partial and `podctl apply` refuses to create a supposedly new deployment from that incomplete view.
 
 ```
 NAME        REPLICA  STATE     AGENT             ORPHANED
@@ -508,9 +516,10 @@ in step 2, and then repeats the tutorial:
 
 * `complete_rootless_stack` waits for the scheduler API, waits for `GET /api/v1/agents/select` to
   return an offer, applies the sample manifest with `PODMESH_PROXY_URL` pointed at the three proxy
-  REST APIs, waits for the workload and injected sidecar containers, fetches
-  `http://127.0.0.1:8080/` with `Host: demo-nginx.mesh.local`, then deletes the workload and waits
-  for the containers to disappear.
+  REST APIs, verifies status, logs, ingress, fixed-placement update, catalog reconstruction through
+  the scheduler with no attached agents, and deletion. It then deploys three replicas on distinct
+  agents, updates them sequentially while continuously probing shared ingress, and verifies complete
+  deletion.
 * `podman_transparent_egress_test` deploys a workload with egress enabled and asserts that outbound
   traffic is intercepted by the sidecar and tunnelled through a proxy.
 

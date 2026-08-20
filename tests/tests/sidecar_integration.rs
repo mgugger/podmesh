@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 use axum::{Router, routing::get};
 use axum_support::spawn_tcp_listener;
 use podmesh_proxy::{Config, Workload};
@@ -645,6 +645,31 @@ fn build_sidecar_config_full(
     Ok((cfg, ingress_host, service_host))
 }
 
+fn workload_credential_with_lifetime(
+    owner_sk: &[u8],
+    owner_b64: &str,
+    lifetime_secs: u64,
+    token_id: &str,
+) -> Result<String> {
+    let owner_pk = crypto::b64_decode(owner_b64)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let encoded = protocol::mint_workload_credential(
+        owner_sk,
+        &owner_pk,
+        &protocol::WorkloadCredentialClaims {
+            tenant_owner: owner_b64.to_string(),
+            manifest_id: protocol::route_id(&owner_pk, DEMO_WORKLOAD_NAME),
+            issued_at_secs: now,
+            expires_at_secs: now + lifetime_secs,
+            token_id: token_id.to_string(),
+        },
+        now,
+    )?;
+    Ok(protocol::workload_credential_to_b64(&encoded))
+}
+
 fn demo_routes(owner_b64: &str, app_port: u16) -> Result<(Vec<SidecarRouteSpec>, String, String)> {
     let extraction = extract_sidecar_routes(DEMO_MANIFEST, &demo_manifest_id(owner_b64))?;
     let mut routes = extraction.routes;
@@ -809,6 +834,131 @@ async fn sidecar_registers_with_tenant_signed_proxy_cert() -> Result<()> {
     }
     .await;
 
+    handle.workload.close().await;
+    test_result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn renewed_workload_credential_reconnects_after_expired_authority_is_refused() -> Result<()> {
+    init_tracing();
+    let (owner_b64, owner_sk, owner_pk) = fresh_tenant_owner();
+    let mut handle = start_workload(Vec::new(), false).await?;
+    let test_result: Result<()> = async {
+        wait_for_network_ready(handle.network_ready_rx(), Duration::from_secs(10)).await?;
+        provision_proxy_cert(
+            handle.rest_port,
+            &owner_pk,
+            &owner_sk,
+            Duration::from_secs(10),
+        )
+        .await?;
+
+        let app_port = allocate_tcp_port();
+        let (mut initial, ingress_host, _) = build_sidecar_config(
+            &owner_b64,
+            &owner_sk,
+            vec![handle.endpoint_record.clone()],
+            app_port,
+        )?;
+        initial.lookup_interval = Duration::from_secs(1);
+        initial.workload_credential_b64 = Some(workload_credential_with_lifetime(
+            &owner_sk,
+            &owner_b64,
+            4,
+            "initial-short-lived",
+        )?);
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let initial_task =
+            tokio::spawn(
+                async move { run_sidecar_with_shutdown(initial, shutdown_rx, None).await },
+            );
+        let routes = handle
+            .workload
+            .routes()
+            .ok_or_else(|| anyhow!("proxy routing table unavailable"))?;
+        let manifest_id = demo_manifest_id(&owner_b64);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let initial_peer = loop {
+            if let Some(target) = routes
+                .select(&manifest_id, "/", Some(&ingress_host))
+                .first()
+            {
+                break target.sidecar_peer_id.clone();
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "initial short-lived credential did not register"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let _ = shutdown.send(());
+        initial_task.await??;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        let (mut expired, _, _) = build_sidecar_config(
+            &owner_b64,
+            &owner_sk,
+            vec![handle.endpoint_record.clone()],
+            app_port,
+        )?;
+        expired.lookup_interval = Duration::from_secs(1);
+        expired.workload_credential_b64 = Some(workload_credential_with_lifetime(
+            &owner_sk,
+            &owner_b64,
+            0,
+            "already-expired",
+        )?);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let expired_task =
+            tokio::spawn(
+                async move { run_sidecar_with_shutdown(expired, shutdown_rx, None).await },
+            );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(
+            routes.select(&manifest_id, "/", Some(&ingress_host))[0].sidecar_peer_id,
+            initial_peer,
+            "expired authority unexpectedly replaced the registered backend"
+        );
+        let _ = shutdown.send(());
+        expired_task.await??;
+
+        let (mut renewed, _, _) = build_sidecar_config(
+            &owner_b64,
+            &owner_sk,
+            vec![handle.endpoint_record.clone()],
+            app_port,
+        )?;
+        renewed.lookup_interval = Duration::from_secs(1);
+        renewed.workload_credential_b64 = Some(workload_credential_with_lifetime(
+            &owner_sk, &owner_b64, 60, "renewed",
+        )?);
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let renewed_task =
+            tokio::spawn(
+                async move { run_sidecar_with_shutdown(renewed, shutdown_rx, None).await },
+            );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if routes
+                .select(&manifest_id, "/", Some(&ingress_host))
+                .first()
+                .is_some_and(|target| target.sidecar_peer_id != initial_peer)
+            {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "renewed credential did not reconnect and replace the backend"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let _ = shutdown.send(());
+        renewed_task.await??;
+        Ok(())
+    }
+    .await;
     handle.workload.close().await;
     test_result
 }

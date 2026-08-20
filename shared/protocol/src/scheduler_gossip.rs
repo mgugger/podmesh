@@ -38,6 +38,8 @@ pub enum SchedulerGossipMessage {
     Announcement(Box<EndpointRecord>),
     /// Ask which scheduler holds an agent's attachment.
     Locate(Box<AgentLocationQuery>),
+    /// Ask every scheduler to query only its locally attached agents.
+    Reconcile(Box<crate::SchedulerReconciliationQuery>),
 }
 
 impl SchedulerGossipMessage {

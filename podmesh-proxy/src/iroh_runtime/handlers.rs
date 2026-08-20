@@ -11,7 +11,7 @@ use protocol::{
     write_workload_frame,
 };
 
-use super::tenant_gate::prove_tenant;
+use super::tenant_gate::{live_tenant, prove_tenant};
 use super::{RuntimeState, now_millis, now_secs};
 
 /// Largest number of distinct routing keys the proxy will hold.
@@ -89,7 +89,7 @@ pub async fn handle_stream(
             // The request names an owner, but only what this connection proved
             // decides whose proxies it may enumerate.
             let _request = ProxyDiscoveryRequest::from_bytes(&payload)?;
-            let proven = state.tenants.proven(&remote);
+            let proven = live_tenant(&state, remote).ok();
             let endpoints = if proven.as_ref().is_some_and(|tenant| {
                 state.grant_store.holds_live_grant(
                     &tenant.owner_pubkey,
@@ -157,10 +157,7 @@ pub(super) fn install_registration(
     // derived from public inputs, so neither can carry the decision. The
     // credential presented at handshake is what proves the tenant, and the
     // registration has to match it exactly.
-    let proven = state
-        .tenants
-        .proven(&transport_endpoint)
-        .context("registration on a connection that proved no tenant")?;
+    let proven = live_tenant(state, transport_endpoint)?;
     ensure!(
         proven.owner_pubkey == registration.owner_pubkey,
         "registration names a different owner than this connection proved"

@@ -74,6 +74,7 @@ fn validate_received_query(
 pub(super) enum ReceivedGossip {
     Capacity(Box<CapacityQuery>),
     Locate(Box<protocol::AgentLocationQuery>),
+    Reconcile(Box<protocol::SchedulerReconciliationQuery>),
     Announcement(Box<protocol::EndpointRecord>),
 }
 
@@ -103,6 +104,18 @@ pub(super) fn classify(
         protocol::SchedulerGossipMessage::Announcement(record) => {
             record.verify(crate::now_secs())?;
             Ok(Some(ReceivedGossip::Announcement(record)))
+        }
+        protocol::SchedulerGossipMessage::Reconcile(query) => {
+            query.verify(crate::now_secs())?;
+            let asker = decode_endpoint(&query.reply_endpoint.endpoint_id)?;
+            ensure!(
+                members.contains(&asker),
+                "reconciliation query came from an unauthorized scheduler"
+            );
+            if !seen.insert((asker.as_bytes().to_vec(), query.query_id.clone())) {
+                return Ok(None);
+            }
+            Ok(Some(ReceivedGossip::Reconcile(query)))
         }
     }
 }

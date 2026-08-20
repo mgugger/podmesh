@@ -12,6 +12,18 @@ host or another tenant.
 See [Trust Model](#trust-model) for what this does and does not protect, including the parts that are
 explicitly out of scope for the first release.
 
+## Glossary
+
+- **Owner / namespace / tenant:** the Ed25519 identity that signs a deployment. These terms refer to
+  the same security principal.
+- **Deployment:** one owner-scoped workload name and its fixed replica count.
+- **Workload:** one independently admitted replica on one agent.
+- **Revision:** the content hash of the canonical application manifest.
+- **Replica:** one workload identity, indexed within a deployment and pinned to one agent.
+- **Scheduler attachment:** an agent's authenticated, ephemeral Iroh connection to a scheduler.
+- **Reconciliation:** rebuilding client knowledge by asking authoritative agents; schedulers do not
+  become workload databases.
+
 ## Architecture
 
 ```text
@@ -19,7 +31,7 @@ podmesh-agent ==persistent Iroh attachment===> podmesh-scheduler
 podmesh-scheduler <==signed Iroh gossip======> podmesh-scheduler
 podctl --HTTP: select an agent---------------> podmesh-scheduler
 podctl ==HTTP: encrypted admission/grant=====> podmesh-scheduler ==Iroh==> agent
-podctl ==HTTP: encrypted status/log/delete===> podmesh-scheduler ==Iroh==> agent
+podctl ==HTTP: encrypted update/status/log/delete==> scheduler ==Iroh==> agent
 podmesh-agent --Podman + sidecar-------------> workload
 ```
 
@@ -54,15 +66,39 @@ A selection answers as soon as it has collected the number of offers the client 
 between, so placement latency tracks how fast agents answer rather than the query lifetime — which
 matters because replicas are placed one at a time.
 
+## Apply And Update
+
+Applying the same owner and workload name addresses the existing deployment. An unchanged revision
+is idempotent. A changed revision is replaced sequentially on the replicas' existing agents using an
+owner-signed expected-revision compare-and-swap; updates do not move replicas. The catalog is saved
+after each confirmed replica, so a partial failure leaves successful replicas at the new revision
+and failed replicas at their last confirmed revision for a later retry.
+
+Changing the replica count of an existing deployment is refused in the MVP. Scaling, surge
+placements, self-healing, and relocation are outside the release contract.
+
+Proxy records, proxy grants, relay credentials, workload credentials, and the injected sidecar are
+mandatory in production. Re-applying within the renewal window refreshes expiring service-mesh
+authority without changing the workload identity, placement, routing key, or application revision.
+
+## Supported Manifest Subset
+
+An MVP manifest contains exactly one `Pod` or `Deployment`, normalized to one runtime pod, plus
+optional `Service` and `Ingress` documents. Secrets, persistent storage objects, additional
+pod-bearing controllers, unknown kinds, and ephemeral containers are rejected before execution.
+The agent injects the sidecar; tenant manifests cannot disable it.
+
 ## Finding Workloads
 
-`podctl` keeps the only index of where it placed replicas, under `~/.podmesh/workloads/`. Because a
+`podctl` keeps its index of where it placed replicas under `~/.podmesh/workloads/`. Because a
 lost or overwritten index would otherwise leave workloads running that nothing can address,
-`podctl list` asks the mesh instead: the scheduler relays an owner-signed request to every agent
-**attached to it**, and anything the local catalog does not know about is flagged as orphaned. Agents
-that did not answer are named, so a partial view is not mistaken for a complete one. The request is
-not gossiped mesh-wide, so in a mesh of many schedulers a single call sees only that scheduler's
-share of the fleet — ask each scheduler and union the answers.
+`podctl list` asks any scheduler to reconcile through the mesh. The scheduler gossips a bounded,
+signed request to admitted peers; each peer queries only its locally attached agents and returns
+the agents' owner-sealed answers directly to the requesting scheduler. `podctl` verifies current
+receipts and agent identity material and atomically repairs missing or stale catalog placements.
+Schedulers retain only bounded, expiring coordination state and never learn workload identities.
+Unreachable schedulers and agents are reported explicitly. A missing catalog is never treated as a
+new deployment while that view is partial, preventing duplicate stable workload IDs.
 
 ## Bootstrap Without Shared Secrets
 
@@ -174,32 +210,19 @@ These are deliberate scope choices, not oversights:
   requires TLS or another end-to-end protocol terminating in the workload.
 - **One installation, one tenant.** `podctl` holds a single namespace identity; multi-tenant
   deployments are supported, a multi-tenant CLI is not.
-- **No credential rotation or revocation.** Relay tokens are derived per tenant from a mesh secret,
-  so a leaked pod exposes only its own tenant's relay access and `--relay-tenants` can cut one
-  tenant off; rotating the mesh secret still re-issues for everyone. Beyond that,
-  a proxy grant is valid until it expires.
+- **No immediate credential revocation.** Re-applying renews expiring proxy grants and workload
+  credentials, but already issued authority remains valid until expiry. Relay tokens are derived per
+  tenant from a mesh secret; rotating that secret still re-issues for everyone.
 - **Biscuit attenuation is not implemented.** Grants are used as-is.
 - **The agent drives a Podman socket equivalent to host control.** The pod security policy is what
   stands between a tenant manifest and the host.
 
 ## Build And Run
 
-```bash
-cargo build --workspace
-
-./target/debug/podmesh-scheduler --listen 127.0.0.1:3000
-./target/debug/podmesh-agent \
-  --listen 127.0.0.1:3100 \
-  --max-workloads 100 \
-  --runtime mock
-
-./target/debug/podctl --api-url http://127.0.0.1:3000 apply -f deploy/demo_deployment.yml
-```
-
-`podctl` will not deploy to an agent the owner has not agreed to trust. List the agents' base64
-Ed25519 signing keys in `~/.podmesh/trusted_agents` (or `PODMESH_TRUSTED_AGENTS`), or pass
-`--trust-any-agent` to accept whichever agent the mesh offers. `podctl whoami` prints your own
-namespace identity.
+Build with `cargo build --workspace`, then follow the tested
+[local mesh walkthrough](deploy/README.md). A useful deployment requires schedulers, agents,
+proxies, relay credentials, and the sidecar image; starting only a scheduler and mock agent is not a
+workload-plane quick start.
 
 Use `--runtime podman` for real execution. The agent expects a working `podman` command and uses
 `CONTAINER_HOST` to target a mounted Podman socket.

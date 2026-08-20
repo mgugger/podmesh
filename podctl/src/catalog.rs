@@ -11,39 +11,89 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 
-use protocol::DeploymentReceipt;
+use protocol::{DeploymentReceipt, EndpointRecord};
+
+pub const DEPLOYMENT_CATALOG_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicaUpdateState {
+    Active,
+    Updating { requested_revision_id: String },
+}
 
 /// One replica of a deployment, pinned to the agent `podctl` selected for it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicaPlacement {
     pub replica_index: u32,
+    pub revision_id: String,
     pub receipt: DeploymentReceipt,
     /// Scheduler HTTP endpoint that relayed this replica. Lifecycle commands
     /// go back through a scheduler, never straight to the agent.
     pub api_base: String,
     pub agent_endpoint_id: String,
+    pub agent_endpoint: EndpointRecord,
     pub agent_kem_pubkey: String,
     /// Base64 Ed25519 signing key of the agent. Pinned here so a later
     /// lifecycle command is addressed to the same agent that accepted the
     /// deployment, whatever a scheduler answers next time.
     pub agent_signing_pubkey: String,
+    pub service_mesh_expires_at_secs: u64,
+    pub update_state: ReplicaUpdateState,
 }
 
 /// Everything `podctl` needs to reach every replica of one deployment again.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentCatalog {
+    pub version: u16,
     pub deployment_id: String,
     pub workload_name: String,
+    pub replica_count: u32,
     pub replicas: Vec<ReplicaPlacement>,
 }
 
 impl DeploymentCatalog {
-    pub fn new(deployment_id: String, workload_name: String) -> Self {
+    pub fn new(deployment_id: String, workload_name: String, replica_count: u32) -> Self {
         Self {
+            version: DEPLOYMENT_CATALOG_VERSION,
             deployment_id,
             workload_name,
+            replica_count,
             replicas: Vec::new(),
         }
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.version == DEPLOYMENT_CATALOG_VERSION,
+            "unsupported deployment catalog version"
+        );
+        ensure!(
+            self.replica_count >= 1 && self.replica_count <= protocol::MAX_WORKLOAD_REPLICAS,
+            "deployment catalog replica count is invalid"
+        );
+        ensure!(
+            self.replicas.len() <= self.replica_count as usize,
+            "deployment catalog contains too many replicas"
+        );
+        for replica in &self.replicas {
+            ensure!(
+                replica.replica_index < self.replica_count,
+                "deployment catalog replica index is invalid"
+            );
+            ensure!(
+                replica.revision_id == replica.receipt.revision_id,
+                "deployment catalog revision does not match receipt"
+            );
+            replica.receipt.verify()?;
+            replica.agent_endpoint.verify_structure()?;
+            ensure!(
+                hex::encode(&replica.agent_endpoint.endpoint_id) == replica.agent_endpoint_id
+                    && replica.agent_endpoint.signing_pubkey == replica.agent_signing_pubkey,
+                "deployment catalog agent identity binding is invalid"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -71,6 +121,7 @@ fn catalog_path(key_dir: &Path, deployment_id: &str) -> Result<PathBuf> {
 /// Write the catalog atomically, so a crash mid-write cannot destroy the only
 /// record of a running deployment.
 pub fn save(key_dir: &Path, catalog: &DeploymentCatalog) -> Result<()> {
+    catalog.validate()?;
     let path = catalog_path(key_dir, &catalog.deployment_id)?;
     let temporary = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(catalog)?;
@@ -104,10 +155,10 @@ pub fn remove(key_dir: &Path, deployment_id: &str) -> Result<()> {
 /// here and must be addressed by its deployment id.
 pub fn load(key_dir: &Path, identifier: &str) -> Result<DeploymentCatalog> {
     if let Ok(path) = catalog_path(key_dir, identifier) {
-        return serde_json::from_slice(
-            &std::fs::read(path).context("deployment catalog not found")?,
-        )
-        .map_err(Into::into);
+        let catalog: DeploymentCatalog =
+            serde_json::from_slice(&std::fs::read(path).context("deployment catalog not found")?)?;
+        catalog.validate()?;
+        return Ok(catalog);
     }
     let mut matched: Option<DeploymentCatalog> = None;
     for catalog in load_all(key_dir)? {
@@ -123,6 +174,16 @@ pub fn load(key_dir: &Path, identifier: &str) -> Result<DeploymentCatalog> {
     matched.ok_or_else(|| anyhow!("no deployment named {identifier}"))
 }
 
+pub fn load_if_exists(key_dir: &Path, deployment_id: &str) -> Result<Option<DeploymentCatalog>> {
+    let path = catalog_path(key_dir, deployment_id)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let catalog: DeploymentCatalog = serde_json::from_slice(&std::fs::read(path)?)?;
+    catalog.validate()?;
+    Ok(Some(catalog))
+}
+
 pub fn load_all(key_dir: &Path) -> Result<Vec<DeploymentCatalog>> {
     let mut catalogs = Vec::new();
     for entry in std::fs::read_dir(catalog_dir(key_dir)?)? {
@@ -131,7 +192,11 @@ pub fn load_all(key_dir: &Path) -> Result<Vec<DeploymentCatalog>> {
             continue;
         }
         match serde_json::from_slice::<DeploymentCatalog>(&std::fs::read(entry.path())?) {
-            Ok(catalog) => catalogs.push(catalog),
+            Ok(catalog) if catalog.validate().is_ok() => catalogs.push(catalog),
+            Ok(_) => log::warn!(
+                "skipping invalid deployment catalog {}",
+                entry.path().display()
+            ),
             Err(error) => log::warn!(
                 "skipping unreadable deployment catalog {}: {error}",
                 entry.path().display()
@@ -147,7 +212,7 @@ mod tests {
     use super::*;
 
     fn catalog() -> DeploymentCatalog {
-        DeploymentCatalog::new("a".repeat(64), "demo".into())
+        DeploymentCatalog::new("a".repeat(64), "demo".into(), 1)
     }
 
     #[test]
