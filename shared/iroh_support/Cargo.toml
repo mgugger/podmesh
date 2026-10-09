@@ -3,6 +3,7 @@ name = "iroh-support"
 version = "0.1.0"
 edition = "2024"
 description = "Shared Iroh transport support for Podmesh"
+license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
@@ -15,6 +16,10 @@ rand = { workspace = true }
 rcgen = { workspace = true }
 rustls-pki-types = { workspace = true }
 uuid = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "sync", "time"] }
+tokio-util = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

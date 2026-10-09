@@ -7,7 +7,91 @@ the sidecar is the in-pod companion that registers routes and forwards traffic t
 container. They authenticate each other with owner-signed Biscuit grants over the
 `/podmesh/workload/1` Iroh protocol.
 
+Iroh encrypts the sidecar-to-proxy transport hop. The terminating proxy can read application bytes
+unless an additional end-to-end protocol protects them. External ingress is plain HTTP; TLS
+terminated in front of a proxy does not hide traffic from that proxy. Owner-to-agent encryption of
+execution specifications is a separate control-plane guarantee. Workload credentials are bearer
+tokens: presenting one proves possession of owner-issued authority, not the owner's private key.
+
 ## Requirements
+
+### Requirement: Proxy and sidecar metrics SHALL be bounded and independent from traffic authority
+
+The proxy and sidecar SHALL each accept optional `--metrics-listen` /
+`PODMESH_METRICS_LISTEN` configuration and expose a dedicated unauthenticated OpenMetrics listener
+only when configured. The proxy listener SHALL be distinct from REST, ingress, Iroh, workload relay,
+and workload relay metrics listeners. The sidecar listener SHALL be distinct from its application,
+Iroh, transparent egress, and HTTP CONNECT listeners.
+
+Proxy metrics SHALL aggregate grant, announcement, handshake, registration, discovery, ingress,
+egress, route update, and scrape outcomes, together with proxy-peer, tenant-session, route/backend,
+and active traffic state. Sidecar metrics SHALL aggregate proxy connection, handshake, registration,
+discovery, ingress, egress, WebSocket relay, and scrape outcomes, together with proxy-session and
+active traffic state.
+
+Every label SHALL come from the closed component, operation, group, outcome, reason, event, and
+gauge catalogs. Metrics SHALL NOT contain owner or workload identities, endpoint ids, hosts, URLs,
+destinations, methods, paths, credentials, grants, tokens, payloads, caller addresses, or raw errors.
+
+#### Scenario: Authorization refusal remains aggregate
+
+- **WHEN** a handshake, registration, discovery, ingress, or egress operation lacks authority
+- **THEN** the metrics identify only a finite refusal outcome and reason
+- **AND** they do not reveal which tenant, workload, route, endpoint, or destination was refused
+
+#### Scenario: Traffic is independent from scrape success
+
+- **WHEN** a metrics update, snapshot, render, or response write fails
+- **THEN** proxy and sidecar authorization and traffic results remain unchanged
+
+#### Scenario: Active gauges follow task lifetime
+
+- **WHEN** an ingress, egress, or WebSocket relay starts and ends
+- **THEN** its owning process sets an absolute active gauge from current task state
+- **AND** cancellation or failure releases the gauge without requiring a successful metric response
+
+### Requirement: Every application metrics listener SHALL share one bounded HTTP contract
+
+Application metrics listeners SHALL permit at most 32 active connections and 8 executing requests,
+accept no request body inside an 8 KiB HTTP/1 request bound, disable keep-alive, and apply a
+five-second connection deadline. A complete rendered response SHALL be no larger than 1 MiB.
+
+`GET /metrics` SHALL return OpenMetrics text 1.0 with content type
+`application/openmetrics-text; version=1.0.0; charset=utf-8` and final `# EOF`. `GET /health` SHALL
+return exactly `ok\n` and SHALL describe only metrics-listener readiness. Other paths and methods
+SHALL receive fixed bounded errors.
+
+#### Scenario: Oversized or partial metrics output is never successful
+
+- **WHEN** rendering exceeds the byte or time bound
+- **THEN** the request fails without returning a truncated successful OpenMetrics document
+
+### Requirement: Workload control and raw traffic SHALL have distinct phases
+
+Every handshake, registration, discovery, ingress, egress setup, and proxy announcement request and
+response SHALL use its operation-and-direction-specific signed envelope. Raw HTTP, WebSocket, or TCP
+bytes SHALL begin only after the matching envelope is accepted and tenant authority succeeds.
+
+HTTP request and response bodies SHALL stream in chunks no larger than 64 KiB with a 16 MiB
+cumulative bound. A WebSocket upgrade SHALL enter opaque duplex mode only after the application
+upgrade succeeds and the proxy accepts a signed status 101 response. WebSocket transfer is bounded
+to 512 MiB per direction, five minutes idle, and one hour total lifetime. Podmesh does not parse or
+rewrite WebSocket frames.
+
+Long-lived raw streams SHALL recheck locally observable authority every 30 seconds. A proxy observes
+credential expiry and its local grant store; a sidecar observes cached grant expiry. Owner
+revocation is not pushed to an existing sidecar session and becomes visible there only through
+expiry or reconnection.
+
+#### Scenario: Raw bytes before setup are refused
+
+- **WHEN** a peer sends application bytes before accepted and authorized control setup
+- **THEN** the stream is terminated without treating those bytes as traffic
+
+#### Scenario: WebSocket upgrade crosses the direct traffic plane
+
+- **WHEN** the local application accepts an HTTP upgrade with status 101
+- **THEN** proxy and sidecar relay opaque duplex bytes directly without scheduler or agent traffic
 
 ### Requirement: The proxy SHALL prove the tenant authorised it
 
@@ -81,6 +165,12 @@ address.
 
 The proxy SHALL store at most `MAX_TENANT_GRANTS` tenant grants, SHALL re-verify a grant before
 each use, and SHALL evict expired grants. Grant storage SHALL NOT grow without bound.
+
+Grant storage MAY remain in memory for this PoC. Restart loses grants and requires the owner to
+repost them with `podctl cert grant-proxy` before affected traffic can resume. An unchanged
+`podctl apply` may return before reposting grants; automatic recovery of proxy authorization is
+not guaranteed. Self-created owner identities can consume grant slots despite per-peer rate limits;
+validating an owner's signature is not an operator admission policy.
 
 #### Scenario: Store at capacity
 
@@ -336,6 +426,12 @@ publishing it SHALL be opt-in and at most one proxy in a deployment SHALL publis
 Tenants SHALL use `GET /api/v1/workload_relay_bootstrap`, which returns only the derived token for
 the tenant named in the request and SHALL NOT disclose the mesh secret.
 
+A tenant client SHALL treat the proxy's self-signed `EndpointRecord` as an observation rather than
+identity authority. Before accepting this endpoint record, a derived relay token, or a relay CA, the
+client SHALL match the configured canonical proxy origin, endpoint id, and signing key against an
+explicit owner-local binding. A later identity mismatch SHALL require an explicit owner replacement
+decision and SHALL never be accepted by ordinary workload apply.
+
 #### Scenario: Second proxy adopts the first proxy's mesh secret
 
 - **GIVEN** one proxy started with relay bootstrap publishing enabled
@@ -356,3 +452,61 @@ the tenant named in the request and SHALL NOT disclose the mesh secret.
 
 - **WHEN** the peer proxy was not started with relay bootstrap publishing enabled
 - **THEN** startup fails with an error naming the required flag
+
+### Requirement: Traffic tests SHALL cover authorization and forwarding
+
+Traffic changes SHALL retain affected tests for tenant/grant authorization, registration, bounded
+ingress/egress, stream cancellation and direct/relay recovery. Metric cardinality and secret-safe
+output checks SHALL remain ordinary tests. Real Podman ingress and transparent-egress tests SHALL
+remain available when explicitly enabled, without a timed sustained-traffic requirement or SLO.
+
+#### Scenario: A traffic check did not execute
+
+- **WHEN** Podman or a separate-host environment is unavailable
+- **THEN** the result states that real execution was not verified rather than claiming success
+
+### Requirement: Explicit HTTP proxy admission SHALL bound pre-tunnel work
+
+When enabled, the local HTTP proxy SHALL enforce a 16 KiB combined request-line/header bound,
+at most 64 headers, a five-second whole-head deadline from socket acceptance and at most 64
+concurrent pre-tunnel handlers. Reads SHALL enforce bounds before unbounded allocation; per-line
+progress SHALL NOT reset the overall deadline. These bounds do not imply public-network isolation.
+
+Excess connections SHALL be closed before spawning work. Admitted handlers SHALL retain admission
+until bounded tunnel handoff or failure; queue handoff and best-effort error writes SHALL each take
+at most one second. Listener shutdown SHALL terminate outstanding pre-tunnel handlers, reclaim
+permits and stop accepting work. Existing raw traffic/session bounds SHALL remain independently enforced.
+
+#### Scenario: A request exceeds the head or header-count bound
+
+- **WHEN** a client sends an excessive request line or header set
+- **THEN** it is refused without unbounded buffering or enqueueing a tunnel
+- **AND** any best-effort 431 response is time-bounded
+
+#### Scenario: A client dribbles bytes or ends an incomplete head
+
+- **WHEN** input cannot form a complete valid head within the total deadline, or EOF arrives early
+- **THEN** the handler closes or returns a bounded error without creating a tunnel
+
+#### Scenario: The listener or tunnel queue is saturated
+
+- **WHEN** all pre-tunnel slots are occupied or queue handoff cannot complete within one second
+- **THEN** the new request is refused and its socket/permit is released without an unbounded waiter
+
+#### Scenario: The listener stops during partial input
+
+- **WHEN** listener shutdown occurs while clients are reading headers or waiting to hand off
+- **THEN** those handlers terminate and release their resources
+
+### Requirement: HTTP admission hardening SHALL preserve authorized byte handoff
+
+Bounded parsing SHALL preserve already-buffered HTTP body bytes and early CONNECT bytes exactly
+once when handing the socket to the tunnel. The existing initial-data bound and authenticated
+remote setup SHALL still apply; CONNECT success SHALL NOT be emitted before authorized setup.
+Raw request lines, headers, URL userinfo and query data SHALL NOT be copied into diagnostics.
+
+#### Scenario: Body bytes arrive in the same read as headers
+
+- **WHEN** a valid head is followed by prefetched application bytes
+- **THEN** the reconstructed origin request or CONNECT handoff forwards those bytes once and in order
+- **AND** normal tunneled traffic keeps its existing authorization and stream limits

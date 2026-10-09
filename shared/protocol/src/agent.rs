@@ -168,6 +168,56 @@ pub struct Reservation {
     pub signature: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionRefusal {
+    StateRequiresRepair,
+    AlreadyActive,
+    WorkloadLimit,
+    ReservationLimit,
+    InsufficientCapacity,
+    PendingCapacityLimit,
+}
+
+impl AdmissionRefusal {
+    pub const ALL: [Self; 6] = [
+        Self::StateRequiresRepair,
+        Self::AlreadyActive,
+        Self::WorkloadLimit,
+        Self::ReservationLimit,
+        Self::InsufficientCapacity,
+        Self::PendingCapacityLimit,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StateRequiresRepair => "agent workload state requires repair",
+            Self::AlreadyActive => "workload is already active or reserved",
+            Self::WorkloadLimit => "agent workload limit reached",
+            Self::ReservationLimit => "agent reservation limit reached",
+            Self::InsufficientCapacity => "insufficient capacity",
+            Self::PendingCapacityLimit => {
+                "pending reservation limit reached; retry once admissions settle"
+            }
+        }
+    }
+
+    pub fn from_reason(reason: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|refusal| refusal.as_str() == reason)
+    }
+
+    pub const fn is_capacity(self) -> bool {
+        matches!(
+            self,
+            Self::WorkloadLimit
+                | Self::ReservationLimit
+                | Self::InsufficientCapacity
+                | Self::PendingCapacityLimit
+        )
+    }
+}
+
 impl Reservation {
     fn canonical_bytes(&self) -> anyhow::Result<Vec<u8>> {
         canonical(&Self {

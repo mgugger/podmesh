@@ -14,7 +14,7 @@
 //! the mesh, and a relay call opens a QUIC connection, so both are throttled per
 //! peer address. That is a availability bound, not access control.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -83,6 +83,7 @@ pub struct ClientApi {
     endpoint: iroh::Endpoint,
     reconciliation: Option<ReconciliationService>,
     rate_limit_per_minute: u32,
+    metrics: podmesh_metrics::Metrics,
 }
 
 impl ClientApi {
@@ -99,7 +100,13 @@ impl ClientApi {
             endpoint,
             reconciliation: None,
             rate_limit_per_minute: DEFAULT_CLIENT_RATE_LIMIT_PER_MINUTE,
+            metrics: podmesh_metrics::Metrics::noop(),
         }
+    }
+
+    pub fn with_metrics(mut self, metrics: podmesh_metrics::Metrics) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     pub fn with_reconciliation(mut self, reconciliation: ReconciliationService) -> Self {
@@ -122,6 +129,7 @@ impl ClientApi {
     /// route answers 500.
     pub fn router(self) -> Router {
         let rate_limit_per_minute = self.rate_limit_per_minute;
+        let rate_limit_metrics = self.metrics.clone();
         let router = Router::new()
             .route("/api/v1/endpoint_record", get(get_endpoint_record))
             .route("/api/v1/agents/select", get(select_agent))
@@ -139,7 +147,13 @@ impl ClientApi {
         Router::new()
             .route("/health", get(|| async { "ok" }))
             .route("/ready", get(|| async { "ready" }))
-            .merge(axum_support::with_rate_limit(router, rate_limit_per_minute))
+            .merge(axum_support::with_rate_limit_callback(
+                router,
+                rate_limit_per_minute,
+                Some(Arc::new(move || {
+                    rate_limit_metrics.record_event(podmesh_metrics::EventName::RateLimitRefusal);
+                })),
+            ))
     }
 }
 
@@ -161,6 +175,15 @@ struct EndpointRecordResponse {
 async fn get_endpoint_record(
     State(api): State<ClientApi>,
 ) -> ApiResult<Json<EndpointRecordResponse>> {
+    let timer = api
+        .metrics
+        .operation_started(podmesh_metrics::OperationName::ClientRequest);
+    let result = get_endpoint_record_inner(&api);
+    finish_api_timer(timer, &result);
+    result
+}
+
+fn get_endpoint_record_inner(api: &ClientApi) -> ApiResult<Json<EndpointRecordResponse>> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| {
@@ -217,6 +240,18 @@ struct SelectQuery {
 async fn select_agent(
     State(api): State<ClientApi>,
     Query(query): Query<SelectQuery>,
+) -> ApiResult<Json<protocol::CapacityOffer>> {
+    let timer = api
+        .metrics
+        .operation_started(podmesh_metrics::OperationName::ClientRequest);
+    let result = select_agent_inner(&api, query).await;
+    finish_api_timer(timer, &result);
+    result
+}
+
+async fn select_agent_inner(
+    api: &ClientApi,
+    query: SelectQuery,
 ) -> ApiResult<Json<protocol::CapacityOffer>> {
     validate_placement_resources(query.cpu_milli, query.memory_bytes, query.storage_bytes)?;
     let criteria = CapacityCriteria {
@@ -322,7 +357,7 @@ async fn post_admission(
     Path(agent): Path<String>,
     body: Bytes,
 ) -> ApiResult<Vec<u8>> {
-    relay(api, agent, AgentControlOperation::Admission, body).await
+    timed_relay(api, agent, AgentControlOperation::Admission, body).await
 }
 
 async fn post_deploy(
@@ -330,7 +365,7 @@ async fn post_deploy(
     Path(agent): Path<String>,
     body: Bytes,
 ) -> ApiResult<Vec<u8>> {
-    relay(api, agent, AgentControlOperation::Deploy, body).await
+    timed_relay(api, agent, AgentControlOperation::Deploy, body).await
 }
 
 async fn post_update(
@@ -338,7 +373,7 @@ async fn post_update(
     Path(agent): Path<String>,
     body: Bytes,
 ) -> ApiResult<Vec<u8>> {
-    relay(api, agent, AgentControlOperation::Update, body).await
+    timed_relay(api, agent, AgentControlOperation::Update, body).await
 }
 
 async fn post_command(
@@ -346,7 +381,7 @@ async fn post_command(
     Path(agent): Path<String>,
     body: Bytes,
 ) -> ApiResult<Vec<u8>> {
-    relay(api, agent, AgentControlOperation::Command, body).await
+    timed_relay(api, agent, AgentControlOperation::Command, body).await
 }
 
 /// One agent's answer to a broadcast list request.
@@ -385,6 +420,18 @@ async fn post_workload_list(
     State(api): State<ClientApi>,
     body: Bytes,
 ) -> ApiResult<Json<WorkloadListReply>> {
+    let timer = api
+        .metrics
+        .operation_started(podmesh_metrics::OperationName::ClientRequest);
+    let result = post_workload_list_inner(&api, body).await;
+    finish_api_timer(timer, &result);
+    result
+}
+
+async fn post_workload_list_inner(
+    api: &ClientApi,
+    body: Bytes,
+) -> ApiResult<Json<WorkloadListReply>> {
     if body.is_empty() || body.len() > protocol::MAX_WORKLOAD_LIST_REQUEST_BYTES {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -407,6 +454,9 @@ async fn post_workload_list(
             "workload reconciliation is not initialized".to_string(),
         )
     })?;
+    let reconciliation_timer = api
+        .metrics
+        .operation_started(podmesh_metrics::OperationName::Reconciliation);
     let outcome = reconciliation
         .reconcile(body.to_vec())
         .await
@@ -416,7 +466,18 @@ async fn post_workload_list(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "workload reconciliation failed".to_string(),
             )
-        })?;
+        });
+    match &outcome {
+        Ok(_) => reconciliation_timer.finish(
+            podmesh_metrics::Outcome::Success,
+            podmesh_metrics::Reason::None,
+        ),
+        Err(_) => reconciliation_timer.finish(
+            podmesh_metrics::Outcome::Error,
+            podmesh_metrics::Reason::Internal,
+        ),
+    }
+    let outcome = outcome?;
     let answered = outcome
         .answers
         .into_iter()
@@ -440,8 +501,26 @@ async fn post_workload_list(
     }))
 }
 
-async fn relay(
+async fn timed_relay(
     api: ClientApi,
+    agent: String,
+    operation: AgentControlOperation,
+    body: Bytes,
+) -> ApiResult<Vec<u8>> {
+    let client_timer = api
+        .metrics
+        .operation_started(podmesh_metrics::OperationName::ClientRequest);
+    let control_timer = api
+        .metrics
+        .operation_started(podmesh_metrics::OperationName::ControlRelay);
+    let result = relay(&api, agent, operation, body).await;
+    finish_api_timer(client_timer, &result);
+    finish_api_timer(control_timer, &result);
+    result
+}
+
+async fn relay(
+    api: &ClientApi,
     agent: String,
     operation: AgentControlOperation,
     body: Bytes,
@@ -465,6 +544,40 @@ async fn relay(
             };
             (status, error.to_string())
         })
+}
+
+fn finish_api_timer<T>(timer: podmesh_metrics::OperationTimer, result: &ApiResult<T>) {
+    let (outcome, reason) = match result {
+        Ok(_) => (
+            podmesh_metrics::Outcome::Success,
+            podmesh_metrics::Reason::None,
+        ),
+        Err((StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN, _)) => (
+            podmesh_metrics::Outcome::Refused,
+            podmesh_metrics::Reason::Invalid,
+        ),
+        Err((StatusCode::TOO_MANY_REQUESTS, _)) => (
+            podmesh_metrics::Outcome::Refused,
+            podmesh_metrics::Reason::RateLimit,
+        ),
+        Err((StatusCode::NOT_FOUND | StatusCode::BAD_GATEWAY, _)) => (
+            podmesh_metrics::Outcome::Unreachable,
+            podmesh_metrics::Reason::Unavailable,
+        ),
+        Err((StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT, _)) => (
+            podmesh_metrics::Outcome::Timeout,
+            podmesh_metrics::Reason::Deadline,
+        ),
+        Err((StatusCode::SERVICE_UNAVAILABLE, _)) => (
+            podmesh_metrics::Outcome::Saturated,
+            podmesh_metrics::Reason::Capacity,
+        ),
+        Err(_) => (
+            podmesh_metrics::Outcome::Error,
+            podmesh_metrics::Reason::Internal,
+        ),
+    };
+    timer.finish(outcome, reason);
 }
 
 /// Agent EndpointIds travel as lowercase hex so that `podctl` never needs to

@@ -41,6 +41,17 @@ const SAMPLE_WORKLOAD_NAME: &str = "my-nginx";
 /// The sample manifest declares a single replica.
 const SAMPLE_REPLICA_INDEX: u32 = 0;
 const PODMESH_NETWORK: &str = "podmesh";
+const RUNTIME_METRICS_TARGETS: [&str; 9] = [
+    "podmesh-control:9200",
+    "podmesh-control:9201",
+    "podmesh-control:9202",
+    "podmesh-agents:9210",
+    "podmesh-agents:9211",
+    "podmesh-agents:9212",
+    "podmesh-proxies:9220",
+    "podmesh-proxies:9221",
+    "podmesh-proxies:9222",
+];
 /// `GET /api/v1/agents/select` gossips a capacity query and waits for offers,
 /// which takes several seconds, so probes must outlast a full solicitation.
 const HTTP_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -94,6 +105,9 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
 
     wait_for_machine_health(&client, Duration::from_secs(120)).await?;
     wait_for_agent_registration(&client, Duration::from_secs(180)).await?;
+    for target in RUNTIME_METRICS_TARGETS {
+        verify_metrics_target(target).await?;
+    }
 
     // The client keeps its own key directory rather than the developer's real
     // one, and accepts whichever agent this stack offers: the agents are part
@@ -105,6 +119,12 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
         trust_any_agent: true,
     };
     wait_for_complete_reconciliation(&options, Duration::from_secs(180)).await?;
+
+    for proxy_url in PODMESH_PROXY_API_URLS.split(',') {
+        podctl::cert::trust_proxy_async_at(key_dir.path(), proxy_url, false)
+            .await
+            .with_context(|| format!("trust local proxy {proxy_url}"))?;
+    }
 
     let manifest_id = apply_file_with_proxy_urls(
         sample_manifest.clone(),
@@ -123,6 +143,7 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
     workload_guard.set(workload_id.clone());
 
     wait_for_workload_containers(&workload_id, Duration::from_secs(180)).await?;
+    verify_metrics_target(&format!("{}-pod:9230", workload_runtime_name(&workload_id))).await?;
     wait_for_podmesh_proxy_response(&client, Duration::from_secs(120)).await?;
 
     let status = get_pod(&manifest_id, &options)
@@ -627,6 +648,41 @@ async fn run_podman_command<const N: usize>(args: [&str; N]) -> Result<String> {
             String::from_utf8_lossy(&output.stderr)
         ))
     }
+}
+
+async fn verify_metrics_target(target: &str) -> Result<()> {
+    let output = TokioCommand::new("podman")
+        .args([
+            "run",
+            "--rm",
+            "--network",
+            PODMESH_NETWORK,
+            "docker.io/curlimages/curl:latest",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "5",
+            &format!("http://{target}/metrics"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .with_context(|| format!("launch metrics probe for {target}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "metrics probe for {target} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = String::from_utf8(output.stdout).context("metrics response is not UTF-8")?;
+    anyhow::ensure!(
+        body.ends_with("# EOF\n"),
+        "{target} returned invalid OpenMetrics"
+    );
+    anyhow::ensure!(body.len() <= podmesh_metrics::MAX_RENDERED_BYTES);
+    Ok(())
 }
 
 async fn ensure_podman_network(network: &str) -> Result<()> {

@@ -174,3 +174,50 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cert_proxy_trust_commands_parse() {
+        let trust = Cli::try_parse_from([
+            "podctl",
+            "cert",
+            "trust-proxy",
+            "--proxy-url",
+            "http://proxy.example:7100",
+            "--replace",
+        ])
+        .unwrap();
+        assert!(matches!(
+            trust.command,
+            Commands::Cert {
+                cmd: cert::CertCommands::TrustProxy { replace: true, .. }
+            }
+        ));
+
+        let list = Cli::try_parse_from(["podctl", "cert", "list-proxies"]).unwrap();
+        assert!(matches!(
+            list.command,
+            Commands::Cert {
+                cmd: cert::CertCommands::ListProxies
+            }
+        ));
+
+        let remove = Cli::try_parse_from([
+            "podctl",
+            "cert",
+            "remove-proxy",
+            "--proxy-url",
+            "http://proxy.example:7100",
+        ])
+        .unwrap();
+        assert!(matches!(
+            remove.command,
+            Commands::Cert {
+                cmd: cert::CertCommands::RemoveProxy { .. }
+            }
+        ));
+    }
+}

@@ -165,6 +165,8 @@ async fn podctl_http_reaches_the_agent_through_the_scheduler() -> Result<()> {
     let agent_temp = tempfile::tempdir()?;
     let agent_config = Config {
         listen: "127.0.0.1:0".into(),
+        metrics_listen: None,
+        sidecar_metrics_listen: None,
         key_dir: agent_temp.path().join("keys"),
         state_path: agent_temp.path().join("state.redb"),
         runtime: RuntimeKind::Mock,

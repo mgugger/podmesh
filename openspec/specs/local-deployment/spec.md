@@ -8,6 +8,43 @@ end with `podctl`.
 
 ## Requirements
 
+### Requirement: The local manifests SHALL expose application metrics only on the pod network
+
+Both rootless and rootful manifests SHALL explicitly enable application metrics with identical
+topology: schedulers on 9200-9202, agents on 9210-9212, proxies on 9220-9222, and every injected
+sidecar on 9230 in its workload pod. Each runtime SHALL use `PODMESH_METRICS_LISTEN`; agents SHALL
+use `PODMESH_AGENT_SIDECAR_METRICS_LISTEN` only as the source they propagate to child sidecars.
+
+The manifests SHALL declare matching TCP container ports and SHALL NOT publish a metrics `hostPort`.
+Application metrics SHALL remain distinct from scheduler relay metrics on 9090-9092 and workload
+relay metrics on 9100-9102. The sample deployment SHALL add no collector, helper container,
+dashboard, alert, trace service, metric volume, queue, or retention system.
+
+#### Scenario: Metrics ports do not collide in shared pod namespaces
+
+- **WHEN** either manifest is parsed
+- **THEN** every scheduler, agent, and proxy application-metrics port is unique within its pod
+- **AND** no application-metrics port equals an API, ingress, Iroh, relay, or relay-metrics port
+
+#### Scenario: Unauthenticated metrics are not host-published
+
+- **WHEN** either sample stack is started
+- **THEN** application metrics are reachable from the `podmesh` network
+- **AND** no application-metrics port is published to the host
+
+### Requirement: Gate 8 SHALL use direct bounded scrapes without a resident collector
+
+The feature-gated complete-stack test SHALL directly scrape all nine scheduler, agent, and proxy
+application targets and one deployed workload sidecar through the Podman network. It SHALL validate
+the OpenMetrics EOF, component identity, response size, and bounded completion. Compilation without
+execution SHALL be reported separately from an executed Podman test.
+
+#### Scenario: Direct scrape evidence is reproducible
+
+- **WHEN** the Podman test environment and required images are available
+- **THEN** the complete-stack test checks ports 9200-9222 and sidecar port 9230
+- **AND** it leaves no collector running after the test
+
 ### Requirement: The local manifests SHALL deploy three schedulers and three agents
 
 `deploy/podmesh_rootless.yml` and `deploy/podmesh_rootful.yml` SHALL each bring up three
@@ -111,3 +148,22 @@ Podman socket that is equivalent to host control.
 
 - **WHEN** the operator follows the replica-spreading step after the single-replica step
 - **THEN** the documentation has them delete the first deployment first
+
+### Requirement: Local images SHALL contain only runtime assets
+
+The image build command SHALL accept a validated optional `PODMESH_IMAGE_TAG`, preserve `latest` as
+the local default, refuse cross-architecture builds, print each resulting image identity, and copy
+only runtime binaries, the Podman client where required, and CA certificates into final scratch
+images. Local checks SHALL NOT imply multi-architecture, mixed-version, production-readiness or
+numeric SLO guarantees. Ordinary CI SHALL run tests directly and keep real Podman execution an
+explicit opt-in with its socket/image prerequisites.
+
+#### Scenario: A run-scoped image is built
+
+- **WHEN** `PODMESH_IMAGE_TAG` contains a valid run identifier
+- **THEN** all four images receive that tag and their local image identities are printed
+
+#### Scenario: A final image copy boundary is inspected
+
+- **WHEN** the Containerfile final stages are inspected
+- **THEN** only the required runtime binaries and certificates are copied into each image

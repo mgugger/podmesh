@@ -89,6 +89,14 @@ impl SchedulerGossip {
         services: SchedulerGossipServices,
         config: &ValidatedMachineConfig,
     ) -> Result<Self> {
+        Self::start_with_metrics(services, config, podmesh_metrics::Metrics::noop()).await
+    }
+
+    pub async fn start_with_metrics(
+        services: SchedulerGossipServices,
+        config: &ValidatedMachineConfig,
+        metrics: podmesh_metrics::Metrics,
+    ) -> Result<Self> {
         let SchedulerGossipServices {
             endpoint,
             attachments: attachment_handler,
@@ -107,7 +115,8 @@ impl SchedulerGossip {
             gossip.max_message_size() == MAX_CAPACITY_MESSAGE_BYTES,
             "scheduler gossip message bound was not applied"
         );
-        let members = MemberRegistry::new(config.scheduler_members.clone())?;
+        let members =
+            MemberRegistry::new(config.scheduler_members.clone())?.with_metrics(metrics.clone());
         // The forwarder cannot exist before the router is up, so the handler is
         // created here and completed with `install` once startup finishes.
         let control_relay = AgentControlRelayHandler::new(
@@ -185,6 +194,7 @@ impl SchedulerGossip {
         let reconciliation_responder =
             std::sync::Arc::new(tokio::sync::OnceCell::<ReconciliationResponder>::new());
         let receiver_reconciliation_responder = reconciliation_responder.clone();
+        let receiver_metrics = metrics;
         let max_seen = config.max_seen_queries;
         let receiver_task = tokio::spawn(async move {
             let mut seen = SeenQueries::new(max_seen);
@@ -193,15 +203,26 @@ impl SchedulerGossip {
                     _ = receiver_cancellation.cancelled() => return Ok(()),
                     event = receiver.next() => match event {
                         Some(Ok(Event::Received(message))) => {
+                            let timer = receiver_metrics.operation_started(
+                                podmesh_metrics::OperationName::SchedulerGossip,
+                            );
                             match super::gossip_messages::classify(
                                 &message.content,
                                 &receiver_members,
                                 &mut seen,
                             ) {
                                 Ok(Some(ReceivedGossip::Capacity(query))) => {
+                                    timer.finish(
+                                        podmesh_metrics::Outcome::Success,
+                                        podmesh_metrics::Reason::None,
+                                    );
                                     let _ = event_tx.send(*query);
                                 }
                                 Ok(Some(ReceivedGossip::Locate(query))) => {
+                                    timer.finish(
+                                        podmesh_metrics::Outcome::Success,
+                                        podmesh_metrics::Reason::None,
+                                    );
                                     // Only the scheduler that holds the agent
                                     // answers, so this costs the rest one
                                     // membership check.
@@ -212,6 +233,10 @@ impl SchedulerGossip {
                                     });
                                 }
                                 Ok(Some(ReceivedGossip::Announcement(record))) => {
+                                    timer.finish(
+                                        podmesh_metrics::Outcome::Success,
+                                        podmesh_metrics::Reason::None,
+                                    );
                                     admit_announced_peer(
                                         &receiver_members,
                                         &receiver_issuers,
@@ -220,6 +245,10 @@ impl SchedulerGossip {
                                     );
                                 }
                                 Ok(Some(ReceivedGossip::Reconcile(query))) => {
+                                    timer.finish(
+                                        podmesh_metrics::Outcome::Success,
+                                        podmesh_metrics::Reason::None,
+                                    );
                                     if let Some(responder) =
                                         receiver_reconciliation_responder.get().cloned()
                                     {
@@ -232,8 +261,17 @@ impl SchedulerGossip {
                                         });
                                     }
                                 }
-                                Ok(None) => {}
-                                Err(error) => log::warn!("scheduler gossip message rejected: {error}"),
+                                Ok(None) => timer.finish(
+                                    podmesh_metrics::Outcome::Success,
+                                    podmesh_metrics::Reason::None,
+                                ),
+                                Err(error) => {
+                                    timer.finish(
+                                        podmesh_metrics::Outcome::Refused,
+                                        podmesh_metrics::Reason::Invalid,
+                                    );
+                                    log::warn!("scheduler gossip message rejected: {error}");
+                                }
                             }
                         }
                         Some(Ok(Event::Lagged)) => {

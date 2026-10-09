@@ -2,9 +2,22 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_podman:
+        description: Build images and run real Podman integration tests
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,104 +26,77 @@ env:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
+          toolchain: 1.98.0
           components: rustfmt, clippy
-
-      - name: Cache Cargo build artifacts
-        uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             target
             ~/.cargo/registry
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-lint-
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Formatting
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-  build-and-test:
+  test:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 55
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo build artifacts
-        uses: actions/cache@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.98.0
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             target
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-core-${{ hashFiles('**/Cargo.lock') }}
+      - run: cargo build --workspace --all-targets --locked
+      - run: cargo test --quiet --locked --workspace
+      - run: cargo check --locked -p podmesh-integration-tests --features podman-tests --tests
 
-      - name: Cargo build
-        run: cargo build --workspace --all-targets --locked
-
-      - name: Cargo test (without Podman)
-        run: cargo test --workspace --locked
-
-  # The Podman suite plays the shipped deploy manifests and drives podctl
-  # against real containers. It is the only coverage of the manifests and of the
-  # agent's Podman driver, so it runs on every change rather than by hand.
-  podman-e2e:
+  dependency-policy:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 35
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo build artifacts
-        uses: actions/cache@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          path: |
-            target
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-podman-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-podman-
+          toolchain: 1.98.0
+      - name: Check dependency policy
+        run: |
+          . .github/ci-tool-versions.env
+          cargo install cargo-deny --version "$CARGO_DENY_VERSION" --locked
+          cargo deny check
 
-      - name: Install Podman
+  podman-tests:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_podman
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.98.0
+      - name: Install and start Podman
         run: |
           sudo apt-get update
           sudo apt-get -y install podman
-
-      - name: Start the rootless Podman service
-        run: |
-          systemctl --user start podman.socket || \
-            (podman system service --time=0 "unix://${XDG_RUNTIME_DIR}/podman/podman.sock" &)
-          for _ in $(seq 1 30); do
-            podman info >/dev/null 2>&1 && break
-            sleep 1
-          done
+          systemctl --user start podman.socket || (podman system service --time=0 "unix://${XDG_RUNTIME_DIR}/podman/podman.sock" &)
+          for _ in $(seq 1 30); do podman info >/dev/null 2>&1 && break; done
           podman info >/dev/null
           echo "CONTAINER_HOST=unix://${XDG_RUNTIME_DIR}/podman/podman.sock" >> "$GITHUB_ENV"
-
-      - name: Create the podmesh network
-        run: podman network create podmesh || true
-
-      - name: Build container images
-        run: ./deploy/build_containers.sh
-
-      - name: Cargo test (with Podman)
-        run: cargo test --workspace --locked --features podman-tests
+      - name: Build run-scoped images
+        run: |
+          export PODMESH_IMAGE_TAG="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ./deploy/build_containers.sh
+          for role in scheduler agent proxy sidecar; do podman tag "podmesh/$role:$PODMESH_IMAGE_TAG" "podmesh/$role:latest"; done
+          podman network create podmesh
+      - run: cargo test --locked -p podmesh-integration-tests --features podman-tests

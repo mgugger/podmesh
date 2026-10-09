@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use anyhow::Result;
 use log::info;
 use tokio::{sync::watch, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 
 use crate::{config::Config, ingress, iroh_runtime, restapi};
 
@@ -14,6 +15,7 @@ pub struct Workload {
     rest_handle: Option<JoinHandle<()>>,
     peer_id: Option<String>,
     ingress: Option<ingress::IngressServer>,
+    metrics_runtime: Option<podmesh_metrics::MetricsRuntime>,
 }
 
 impl Workload {
@@ -24,6 +26,7 @@ impl Workload {
             rest_handle: None,
             peer_id: None,
             ingress: None,
+            metrics_runtime: None,
         })
     }
 
@@ -45,7 +48,17 @@ impl Workload {
             return Ok(());
         }
 
-        let node = iroh_runtime::spawn(&self.cfg).await?;
+        self.cfg.validate()?;
+        let metrics_runtime = podmesh_metrics::MetricsRuntime::start(
+            podmesh_metrics::ComponentName::Proxy,
+            podmesh_metrics::MetricsConfig {
+                listen: self.cfg.metrics_listen,
+            },
+            CancellationToken::new(),
+        )
+        .await?;
+        let metrics = metrics_runtime.metrics();
+        let node = iroh_runtime::spawn_with_metrics(&self.cfg, metrics.clone()).await?;
         let peer_rx = node.peer_rx();
         let proxy_client = node.proxy_client();
         let peer_id = node.peer_id().to_string();
@@ -67,12 +80,14 @@ impl Workload {
                 grant_store,
                 relay_bootstrap: self.relay_bootstrap(),
                 rate_limit_per_minute: self.cfg.rest_rate_limit_per_minute,
+                metrics: metrics.clone(),
             })?)
         };
 
         self.rest_handle = rest_handle;
         self.p2p_node = Some(node);
         self.peer_id = Some(peer_id);
+        self.metrics_runtime = Some(metrics_runtime);
 
         if self.cfg.enable_ingress {
             let ingress_server = ingress::IngressServer::spawn(
@@ -98,6 +113,9 @@ impl Workload {
         }
         if let Some(node) = self.p2p_node.take() {
             node.shutdown().await;
+        }
+        if let Some(runtime) = self.metrics_runtime.take() {
+            let _ = runtime.shutdown().await;
         }
     }
 

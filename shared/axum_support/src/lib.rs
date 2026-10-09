@@ -11,7 +11,8 @@ use tokio::task::JoinHandle;
 
 pub mod rate_limiter;
 pub use rate_limiter::{
-    RateLimiterState, create_rate_limiter, rate_limit_middleware, with_rate_limit,
+    RateLimiterState, create_rate_limiter, create_rate_limiter_with_callback,
+    rate_limit_middleware, with_rate_limit, with_rate_limit_callback,
 };
 
 /// Turn a router into a service that carries the peer address.

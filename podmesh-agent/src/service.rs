@@ -95,14 +95,30 @@ struct Inner {
     runtime_operation_timeout: Duration,
     store: Arc<dyn WorkloadStore>,
     state: Mutex<WorkloadState>,
+    mutations: RwLock<HashSet<String>>,
     replay: Mutex<ReplayCache>,
     current_endpoint_address: RwLock<Option<iroh::EndpointAddr>>,
     service_mesh_required: bool,
+    metrics: podmesh_metrics::Metrics,
 }
 
 struct BuildOptions {
     store: Arc<dyn WorkloadStore>,
     service_mesh_required: bool,
+    metrics: podmesh_metrics::Metrics,
+}
+
+struct MutationGuard<'a> {
+    mutations: &'a RwLock<HashSet<String>>,
+    workload_id: String,
+}
+
+impl Drop for MutationGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut mutations) = self.mutations.write() {
+            mutations.remove(&self.workload_id);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -216,6 +232,14 @@ impl WorkloadState {
 
 impl AgentService {
     pub async fn new(config: Config, runtime: Arc<dyn WorkloadRuntime>) -> Result<Self> {
+        Self::new_with_metrics(config, runtime, podmesh_metrics::Metrics::noop()).await
+    }
+
+    pub async fn new_with_metrics(
+        config: Config,
+        runtime: Arc<dyn WorkloadRuntime>,
+        metrics: podmesh_metrics::Metrics,
+    ) -> Result<Self> {
         anyhow::ensure!(
             config.max_workloads > 0 && config.max_workloads <= MAX_CONFIGURED_WORKLOADS,
             "max_workloads must be between 1 and {MAX_CONFIGURED_WORKLOADS}"
@@ -250,6 +274,7 @@ impl AgentService {
             BuildOptions {
                 store,
                 service_mesh_required: true,
+                metrics,
             },
         )
         .await
@@ -280,6 +305,7 @@ impl AgentService {
             BuildOptions {
                 store,
                 service_mesh_required: false,
+                metrics: podmesh_metrics::Metrics::noop(),
             },
         )
         .await
@@ -297,7 +323,9 @@ impl AgentService {
         let BuildOptions {
             store,
             service_mesh_required,
+            metrics,
         } = options;
+        metrics.set_gauge(podmesh_metrics::GaugeName::AttachedSchedulers, 0);
         let runtime_operations = Semaphore::new(config.max_concurrent_runtime_operations);
         let runtime_operation_timeout = Duration::from_secs(config.runtime_operation_timeout_secs);
         let service = Self {
@@ -312,9 +340,11 @@ impl AgentService {
                 runtime_operation_timeout,
                 store,
                 state: Mutex::new(WorkloadState::default()),
+                mutations: RwLock::new(HashSet::new()),
                 replay: Mutex::new(ReplayCache::default()),
                 current_endpoint_address: RwLock::new(None),
                 service_mesh_required,
+                metrics,
             }),
         };
         service.restore().await?;
@@ -327,6 +357,10 @@ impl AgentService {
     /// scheduler. Only liveness probing stays on HTTP.
     pub fn router(&self) -> Router {
         Router::new().route("/health", get(|| async { "ok" }))
+    }
+
+    pub(crate) fn metrics(&self) -> podmesh_metrics::Metrics {
+        self.inner.metrics.clone()
     }
 
     pub(crate) fn attachment_hello(
@@ -401,7 +435,11 @@ impl AgentService {
             && available_cpu >= u64::from(query.cpu_milli)
             && available_memory >= query.memory_bytes
             && available_storage >= query.storage_bytes;
+        let reservations = state.reservations.len() as u64;
         drop(state);
+        self.inner
+            .metrics
+            .set_gauge(podmesh_metrics::GaugeName::ActiveReservations, reservations);
         if !can_satisfy {
             return Ok(None);
         }
@@ -466,11 +504,30 @@ impl AgentService {
         nonce: &str,
         expires_at: u64,
     ) -> Result<()> {
-        self.inner.replay.lock().await.record(
+        let result = self.inner.replay.lock().await.record(
             format!("{operation}:{namespace}:{nonce}"),
             expires_at,
             now_secs(),
-        )
+        );
+        if result.is_err() {
+            self.inner
+                .metrics
+                .record_event(podmesh_metrics::EventName::ReplayRefusal);
+        }
+        result
+    }
+
+    async fn refresh_state_metrics(&self) {
+        let state = self.inner.state.lock().await;
+        let reservations = state.reservations.len() as u64;
+        let workloads = state.active.len() as u64;
+        drop(state);
+        self.inner
+            .metrics
+            .set_gauge(podmesh_metrics::GaugeName::ActiveReservations, reservations);
+        self.inner
+            .metrics
+            .set_gauge(podmesh_metrics::GaugeName::RunningWorkloads, workloads);
     }
 
     pub(crate) fn decrypt<T: for<'de> serde::Deserialize<'de>>(&self, body: &[u8]) -> Result<T> {
@@ -482,6 +539,26 @@ impl AgentService {
         let recipient = crypto::b64_decode(recipient)?;
         let plaintext = postcard::to_allocvec(value)?;
         crypto::encrypt_payload_for_recipient(&recipient, &plaintext)
+    }
+
+    fn mutation(&self, workload_id: &str) -> Result<MutationGuard<'_>> {
+        let mut mutations = self
+            .inner
+            .mutations
+            .write()
+            .map_err(|_| anyhow!("workload mutation lock poisoned"))?;
+        anyhow::ensure!(
+            mutations.len() < MAX_CONFIGURED_WORKLOADS,
+            "workload mutation limit reached"
+        );
+        anyhow::ensure!(
+            mutations.insert(workload_id.to_string()),
+            "workload is busy"
+        );
+        Ok(MutationGuard {
+            mutations: &self.inner.mutations,
+            workload_id: workload_id.to_string(),
+        })
     }
 
     async fn runtime_operation<T>(
@@ -499,7 +576,10 @@ impl AgentService {
             future.await
         })
         .await
-        .map_err(|_| anyhow!("{operation} runtime operation timed out"))?
+        .map_err(|_| {
+            anyhow!(crate::runtime::RuntimeOutcomeUnknown)
+                .context(format!("{operation} runtime operation timed out"))
+        })?
     }
 
     /// Most capacity that may be held by reservations that have not deployed.
@@ -540,6 +620,14 @@ impl AgentService {
     }
 
     pub(crate) async fn admit(&self, request: AdmissionRequest) -> Result<Vec<u8>> {
+        let timer = self
+            .inner
+            .metrics
+            .operation_started(podmesh_metrics::OperationName::Admission);
+        let reservation_timer = self
+            .inner
+            .metrics
+            .operation_started(podmesh_metrics::OperationName::Reservation);
         let now = now_secs();
         request.verify(now)?;
         // Every owner-signed message names the agent it is for, so a relay
@@ -624,17 +712,29 @@ impl AgentService {
             storage_bytes: request.storage_bytes,
             accepted,
             reason: if !state_reliable {
-                "agent workload state requires repair".into()
+                protocol::agent::AdmissionRefusal::StateRequiresRepair
+                    .as_str()
+                    .into()
             } else if duplicate {
-                "workload is already active or reserved".into()
+                protocol::agent::AdmissionRefusal::AlreadyActive
+                    .as_str()
+                    .into()
             } else if !count_available {
-                "agent workload limit reached".into()
+                protocol::agent::AdmissionRefusal::WorkloadLimit
+                    .as_str()
+                    .into()
             } else if !reservation_available {
-                "agent reservation limit reached".into()
+                protocol::agent::AdmissionRefusal::ReservationLimit
+                    .as_str()
+                    .into()
             } else if !capacity_ok {
-                "insufficient capacity".into()
+                protocol::agent::AdmissionRefusal::InsufficientCapacity
+                    .as_str()
+                    .into()
             } else if !reservation_capacity_ok {
-                "pending reservation limit reached; retry once admissions settle".into()
+                protocol::agent::AdmissionRefusal::PendingCapacityLimit
+                    .as_str()
+                    .into()
             } else {
                 String::new()
             },
@@ -647,7 +747,55 @@ impl AgentService {
                 .reservations
                 .insert(reservation.reservation_id.clone(), reservation.clone());
         }
+        let reservations = state.reservations.len() as u64;
+        let workloads = state.active.len() as u64;
         drop(state);
+        self.inner
+            .metrics
+            .set_gauge(podmesh_metrics::GaugeName::ActiveReservations, reservations);
+        self.inner
+            .metrics
+            .set_gauge(podmesh_metrics::GaugeName::RunningWorkloads, workloads);
+        if accepted {
+            timer.finish(
+                podmesh_metrics::Outcome::Success,
+                podmesh_metrics::Reason::None,
+            );
+            reservation_timer.finish(
+                podmesh_metrics::Outcome::Success,
+                podmesh_metrics::Reason::None,
+            );
+        } else if !state_reliable {
+            timer.finish(
+                podmesh_metrics::Outcome::Error,
+                podmesh_metrics::Reason::Internal,
+            );
+            reservation_timer.finish(
+                podmesh_metrics::Outcome::Error,
+                podmesh_metrics::Reason::Internal,
+            );
+        } else if duplicate {
+            timer.finish(
+                podmesh_metrics::Outcome::Refused,
+                podmesh_metrics::Reason::Policy,
+            );
+            reservation_timer.finish(
+                podmesh_metrics::Outcome::Refused,
+                podmesh_metrics::Reason::Policy,
+            );
+        } else {
+            self.inner
+                .metrics
+                .record_event(podmesh_metrics::EventName::StoreSaturation);
+            timer.finish(
+                podmesh_metrics::Outcome::Saturated,
+                podmesh_metrics::Reason::Capacity,
+            );
+            reservation_timer.finish(
+                podmesh_metrics::Outcome::Saturated,
+                podmesh_metrics::Reason::Capacity,
+            );
+        }
         self.encrypt(&reservation, &request.response_kem_pubkey)
     }
 
@@ -697,6 +845,7 @@ impl AgentService {
                     workload_credential_b64: &execution.workload_credential_b64,
                     workload_relay_auth_token: &execution.workload_relay_auth_token,
                     workload_relay_ca_certificates: &execution.workload_relay_ca_certificates,
+                    metrics_listen: self.inner.config.sidecar_metrics_listen,
                 },
             )?
         } else {
@@ -742,6 +891,17 @@ impl AgentService {
     }
 
     pub(crate) async fn deploy(&self, grant: DeploymentGrant) -> Result<Vec<u8>> {
+        let timer = self
+            .inner
+            .metrics
+            .operation_started(podmesh_metrics::OperationName::Deploy);
+        let result = self.deploy_inner(grant).await;
+        self.refresh_state_metrics().await;
+        finish_operation(timer, &result);
+        result
+    }
+
+    async fn deploy_inner(&self, grant: DeploymentGrant) -> Result<Vec<u8>> {
         let now = now_secs();
         grant.verify(now)?;
         anyhow::ensure!(
@@ -760,6 +920,7 @@ impl AgentService {
         // reservation. A custom signed client must not bypass podctl's
         // normalization and turn one reservation into multiple runtime pods.
         protocol::validate_and_measure_manifest(&execution.manifest)?;
+        let _mutation = self.mutation(&grant.workload_id)?;
         let mut state = self.inner.state.lock().await;
         // Consume and bind the reservation *before* consulting the active set.
         // Checking `active` first would leave the reservation intact only when
@@ -788,11 +949,20 @@ impl AgentService {
                 && measured.storage_bytes <= reservation.storage_bytes,
             "workload resource limits exceed signed reservation"
         );
+        let planned_id = self
+            .inner
+            .runtime
+            .target_id(&crate::runtime::WorkloadDeployment {
+                workload_id: &grant.workload_id,
+                namespace_id: &grant.namespace_id,
+                manifest: &manifest,
+            })?;
+        anyhow::ensure!(!planned_id.is_empty(), "runtime target is empty");
         let mut stored = StoredWorkload {
             version: STORED_WORKLOAD_VERSION,
-            phase: StoredWorkloadPhase::Active,
+            phase: StoredWorkloadPhase::Creating,
             grant: grant.clone(),
-            runtime_id: String::new(),
+            runtime_id: planned_id,
             deleting: false,
             cpu_milli: reservation.cpu_milli,
             memory_bytes: reservation.memory_bytes,
@@ -821,45 +991,22 @@ impl AgentService {
         {
             Ok(runtime_id) => runtime_id,
             Err(error) => {
-                self.inner
-                    .state
-                    .lock()
-                    .await
-                    .active
-                    .remove(&grant.workload_id);
-                if let Err(cleanup_error) = self.inner.store.remove(&grant.workload_id) {
-                    log::error!(
-                        "deploy failed for {}; removing pending state also failed: {cleanup_error:#}",
-                        grant.workload_id
-                    );
-                }
+                let uncertain = error
+                    .downcast_ref::<crate::runtime::RuntimeOutcomeUnknown>()
+                    .is_some();
+                self.failed_deploy(stored, uncertain).await;
                 return Err(error);
             }
         };
-        stored.runtime_id = runtime_id.clone();
+        if runtime_id != stored.runtime_id {
+            self.failed_deploy(stored, true).await;
+            return Err(anyhow!(
+                "runtime returned an unexpected workload identity; repair required"
+            ));
+        }
+        stored.phase = StoredWorkloadPhase::Active;
         if let Err(error) = self.inner.store.save(&stored) {
-            self.inner
-                .state
-                .lock()
-                .await
-                .active
-                .remove(&grant.workload_id);
-            if let Err(cleanup_error) = self
-                .runtime_operation("deploy cleanup", self.inner.runtime.delete(&runtime_id))
-                .await
-            {
-                log::error!(
-                    "deploy persistence failed for {}; deleting runtime {} also failed: {cleanup_error:#}",
-                    grant.workload_id,
-                    runtime_id
-                );
-            }
-            if let Err(cleanup_error) = self.inner.store.remove(&grant.workload_id) {
-                log::error!(
-                    "deploy persistence failed for {}; removing pending state also failed: {cleanup_error:#}",
-                    grant.workload_id
-                );
-            }
+            self.failed_deploy(stored, false).await;
             return Err(error);
         }
         self.inner
@@ -882,7 +1029,77 @@ impl AgentService {
         self.encrypt(&receipt, &grant.response_kem_pubkey)
     }
 
+    async fn failed_deploy(&self, mut stored: StoredWorkload, uncertain: bool) {
+        stored.phase = StoredWorkloadPhase::CleanupPending { uncertain };
+        let mut state = self.inner.state.lock().await;
+        state
+            .active
+            .insert(stored.grant.workload_id.clone(), stored.clone());
+        if let Err(error) = self.inner.store.save(&stored) {
+            log::error!(
+                "failed to persist pending cleanup for {}: {error:#}",
+                stored.grant.workload_id
+            );
+        }
+        drop(state);
+        match self.cleanup_pending(&stored).await {
+            Ok(()) => {
+                self.inner
+                    .state
+                    .lock()
+                    .await
+                    .active
+                    .remove(&stored.grant.workload_id);
+            }
+            Err(error) => log::error!(
+                "cleanup remains pending for {}: {error:#}",
+                stored.grant.workload_id
+            ),
+        }
+    }
+
+    async fn cleanup_pending(&self, stored: &StoredWorkload) -> Result<()> {
+        let uncertain = !matches!(
+            stored.phase,
+            StoredWorkloadPhase::CleanupPending { uncertain: false }
+        );
+        let target = if stored.runtime_id.is_empty() {
+            let execution = self.decode_execution(&stored.grant)?;
+            let (manifest, _) = self.runtime_manifest(
+                &stored.grant.workload_id,
+                &stored.grant.namespace_id,
+                &execution,
+            )?;
+            self.inner
+                .runtime
+                .target_id(&crate::runtime::WorkloadDeployment {
+                    workload_id: &stored.grant.workload_id,
+                    namespace_id: &stored.grant.namespace_id,
+                    manifest: &manifest,
+                })?
+        } else {
+            stored.runtime_id.clone()
+        };
+        self.runtime_operation(
+            "failed deployment cleanup",
+            self.inner.runtime.cleanup_failed_deploy(&target, uncertain),
+        )
+        .await?;
+        self.inner.store.remove(&stored.grant.workload_id)
+    }
+
     pub(crate) async fn update(&self, request: UpdateRequest) -> Result<Vec<u8>> {
+        let timer = self
+            .inner
+            .metrics
+            .operation_started(podmesh_metrics::OperationName::Update);
+        let result = self.update_inner(request).await;
+        self.refresh_state_metrics().await;
+        finish_operation(timer, &result);
+        result
+    }
+
+    async fn update_inner(&self, request: UpdateRequest) -> Result<Vec<u8>> {
         let now = now_secs();
         request.verify(now)?;
         anyhow::ensure!(
@@ -898,6 +1115,7 @@ impl AgentService {
         .await?;
 
         let execution = self.decode_execution(&request.grant)?;
+        let _mutation = self.mutation(&request.workload_id)?;
         protocol::validate_and_measure_manifest(&execution.manifest)?;
         let (manifest, measured) =
             self.runtime_manifest(&request.workload_id, &request.namespace_id, &execution)?;
@@ -915,6 +1133,12 @@ impl AgentService {
             .filter(|stored| stored.grant.namespace_id == request.namespace_id)
             .cloned()
             .ok_or_else(|| anyhow!("workload not found"))?;
+        anyhow::ensure!(
+            !active.deleting
+                && matches!(active.phase, StoredWorkloadPhase::Active)
+                && !active.runtime_id.is_empty(),
+            "workload is not active"
+        );
         if active.grant.revision_id == request.requested_revision_id
             && !request.refresh_service_mesh
         {
@@ -1071,6 +1295,16 @@ impl AgentService {
     /// listing is for finding workloads, and probing every pod would turn one
     /// list into one runtime call per workload.
     pub(crate) async fn list(&self, request: WorkloadListRequest) -> Result<Vec<u8>> {
+        let timer = self
+            .inner
+            .metrics
+            .operation_started(podmesh_metrics::OperationName::Reconciliation);
+        let result = self.list_inner(request).await;
+        finish_operation(timer, &result);
+        result
+    }
+
+    async fn list_inner(&self, request: WorkloadListRequest) -> Result<Vec<u8>> {
         let now = now_secs();
         request.verify(now)?;
         self.check_replay(
@@ -1096,7 +1330,9 @@ impl AgentService {
                     revision_id: stored.grant.revision_id.clone(),
                     replica_index: stored.replica_index,
                     replica_count: stored.replica_count,
-                    state: if stored.deleting {
+                    state: if stored.needs_cleanup() {
+                        "cleanup-required".into()
+                    } else if stored.deleting {
                         "deleting".into()
                     } else if matches!(stored.phase, StoredWorkloadPhase::Updating { .. }) {
                         "updating".into()
@@ -1138,6 +1374,12 @@ impl AgentService {
     }
 
     pub(crate) async fn command(&self, command: WorkloadCommand) -> Result<Vec<u8>> {
+        let operation = match command.operation {
+            WorkloadOperation::Status => podmesh_metrics::OperationName::Status,
+            WorkloadOperation::Logs => podmesh_metrics::OperationName::Logs,
+            WorkloadOperation::Delete => podmesh_metrics::OperationName::Delete,
+        };
+        let timer = self.inner.metrics.operation_started(operation);
         let now = now_secs();
         command.verify(now)?;
         anyhow::ensure!(
@@ -1155,7 +1397,7 @@ impl AgentService {
         // to the caller, otherwise a lifecycle command becomes an oracle for
         // which workloads a co-tenant is running here. The distinction is only
         // written to this agent's own log.
-        let active = self
+        let mut active = self
             .inner
             .state
             .lock()
@@ -1171,8 +1413,43 @@ impl AgentService {
                 );
                 anyhow!("workload not found")
             })?;
+        let _mutation = if matches!(command.operation, WorkloadOperation::Delete) {
+            let guard = self.mutation(&command.workload_id)?;
+            active = self
+                .inner
+                .state
+                .lock()
+                .await
+                .active
+                .get(&command.workload_id)
+                .filter(|stored| stored.grant.namespace_id == command.namespace_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("workload not found"))?;
+            Some(guard)
+        } else {
+            None
+        };
         let result = match command.operation {
-            _ if active.deleting => Err(anyhow!("workload is deleting")),
+            WorkloadOperation::Delete if active.needs_cleanup() => {
+                match self.cleanup_pending(&active).await {
+                    Ok(()) => {
+                        self.inner
+                            .state
+                            .lock()
+                            .await
+                            .active
+                            .remove(&command.workload_id);
+                        Ok("deleted".into())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            _ if active.needs_cleanup() => Err(anyhow!(
+                "workload requires cleanup; creation may be incomplete"
+            )),
+            _ if active.deleting && !matches!(command.operation, WorkloadOperation::Delete) => {
+                Err(anyhow!("workload is deleting"))
+            }
             _ if matches!(active.phase, StoredWorkloadPhase::Updating { .. }) => {
                 Err(anyhow!("workload is updating"))
             }
@@ -1199,7 +1476,6 @@ impl AgentService {
                         .active
                         .get_mut(&command.workload_id)
                         .ok_or_else(|| anyhow!("workload not found"))?;
-                    anyhow::ensure!(!current.deleting, "workload is deleting");
                     current.deleting = true;
                     current.clone()
                 };
@@ -1247,9 +1523,22 @@ impl AgentService {
             }
         };
         let (ok, payload) = match result {
-            Ok(payload) => (true, payload),
-            Err(error) => (false, error.to_string()),
+            Ok(payload) => {
+                timer.finish(
+                    podmesh_metrics::Outcome::Success,
+                    podmesh_metrics::Reason::None,
+                );
+                (true, payload)
+            }
+            Err(error) => {
+                timer.finish(
+                    podmesh_metrics::Outcome::Refused,
+                    podmesh_metrics::Reason::Policy,
+                );
+                (false, error.to_string())
+            }
         };
+        self.refresh_state_metrics().await;
         let response = WorkloadCommandResponse {
             version: AGENT_PROTOCOL_VERSION,
             request_id: command.request_id,
@@ -1272,6 +1561,17 @@ impl AgentService {
     /// cannot be reconciled is therefore logged and skipped, and its resources
     /// are released rather than being held by a workload that is not running.
     async fn restore(&self) -> Result<()> {
+        let timer = self
+            .inner
+            .metrics
+            .operation_started(podmesh_metrics::OperationName::RuntimeRestore);
+        let result = self.restore_inner().await;
+        self.refresh_state_metrics().await;
+        finish_operation(timer, &result);
+        result
+    }
+
+    async fn restore_inner(&self) -> Result<()> {
         let workloads = self.inner.store.load_all()?;
         anyhow::ensure!(
             workloads.len() <= self.inner.config.max_workloads,
@@ -1329,6 +1629,10 @@ impl AgentService {
     /// a pending deletion and is now gone.
     async fn restore_one(&self, mut stored: StoredWorkload) -> Result<Option<StoredWorkload>> {
         let workload_id = stored.grant.workload_id.clone();
+        if stored.needs_cleanup() {
+            self.cleanup_pending(&stored).await?;
+            return Ok(None);
+        }
         if stored.deleting {
             if !stored.runtime_id.is_empty() {
                 self.runtime_operation(
@@ -1430,6 +1734,39 @@ impl AgentService {
     }
 }
 
+fn finish_operation<T>(timer: podmesh_metrics::OperationTimer, result: &Result<T>) {
+    let (outcome, reason) = match result {
+        Ok(_) => (
+            podmesh_metrics::Outcome::Success,
+            podmesh_metrics::Reason::None,
+        ),
+        Err(error) if error.to_string().contains("timed out") => (
+            podmesh_metrics::Outcome::Timeout,
+            podmesh_metrics::Reason::Deadline,
+        ),
+        Err(error)
+            if error.to_string().contains("capacity")
+                || error.to_string().contains("limit")
+                || error.to_string().contains("starting")
+                || error.to_string().contains("updating") =>
+        {
+            (
+                podmesh_metrics::Outcome::Saturated,
+                podmesh_metrics::Reason::Capacity,
+            )
+        }
+        Err(error) if error.to_string().contains("replay") => (
+            podmesh_metrics::Outcome::Refused,
+            podmesh_metrics::Reason::Replay,
+        ),
+        Err(_) => (
+            podmesh_metrics::Outcome::Refused,
+            podmesh_metrics::Reason::Invalid,
+        ),
+    };
+    timer.finish(outcome, reason);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1489,15 +1826,17 @@ mod tests {
     }
 
     struct FaultStore {
-        inner: AgentStore,
+        inner: Arc<dyn WorkloadStore>,
         saves_before_failure: std::sync::Mutex<Option<usize>>,
+        fail_remove: std::sync::atomic::AtomicBool,
     }
 
     impl FaultStore {
         fn new(inner: AgentStore) -> Self {
             Self {
-                inner,
+                inner: Arc::new(inner),
                 saves_before_failure: std::sync::Mutex::new(None),
+                fail_remove: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -1527,6 +1866,10 @@ mod tests {
         }
 
         fn remove(&self, workload_id: &str) -> Result<()> {
+            anyhow::ensure!(
+                !self.fail_remove.load(std::sync::atomic::Ordering::SeqCst),
+                "injected workload-store remove failure"
+            );
             self.inner.remove(workload_id)
         }
     }
@@ -1606,6 +1949,22 @@ mod tests {
         name: &str,
         cpu_milli: u32,
     ) -> TestWorkload {
+        let (workload, grant) = prepare_test_workload(service, name, cpu_milli).await;
+        let receipt_body = service.deploy(grant).await.unwrap();
+        let receipt: DeploymentReceipt = postcard::from_bytes(
+            &crypto::decrypt_payload_from_recipient_blob(&receipt_body, &workload.response_private)
+                .unwrap(),
+        )
+        .unwrap();
+        receipt.verify().unwrap();
+        workload
+    }
+
+    async fn prepare_test_workload(
+        service: &AgentService,
+        name: &str,
+        cpu_milli: u32,
+    ) -> (TestWorkload, DeploymentGrant) {
         let (owner_public, owner_private) = crypto::generate_signing_keypair();
         let (response_public, response_private) = crypto::generate_kem_keypair();
         let namespace_id = crypto::b64_encode(&owner_public);
@@ -1675,20 +2034,519 @@ mod tests {
         }
         .sign(&owner_private)
         .unwrap();
-        let receipt_body = service.deploy(grant).await.unwrap();
-        let receipt: DeploymentReceipt = postcard::from_bytes(
-            &crypto::decrypt_payload_from_recipient_blob(&receipt_body, &response_private).unwrap(),
+        (
+            TestWorkload {
+                name: name.to_string(),
+                workload_id,
+                owner_public,
+                owner_private,
+                response_public,
+                response_private,
+            },
+            grant,
         )
-        .unwrap();
-        receipt.verify().unwrap();
+    }
 
-        TestWorkload {
-            name: name.to_string(),
-            workload_id,
-            owner_public,
-            owner_private,
-            response_public,
-            response_private,
+    #[derive(Default)]
+    struct PartialRuntime {
+        inner: MockRuntime,
+        fail_delete: std::sync::atomic::AtomicBool,
+        block_create: std::sync::atomic::AtomicBool,
+        fail_create: std::sync::atomic::AtomicBool,
+        created: tokio::sync::Notify,
+        block_delete: std::sync::atomic::AtomicBool,
+        deleting: tokio::sync::Notify,
+        uncertain_backend: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkloadRuntime for PartialRuntime {
+        fn target_id(&self, deployment: &crate::runtime::WorkloadDeployment<'_>) -> Result<String> {
+            self.inner.target_id(deployment)
+        }
+        async fn deploy(
+            &self,
+            deployment: crate::runtime::WorkloadDeployment<'_>,
+        ) -> Result<String> {
+            let id = self.inner.deploy(deployment).await?;
+            self.created.notify_one();
+            if self.block_create.load(std::sync::atomic::Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            anyhow::ensure!(
+                !self.fail_create.load(std::sync::atomic::Ordering::SeqCst),
+                "injected failure after creation"
+            );
+            Ok(id)
+        }
+        async fn status(&self, id: &str) -> Result<String> {
+            self.inner.status(id).await
+        }
+        async fn logs(&self, id: &str, tail: u32) -> Result<String> {
+            self.inner.logs(id, tail).await
+        }
+        async fn delete(&self, id: &str) -> Result<()> {
+            self.deleting.notify_one();
+            if self.block_delete.load(std::sync::atomic::Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            anyhow::ensure!(
+                !self.fail_delete.load(std::sync::atomic::Ordering::SeqCst),
+                "injected cleanup failure"
+            );
+            self.inner.delete(id).await
+        }
+        async fn cleanup_failed_deploy(&self, id: &str, uncertain: bool) -> Result<()> {
+            anyhow::ensure!(
+                !(uncertain
+                    && self
+                        .uncertain_backend
+                        .load(std::sync::atomic::Ordering::SeqCst)),
+                "backend outcome uncertain; repair required"
+            );
+            self.delete(id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_creation_releases_accounting_only_after_cleanup() {
+        for fail_delete in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let runtime = Arc::new(PartialRuntime::default());
+            runtime
+                .fail_create
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            runtime
+                .fail_delete
+                .store(fail_delete, std::sync::atomic::Ordering::SeqCst);
+            let service = AgentService::new(test_config(temp.path(), 1000, 4), runtime.clone())
+                .await
+                .unwrap();
+            let (workload, grant) = prepare_test_workload(&service, "partial-create", 500).await;
+            let error = service.deploy(grant).await.unwrap_err();
+            assert!(error.to_string().contains("failure after creation"));
+            assert_eq!(
+                runtime
+                    .inner
+                    .deployed_workload_ids()
+                    .await
+                    .contains(&workload.workload_id),
+                fail_delete
+            );
+            let state = service.inner.state.lock().await;
+            assert_eq!(
+                state.active.contains_key(&workload.workload_id),
+                fail_delete
+            );
+            assert_eq!(state.usage().cpu_milli, if fail_delete { 500 } else { 0 });
+            assert_eq!(
+                service.inner.store.load_all().unwrap().len(),
+                usize::from(fail_delete)
+            );
+            drop(state);
+            if fail_delete {
+                runtime
+                    .fail_delete
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    command_test_workload(
+                        &service,
+                        &workload,
+                        WorkloadOperation::Delete,
+                        "cleanup-retry"
+                    )
+                    .await
+                    .ok
+                );
+                assert_eq!(service.inner.state.lock().await.usage().cpu_milli, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_creation_stays_charged_and_cannot_race_owner_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(PartialRuntime::default());
+        runtime
+            .block_create
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let config = test_config(temp.path(), 2000, 4);
+        let service = AgentService::new(config.clone(), runtime.clone())
+            .await
+            .unwrap();
+        let (workload, grant) = prepare_test_workload(&service, "cancel-create", 500).await;
+        let worker = service.clone();
+        let task = tokio::spawn(async move { worker.deploy(grant).await });
+        tokio::time::timeout(Duration::from_secs(2), runtime.created.notified())
+            .await
+            .unwrap();
+        assert!(service.mutation(&workload.workload_id).is_err());
+        let update = test_update_request(
+            &service,
+            &workload,
+            "v2",
+            "0".repeat(64),
+            false,
+            "busy-update",
+        );
+        assert!(service.update(update).await.is_err());
+        let delete = WorkloadCommand {
+            version: AGENT_PROTOCOL_VERSION,
+            request_id: "busy-delete".into(),
+            namespace_id: crypto::b64_encode(&workload.owner_public),
+            workload_id: workload.workload_id.clone(),
+            target_node_id: service.signing_pubkey_b64(),
+            operation: WorkloadOperation::Delete,
+            log_tail: None,
+            response_kem_pubkey: crypto::b64_encode(&workload.response_public),
+            issued_at_secs: now_secs(),
+            expires_at_secs: now_secs() + 30,
+            nonce: "busy-delete".into(),
+            owner_signature: String::new(),
+        }
+        .sign(&workload.owner_private)
+        .unwrap();
+        assert!(service.command(delete).await.is_err());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(service.inner.state.lock().await.usage().cpu_milli, 500);
+        let stored = service
+            .inner
+            .store
+            .load_all()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .1
+            .unwrap();
+        assert!(matches!(stored.phase, StoredWorkloadPhase::Creating));
+        assert_eq!(stored.runtime_id, workload.workload_id);
+        assert!(service.mutation(&workload.workload_id).is_ok());
+        drop(service);
+        let restarted = AgentService::new(config, runtime.clone()).await.unwrap();
+        assert_eq!(restarted.inner.state.lock().await.usage().cpu_milli, 0);
+        assert!(runtime.inner.deployed_workload_ids().await.is_empty());
+        assert_eq!(runtime.inner.deploy_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn deploy_persistence_failures_retain_retryable_state_until_removal() {
+        for initial_save_fails in [false, true] {
+            for cleanup_fails in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let runtime = Arc::new(PartialRuntime::default());
+                runtime
+                    .fail_delete
+                    .store(cleanup_fails, std::sync::atomic::Ordering::SeqCst);
+                let mut service =
+                    AgentService::new(test_config(temp.path(), 2000, 4), runtime.clone())
+                        .await
+                        .unwrap();
+                let fault = Arc::new(FaultStore {
+                    inner: service.inner.store.clone(),
+                    saves_before_failure: std::sync::Mutex::new(None),
+                    fail_remove: std::sync::atomic::AtomicBool::new(true),
+                });
+                Arc::get_mut(&mut service.inner).unwrap().store = fault.clone();
+                let (workload, grant) = prepare_test_workload(&service, "save-failure", 500).await;
+                fault.fail_after_successful_saves(usize::from(!initial_save_fails));
+                let error = service.deploy(grant).await.unwrap_err();
+                assert!(error.to_string().contains("save failure"));
+                assert_eq!(
+                    runtime.inner.deploy_count(),
+                    usize::from(!initial_save_fails)
+                );
+                assert_eq!(
+                    service.inner.state.lock().await.usage().cpu_milli,
+                    if initial_save_fails { 0 } else { 500 }
+                );
+                if !initial_save_fails {
+                    assert_eq!(service.inner.store.load_all().unwrap().len(), 1);
+                    fault.clear_failure();
+                    fault
+                        .fail_remove
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    runtime
+                        .fail_delete
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    assert!(
+                        command_test_workload(
+                            &service,
+                            &workload,
+                            WorkloadOperation::Delete,
+                            "delete-after-save-failure"
+                        )
+                        .await
+                        .ok
+                    );
+                    assert!(service.inner.store.load_all().unwrap().is_empty());
+                    assert_eq!(service.inner.state.lock().await.usage().cpu_milli, 0);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_out_creation_is_cleaned_without_releasing_sibling_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(PartialRuntime::default());
+        let mut service = AgentService::new(test_config(temp.path(), 2000, 4), runtime.clone())
+            .await
+            .unwrap();
+        let sibling = deploy_test_workload(&service, "sibling", 500).await;
+        Arc::get_mut(&mut service.inner)
+            .unwrap()
+            .runtime_operation_timeout = Duration::from_millis(10);
+        runtime
+            .block_create
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (_, grant) = prepare_test_workload(&service, "timed-out", 500).await;
+        let error = service.deploy(grant).await.unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::runtime::RuntimeOutcomeUnknown>()
+                .is_some()
+        );
+        assert_eq!(
+            runtime.inner.deployed_workload_ids().await,
+            vec![sibling.workload_id]
+        );
+        assert_eq!(service.inner.state.lock().await.usage().cpu_milli, 500);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_delete_can_be_retried_by_its_owner() {
+        let (service, _temp, runtime) = test_service_with_runtime(2000, 4).await;
+        let workload = deploy_test_workload(&service, "retry-deletion", 500).await;
+        let mut state = service.inner.state.lock().await;
+        let stored = state.active.get_mut(&workload.workload_id).unwrap();
+        stored.deleting = true;
+        service.inner.store.save(stored).unwrap();
+        drop(state);
+        assert!(
+            command_test_workload(
+                &service,
+                &workload,
+                WorkloadOperation::Delete,
+                "retry-deleting"
+            )
+            .await
+            .ok
+        );
+        assert!(runtime.deployed_workload_ids().await.is_empty());
+        assert_eq!(service.inner.state.lock().await.usage().cpu_milli, 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_cleanup_is_retryable_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(PartialRuntime::default());
+        runtime
+            .fail_create
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        runtime
+            .block_delete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let config = test_config(temp.path(), 2000, 4);
+        let service = AgentService::new(config.clone(), runtime.clone())
+            .await
+            .unwrap();
+        let (_, grant) = prepare_test_workload(&service, "cancel-cleanup", 500).await;
+        let worker = service.clone();
+        let task = tokio::spawn(async move { worker.deploy(grant).await });
+        tokio::time::timeout(Duration::from_secs(2), runtime.deleting.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(service.inner.state.lock().await.usage().cpu_milli, 500);
+        assert!(matches!(
+            service
+                .inner
+                .store
+                .load_all()
+                .unwrap()
+                .pop()
+                .unwrap()
+                .1
+                .unwrap()
+                .phase,
+            StoredWorkloadPhase::CleanupPending { uncertain: false }
+        ));
+        drop(service);
+        runtime
+            .block_delete
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let restarted = AgentService::new(config, runtime.clone()).await.unwrap();
+        assert_eq!(restarted.inner.state.lock().await.usage().cpu_milli, 0);
+        assert!(runtime.inner.deployed_workload_ids().await.is_empty());
+        assert_eq!(runtime.inner.deploy_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn uncertain_backend_retains_charge_and_owner_visibility_across_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = test_config(temp.path(), 2000, 4);
+        let runtime = Arc::new(PartialRuntime::default());
+        runtime
+            .block_create
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        runtime
+            .uncertain_backend
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut service = AgentService::new(config.clone(), runtime.clone())
+            .await
+            .unwrap();
+        Arc::get_mut(&mut service.inner)
+            .unwrap()
+            .runtime_operation_timeout = Duration::from_millis(10);
+        let (workload, grant) = prepare_test_workload(&service, "uncertain", 500).await;
+        assert!(service.deploy(grant).await.is_err());
+        drop(service);
+        let service = AgentService::new(config, runtime.clone()).await.unwrap();
+        assert_eq!(service.inner.state.lock().await.usage().cpu_milli, 500);
+        assert_eq!(runtime.inner.deploy_count(), 1);
+        assert!(
+            !command_test_workload(
+                &service,
+                &workload,
+                WorkloadOperation::Delete,
+                "uncertain-delete"
+            )
+            .await
+            .ok
+        );
+        *service.inner.current_endpoint_address.write().unwrap() = Some(test_agent_address());
+        let request = WorkloadListRequest {
+            version: AGENT_PROTOCOL_VERSION,
+            request_id: "list-pending".into(),
+            namespace_id: crypto::b64_encode(&workload.owner_public),
+            response_kem_pubkey: crypto::b64_encode(&workload.response_public),
+            issued_at_secs: now_secs(),
+            expires_at_secs: now_secs() + 30,
+            nonce: "list-pending".into(),
+            owner_signature: String::new(),
+        }
+        .sign(&workload.owner_private)
+        .unwrap();
+        let encrypted = service.list(request).await.unwrap();
+        let plaintext =
+            crypto::decrypt_payload_from_recipient_blob(&encrypted, &workload.response_private)
+                .unwrap();
+        let listed: protocol::WorkloadListResponse = postcard::from_bytes(&plaintext).unwrap();
+        assert_eq!(listed.workloads.len(), 1);
+        assert_eq!(listed.workloads[0].state, "cleanup-required");
+        runtime
+            .uncertain_backend
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            command_test_workload(
+                &service,
+                &workload,
+                WorkloadOperation::Delete,
+                "resolved-delete"
+            )
+            .await
+            .ok
+        );
+        assert_eq!(service.inner.state.lock().await.usage().cpu_milli, 0);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 256,
+            rng_seed: proptest::test_runner::RngSeed::Fixed(0x504f_444d_4553_4806),
+            ..proptest::test_runner::Config::default()
+        })]
+
+        #[test]
+        fn cleanup_traces_preserve_accounting_until_confirmed(refusals in proptest::collection::vec(proptest::bool::ANY, 1..12)) {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                let temp = tempfile::tempdir().unwrap();
+                let runtime = Arc::new(PartialRuntime::default());
+                runtime.fail_create.store(true, std::sync::atomic::Ordering::SeqCst);
+                runtime.fail_delete.store(true, std::sync::atomic::Ordering::SeqCst);
+                let service = AgentService::new(test_config(temp.path(), 2000, 4), runtime.clone()).await.unwrap();
+                let (workload, grant) = prepare_test_workload(&service, "model-cleanup", 500).await;
+                assert!(service.deploy(grant).await.is_err());
+                let mut retained = true;
+                for (index, refused) in refusals.into_iter().enumerate() {
+                    if retained {
+                        runtime.fail_delete.store(refused, std::sync::atomic::Ordering::SeqCst);
+                        let response = command_test_workload(&service, &workload, WorkloadOperation::Delete, &format!("model-delete-{index}")).await;
+                        assert_eq!(response.ok, !refused);
+                        retained = refused;
+                    }
+                    assert_eq!(service.inner.state.lock().await.usage().cpu_milli, if retained {500} else {0});
+                    assert_eq!(service.inner.store.load_all().unwrap().len(), usize::from(retained));
+                    assert_eq!(runtime.inner.deployed_workload_ids().await.len(), usize::from(retained));
+                }
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn version_one_active_and_updating_records_keep_their_encoding() {
+        let (service, _temp, _) = test_service_with_runtime(2000, 4).await;
+        let workload = deploy_test_workload(&service, "stored-version-one", 500).await;
+        let stored = service
+            .inner
+            .state
+            .lock()
+            .await
+            .active
+            .get(&workload.workload_id)
+            .unwrap()
+            .clone();
+        let request = test_update_request(
+            &service,
+            &workload,
+            "v2",
+            stored.grant.revision_id.clone(),
+            false,
+            "stored-update",
+        );
+        for phase in [
+            StoredWorkloadPhase::Active,
+            StoredWorkloadPhase::Updating {
+                previous_grant: Box::new(stored.grant.clone()),
+                previous_runtime_id: stored.runtime_id.clone(),
+                request: Box::new(request.clone()),
+            },
+        ] {
+            let mut old_bytes = postcard::to_allocvec(&1u16).unwrap();
+            match &phase {
+                StoredWorkloadPhase::Active => old_bytes.push(0),
+                StoredWorkloadPhase::Updating {
+                    previous_grant,
+                    previous_runtime_id,
+                    request,
+                } => {
+                    old_bytes.push(1);
+                    old_bytes.extend(
+                        postcard::to_allocvec(&(previous_grant, previous_runtime_id, request))
+                            .unwrap(),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            old_bytes.extend(
+                postcard::to_allocvec(&(
+                    &stored.grant,
+                    &stored.runtime_id,
+                    stored.deleting,
+                    stored.cpu_milli,
+                    stored.memory_bytes,
+                    stored.storage_bytes,
+                    &stored.workload_name,
+                    stored.replica_index,
+                    stored.replica_count,
+                ))
+                .unwrap(),
+            );
+            let decoded: StoredWorkload = postcard::from_bytes(&old_bytes).unwrap();
+            assert_eq!(postcard::to_allocvec(&decoded).unwrap(), old_bytes);
+            assert!(!decoded.needs_cleanup());
         }
     }
 
@@ -2007,6 +2865,7 @@ mod tests {
             BuildOptions {
                 store: fault_store.clone(),
                 service_mesh_required: true,
+                metrics: podmesh_metrics::Metrics::noop(),
             },
         )
         .await
@@ -2059,6 +2918,7 @@ mod tests {
             BuildOptions {
                 store: fault_store.clone(),
                 service_mesh_required: true,
+                metrics: podmesh_metrics::Metrics::noop(),
             },
         )
         .await
@@ -2085,6 +2945,7 @@ mod tests {
             BuildOptions {
                 store: fault_store,
                 service_mesh_required: true,
+                metrics: podmesh_metrics::Metrics::noop(),
             },
         )
         .await
@@ -2144,6 +3005,8 @@ mod tests {
         let service = AgentService::new(
             Config {
                 listen: "127.0.0.1:0".into(),
+                metrics_listen: None,
+                sidecar_metrics_listen: None,
                 key_dir: temp.path().join("keys"),
                 state_path: temp.path().join("state.redb"),
                 runtime: RuntimeKind::Mock,
@@ -2229,6 +3092,8 @@ mod tests {
     ) -> Config {
         Config {
             listen: "127.0.0.1:0".into(),
+            metrics_listen: None,
+            sidecar_metrics_listen: None,
             key_dir: path.join("keys"),
             state_path: path.join("state.redb"),
             runtime: RuntimeKind::Mock,
@@ -2487,6 +3352,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let config = Config {
             listen: "127.0.0.1:0".into(),
+            metrics_listen: None,
+            sidecar_metrics_listen: None,
             key_dir: temp.path().join("keys"),
             state_path: temp.path().join("state.redb"),
             runtime: RuntimeKind::Mock,
@@ -2536,6 +3403,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let config = Config {
             listen: "127.0.0.1:0".into(),
+            metrics_listen: None,
+            sidecar_metrics_listen: None,
             key_dir: temp.path().join("keys"),
             state_path: temp.path().join("state.redb"),
             runtime: RuntimeKind::Mock,
@@ -2617,6 +3486,8 @@ mod tests {
         let service = AgentService::new(
             Config {
                 listen: "127.0.0.1:0".into(),
+                metrics_listen: None,
+                sidecar_metrics_listen: None,
                 key_dir: temp.path().join("keys"),
                 state_path: temp.path().join("state.redb"),
                 runtime: RuntimeKind::Mock,
@@ -2679,6 +3550,8 @@ mod tests {
         let service = AgentService::new(
             Config {
                 listen: "127.0.0.1:0".into(),
+                metrics_listen: None,
+                sidecar_metrics_listen: None,
                 key_dir: temp.path().join("keys"),
                 state_path: temp.path().join("state.redb"),
                 runtime: RuntimeKind::Mock,
@@ -2793,6 +3666,8 @@ mod tests {
         let service = AgentService::new(
             Config {
                 listen: "127.0.0.1:0".into(),
+                metrics_listen: None,
+                sidecar_metrics_listen: None,
                 key_dir: temp.path().join("keys"),
                 state_path: temp.path().join("state.redb"),
                 runtime: RuntimeKind::Mock,
@@ -2865,6 +3740,8 @@ mod tests {
         let service = AgentService::new(
             Config {
                 listen: "127.0.0.1:0".into(),
+                metrics_listen: None,
+                sidecar_metrics_listen: None,
                 key_dir: temp.path().join("keys"),
                 state_path: temp.path().join("state.redb"),
                 runtime: RuntimeKind::Mock,
@@ -2905,5 +3782,48 @@ mod tests {
             .unwrap();
         assert_eq!(offer.available_cpu_milli, 4_000);
         assert!(service.inner.state.lock().await.reservations.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn registered_metrics_track_admission_reservation_replay_and_gauges() {
+        let temp = tempfile::tempdir().unwrap();
+        let metrics = podmesh_metrics::Metrics::registered(podmesh_metrics::ComponentName::Agent);
+        let service = AgentService::new_with_metrics(
+            test_config(temp.path(), 4_000, 4),
+            Arc::new(MockRuntime::default()),
+            metrics.clone(),
+        )
+        .await
+        .unwrap();
+        let (request, _) = signed_admission(
+            &service.signing_pubkey_b64(),
+            "metrics-admission",
+            100,
+            100,
+            100,
+        );
+        service.admit(request.clone()).await.unwrap();
+        assert!(service.admit(request).await.is_err());
+
+        let snapshot = metrics.snapshot().unwrap();
+        assert!(snapshot.operations().any(|(key, value)| {
+            key.operation() == podmesh_metrics::OperationName::Admission && value.count() == 1
+        }));
+        assert!(snapshot.operations().any(|(key, value)| {
+            key.operation() == podmesh_metrics::OperationName::Reservation && value.count() == 1
+        }));
+        assert!(snapshot.events().any(|(key, count)| {
+            key.event() == podmesh_metrics::EventName::ReplayRefusal && *count == 1
+        }));
+        assert!(snapshot.gauges().any(|(key, value)| {
+            key.gauge() == podmesh_metrics::GaugeName::ActiveReservations && *value == 1
+        }));
+        assert!(snapshot.gauges().any(|(key, value)| {
+            key.gauge() == podmesh_metrics::GaugeName::RunningWorkloads && *value == 0
+        }));
+        assert!(snapshot.gauges().any(|(key, value)| {
+            key.gauge() == podmesh_metrics::GaugeName::AttachedSchedulers && *value == 0
+        }));
     }
 }

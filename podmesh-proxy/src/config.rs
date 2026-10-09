@@ -34,8 +34,10 @@ impl IdentitySource {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub proxy_endpoints: Vec<EndpointRecord>,
+    pub workload_replay_limits: protocol::ReplayLimits,
     pub identity: IdentitySource,
     pub iroh_bind_addr: SocketAddr,
+    pub metrics_listen: Option<SocketAddr>,
     pub workload_relay: Option<WorkloadRelayConfig>,
     /// DER of the workload relay certificate, published together with the relay
     /// token when `publish_relay_bootstrap` is set.
@@ -70,6 +72,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.workload_replay_limits.validate()?;
         ensure!(
             self.proxy_endpoints.len() <= MAX_CONFIGURED_PROXY_ENDPOINTS,
             "too many configured proxy endpoints"
@@ -79,6 +82,43 @@ impl Config {
             endpoint.verify(now)?;
         }
         ensure!(!self.rest_host.is_empty(), "REST host must not be empty");
+        if let Some(metrics_listen) = self.metrics_listen {
+            ensure!(
+                !podmesh_metrics::listeners_conflict(metrics_listen, self.iroh_bind_addr),
+                "proxy metrics listener conflicts with the Iroh listener"
+            );
+            if !self.disable_rest_api {
+                let rest_listen: SocketAddr = format!("{}:{}", self.rest_host, self.rest_port)
+                    .parse()
+                    .context("parse proxy REST listen address")?;
+                ensure!(
+                    !podmesh_metrics::listeners_conflict(metrics_listen, rest_listen),
+                    "proxy metrics listener conflicts with the REST listener"
+                );
+            }
+            if self.enable_ingress {
+                let ingress_listen: SocketAddr = format!("{}:8080", self.rest_host)
+                    .parse()
+                    .context("parse proxy ingress listen address")?;
+                ensure!(
+                    !podmesh_metrics::listeners_conflict(metrics_listen, ingress_listen),
+                    "proxy metrics listener conflicts with the ingress listener"
+                );
+            }
+            if let Some(relay) = &self.workload_relay {
+                for relay_listen in [
+                    relay.http_listen,
+                    relay.https_listen,
+                    relay.qad_listen,
+                    relay.metrics_listen,
+                ] {
+                    ensure!(
+                        !podmesh_metrics::listeners_conflict(metrics_listen, relay_listen),
+                        "proxy metrics listener conflicts with a workload relay listener"
+                    );
+                }
+            }
+        }
         if let Some(relay) = &self.workload_relay {
             relay.validate()?;
         }

@@ -33,11 +33,17 @@ struct StoredGrant {
 #[derive(Clone, Default)]
 pub struct ProxyGrantStore {
     inner: Arc<RwLock<HashMap<String, StoredGrant>>>,
+    metrics: podmesh_metrics::Metrics,
 }
 
 impl ProxyGrantStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_metrics(mut self, metrics: podmesh_metrics::Metrics) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Verifies that `encoded` is a live grant issued by `owner_pubkey_b64` for
@@ -68,10 +74,12 @@ impl ProxyGrantStore {
             .inner
             .write()
             .map_err(|_| anyhow::anyhow!("proxy grant store lock poisoned"))?;
-        ensure!(
-            grants.contains_key(owner_pubkey_b64) || grants.len() < MAX_TENANT_GRANTS,
-            "proxy grant capacity of {MAX_TENANT_GRANTS} tenants is reached"
-        );
+        if !grants.contains_key(owner_pubkey_b64) && grants.len() >= MAX_TENANT_GRANTS {
+            drop(grants);
+            self.metrics
+                .record_event(podmesh_metrics::EventName::StoreSaturation);
+            anyhow::bail!("proxy grant capacity of {MAX_TENANT_GRANTS} tenants is reached");
+        }
         grants.insert(
             owner_pubkey_b64.to_string(),
             StoredGrant {

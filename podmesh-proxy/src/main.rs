@@ -1,10 +1,56 @@
 use std::{
     net::SocketAddr,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
+#[cfg(test)]
+mod replay_args_tests {
+    use super::*;
+
+    #[test]
+    fn replay_options_use_shared_defaults_and_validate_explicit_bounds() {
+        let defaults = Args::try_parse_from(["podmesh-proxy"]).unwrap();
+        assert_eq!(
+            defaults.workload_replay_max_peers,
+            protocol::replay_registry::DEFAULT_REPLAY_MAX_PEERS
+        );
+        assert_eq!(
+            defaults.workload_replay_nonces_per_peer,
+            protocol::replay_registry::DEFAULT_REPLAY_NONCES_PER_PEER
+        );
+        assert_eq!(
+            defaults.workload_replay_max_nonce_bytes,
+            protocol::replay_registry::DEFAULT_REPLAY_MAX_NONCE_BYTES
+        );
+        assert_eq!(
+            defaults.workload_replay_retention_secs,
+            protocol::replay_registry::DEFAULT_REPLAY_RETENTION.as_secs()
+        );
+
+        let explicit = Args::try_parse_from([
+            "podmesh-proxy",
+            "--workload-replay-max-peers",
+            "1",
+            "--workload-replay-nonces-per-peer",
+            "1",
+            "--workload-replay-max-nonce-bytes",
+            "36",
+            "--workload-replay-retention-secs",
+            "60",
+        ])
+        .unwrap();
+        protocol::ReplayLimits {
+            max_peers: explicit.workload_replay_max_peers,
+            nonces_per_peer: explicit.workload_replay_nonces_per_peer,
+            max_nonce_bytes: explicit.workload_replay_max_nonce_bytes,
+            retention: Duration::from_secs(explicit.workload_replay_retention_secs),
+        }
+        .validate()
+        .unwrap();
+    }
+}
 use clap::Parser;
 use log::{error, info};
 use tokio::signal;
@@ -37,6 +83,8 @@ struct Args {
         default_value = "0.0.0.0:0"
     )]
     iroh_bind_addr: SocketAddr,
+    #[arg(long = "metrics-listen", env = "PODMESH_METRICS_LISTEN")]
+    metrics_listen: Option<SocketAddr>,
     #[arg(long = "workload-relay-url", env = "PODMESH_WORKLOAD_RELAY_URL")]
     workload_relay_url: Option<String>,
     /// Secret every proxy in the mesh shares, from which per-tenant relay
@@ -151,6 +199,30 @@ struct Args {
         default_value_t = podmesh_proxy::restapi::DEFAULT_REST_RATE_LIMIT_PER_MINUTE
     )]
     rest_rate_limit_per_minute: u32,
+    #[arg(
+        long = "workload-replay-max-peers",
+        env = "PODMESH_WORKLOAD_REPLAY_MAX_PEERS",
+        default_value_t = protocol::replay_registry::DEFAULT_REPLAY_MAX_PEERS
+    )]
+    workload_replay_max_peers: usize,
+    #[arg(
+        long = "workload-replay-nonces-per-peer",
+        env = "PODMESH_WORKLOAD_REPLAY_NONCES_PER_PEER",
+        default_value_t = protocol::replay_registry::DEFAULT_REPLAY_NONCES_PER_PEER
+    )]
+    workload_replay_nonces_per_peer: usize,
+    #[arg(
+        long = "workload-replay-max-nonce-bytes",
+        env = "PODMESH_WORKLOAD_REPLAY_MAX_NONCE_BYTES",
+        default_value_t = protocol::replay_registry::DEFAULT_REPLAY_MAX_NONCE_BYTES
+    )]
+    workload_replay_max_nonce_bytes: usize,
+    #[arg(
+        long = "workload-replay-retention-secs",
+        env = "PODMESH_WORKLOAD_REPLAY_RETENTION_SECS",
+        default_value_t = protocol::replay_registry::DEFAULT_REPLAY_RETENTION.as_secs()
+    )]
+    workload_replay_retention_secs: u64,
 
     /// REST URL of a peer proxy to adopt the workload relay token from.
     ///
@@ -179,6 +251,7 @@ async fn run() -> Result<()> {
         key_dir,
         init_identity,
         iroh_bind_addr,
+        metrics_listen,
         workload_relay_url,
         workload_relay_mesh_secret,
         relay_tenants,
@@ -197,6 +270,10 @@ async fn run() -> Result<()> {
         owner_pubkey,
         publish_relay_bootstrap,
         rest_rate_limit_per_minute,
+        workload_replay_max_peers,
+        workload_replay_nonces_per_peer,
+        workload_replay_max_nonce_bytes,
+        workload_replay_retention_secs,
         workload_relay_bootstrap_url,
     } = Args::parse();
 
@@ -269,8 +346,15 @@ async fn run() -> Result<()> {
 
     let mut cfg = Config {
         proxy_endpoints,
+        workload_replay_limits: protocol::ReplayLimits {
+            max_peers: workload_replay_max_peers,
+            nonces_per_peer: workload_replay_nonces_per_peer,
+            max_nonce_bytes: workload_replay_max_nonce_bytes,
+            retention: Duration::from_secs(workload_replay_retention_secs),
+        },
         identity: IdentitySource::Persistent(key_dir),
         iroh_bind_addr,
+        metrics_listen,
         workload_relay: Some(workload_relay),
         workload_relay_certificate_der: relay_tls.certificate_der,
         publish_relay_bootstrap,

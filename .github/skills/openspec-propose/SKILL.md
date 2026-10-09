@@ -11,6 +11,11 @@ metadata:
 
 Propose a new change - create the change and generate all artifacts in one step.
 
+Follow `openspec/README.md` for the adaptive workflow: assess scope/risk, clarify material questions,
+record settled answers in the change design, and present substantial scope/approach/checks for
+approval. Create the OpenSpec artifacts, not a separate AI-DLC plan or state file. Generating an
+apply-ready proposal is not approval for an unseen implementation plan.
+
 I'll create a change with artifacts:
 - proposal.md (what & why)
 - design.md (how)

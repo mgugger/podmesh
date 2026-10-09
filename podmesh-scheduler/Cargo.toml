@@ -2,6 +2,7 @@
 name = "podmesh-scheduler"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 axum-support = { workspace = true }
@@ -18,6 +19,7 @@ iroh-gossip = { workspace = true }
 iroh-support = { workspace = true }
 iroh-relay = { workspace = true }
 log = { workspace = true }
+podmesh-metrics = { workspace = true }
 protocol = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }

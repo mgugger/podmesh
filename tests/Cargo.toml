@@ -4,12 +4,15 @@ version = "0.1.0"
 edition = "2024"
 description = "Integration tests for podmesh"
 publish = false
+license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["process"] }
+tokio-util = { workspace = true }
 podmesh-proxy = { workspace = true }
 podmesh-sidecar = { workspace = true }
+podmesh-metrics = { workspace = true }
 podmesh-agent = { workspace = true }
 protocol = { workspace = true }
 podmesh-scheduler = { workspace = true }
@@ -24,6 +27,8 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 serde = { workspace = true }
 futures = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 log = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
@@ -34,6 +39,7 @@ postcard = { workspace = true }
 tempfile = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
+proptest = { workspace = true }
 
 [features]
 default = []

@@ -3,6 +3,7 @@ name = "protocol"
 version = "0.1.0"
 edition = "2024"
 description = "Protocol IPC for podmesh machine plane"
+license.workspace = true
 
 [dependencies]
 serde = { workspace = true }
@@ -19,3 +20,9 @@ blake3 = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "time"] }
 tokio-util = { workspace = true }
 biscuit-auth = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+proptest = { workspace = true }

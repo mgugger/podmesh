@@ -8,6 +8,36 @@ Nothing has to be created by hand. Every Iroh identity, relay TLS keypair, and r
 generated on first start and persisted in the `podmesh-state` volume. There are no Kubernetes
 Secrets in the manifests.
 
+## Application metrics
+
+The sample manifests explicitly enable bounded application metrics inside the `podmesh` network:
+
+| Runtime | Application metrics | Existing relay metrics |
+|---|---|---|
+| schedulers 1-3 | `podmesh-control:9200-9202` | `podmesh-control:9090-9092` |
+| agents 1-3 | `podmesh-agents:9210-9212` | none |
+| proxies 1-3 | `podmesh-proxies:9220-9222` | `podmesh-proxies:9100-9102` |
+| each workload sidecar | workload pod address on 9230 | none |
+
+Application metrics use `PODMESH_METRICS_LISTEN`. Agents receive
+`PODMESH_AGENT_SIDECAR_METRICS_LISTEN=0.0.0.0:9230` and inject the universal setting into sidecars
+outside their signed metadata. These unauthenticated ports have `containerPort` declarations but no
+`hostPort`; any peer that can reach the Podman network can scrape them. That placement is not
+authentication or tenant isolation.
+
+The runtime images are scratch-based, so use a disposable network client rather than `podman exec`:
+
+```bash
+podman run --rm --network podmesh docker.io/curlimages/curl:latest \
+  --fail --silent --show-error --max-time 5 \
+  http://podmesh-control:9200/metrics
+```
+
+Repeat for scheduler 9200-9202, agent 9210-9212, and proxy 9220-9222. `GET /metrics` ends with
+`# EOF`. The metrics listener's `GET /health` returns `ok` but is not business readiness; retain the
+capacity, agent, ingress, and traffic checks below. No collector, dashboard, alert, trace service,
+metric persistence, or quantitative SLO is included.
+
 Every command and every output below was run against this repository.
 
 ---
@@ -175,21 +205,40 @@ Worth knowing before you point anything real at it:
 * **Anyone can deploy.** The scheduler client API on `:3000`–`:3002` is unauthenticated. It is rate
   limited per peer address (`--client-rate-limit-per-minute`, default 1200), which bounds abuse but
   does not decide who may call.
-* **Ingress is plain HTTP** on `:8080`. There is no TLS termination.
+* **Ingress is plain HTTP** on `:8080`. There is no TLS termination. Iroh encrypts the
+  sidecar/proxy hop, but proxies can read application bytes unless an additional end-to-end
+  protocol protects them. TLS terminated in front of the proxy protects only that external hop.
 * **`POST /api/v1/proxy_grant` is unauthenticated.** A grant authenticates itself, so nobody can
   forge authority for your owner key. It is rate limited per peer
   (`--rest-rate-limit-per-minute`, default 600) so filling the grant store is not free.
 * **Agents drive the Podman socket**, which is equivalent to host control in the rootful manifest.
   The pod security policy is what stands between a tenant manifest and your host: volumes of every
-  kind, host namespaces, host ports, added capabilities and privileged execution are all refused.
+  kind, host namespaces, host ports, tenant-added capabilities and explicit privileged settings are
+  refused. Manifest checks do not certify host confinement; the injected sidecar may add `NET_ADMIN`.
 * **All nine components share one state volume**, so they are not isolated from each other.
 * **Tenants share one workload network**, so one tenant's pod can reach another's by address. This
-  is by design: tenants are separated by owner identity at the proxy, not by topology. A per-tenant
-  bridge would not survive agents, proxies and schedulers running on different machines.
+  is by design: mesh operations are authorized by owner identity at the proxy, while direct traffic
+  to application ports is not isolated. Network isolation is outside this PoC, not incompatible
+  with multi-host deployment.
 * **Egress tunnels are not filtered by destination address.** A workload whose owner granted a
   proxy can tunnel anywhere that proxy can reach, including its own loopback services and cloud
   instance metadata. Authorisation is by tenant, not by address, so run proxies where that reach is
   acceptable.
+* **Workload control is fully enveloped.** Proxy and sidecar sign every handshake, registration,
+  discovery, ingress, egress setup, and announcement request/response. HTTP bodies stream in 64 KiB
+  chunks up to 16 MiB; WebSocket streams allow 512 MiB per direction, five minutes idle, and one
+  hour total. Upgrade proxy and sidecar together; mixed workload protocol versions are unsupported.
+* **Replay limits are configurable.** Use `PODMESH_WORKLOAD_REPLAY_MAX_PEERS`,
+  `PODMESH_WORKLOAD_REPLAY_NONCES_PER_PEER`, `PODMESH_WORKLOAD_REPLAY_MAX_NONCE_BYTES`, and
+  `PODMESH_WORKLOAD_REPLAY_RETENTION_SECS`; defaults are `10000`, `1000`, `128`, and `120`.
+  Duplicates are refused while retained; eviction or process restart can permit replay within the
+  freshness window. Signatures and authorization remain mandatory.
+* **Proxy grants are in memory.** After proxy restart, repost grants with `podctl cert grant-proxy`.
+  An unchanged `podctl apply` can return without reposting them. Manual recovery is accepted.
+* **Stateless and decentralized describe scheduler coordination.** Agents retain local workload
+  records and keys; owners retain keys and catalogs. Multiple scheduler entry points require no
+  central workload database or leader, but configured bootstrap and trusted execution hosts remain
+  necessary. Separate agent identities do not prove separate physical hosts.
 
 ## Step 4 — Point `podctl` at the mesh
 
@@ -234,6 +283,32 @@ export PODMESH_TRUST_ANY_AGENT=1   # or pass --trust-any-agent on each command
 
 In a real mesh, list the trusted agents' base64 Ed25519 signing keys, one per line, in
 `~/.podmesh/trusted_agents`.
+
+### Tell `podctl` which proxies it may trust
+
+Each proxy endpoint record is self-signed, so its signature proves internal consistency but does not
+prove that the party answering a plain HTTP URL is the proxy you intended. Explicitly record each
+configured proxy before apply:
+
+```bash
+./target/debug/podctl cert trust-proxy --proxy-url http://127.0.0.1:3010
+./target/debug/podctl cert trust-proxy --proxy-url http://127.0.0.1:3011
+./target/debug/podctl cert trust-proxy --proxy-url http://127.0.0.1:3012
+./target/debug/podctl cert list-proxies
+```
+
+The trust command is intentionally non-interactive: invoking it is the decision, and it prints the
+full canonical URL, endpoint id, and signing key immediately before committing. If a proxy is rebuilt
+with a new identity, inspect it and repeat the command with `--replace`. Ordinary apply never creates
+or changes trust.
+
+Proxy bindings and agent keys share the versioned `~/.podmesh/trusted_agents` file. The first
+mutation migrates a legacy bare-key file and keeps unique agent keys but drops comments. Unix
+permissions are narrowed to `0600` before reading. `remove-proxy` is idempotent. Concurrent writers
+are not coordinated, so the last complete atomic write wins. If a trust command reports a
+persistence error after rename, run `list-proxies` before retrying because the new complete binding
+may already be visible. Older `podctl` binaries refuse the typed header rather than ignoring proxy
+trust.
 
 If you prefer to wire things explicitly, unset `PODMESH_PROXY_URL` and supply
 `PODMESH_WORKLOAD_RELAY_AUTH_TOKEN` — this tenant's derived token, not the mesh secret — plus
@@ -525,3 +600,24 @@ in step 2, and then repeats the tutorial:
 
 Both derive the pod name from the per-replica workload id (`protocol::workload_id`), which is what
 the agent names its pods after; `podctl` prints the deployment id instead.
+
+## Local Image Tags and Verification
+
+Local image names default to `latest`. A custom tag is optional; the builder prints each local
+image identity so operators can see what was built:
+
+```bash
+PODMESH_IMAGE_TAG=poc-local-1 ./deploy/build_containers.sh
+```
+
+The provided manifests and tests use `latest`; build without an override or retag all four images
+before running them. With current images and a working socket, run:
+
+```bash
+cargo test --locked -p podmesh-integration-tests --features podman-tests
+```
+
+The normal CI workflow exposes an optional `run_podman` input for this real-container path. Default
+workspace tests and a feature-enabled compile check do not claim actual Podman or multi-host success.
+This greenfield PoC has no production latency, availability or recovery SLO; see the
+[scope and trust boundaries](../docs/poc-scope.md).

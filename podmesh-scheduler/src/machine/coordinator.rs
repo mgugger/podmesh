@@ -1,5 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
+use crate::now_secs;
 use anyhow::{Context, Result, ensure};
 use iroh::Endpoint;
 use tokio::{sync::broadcast, task::JoinHandle};
@@ -21,6 +22,7 @@ pub struct CapacityService {
     queries: QueryManager,
     publisher: GossipPublisher,
     cancellation: CancellationToken,
+    metrics: podmesh_metrics::Metrics,
 }
 
 impl CapacityService {
@@ -32,6 +34,28 @@ impl CapacityService {
     /// every agent in a large mesh would make every placement cost the full
     /// timeout, and a deployment pays that cost once per replica.
     pub async fn solicit(
+        &self,
+        criteria: CapacityCriteria,
+        target_offers: usize,
+    ) -> Result<Option<protocol::CapacityOffer>> {
+        let timer = self
+            .metrics
+            .operation_started(podmesh_metrics::OperationName::CapacityQuery);
+        let result = self.solicit_inner(criteria, target_offers).await;
+        match &result {
+            Ok(_) => timer.finish(
+                podmesh_metrics::Outcome::Success,
+                podmesh_metrics::Reason::None,
+            ),
+            Err(_) => timer.finish(
+                podmesh_metrics::Outcome::Error,
+                podmesh_metrics::Reason::Internal,
+            ),
+        }
+        result
+    }
+
+    async fn solicit_inner(
         &self,
         criteria: CapacityCriteria,
         target_offers: usize,
@@ -71,7 +95,21 @@ impl CapacityService {
             }
             _ = tokio::time::sleep(wait) => {}
         }
-        Ok(self.queries.finish(&begun.query.query_id, now_secs()).await)
+        let selection_timer = self
+            .metrics
+            .operation_started(podmesh_metrics::OperationName::CapacitySelection);
+        let selected = self.queries.finish(&begun.query.query_id, now_secs()).await;
+        match selected {
+            Some(_) => selection_timer.finish(
+                podmesh_metrics::Outcome::Success,
+                podmesh_metrics::Reason::None,
+            ),
+            None => selection_timer.finish(
+                podmesh_metrics::Outcome::Saturated,
+                podmesh_metrics::Reason::Capacity,
+            ),
+        }
+        Ok(selected)
     }
 }
 
@@ -89,6 +127,7 @@ impl CapacityCoordinator {
         gossip: &SchedulerGossip,
         machine_config: &ValidatedMachineConfig,
     ) -> (CapacityService, Self) {
+        let metrics = queries.metrics();
         let mut query_events = gossip.subscribe_queries();
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
@@ -149,6 +188,7 @@ impl CapacityCoordinator {
             queries,
             publisher: gossip.publisher(),
             cancellation: cancellation.clone(),
+            metrics,
         };
         (service, Self { cancellation, task })
     }
@@ -164,11 +204,4 @@ impl CapacityCoordinator {
             .context("join capacity coordinator task")??;
         Ok(())
     }
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }

@@ -1,45 +1,66 @@
 schema: spec-driven
 
 context: |
-  Podmesh is a decentralized, zero-trust workload system written in Rust (2024 edition,
-  cargo workspace). Crates: podctl, podmesh-scheduler, podmesh-agent, podmesh-proxy,
-  podmesh-sidecar, and shared/{crypto,protocol,iroh_support,axum_support}.
+  OpenSpec is the sole active source for requirements, design decisions, and change tasks.
+  Read openspec/README.md for document ownership and openspec/decisions.md for accepted decisions.
+  Use project-specific adaptive planning, structured questions/answers, meaningful approval checkpoints,
+  incremental progress, verification/review and session continuity using OpenSpec artifacts only.
+  The redundant AI-DLC document/rule tree is removed; never recreate it or a separate state/audit.
+  Create or update changes/<change>/proposal.md, design.md, tasks.md and verification.md under
+  openspec, plus specs/<capability>/spec.md deltas for changed behavior. Follow schema instructions.
+  Record material answers and approval scope in design.md. Before substantial implementation,
+  present scope/approach/checks for approval; implementation of an already presented plan may be
+  explicitly approved in the same request. Do not ask again for unchanged scope. Small clear fixes
+  need only a minimal change record and focused checks. Resume from tasks/design/verification.
+  User acceptance is distinct from implementation and test completion.
+
+  Podmesh is a greenfield decentralized workload-scheduling PoC in Rust 2024.
+  Workspace: podctl, podmesh-scheduler, podmesh-agent, podmesh-proxy, podmesh-sidecar,
+  shared/{crypto,protocol,iroh_support,axum_support,metrics}, and tests.
 
   Architecture invariants:
-  - The scheduler is a stateless selector and blind relay. It never sees workload plaintext,
-    tenant keys, lifecycle state, or logs, and keeps no durable agent records.
+  - Scoped zero trust covers owner-to-agent control and sidecar-to-proxy authorization,
+    not hostile-host confinement, tenant network isolation, or Byzantine availability.
+  - Schedulers are stateless selectors and blind relays with no authoritative workload state
+    or durable agent records. They see coordination metadata but not sealed workload plaintext.
   - podctl is a plain HTTP CLI with no Iroh endpoint. It decides replica placement itself.
+    Fixed-count replicas use distinct agent identities, not attested distinct physical hosts.
   - The agent owns admission, aggregate resource accounting, Podman, sidecar injection,
     encrypted per-workload persistence, restart reconciliation, status, logs, and deletion.
-  - Proxy and sidecar form a separate workload traffic plane using owner-signed Biscuit grants.
+  - Proxy/sidecar traffic is independent of scheduler/agent processes. Iroh encrypts that hop;
+    proxies can see application bytes unless applications use additional end-to-end protection.
+  - Proxy grants may remain in memory with manual recovery. No clustering, consensus, automatic
+    scaling, relocation, self-healing, persistent volumes, or mixed-version compatibility is promised.
 
   Transport is Iroh (no libp2p, no DHT in the workload plane). Crypto is Ed25519 signing,
-  X25519 KEM, XChaCha20-Poly1305, and Biscuit for delegatable service grants.
+  X25519 KEM, BLAKE3 key derivation, XChaCha20-Poly1305, and owner-issued Biscuit credentials.
 
-  Conventions: log:: macros never println!, files under 300 lines, named constants for every
-  bound and timeout, no TODO/FIXME placeholders, anyhow with .context(), no backward
-  compatibility guarantees.
+  Prefer small cohesive interfaces, existing shared validators, named bounds/timeouts, and
+  contextual errors. Do not split files or add abstractions just to meet a line-count target.
+  Runtime diagnostics use log; CLI output and bounded metrics are intentional output interfaces.
+  Preserve public APIs and wire formats unless the requested change requires altering them.
+  Test before widening an edit. Use proptest for applicable transformation/state invariants,
+  structured generators, shrinking, reproducible seeds, and existing Cargo/CI integration.
+  Use normal unit/integration/adversarial/property tests, formatting and Clippy. Podman/multi-host
+  execution is optional and reported separately. Fuzz campaigns, soak tests and dedicated release
+  evidence, SBOM/bundle or baseline pipelines are removed scope; do not recreate them.
+  Greenfield work needs no speculative compatibility adapters, migrations or enterprise delivery
+  stages. Name the affected flow, trust boundary, failure cases and cheapest meaningful checks.
+  Change verification is a short command/result note, not a prescribed evidence schema.
 
 rules:
-  spec:
-    - Each requirement's first body line must contain SHALL or MUST
-    - Prefer observable behaviour over implementation detail in scenarios
-
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
-
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+  proposal:
+    - State scope, non-goals, impacted capabilities, and whether behavior or only documentation changes.
+    - Assess uncertainty and risk; identify material questions and the appropriate planning depth.
+  design:
+    - Reference accepted decisions instead of duplicating requirements; explain any deliberate change.
+    - Keep PoC limitations distinct from implementation defects and unexecuted tests; avoid speculative migration or certification designs.
+    - Record settled questions/answers, alternatives, and the actual user-approved scope before substantial implementation.
+  specs:
+    - Each requirement's first body line must contain SHALL or MUST.
+    - Prefer observable behavior over implementation detail in scenarios.
+    - Source specs are normative; README and deployment guides explain them, not redefine them.
+  tasks:
+    - Use testable checkboxes and record verification with the change; mark only completed work.
+    - Keep one active task owner per work item; do not maintain a parallel AI-SDLC plan or audit.
+    - Update verified increments and record actual commands, outcomes, blockers and review in the change's verification.md.

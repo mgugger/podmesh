@@ -4,6 +4,13 @@ description: Implement tasks from an OpenSpec change (Experimental)
 
 Implement tasks from an OpenSpec change.
 
+Follow `openspec/README.md` for adaptive checkpoints and artifact ownership. On resume summarize
+the relevant design, task progress and verification. Before substantial implementation confirm
+approval of the presented scope/approach/checks; an explicit request to implement that presented
+plan counts, so do not repeat the checkpoint for unchanged scope. Record approval scope in
+`design.md`, update `tasks.md` after verified increments, and write actual checks/findings/blockers
+to the change's `verification.md`. Finish with a review summary, not an assumed user acceptance.
+
 **Input**: Optionally specify a change name (e.g., `/opsx:apply add-auth`). If omitted, check if it can be inferred from conversation context. If vague or ambiguous you MUST prompt for available changes.
 
 **Steps**

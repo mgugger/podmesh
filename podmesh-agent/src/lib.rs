@@ -16,13 +16,29 @@ use tokio_util::sync::CancellationToken;
 const SERVICE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
-    let runtime = runtime::create_runtime(config.runtime, &config.workload_network)?;
-    let service = AgentService::new(config.clone(), runtime).await?;
-    let mut machine = machine::AgentMachine::start(&config, service.clone()).await?;
     let listener = tokio::net::TcpListener::bind(&config.listen).await?;
+    if let Some(metrics_listen) = config.metrics_listen {
+        anyhow::ensure!(
+            !podmesh_metrics::listeners_conflict(metrics_listen, listener.local_addr()?)
+                && !podmesh_metrics::listeners_conflict(metrics_listen, config.machine.bind_addr),
+            "agent metrics listener conflicts with an existing listener"
+        );
+    }
+    let cancellation = CancellationToken::new();
+    let metrics_runtime = podmesh_metrics::MetricsRuntime::start(
+        podmesh_metrics::ComponentName::Agent,
+        podmesh_metrics::MetricsConfig {
+            listen: config.metrics_listen,
+        },
+        cancellation.clone(),
+    )
+    .await?;
+    let runtime = runtime::create_runtime(config.runtime, &config.workload_network)?;
+    let service =
+        AgentService::new_with_metrics(config.clone(), runtime, metrics_runtime.metrics()).await?;
+    let mut machine = machine::AgentMachine::start(&config, service.clone()).await?;
     log::info!("podmesh agent listening on {}", listener.local_addr()?);
 
-    let cancellation = CancellationToken::new();
     let http_cancellation = cancellation.clone();
     let http_server = axum::serve(listener, service.router())
         .with_graceful_shutdown(async move { http_cancellation.cancelled().await })
@@ -34,11 +50,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             signal_result?;
             cancellation.cancel();
             shutdown_http(&mut http_server).await?;
-            shutdown_machine(machine).await
+            shutdown_machine(machine).await?;
+            metrics_runtime.shutdown().await?;
+            Ok(())
         }
         http_result = &mut http_server => {
             cancellation.cancel();
             shutdown_machine(machine).await?;
+            metrics_runtime.shutdown().await?;
             http_result?;
             anyhow::bail!("agent HTTP service stopped unexpectedly")
         }
@@ -46,6 +65,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             cancellation.cancel();
             shutdown_http(&mut http_server).await?;
             shutdown_machine(machine).await?;
+            metrics_runtime.shutdown().await?;
             machine_result.context("agent machine supervisor task failed")??;
             anyhow::bail!("agent machine plane stopped unexpectedly")
         }

@@ -2,11 +2,14 @@
 name = "podmesh-sidecar"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 authors = ["Podmesh"]
 
 [dependencies]
 anyhow = { workspace = true }
+httparse = { workspace = true }
+futures = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 crypto = { workspace = true }
 iroh = { workspace = true }
@@ -14,6 +17,7 @@ iroh-support = { workspace = true }
 rustls-pki-types = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 log = { workspace = true }
+podmesh-metrics = { workspace = true }
 env_logger = { workspace = true }
 protocol = { workspace = true }
 reqwest = { workspace = true }
@@ -29,4 +33,8 @@ ipnetwork = "0.21"
 tokio-util = { workspace = true }
 postcard = { workspace = true }
 sha2 = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 

@@ -227,5 +227,9 @@ pub async fn provision_proxy_cert(
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    podctl::cert::grant_proxy_async(&url, owner_pk, owner_sk, 30).await
+    let trust_dir = tempfile::tempdir().context("create isolated proxy trust directory")?;
+    podctl::cert::trust_proxy_async_at(trust_dir.path(), &url, false)
+        .await
+        .context("explicitly trust proxy for test")?;
+    podctl::cert::grant_proxy_async_at(&url, owner_pk, owner_sk, 30, trust_dir.path()).await
 }

@@ -3,6 +3,7 @@ name = "podctl"
 version = "0.1.0"
 edition = "2024"
 description = "Command-line interface for podmesh"
+license.workspace = true
 
 [lib]
 name = "podctl"
@@ -25,10 +26,13 @@ uuid = { workspace = true }
 postcard = { workspace = true }
 rand = { workspace = true }
 dirs = { workspace = true }
+thiserror = { workspace = true }
 
 [[bin]]
 name = "podctl"
 path = "src/main.rs"
 
 [dev-dependencies]
+proptest = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["net"] }

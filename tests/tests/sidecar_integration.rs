@@ -1,7 +1,12 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, ensure};
-use axum::{Router, routing::get};
+use axum::{
+    Router,
+    body::{Body, to_bytes},
+    http::{Request, Response},
+    routing::{any, get, post},
+};
 use axum_support::spawn_tcp_listener;
 use podmesh_proxy::{Config, Workload};
 use podmesh_sidecar::{
@@ -12,6 +17,7 @@ use protocol::machine::{SidecarRouteKind, SidecarRouteSpec};
 use reqwest::Client;
 use serial_test::serial;
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
@@ -41,8 +47,10 @@ fn build_workload_config(
 ) -> Config {
     Config {
         proxy_endpoints,
+        workload_replay_limits: protocol::ReplayLimits::default(),
         identity: podmesh_proxy::IdentitySource::ephemeral(),
         iroh_bind_addr: format!("127.0.0.1:{iroh_port}").parse().unwrap(),
+        metrics_listen: None,
         workload_relay: None,
         workload_relay_certificate_der: Vec::new(),
         publish_relay_bootstrap: false,
@@ -116,6 +124,43 @@ async fn ingress_proxies_requests_via_sidecar() -> Result<()> {
         let body = wait_for_ingress_response(&client, &url, &service_host, Duration::from_secs(20))
             .await?;
         assert_eq!(body, app_body);
+
+        let posted = vec![42u8; protocol::workload_body::MAX_HTTP_BODY_CHUNK_BYTES + 17];
+        let echoed = client
+            .post(format!("http://{ingress_addr}/echo"))
+            .header("host", &ingress_host)
+            .body(posted.clone())
+            .send()
+            .await?
+            .bytes()
+            .await?;
+        assert_eq!(echoed.as_ref(), posted.as_slice());
+
+        let mut websocket = tokio::net::TcpStream::connect(ingress_addr).await?;
+        websocket
+            .write_all(
+                format!(
+                    "GET /ws HTTP/1.1\r\nHost: {ingress_host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let mut headers = Vec::new();
+        let mut byte = [0u8; 1];
+        while !headers.ends_with(b"\r\n\r\n") {
+            tokio::time::timeout(Duration::from_secs(5), websocket.read_exact(&mut byte)).await??;
+            headers.push(byte[0]);
+            ensure!(headers.len() <= 8 * 1024, "upgrade response headers are oversized");
+        }
+        ensure!(
+            String::from_utf8_lossy(&headers).starts_with("HTTP/1.1 101"),
+            "proxy did not accept WebSocket upgrade: {}",
+            String::from_utf8_lossy(&headers)
+        );
+        websocket.write_all(b"ping").await?;
+        let mut echoed = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), websocket.read_exact(&mut echoed)).await??;
+        assert_eq!(&echoed, b"ping");
         Ok(())
     }
     .await;
@@ -508,17 +553,44 @@ async fn wait_for_network_ready(mut rx: watch::Receiver<bool>, timeout: Duration
 
 async fn spawn_test_app(port: u16, response_body: String) -> Result<JoinHandle<()>> {
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
-    let router = Router::new().route(
-        "/hello",
-        get({
-            let response_body = response_body.clone();
-            move || {
-                let body = response_body.clone();
-                async move { body }
-            }
-        }),
-    );
+    let router = Router::new()
+        .route(
+            "/hello",
+            get({
+                let response_body = response_body.clone();
+                move || {
+                    let body = response_body.clone();
+                    async move { body }
+                }
+            }),
+        )
+        .route(
+            "/echo",
+            post(|body: Body| async move {
+                to_bytes(body, protocol::workload_body::MAX_HTTP_BODY_BYTES)
+                    .await
+                    .expect("bounded echo body")
+            }),
+        )
+        .route("/ws", any(raw_upgrade_echo));
     Ok(spawn_tcp_listener(listener, router, "workplane-test-app"))
+}
+
+async fn raw_upgrade_echo(mut request: Request<Body>) -> Response<Body> {
+    let on_upgrade = hyper::upgrade::on(&mut request);
+    tokio::spawn(async move {
+        if let Ok(upgraded) = on_upgrade.await {
+            let upgraded = hyper_util::rt::TokioIo::new(upgraded);
+            let (mut reader, mut writer) = tokio::io::split(upgraded);
+            let _ = tokio::io::copy(&mut reader, &mut writer).await;
+        }
+    });
+    Response::builder()
+        .status(101)
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .body(Body::empty())
+        .expect("valid upgrade response")
 }
 
 async fn wait_for_ingress_response(
@@ -621,6 +693,7 @@ fn build_sidecar_config_full(
     let cfg = SidecarConfig {
         identity: podmesh_sidecar::IdentitySource::ephemeral(),
         proxy_endpoints: bootstrap_peers,
+        workload_replay_limits: protocol::ReplayLimits::default(),
         workload_credential_b64: Some(podmesh_integration_tests::support::workload_credential(
             owner_sk,
             owner_b64,
@@ -630,6 +703,7 @@ fn build_sidecar_config_full(
         workload_relay_ca_certificates: Vec::new(),
         lookup_interval: Duration::from_secs(2),
         iroh_bind_addr: "127.0.0.1:0".parse()?,
+        metrics_listen: None,
         workload_name: DEMO_WORKLOAD_NAME.to_string(),
         manifest_id: demo_manifest_id(owner_b64),
         replica_index: 0,

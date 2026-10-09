@@ -27,6 +27,9 @@ pub async fn run_scheduler_attachment(
         if cancellation.is_cancelled() {
             return Ok(());
         }
+        let timer = service
+            .metrics()
+            .operation_started(podmesh_metrics::OperationName::SchedulerAttachment);
         match run_session(
             &endpoint,
             &scheduler,
@@ -37,9 +40,33 @@ pub async fn run_scheduler_attachment(
         )
         .await
         {
-            Ok(()) if cancellation.is_cancelled() => return Ok(()),
-            Ok(()) => backoff = config.reconnect_initial,
+            Ok(()) if cancellation.is_cancelled() => {
+                timer.finish(
+                    podmesh_metrics::Outcome::Success,
+                    podmesh_metrics::Reason::None,
+                );
+                return Ok(());
+            }
+            Ok(()) => {
+                timer.finish(
+                    podmesh_metrics::Outcome::Success,
+                    podmesh_metrics::Reason::None,
+                );
+                backoff = config.reconnect_initial;
+            }
             Err(error) => {
+                let (outcome, reason) = if error.to_string().contains("timed out") {
+                    (
+                        podmesh_metrics::Outcome::Timeout,
+                        podmesh_metrics::Reason::Deadline,
+                    )
+                } else {
+                    (
+                        podmesh_metrics::Outcome::Unreachable,
+                        podmesh_metrics::Reason::Unavailable,
+                    )
+                };
+                timer.finish(outcome, reason);
                 log::warn!(
                     "scheduler attachment {} failed: {error}",
                     super::record_endpoint_id(&scheduler)?.fmt_short()
@@ -98,6 +125,10 @@ async fn run_session(
         "agent attached to scheduler {}",
         expected_scheduler.fmt_short()
     );
+    service
+        .metrics()
+        .set_gauge(podmesh_metrics::GaugeName::AttachedSchedulers, 1);
+    let _attached_gauge = AttachedSchedulerGauge(service.metrics());
 
     let refresh_wait = Duration::from_secs(ack.refresh_after_secs.saturating_sub(now_secs()));
     let refresh = tokio::time::sleep(refresh_wait);
@@ -156,6 +187,9 @@ async fn process_query(
         query.expires_at_secs,
         now,
     )? {
+        service
+            .metrics()
+            .record_event(podmesh_metrics::EventName::ReplayRefusal);
         return Ok(());
     }
     if let Some(offer) = service
@@ -165,6 +199,15 @@ async fn process_query(
         send_offer(endpoint, config, &query.reply_endpoint, &offer).await?;
     }
     Ok(())
+}
+
+struct AttachedSchedulerGauge(podmesh_metrics::Metrics);
+
+impl Drop for AttachedSchedulerGauge {
+    fn drop(&mut self) {
+        self.0
+            .set_gauge(podmesh_metrics::GaugeName::AttachedSchedulers, 0);
+    }
 }
 
 async fn send_offer(

@@ -1,0 +1,23 @@
+[package]
+name = "podmesh-metrics"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+log = { workspace = true }
+parking_lot = { workspace = true }
+prometheus-client = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+nom-openmetrics = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }

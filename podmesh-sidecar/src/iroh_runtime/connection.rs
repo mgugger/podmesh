@@ -1,12 +1,17 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Arc,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, ensure};
 use iroh::{Endpoint, EndpointId, endpoint::Connection};
 use protocol::{
-    DEFAULT_WORKLOAD_STREAM_TIMEOUT, EndpointRecord, ProxyDiscoveryRequest,
-    ProxyEndpointDiscoveryResponse, SidecarRegistration, SidecarRegistrationAck, SidecarRoute,
-    WORKLOAD_ALPN, WorkloadStreamKind, read_workload_frame, write_workload_frame,
+    AcceptedWorkloadPayload, DEFAULT_WORKLOAD_STREAM_TIMEOUT, EndpointRecord,
+    ProxyDiscoveryRequest, ProxyEndpointDiscoveryResponse, SidecarRegistration,
+    SidecarRegistrationAck, SidecarRoute, WORKLOAD_ALPN, WorkloadEnvelopeParts, WorkloadPayload,
+    accept_workload_payload, read_workload_frame, seal_workload_payload, write_workload_frame,
 };
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::SidecarConfig;
@@ -16,6 +21,13 @@ pub struct ProxySession {
     pub connection: Connection,
     pub record: EndpointRecord,
     pub verified: bool,
+    pub proxy_grant: Vec<u8>,
+    pub owner_pubkey: String,
+    pub owner_public: Vec<u8>,
+    pub identity: iroh_support::NodeIdentity,
+    pub replay_registry: Arc<protocol::PeerReplayRegistry>,
+    pub stream_slots: Arc<Semaphore>,
+    pub metrics: podmesh_metrics::Metrics,
 }
 
 pub async fn connect(
@@ -23,6 +35,8 @@ pub async fn connect(
     identity: &iroh_support::NodeIdentity,
     config: &SidecarConfig,
     record: EndpointRecord,
+    replay_registry: Arc<protocol::PeerReplayRegistry>,
+    metrics: podmesh_metrics::Metrics,
     cancellation: &CancellationToken,
 ) -> Result<ProxySession> {
     let address = iroh_support::endpoint_addr(&record, now_secs()?)?;
@@ -38,15 +52,58 @@ pub async fn connect(
         connection.remote_id() == expected,
         "connected proxy EndpointId does not match endpoint record"
     );
-    let verified = authenticate(endpoint.id(), identity, config, &connection, cancellation).await?;
+    let handshake_timer =
+        metrics.operation_started(podmesh_metrics::OperationName::WorkloadHandshake);
+    let proxy_grant = authenticate(
+        endpoint.id(),
+        identity,
+        config,
+        &connection,
+        &replay_registry,
+        cancellation,
+    )
+    .await;
+    super::finish_operation(handshake_timer, &proxy_grant, &metrics);
+    let proxy_grant = proxy_grant?;
     Ok(ProxySession {
         connection,
         record,
-        verified,
+        verified: true,
+        proxy_grant,
+        owner_pubkey: config
+            .owner_public_key_b64
+            .clone()
+            .context("sidecar owner key is missing")?,
+        owner_public: crypto::b64_decode(
+            config
+                .owner_public_key_b64
+                .as_deref()
+                .context("sidecar owner key is missing")?,
+        )?,
+        identity: identity.clone(),
+        replay_registry,
+        metrics,
+        stream_slots: Arc::new(Semaphore::new(
+            protocol::MAX_WORKLOAD_STREAMS_PER_CONNECTION,
+        )),
     })
 }
 
 pub async fn register(
+    local_endpoint: EndpointId,
+    config: &SidecarConfig,
+    session: &ProxySession,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let timer = session
+        .metrics
+        .operation_started(podmesh_metrics::OperationName::Registration);
+    let result = register_inner(local_endpoint, config, session, cancellation).await;
+    super::finish_operation(timer, &result, &session.metrics);
+    result
+}
+
+async fn register_inner(
     local_endpoint: EndpointId,
     config: &SidecarConfig,
     session: &ProxySession,
@@ -80,15 +137,17 @@ pub async fn register(
             .collect(),
         &local_endpoint.to_string(),
     );
-    let response = request_response(
+    let accepted = request_response::<_, SidecarRegistrationAck>(
+        local_endpoint,
         &session.connection,
-        WorkloadStreamKind::Registration,
-        &registration.to_bytes()?,
+        &session.identity,
+        &session.replay_registry,
+        Some(&session.stream_slots),
+        &registration,
         cancellation,
     )
     .await?;
-    let acknowledgement = SidecarRegistrationAck::from_bytes(&response)
-        .context("decode sidecar registration acknowledgement")?;
+    let acknowledgement = accepted.payload;
     ensure!(
         acknowledgement.ok,
         "sidecar registration rejected: {}",
@@ -108,6 +167,19 @@ pub async fn discover(
     session: &ProxySession,
     cancellation: &CancellationToken,
 ) -> Result<Vec<EndpointRecord>> {
+    let timer = session
+        .metrics
+        .operation_started(podmesh_metrics::OperationName::Discovery);
+    let result = discover_inner(config, session, cancellation).await;
+    super::finish_operation(timer, &result, &session.metrics);
+    result
+}
+
+async fn discover_inner(
+    config: &SidecarConfig,
+    session: &ProxySession,
+    cancellation: &CancellationToken,
+) -> Result<Vec<EndpointRecord>> {
     ensure!(
         session.verified,
         "verified proxy grant is required for discovery"
@@ -120,14 +192,17 @@ pub async fn discover(
         owner_pubkey: owner.clone(),
         limit: protocol::proxy_endpoint_discovery::MAX_PROXY_ENDPOINTS as u16,
     };
-    let response = request_response(
+    let accepted = request_response::<_, ProxyEndpointDiscoveryResponse>(
+        session.identity.endpoint_id(),
         &session.connection,
-        WorkloadStreamKind::ProxyDiscovery,
-        &request.to_bytes()?,
+        &session.identity,
+        &session.replay_registry,
+        Some(&session.stream_slots),
+        &request,
         cancellation,
     )
     .await?;
-    Ok(ProxyEndpointDiscoveryResponse::from_bytes(&response, now_secs()?)?.endpoints)
+    Ok(accepted.payload.endpoints)
 }
 
 async fn authenticate(
@@ -135,45 +210,40 @@ async fn authenticate(
     identity: &iroh_support::NodeIdentity,
     config: &SidecarConfig,
     connection: &Connection,
+    replay_registry: &protocol::PeerReplayRegistry,
     cancellation: &CancellationToken,
-) -> Result<bool> {
+) -> Result<Vec<u8>> {
     // The owner key alone is public, so it is sent together with the credential
     // that proves this pod was deployed by that owner for this routing key.
-    let request = iroh_support::build_workload_handshake_request(
-        &identity.handshake(),
+    let owner = config
+        .owner_public_key_b64
+        .as_deref()
+        .context("sidecar was injected without a tenant owner key")?;
+    let credential = config
+        .workload_credential_b64
+        .as_deref()
+        .context("sidecar was injected without a workload credential")?;
+    let request =
+        protocol::machine::WorkloadHandshakeRequest::new(owner, &config.manifest_id, credential);
+    let accepted = request_response::<_, protocol::machine::WorkloadHandshakeResponse>(
         local_endpoint,
-        connection.remote_id(),
-        config.owner_public_key_b64.as_deref(),
-        Some(config.manifest_id.as_str()),
-        config.workload_credential_b64.as_deref(),
-    )?;
-    let response = request_response(
         connection,
-        WorkloadStreamKind::Handshake,
+        identity,
+        replay_registry,
+        None,
         &request,
         cancellation,
     )
     .await?;
-    let verified = iroh_support::verify_workload_handshake(
-        &response,
-        local_endpoint,
-        connection.remote_id(),
-        protocol::machine::HandshakeRole::Response,
-    )?;
     // Without an owner key there is nothing to check the proxy's grant against,
     // so the session cannot be trusted with tenant traffic at all. This is a
     // hard failure rather than an unverified session, because callers would
     // otherwise have to remember to gate on `verified` everywhere.
-    let owner = config
-        .owner_public_key_b64
-        .as_ref()
-        .context("sidecar was injected without a tenant owner key")?;
     // The proxy proves it was authorized by this workload's owner. The endpoint
     // is taken from the authenticated transport rather than from the handshake,
     // so a grant leaked to a third party cannot be replayed by them.
-    let encoded_grant = verified
-        .handshake
-        .proxy_grant_b64()
+    let encoded_grant = (!accepted.payload.proxy_grant_b64.is_empty())
+        .then_some(accepted.payload.proxy_grant_b64.as_str())
         .context("proxy handshake did not include an owner-signed grant")?;
     let grant = protocol::proxy_grant_from_b64(encoded_grant)?;
     let owner_public = crypto::b64_decode(owner).context("decode tenant owner key")?;
@@ -185,15 +255,57 @@ async fn authenticate(
         now_secs()?,
     )
     .context("verify proxy grant")?;
-    Ok(true)
+    Ok(grant)
 }
 
-async fn request_response(
+fn now_millis() -> Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?
+        .as_millis()
+        .try_into()
+        .context("system time exceeds u64 milliseconds")
+}
+
+async fn request_response<Req, Res>(
+    local_endpoint: EndpointId,
     connection: &Connection,
-    kind: WorkloadStreamKind,
-    payload: &[u8],
+    identity: &iroh_support::NodeIdentity,
+    replay_registry: &protocol::PeerReplayRegistry,
+    stream_slots: Option<&Arc<Semaphore>>,
+    request: &Req,
     cancellation: &CancellationToken,
-) -> Result<Vec<u8>> {
+) -> Result<AcceptedWorkloadPayload<Res>>
+where
+    Req: WorkloadPayload,
+    Res: WorkloadPayload,
+{
+    let _connection_permit = if let Some(slots) = stream_slots {
+        Some(
+            slots
+                .clone()
+                .try_acquire_owned()
+                .context("proxy connection stream limit reached")?,
+        )
+    } else {
+        None
+    };
+    ensure!(
+        Req::TYPE.response() == Some(Res::TYPE),
+        "workload request and response types are not paired"
+    );
+    let envelope = seal_workload_payload(
+        WorkloadEnvelopeParts {
+            nonce: &crypto::generate_secure_nonce(),
+            now_millis: now_millis()?,
+            sender_id: &local_endpoint.to_string(),
+            recipient_id: &connection.remote_id().to_string(),
+            sender_signing_public: identity.signing_public(),
+            sender_signing_private: identity.signing_private(),
+            sender_kem_public: Some(identity.kem_public()),
+        },
+        request,
+    )?;
     let (mut send, mut recv) =
         tokio::time::timeout(DEFAULT_WORKLOAD_STREAM_TIMEOUT, connection.open_bi())
             .await
@@ -201,8 +313,8 @@ async fn request_response(
             .context("open workload stream")?;
     write_workload_frame(
         &mut send,
-        kind,
-        payload,
+        Req::TYPE.frame_kind(),
+        &envelope,
         DEFAULT_WORKLOAD_STREAM_TIMEOUT,
         cancellation,
     )
@@ -210,8 +322,18 @@ async fn request_response(
     send.finish().context("finish workload request")?;
     let (response_kind, response) =
         read_workload_frame(&mut recv, DEFAULT_WORKLOAD_STREAM_TIMEOUT, cancellation).await?;
-    ensure!(response_kind == kind, "unexpected workload response kind");
-    Ok(response)
+    ensure!(
+        response_kind == Res::TYPE.frame_kind(),
+        "unexpected workload response kind"
+    );
+    accept_workload_payload::<Res>(
+        &response,
+        &local_endpoint.to_string(),
+        &connection.remote_id().to_string(),
+        now_millis()?,
+        replay_registry,
+        Instant::now(),
+    )
 }
 
 fn now_secs() -> Result<u64> {

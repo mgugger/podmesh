@@ -41,12 +41,13 @@ fn endpoint_record() -> Result<Arc<RwLock<protocol::EndpointRecord>>> {
 /// The port has to be released before the server can bind it, so another
 /// process can take it in between; the whole start is retried rather than
 /// failing the test on a lost race.
-async fn start_rest_api(rate_limit_per_minute: u32) -> Result<String> {
+async fn start_rest_api(rate_limit_per_minute: u32) -> Result<(String, podmesh_metrics::Metrics)> {
     for _ in 0..16 {
         let port = std::net::TcpListener::bind(("127.0.0.1", 0))?
             .local_addr()?
             .port();
         let (_peer_tx, peer_rx) = watch::channel(Vec::new());
+        let metrics = podmesh_metrics::Metrics::registered(podmesh_metrics::ComponentName::Proxy);
         spawn_rest_server(RestServerOptions {
             host: "127.0.0.1".into(),
             port,
@@ -56,6 +57,7 @@ async fn start_rest_api(rate_limit_per_minute: u32) -> Result<String> {
             grant_store: ProxyGrantStore::new(),
             relay_bootstrap: None::<WorkloadRelayBootstrap>,
             rate_limit_per_minute,
+            metrics: metrics.clone(),
         })?;
 
         let base = format!("http://127.0.0.1:{port}");
@@ -67,7 +69,7 @@ async fn start_rest_api(rate_limit_per_minute: u32) -> Result<String> {
                 .await
                 .is_ok_and(|response| response.status().is_success())
             {
-                return Ok(base);
+                return Ok((base, metrics));
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -77,7 +79,7 @@ async fn start_rest_api(rate_limit_per_minute: u32) -> Result<String> {
 
 #[tokio::test]
 async fn a_caller_exceeding_its_budget_is_refused() -> Result<()> {
-    let base = start_rest_api(TEST_RATE_LIMIT).await?;
+    let (base, metrics) = start_rest_api(TEST_RATE_LIMIT).await?;
     let client = reqwest::Client::new();
 
     // The budget is spent on real API calls, not on health probes.
@@ -104,6 +106,12 @@ async fn a_caller_exceeding_its_budget_is_refused() -> Result<()> {
         status == reqwest::StatusCode::TOO_MANY_REQUESTS,
         "a caller past its budget must be refused, got {status}"
     );
+    anyhow::ensure!(
+        metrics.snapshot().unwrap().events().any(|(key, count)| {
+            key.event() == podmesh_metrics::EventName::RateLimitRefusal && *count == 1
+        }),
+        "the REST limiter must emit one bounded refusal event"
+    );
     Ok(())
 }
 
@@ -111,7 +119,7 @@ async fn a_caller_exceeding_its_budget_is_refused() -> Result<()> {
 /// grant store, so it has to be behind the limiter rather than beside it.
 #[tokio::test]
 async fn the_unauthenticated_grant_endpoint_is_throttled() -> Result<()> {
-    let base = start_rest_api(TEST_RATE_LIMIT).await?;
+    let (base, metrics) = start_rest_api(TEST_RATE_LIMIT).await?;
     let client = reqwest::Client::new();
     let body = serde_json::json!({ "owner_pubkey_b64": "", "grant_b64": "" });
 
@@ -133,6 +141,16 @@ async fn the_unauthenticated_grant_endpoint_is_throttled() -> Result<()> {
         refused,
         "posting grants past the budget must be refused rather than always evaluated"
     );
+    anyhow::ensure!(
+        metrics
+            .snapshot()
+            .unwrap()
+            .operations()
+            .any(|(key, value)| {
+                key.operation() == podmesh_metrics::OperationName::ProxyGrant && value.count() >= 1
+            }),
+        "grant requests must be timed at the REST boundary"
+    );
     Ok(())
 }
 
@@ -140,7 +158,7 @@ async fn the_unauthenticated_grant_endpoint_is_throttled() -> Result<()> {
 /// otherwise a noisy neighbour takes the proxy out of its orchestrator's pool.
 #[tokio::test]
 async fn health_is_never_throttled() -> Result<()> {
-    let base = start_rest_api(TEST_RATE_LIMIT).await?;
+    let (base, _) = start_rest_api(TEST_RATE_LIMIT).await?;
     let client = reqwest::Client::new();
 
     for _ in 0..(TEST_RATE_LIMIT + 5) {
@@ -173,7 +191,7 @@ async fn health_is_never_throttled() -> Result<()> {
 
 #[tokio::test]
 async fn a_zero_limit_disables_throttling() -> Result<()> {
-    let base = start_rest_api(0).await?;
+    let (base, _) = start_rest_api(0).await?;
     let client = reqwest::Client::new();
     for attempt in 0..50 {
         let status = client

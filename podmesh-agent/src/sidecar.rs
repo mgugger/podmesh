@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use protocol::EndpointRecord;
 use protocol::sidecar_metadata::{METADATA_BLOB_ENV_VAR, SidecarMetadata};
 use serde_json::{Value, json};
+use std::net::SocketAddr;
 
 const SIDECAR_NAME: &str = "podmesh-sidecar";
 const RUNTIME_NAME_PREFIX: &str = "podmesh-";
@@ -28,6 +29,7 @@ pub struct SidecarInjection<'a> {
     pub workload_credential_b64: &'a str,
     pub workload_relay_auth_token: &'a str,
     pub workload_relay_ca_certificates: &'a [Vec<u8>],
+    pub metrics_listen: Option<SocketAddr>,
 }
 
 pub fn inject(manifest: &[u8], injection: SidecarInjection<'_>) -> Result<Vec<u8>> {
@@ -42,6 +44,7 @@ pub fn inject(manifest: &[u8], injection: SidecarInjection<'_>) -> Result<Vec<u8
         workload_credential_b64,
         workload_relay_auth_token,
         workload_relay_ca_certificates,
+        metrics_listen,
     } = injection;
     let original = manifest.to_vec();
     let owner = crypto::b64_decode(namespace_id).context("decode namespace owner key")?;
@@ -61,19 +64,32 @@ pub fn inject(manifest: &[u8], injection: SidecarInjection<'_>) -> Result<Vec<u8
     };
     metadata.validate()?;
     let metadata_blob = crypto::b64_encode(&serde_json::to_vec(&metadata)?);
-    let sidecar = json!({
+    let mut environment = vec![
+        json!({ "name": METADATA_BLOB_ENV_VAR, "value": metadata_blob }),
+        json!({ "name": "PODMESH_ENABLE_EGRESS", "value": "true" }),
+        json!({ "name": "RUST_LOG", "value": "info" }),
+    ];
+    if let Some(metrics_listen) = metrics_listen {
+        environment.push(json!({
+            "name": "PODMESH_METRICS_LISTEN",
+            "value": metrics_listen.to_string(),
+        }));
+    }
+    let mut sidecar = json!({
         "name": SIDECAR_NAME,
         "image": sidecar_image,
         "imagePullPolicy": "IfNotPresent",
-        "env": [
-            { "name": METADATA_BLOB_ENV_VAR, "value": metadata_blob },
-            { "name": "PODMESH_ENABLE_EGRESS", "value": "true" },
-            { "name": "RUST_LOG", "value": "info" }
-        ],
+        "env": environment,
         "securityContext": {
             "capabilities": { "add": ["NET_ADMIN"] }
         }
     });
+    if let Some(metrics_listen) = metrics_listen {
+        sidecar["ports"] = json!([{
+            "containerPort": metrics_listen.port(),
+            "protocol": "TCP",
+        }]);
+    }
     let documents = protocol::manifest_yaml::parse_yaml_documents_from_slice(manifest)
         .context("decode canonical workload manifest")?;
     let mut injected = 0usize;
@@ -172,6 +188,7 @@ mod tests {
             workload_credential_b64: credential,
             workload_relay_auth_token: "r".repeat(32).leak(),
             workload_relay_ca_certificates: &[],
+            metrics_listen: None,
         }
     }
 
@@ -283,6 +300,49 @@ spec:
         metadata
             .validate()
             .expect("injected metadata must validate");
+    }
+
+    #[test]
+    fn optional_metrics_configuration_is_injected_outside_signed_metadata() {
+        let manifest = br#"apiVersion: v1
+kind: Pod
+metadata: { name: demo }
+spec:
+  containers:
+    - { name: app, image: nginx }
+"#;
+        let (owner_public, owner_private) = test_owner();
+        let owner = crypto::b64_encode(&owner_public);
+        let credential = test_credential(&owner_public, &owner_private);
+        let endpoints = test_proxy_endpoints();
+        let mut injection = test_injection(&endpoints, &owner, &credential);
+        injection.metrics_listen = Some("0.0.0.0:9230".parse().unwrap());
+        let output = inject(manifest, injection).unwrap();
+
+        let documents = protocol::manifest_yaml::parse_yaml_documents_from_slice(&output).unwrap();
+        let value = serde_json::to_value(&documents[0]).unwrap();
+        let sidecar = value.pointer("/spec/containers/1").unwrap();
+        let metrics_env = sidecar["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "PODMESH_METRICS_LISTEN")
+            .unwrap();
+        assert_eq!(metrics_env["value"], "0.0.0.0:9230");
+        assert_eq!(sidecar["ports"][0]["containerPort"], 9230);
+        assert_eq!(sidecar["ports"][0]["protocol"], "TCP");
+
+        let blob = sidecar["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == METADATA_BLOB_ENV_VAR)
+            .and_then(|entry| entry["value"].as_str())
+            .unwrap();
+        let metadata: SidecarMetadata =
+            serde_json::from_slice(&crypto::b64_decode(blob).unwrap()).unwrap();
+        assert_eq!(metadata.workload_name, "demo");
+        assert_eq!(metadata.owner_public_key_b64, owner);
     }
 
     #[test]

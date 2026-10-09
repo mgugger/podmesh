@@ -8,11 +8,48 @@ no durable agent records.
 
 ## Requirements
 
+### Requirement: The scheduler SHALL expose bounded application metrics only when configured
+
+The scheduler SHALL accept optional `--metrics-listen` / `PODMESH_METRICS_LISTEN` configuration.
+When absent, it SHALL bind no application-metrics socket. When present, it SHALL start a dedicated
+unauthenticated listener before business services and SHALL fail startup if the address is invalid,
+conflicts with an API, Iroh, relay, or relay-metrics listener, or cannot be bound.
+
+The listener SHALL expose OpenMetrics text for capacity query, fanout, selection, attachment,
+scheduler gossip, control relay, reconciliation, client request, and metrics scrape operations.
+It SHALL expose aggregate attached-agent, scheduler-peer, and pending-query state plus finite
+rate-limit, replay, fanout, and bounded-store events. Labels SHALL contain no peer address, endpoint
+identity, query identifier, owner, workload, payload, URL, or raw error.
+
+#### Scenario: Metrics are disabled by default
+
+- **WHEN** no application metrics address is configured
+- **THEN** the scheduler binds no application-metrics listener
+- **AND** scheduling and control behavior are unchanged
+
+#### Scenario: Scheduler metrics stay separate from relay metrics
+
+- **WHEN** scheduler application metrics and integrated relay metrics are both enabled
+- **THEN** they use independently validated listeners
+- **AND** `PODMESH_METRICS_LISTEN` does not replace `PODMESH_RELAY_METRICS_LISTEN`
+
+#### Scenario: Telemetry failure cannot fail scheduling
+
+- **WHEN** recording or rendering a metric fails after startup
+- **THEN** the capacity, control, and reconciliation result is unchanged
+
 ### Requirement: The scheduler SHALL remain stateless
 
 The scheduler SHALL NOT access Podman, store workload ciphertext, hold tenant keys, track lifecycle
 state, retain status or logs, perform deletion, inject sidecars, or persist durable agent records.
 Restarting a scheduler SHALL NOT lose any information the mesh depends on.
+
+Statelessness concerns authoritative workload state, not the absence of temporary attachments,
+discovery caches, in-flight requests, or persistent node identity and trust configuration. Agents
+and owners retain their own local state. Multiple scheduler entry points and client-driven placement
+provide decentralized coordination without a central workload database or leader; they do not
+provide consensus, Byzantine availability, or bootstrap-free discovery. A malicious scheduler may
+suppress discovery or delivery even though it cannot decrypt or forge owner control traffic.
 
 #### Scenario: Scheduler restart is transparent
 
@@ -369,3 +406,20 @@ start a scheduler.
 
 - **WHEN** a scheduler starts with no existing credentials
 - **THEN** it generates them, writes them with restrictive permissions, and serves its relay
+
+### Requirement: Scheduler tests SHALL cover statelessness and partial views
+
+Scheduler changes SHALL retain focused tests for loss and reattachment, stale-route resolution and
+partial reachability where affected. An unreachable scheduler SHALL remain in the bounded
+reconciliation result and SHALL NOT be reported as a complete owner view.
+
+#### Scenario: One scheduler is absent during reconciliation
+
+- **WHEN** the reconciliation deadline expires before an admitted scheduler completes
+- **THEN** that scheduler is listed as unreachable
+- **AND** the result remains partial until a later successful reconciliation
+
+#### Scenario: The open API remains a limitation
+
+- **WHEN** scheduler behavior tests pass
+- **THEN** it does not claim client authentication, owner quota, or access control for the open API

@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use crate::now_secs;
 use anyhow::{Context, Result, ensure};
 use futures::{StreamExt, stream};
 use iroh::{
@@ -38,6 +39,7 @@ pub struct AttachmentManager {
     max_agent_fanout: usize,
     operation_timeout: Duration,
     relay_issuer: Option<RelayGrantIssuer>,
+    metrics: podmesh_metrics::Metrics,
 }
 
 #[derive(Clone)]
@@ -68,7 +70,14 @@ impl AttachmentManager {
             max_agent_fanout,
             operation_timeout,
             relay_issuer: None,
+            metrics: podmesh_metrics::Metrics::noop(),
         }
+    }
+
+    pub fn with_metrics(mut self, metrics: podmesh_metrics::Metrics) -> Self {
+        metrics.set_gauge(podmesh_metrics::GaugeName::AttachedAgents, 0);
+        self.metrics = metrics;
+        self
     }
 
     pub fn with_relay_grant_issuer(
@@ -113,6 +122,24 @@ impl AttachmentManager {
     }
 
     pub async fn fanout(&self, query: &CapacityQuery) -> Result<usize> {
+        let timer = self
+            .metrics
+            .operation_started(podmesh_metrics::OperationName::CapacityFanout);
+        let result = self.fanout_inner(query).await;
+        match &result {
+            Ok(_) => timer.finish(
+                podmesh_metrics::Outcome::Success,
+                podmesh_metrics::Reason::None,
+            ),
+            Err(_) => timer.finish(
+                podmesh_metrics::Outcome::Error,
+                podmesh_metrics::Reason::Internal,
+            ),
+        }
+        result
+    }
+
+    async fn fanout_inner(&self, query: &CapacityQuery) -> Result<usize> {
         let bytes = query.to_bytes(now_secs())?;
         let mut sessions: Vec<_> = self
             .inner
@@ -121,6 +148,10 @@ impl AttachmentManager {
             .iter()
             .map(|(endpoint_id, session)| (*endpoint_id, session.connection.clone()))
             .collect();
+        if sessions.len() > self.max_agent_fanout {
+            self.metrics
+                .record_event(podmesh_metrics::EventName::FanoutSaturation);
+        }
         // Ordered per query rather than by EndpointId. A fixed order truncates
         // to the same lowest-ranked agents on every query, so everything past
         // the fanout bound would never be asked for capacity and could never be
@@ -182,10 +213,15 @@ impl AttachmentManager {
             !sessions.contains_key(&endpoint_id),
             "agent already has an active scheduler attachment"
         );
-        ensure!(
-            sessions.len() < self.max_attached_agents,
-            "scheduler attachment limit reached"
-        );
+        if sessions.len() >= self.max_attached_agents {
+            let attached = sessions.len();
+            drop(sessions);
+            self.metrics
+                .record_event(podmesh_metrics::EventName::StoreSaturation);
+            self.metrics
+                .set_gauge(podmesh_metrics::GaugeName::AttachedAgents, attached as u64);
+            anyhow::bail!("scheduler attachment limit reached");
+        }
         let generation = Uuid::new_v4();
         sessions.insert(
             endpoint_id,
@@ -195,6 +231,10 @@ impl AttachmentManager {
                 agent_addr,
             },
         );
+        let attached = sessions.len();
+        drop(sessions);
+        self.metrics
+            .set_gauge(podmesh_metrics::GaugeName::AttachedAgents, attached as u64);
         Ok(generation)
     }
 
@@ -206,6 +246,10 @@ impl AttachmentManager {
         {
             sessions.remove(&endpoint_id);
         }
+        let attached = sessions.len();
+        drop(sessions);
+        self.metrics
+            .set_gauge(podmesh_metrics::GaugeName::AttachedAgents, attached as u64);
     }
 
     fn acknowledgement(
@@ -258,6 +302,25 @@ impl ProtocolHandler for AgentAttachmentHandler {
 
 impl AgentAttachmentHandler {
     async fn accept_inner(&self, connection: Connection) -> Result<()> {
+        let timer = self
+            .manager
+            .metrics
+            .operation_started(podmesh_metrics::OperationName::AgentAttachment);
+        let result = self.accept_once(connection).await;
+        match &result {
+            Ok(()) => timer.finish(
+                podmesh_metrics::Outcome::Success,
+                podmesh_metrics::Reason::None,
+            ),
+            Err(_) => timer.finish(
+                podmesh_metrics::Outcome::Error,
+                podmesh_metrics::Reason::Internal,
+            ),
+        }
+        result
+    }
+
+    async fn accept_once(&self, connection: Connection) -> Result<()> {
         let remote_id = connection.remote_id();
         let (mut send, mut recv) =
             tokio::time::timeout(self.manager.operation_timeout, connection.accept_bi())
@@ -293,13 +356,6 @@ impl AgentAttachmentHandler {
         log::info!("agent detached from scheduler: {}", remote_id.fmt_short());
         Ok(())
     }
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[cfg(test)]

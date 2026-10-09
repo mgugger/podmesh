@@ -14,6 +14,10 @@ pub enum StoredWorkloadPhase {
         previous_runtime_id: String,
         request: Box<protocol::UpdateRequest>,
     },
+    Creating,
+    CleanupPending {
+        uncertain: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +35,15 @@ pub struct StoredWorkload {
     pub workload_name: String,
     pub replica_index: u32,
     pub replica_count: u32,
+}
+
+impl StoredWorkload {
+    pub(crate) fn needs_cleanup(&self) -> bool {
+        matches!(
+            self.phase,
+            StoredWorkloadPhase::Creating | StoredWorkloadPhase::CleanupPending { .. }
+        ) || (matches!(self.phase, StoredWorkloadPhase::Active) && self.runtime_id.is_empty())
+    }
 }
 
 pub struct AgentStore {

@@ -2,6 +2,52 @@ use std::{fs, io::ErrorKind, net::SocketAddr, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+#[cfg(test)]
+mod replay_args_tests {
+    use super::*;
+
+    #[test]
+    fn replay_options_use_shared_defaults_and_validate_explicit_bounds() {
+        let defaults = Args::try_parse_from(["podmesh-sidecar"]).unwrap();
+        assert_eq!(
+            defaults.workload_replay_max_peers,
+            protocol::replay_registry::DEFAULT_REPLAY_MAX_PEERS
+        );
+        assert_eq!(
+            defaults.workload_replay_nonces_per_peer,
+            protocol::replay_registry::DEFAULT_REPLAY_NONCES_PER_PEER
+        );
+        assert_eq!(
+            defaults.workload_replay_max_nonce_bytes,
+            protocol::replay_registry::DEFAULT_REPLAY_MAX_NONCE_BYTES
+        );
+        assert_eq!(
+            defaults.workload_replay_retention_secs,
+            protocol::replay_registry::DEFAULT_REPLAY_RETENTION.as_secs()
+        );
+
+        let explicit = Args::try_parse_from([
+            "podmesh-sidecar",
+            "--workload-replay-max-peers",
+            "1",
+            "--workload-replay-nonces-per-peer",
+            "1",
+            "--workload-replay-max-nonce-bytes",
+            "36",
+            "--workload-replay-retention-secs",
+            "60",
+        ])
+        .unwrap();
+        protocol::ReplayLimits {
+            max_peers: explicit.workload_replay_max_peers,
+            nonces_per_peer: explicit.workload_replay_nonces_per_peer,
+            max_nonce_bytes: explicit.workload_replay_max_nonce_bytes,
+            retention: Duration::from_secs(explicit.workload_replay_retention_secs),
+        }
+        .validate()
+        .unwrap();
+    }
+}
 use log::error;
 
 use podmesh_sidecar::{
@@ -24,6 +70,8 @@ struct Args {
         default_value = "0.0.0.0:0"
     )]
     iroh_bind_addr: SocketAddr,
+    #[arg(long = "metrics-listen", env = "PODMESH_METRICS_LISTEN")]
+    metrics_listen: Option<SocketAddr>,
     #[arg(
         long = "metadata-path",
         env = "PODMESH_SIDECAR_METADATA_PATH",
@@ -50,6 +98,30 @@ struct Args {
     /// If not specified, HTTP CONNECT proxy is disabled.
     #[arg(long = "http-proxy-port", env = "PODMESH_HTTP_PROXY_PORT")]
     http_proxy_port: Option<u16>,
+    #[arg(
+        long = "workload-replay-max-peers",
+        env = "PODMESH_WORKLOAD_REPLAY_MAX_PEERS",
+        default_value_t = protocol::replay_registry::DEFAULT_REPLAY_MAX_PEERS
+    )]
+    workload_replay_max_peers: usize,
+    #[arg(
+        long = "workload-replay-nonces-per-peer",
+        env = "PODMESH_WORKLOAD_REPLAY_NONCES_PER_PEER",
+        default_value_t = protocol::replay_registry::DEFAULT_REPLAY_NONCES_PER_PEER
+    )]
+    workload_replay_nonces_per_peer: usize,
+    #[arg(
+        long = "workload-replay-max-nonce-bytes",
+        env = "PODMESH_WORKLOAD_REPLAY_MAX_NONCE_BYTES",
+        default_value_t = protocol::replay_registry::DEFAULT_REPLAY_MAX_NONCE_BYTES
+    )]
+    workload_replay_max_nonce_bytes: usize,
+    #[arg(
+        long = "workload-replay-retention-secs",
+        env = "PODMESH_WORKLOAD_REPLAY_RETENTION_SECS",
+        default_value_t = protocol::replay_registry::DEFAULT_REPLAY_RETENTION.as_secs()
+    )]
+    workload_replay_retention_secs: u64,
 }
 
 impl TryFrom<Args> for SidecarConfig {
@@ -95,10 +167,17 @@ impl TryFrom<Args> for SidecarConfig {
         Ok(Self {
             identity: podmesh_sidecar::IdentitySource::ephemeral(),
             proxy_endpoints: metadata.proxy_endpoints.clone(),
+            workload_replay_limits: protocol::ReplayLimits {
+                max_peers: args.workload_replay_max_peers,
+                nonces_per_peer: args.workload_replay_nonces_per_peer,
+                max_nonce_bytes: args.workload_replay_max_nonce_bytes,
+                retention: Duration::from_secs(args.workload_replay_retention_secs),
+            },
             workload_relay_auth_token: Some(metadata.workload_relay_auth_token.clone()),
             workload_relay_ca_certificates: metadata.workload_relay_ca_certificates.clone(),
             lookup_interval: Duration::from_secs(args.lookup_interval_secs.max(1)),
             iroh_bind_addr: args.iroh_bind_addr,
+            metrics_listen: args.metrics_listen,
             workload_name: metadata.workload_name.clone(),
             replica_index: metadata.replica_index,
             replica_count: metadata.replica_count,

@@ -1,5 +1,5 @@
 use clap::{Parser, ValueEnum};
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
 
 pub const DEFAULT_CPU_MILLI: u32 = 4_000;
 pub const DEFAULT_MEMORY_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -30,6 +30,15 @@ pub struct Config {
     /// exclusively over Iroh, so nothing else is served here.
     #[arg(long, default_value = "0.0.0.0:3100")]
     pub listen: String,
+
+    #[arg(long = "metrics-listen", env = "PODMESH_METRICS_LISTEN")]
+    pub metrics_listen: Option<SocketAddr>,
+
+    #[arg(
+        long = "sidecar-metrics-listen",
+        env = "PODMESH_AGENT_SIDECAR_METRICS_LISTEN"
+    )]
+    pub sidecar_metrics_listen: Option<SocketAddr>,
 
     #[arg(long, default_value = "/etc/podmesh/agent")]
     pub key_dir: PathBuf,

@@ -32,6 +32,8 @@ spec:
       env:
         - name: RUST_LOG
           value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
+        - name: PODMESH_METRICS_LISTEN
+          value: "0.0.0.0:9200"
         - name: PODMESH_SCHEDULER_LISTEN
           value: "0.0.0.0:3000"
         - name: PODMESH_SCHEDULER_MACHINE_KEY_DIR
@@ -64,6 +66,8 @@ spec:
         - containerPort: 3000
           hostPort: 3000
           protocol: TCP
+        - containerPort: 9200
+          protocol: TCP
       volumeMounts:
         - name: podmesh-state
           mountPath: /var/lib/podmesh
@@ -72,6 +76,8 @@ spec:
       env:
         - name: RUST_LOG
           value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
+        - name: PODMESH_METRICS_LISTEN
+          value: "0.0.0.0:9201"
         - name: PODMESH_SCHEDULER_LISTEN
           value: "0.0.0.0:3001"
         - name: PODMESH_SCHEDULER_MACHINE_KEY_DIR
@@ -98,6 +104,8 @@ spec:
         - containerPort: 3001
           hostPort: 3001
           protocol: TCP
+        - containerPort: 9201
+          protocol: TCP
       volumeMounts:
         - name: podmesh-state
           mountPath: /var/lib/podmesh
@@ -106,6 +114,8 @@ spec:
       env:
         - name: RUST_LOG
           value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
+        - name: PODMESH_METRICS_LISTEN
+          value: "0.0.0.0:9202"
         - name: PODMESH_SCHEDULER_LISTEN
           value: "0.0.0.0:3002"
         - name: PODMESH_SCHEDULER_MACHINE_KEY_DIR
@@ -131,6 +141,8 @@ spec:
       ports:
         - containerPort: 3002
           hostPort: 3002
+          protocol: TCP
+        - containerPort: 9202
           protocol: TCP
       volumeMounts:
         - name: podmesh-state
@@ -164,6 +176,10 @@ spec:
       env:
         - name: RUST_LOG
           value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
+        - name: PODMESH_METRICS_LISTEN
+          value: "0.0.0.0:9210"
+        - name: PODMESH_AGENT_SIDECAR_METRICS_LISTEN
+          value: "0.0.0.0:9230"
         - name: CONTAINER_HOST
           value: "unix:///run/podman/podman.sock"
         - name: PODMESH_AGENT_SCHEDULER_URLS
@@ -187,6 +203,8 @@ spec:
         - containerPort: 3100
           hostPort: 3100
           protocol: TCP
+        - containerPort: 9210
+          protocol: TCP
       volumeMounts:
         - name: podman-socket
           mountPath: /run/podman/podman.sock
@@ -197,6 +215,10 @@ spec:
       env:
         - name: RUST_LOG
           value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
+        - name: PODMESH_METRICS_LISTEN
+          value: "0.0.0.0:9211"
+        - name: PODMESH_AGENT_SIDECAR_METRICS_LISTEN
+          value: "0.0.0.0:9230"
         - name: CONTAINER_HOST
           value: "unix:///run/podman/podman.sock"
         - name: PODMESH_AGENT_SCHEDULER_URLS
@@ -220,6 +242,8 @@ spec:
         - containerPort: 3101
           hostPort: 3101
           protocol: TCP
+        - containerPort: 9211
+          protocol: TCP
       volumeMounts:
         - name: podman-socket
           mountPath: /run/podman/podman.sock
@@ -230,6 +254,10 @@ spec:
       env:
         - name: RUST_LOG
           value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
+        - name: PODMESH_METRICS_LISTEN
+          value: "0.0.0.0:9212"
+        - name: PODMESH_AGENT_SIDECAR_METRICS_LISTEN
+          value: "0.0.0.0:9230"
         - name: CONTAINER_HOST
           value: "unix:///run/podman/podman.sock"
         - name: PODMESH_AGENT_SCHEDULER_URLS
@@ -252,6 +280,8 @@ spec:
       ports:
         - containerPort: 3102
           hostPort: 3102
+          protocol: TCP
+        - containerPort: 9212
           protocol: TCP
       volumeMounts:
         - name: podman-socket
@@ -293,6 +323,8 @@ spec:
       env:
         - name: RUST_LOG
           value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
+        - name: PODMESH_METRICS_LISTEN
+          value: "0.0.0.0:9220"
         - name: PODMESH_PROXY_IROH_BIND
           value: "0.0.0.0:4001"
         - name: PODMESH_PROXY_PUBLISH_RELAY_BOOTSTRAP
@@ -313,6 +345,8 @@ spec:
         - containerPort: 3010
           hostPort: 3010
           protocol: TCP
+        - containerPort: 9220
+          protocol: TCP
         - containerPort: 8080
           hostPort: 8080
           protocol: TCP
@@ -331,6 +365,8 @@ spec:
       env:
         - name: RUST_LOG
           value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
+        - name: PODMESH_METRICS_LISTEN
+          value: "0.0.0.0:9221"
         - name: PODMESH_PROXY_IROH_BIND
           value: "0.0.0.0:4002"
         # A sidecar carries one relay token, so proxy-2 adopts proxy-1's
@@ -356,6 +392,8 @@ spec:
         - containerPort: 3011
           hostPort: 3011
           protocol: TCP
+        - containerPort: 9221
+          protocol: TCP
       volumeMounts:
         - name: podmesh-state
           mountPath: /var/lib/podmesh
@@ -371,6 +409,8 @@ spec:
       env:
         - name: RUST_LOG
           value: "info,iroh=warn,iroh_relay=warn,iroh_quinn=warn"
+        - name: PODMESH_METRICS_LISTEN
+          value: "0.0.0.0:9222"
         - name: PODMESH_PROXY_IROH_BIND
           value: "0.0.0.0:4003"
         - name: PODMESH_WORKLOAD_RELAY_BOOTSTRAP_URL
@@ -390,6 +430,8 @@ spec:
       ports:
         - containerPort: 3012
           hostPort: 3012
+          protocol: TCP
+        - containerPort: 9222
           protocol: TCP
       volumeMounts:
         - name: podmesh-state

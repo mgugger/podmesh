@@ -2,6 +2,7 @@
 name = "podmesh-proxy"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 hex = { workspace = true }
@@ -11,10 +12,13 @@ clap = { workspace = true, features = ["env"] }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { workspace = true }
 log = { workspace = true }
+podmesh-metrics = { workspace = true }
 env_logger = { workspace = true }
 protocol = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 axum-support = { workspace = true }

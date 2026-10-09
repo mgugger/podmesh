@@ -7,11 +7,13 @@ use tokio_util::sync::CancellationToken;
 pub const WORKLOAD_ALPN: &[u8] = b"/podmesh/workload/1";
 pub const MESH_DOMAIN_SUFFIX: &str = "mesh.local";
 pub const WORKLOAD_FRAME_HEADER_BYTES: usize = 5;
-pub const DEFAULT_WORKLOAD_STREAM_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_WORKLOAD_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+pub const MAX_WORKLOAD_STREAMS_PER_CONNECTION: usize = 64;
+pub const WORKLOAD_ENVELOPE_OVERHEAD_BYTES: usize = 4 * 1024;
 pub const MAX_HANDSHAKE_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_REGISTRATION_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_PROXY_DISCOVERY_PAYLOAD_BYTES: usize = 64 * 1024;
-pub const MAX_INGRESS_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
+pub const MAX_INGRESS_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_EGRESS_CONTROL_PAYLOAD_BYTES: usize = 32 * 1024;
 pub const MAX_PROXY_ANNOUNCEMENT_PAYLOAD_BYTES: usize = 4 * 1024;
 
@@ -29,12 +31,16 @@ pub enum WorkloadStreamKind {
 impl WorkloadStreamKind {
     pub const fn payload_limit(self) -> usize {
         match self {
-            Self::Handshake => MAX_HANDSHAKE_PAYLOAD_BYTES,
-            Self::Registration => MAX_REGISTRATION_PAYLOAD_BYTES,
-            Self::ProxyDiscovery => MAX_PROXY_DISCOVERY_PAYLOAD_BYTES,
-            Self::Ingress => MAX_INGRESS_PAYLOAD_BYTES,
-            Self::Egress => MAX_EGRESS_CONTROL_PAYLOAD_BYTES,
-            Self::ProxyAnnouncement => MAX_PROXY_ANNOUNCEMENT_PAYLOAD_BYTES,
+            Self::Handshake => MAX_HANDSHAKE_PAYLOAD_BYTES + WORKLOAD_ENVELOPE_OVERHEAD_BYTES,
+            Self::Registration => MAX_REGISTRATION_PAYLOAD_BYTES + WORKLOAD_ENVELOPE_OVERHEAD_BYTES,
+            Self::ProxyDiscovery => {
+                MAX_PROXY_DISCOVERY_PAYLOAD_BYTES + WORKLOAD_ENVELOPE_OVERHEAD_BYTES
+            }
+            Self::Ingress => MAX_INGRESS_PAYLOAD_BYTES + WORKLOAD_ENVELOPE_OVERHEAD_BYTES,
+            Self::Egress => MAX_EGRESS_CONTROL_PAYLOAD_BYTES + WORKLOAD_ENVELOPE_OVERHEAD_BYTES,
+            Self::ProxyAnnouncement => {
+                MAX_PROXY_ANNOUNCEMENT_PAYLOAD_BYTES + WORKLOAD_ENVELOPE_OVERHEAD_BYTES
+            }
         }
     }
 }

@@ -18,25 +18,21 @@ use super::{RuntimeState, now_secs};
 pub(super) fn prove_tenant(
     state: &RuntimeState,
     remote: EndpointId,
-    handshake: &protocol::machine::Handshake,
+    stable_id: usize,
+    handshake: &protocol::machine::WorkloadHandshakeRequest,
 ) -> Result<()> {
-    let owner = handshake
-        .tenant_owner_pubkey()
-        .context("workload handshake did not name a tenant owner")?;
-    let manifest_id = handshake
-        .manifest_id()
-        .context("workload handshake did not name a workload")?;
-    let encoded = handshake
-        .workload_credential_b64()
-        .context("workload handshake did not include an owner-signed credential")?;
+    let owner = &handshake.tenant_owner_pubkey;
+    let manifest_id = &handshake.manifest_id;
+    let encoded = &handshake.workload_credential_b64;
     let credential = protocol::workload_credential_from_b64(encoded)?;
     protocol::verify_workload_credential(&credential, owner, manifest_id, now_secs()?)
         .context("verify workload credential")?;
-    state.tenants.prove(
+    state.tenants.prove_once(
         remote,
+        stable_id,
         crate::tenant_sessions::ProvenTenant {
-            owner_pubkey: owner.to_string(),
-            manifest_id: manifest_id.to_string(),
+            owner_pubkey: owner.clone(),
+            manifest_id: manifest_id.clone(),
             credential,
         },
     )
@@ -45,13 +41,18 @@ pub(super) fn prove_tenant(
 pub(super) fn live_tenant(
     state: &RuntimeState,
     remote: EndpointId,
+    stable_id: usize,
 ) -> Result<crate::tenant_sessions::ProvenTenant> {
-    state.tenants.proven_live(&remote, now_secs()?)
+    state.tenants.proven_live(&remote, stable_id, now_secs()?)
 }
 
 /// Decide whether this connection may open an egress tunnel.
-pub(super) fn authorize_egress(state: &RuntimeState, remote: EndpointId) -> Result<()> {
-    let proven = live_tenant(state, remote)?;
+pub(super) fn authorize_egress(
+    state: &RuntimeState,
+    remote: EndpointId,
+    stable_id: usize,
+) -> Result<()> {
+    let proven = live_tenant(state, remote, stable_id)?;
     ensure!(
         state.grant_store.holds_live_grant(
             &proven.owner_pubkey,

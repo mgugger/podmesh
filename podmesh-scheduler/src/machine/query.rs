@@ -45,6 +45,7 @@ pub struct QueryManager {
     max_pending_queries: usize,
     max_offers_per_query: usize,
     query_timeout: Duration,
+    metrics: podmesh_metrics::Metrics,
 }
 
 struct QueryState {
@@ -77,7 +78,18 @@ impl QueryManager {
             max_pending_queries,
             max_offers_per_query,
             query_timeout,
+            metrics: podmesh_metrics::Metrics::noop(),
         }
+    }
+
+    pub fn with_metrics(mut self, metrics: podmesh_metrics::Metrics) -> Self {
+        metrics.set_gauge(podmesh_metrics::GaugeName::PendingCapacityQueries, 0);
+        self.metrics = metrics;
+        self
+    }
+
+    pub(super) fn metrics(&self) -> podmesh_metrics::Metrics {
+        self.metrics.clone()
     }
 
     /// Open a placement query, or join one already in flight for the same
@@ -109,17 +121,31 @@ impl QueryManager {
                 .target_offers
                 .saturating_add(target_offers)
                 .min(self.max_offers_per_query);
-            return Ok(BegunQuery {
+            let begun = BegunQuery {
                 query: pending.query.clone(),
                 newly_created: false,
                 target_offers: pending.target_offers,
                 offers: pending.offer_count.subscribe(),
-            });
+            };
+            let pending_len = state.pending.len();
+            drop(state);
+            self.metrics.set_gauge(
+                podmesh_metrics::GaugeName::PendingCapacityQueries,
+                pending_len as u64,
+            );
+            return Ok(begun);
         }
-        ensure!(
-            state.pending.len() < self.max_pending_queries,
-            "scheduler pending-query limit reached"
-        );
+        if state.pending.len() >= self.max_pending_queries {
+            let pending_len = state.pending.len();
+            drop(state);
+            self.metrics
+                .record_event(podmesh_metrics::EventName::StoreSaturation);
+            self.metrics.set_gauge(
+                podmesh_metrics::GaugeName::PendingCapacityQueries,
+                pending_len as u64,
+            );
+            anyhow::bail!("scheduler pending-query limit reached");
+        }
         let lifetime_secs = self.query_timeout.as_secs();
         let expires_at_secs = now_secs.saturating_add(lifetime_secs);
         let reply_endpoint = identity.endpoint_record(reply_address, now_secs, expires_at_secs)?;
@@ -158,12 +184,19 @@ impl QueryManager {
                 offer_count,
             },
         );
-        Ok(BegunQuery {
+        let begun = BegunQuery {
             query,
             newly_created: true,
             target_offers,
             offers,
-        })
+        };
+        let pending_len = state.pending.len();
+        drop(state);
+        self.metrics.set_gauge(
+            podmesh_metrics::GaugeName::PendingCapacityQueries,
+            pending_len as u64,
+        );
+        Ok(begun)
     }
 
     pub async fn submit_offer(
@@ -214,10 +247,12 @@ impl QueryManager {
         if pending.offers.contains_key(&authenticated_endpoint) {
             return Ok(false);
         }
-        ensure!(
-            pending.offers.len() < self.max_offers_per_query,
-            "capacity offer limit reached for query"
-        );
+        if pending.offers.len() >= self.max_offers_per_query {
+            drop(state);
+            self.metrics
+                .record_event(podmesh_metrics::EventName::StoreSaturation);
+            anyhow::bail!("capacity offer limit reached for query");
+        }
         pending.offers.insert(authenticated_endpoint, offer);
         // Publishing the count is what lets a waiter return as soon as it has
         // enough to choose from, instead of sleeping out the query lifetime.
@@ -245,11 +280,23 @@ impl QueryManager {
         if let Some(pending) = state.pending.remove(query_id) {
             state.equivalent.remove(&pending.criteria);
         }
+        let pending_len = state.pending.len();
+        drop(state);
+        self.metrics.set_gauge(
+            podmesh_metrics::GaugeName::PendingCapacityQueries,
+            pending_len as u64,
+        );
     }
 
     pub async fn cleanup(&self, now_secs: u64) {
         let mut state = self.inner.lock().await;
         cleanup_locked(&mut state, now_secs);
+        let pending_len = state.pending.len();
+        drop(state);
+        self.metrics.set_gauge(
+            podmesh_metrics::GaugeName::PendingCapacityQueries,
+            pending_len as u64,
+        );
     }
 
     pub async fn pending_len(&self) -> usize {

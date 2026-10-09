@@ -10,6 +10,14 @@ fn response(
     scheduler: EndpointId,
     event: protocol::ReconciliationEvent,
 ) -> protocol::SchedulerReconciliationResponse {
+    response_for("query", scheduler, event)
+}
+
+fn response_for(
+    query_id: &str,
+    scheduler: EndpointId,
+    event: protocol::ReconciliationEvent,
+) -> protocol::SchedulerReconciliationResponse {
     let (public, private) = crypto::generate_signing_keypair();
     let endpoint = protocol::EndpointRecord {
         version: protocol::ENDPOINT_RECORD_VERSION,
@@ -25,7 +33,7 @@ fn response(
     .unwrap();
     protocol::SchedulerReconciliationResponse {
         version: protocol::RECONCILIATION_PROTOCOL_VERSION,
-        query_id: "query".into(),
+        query_id: query_id.into(),
         responder_endpoint: endpoint,
         event,
         responded_at_secs: NOW,
@@ -89,4 +97,112 @@ async fn an_unexpected_scheduler_cannot_complete_a_query() {
         )
         .await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn timeout_reports_unreachable_scheduler_and_preserves_partial_view() {
+    let responding = iroh::SecretKey::generate().public();
+    let unreachable = iroh::SecretKey::generate().public();
+    let registry = ReconciliationRegistry::new(2);
+    let notify = registry
+        .begin("query".into(), HashSet::from([responding, unreachable]))
+        .await
+        .unwrap();
+    registry
+        .record(
+            responding,
+            response(responding, protocol::ReconciliationEvent::Complete),
+        )
+        .await
+        .unwrap();
+
+    let outcome = registry
+        .finish("query", notify, Duration::from_millis(10))
+        .await
+        .unwrap();
+    assert_eq!(outcome.unreachable_schedulers, vec![unreachable]);
+    assert!(outcome.answers.is_empty());
+    assert!(registry.is_empty().await);
+
+    let restored = registry
+        .begin("restored".into(), HashSet::from([responding, unreachable]))
+        .await
+        .unwrap();
+    for scheduler in [responding, unreachable] {
+        let completed = response_for(
+            "restored",
+            scheduler,
+            protocol::ReconciliationEvent::Complete,
+        );
+        registry.record(scheduler, completed).await.unwrap();
+    }
+    let outcome = registry
+        .finish("restored", restored, Duration::from_millis(10))
+        .await
+        .unwrap();
+    assert!(outcome.unreachable_schedulers.is_empty());
+}
+
+#[tokio::test]
+async fn agent_failure_is_reported_without_claiming_a_complete_view() {
+    let scheduler = iroh::SecretKey::generate().public();
+    let unreachable_agent = iroh::SecretKey::generate().public();
+    let registry = ReconciliationRegistry::new(1);
+    let notify = registry
+        .begin("query".into(), HashSet::from([scheduler]))
+        .await
+        .unwrap();
+    registry
+        .record(
+            scheduler,
+            response(
+                scheduler,
+                protocol::ReconciliationEvent::AgentUnreachable {
+                    agent_endpoint_id: unreachable_agent.as_bytes().to_vec(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    registry
+        .record(
+            scheduler,
+            response(scheduler, protocol::ReconciliationEvent::Complete),
+        )
+        .await
+        .unwrap();
+
+    let outcome = registry
+        .finish("query", notify, Duration::from_millis(10))
+        .await
+        .unwrap();
+    assert_eq!(outcome.unreachable_agents, vec![unreachable_agent]);
+    assert!(outcome.unreachable_schedulers.is_empty());
+    assert!(registry.is_empty().await);
+
+    let restored = registry
+        .begin("restored".into(), HashSet::from([scheduler]))
+        .await
+        .unwrap();
+    let answer = response_for(
+        "restored",
+        scheduler,
+        protocol::ReconciliationEvent::AgentAnswer {
+            agent_endpoint_id: unreachable_agent.as_bytes().to_vec(),
+            sealed_response: vec![1],
+        },
+    );
+    registry.record(scheduler, answer).await.unwrap();
+    let completed = response_for(
+        "restored",
+        scheduler,
+        protocol::ReconciliationEvent::Complete,
+    );
+    registry.record(scheduler, completed).await.unwrap();
+    let outcome = registry
+        .finish("restored", restored, Duration::from_millis(10))
+        .await
+        .unwrap();
+    assert_eq!(outcome.answers.len(), 1);
+    assert!(outcome.unreachable_agents.is_empty());
 }

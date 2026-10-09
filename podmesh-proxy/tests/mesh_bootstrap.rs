@@ -81,8 +81,10 @@ async fn start_node(
 ) -> Result<NodeHandle> {
     let cfg = Config {
         proxy_endpoints: bootstrap_peers,
+        workload_replay_limits: protocol::ReplayLimits::default(),
         identity: podmesh_proxy::IdentitySource::ephemeral(),
         iroh_bind_addr: format!("127.0.0.1:{iroh_port}").parse()?,
+        metrics_listen: None,
         workload_relay: None,
         workload_relay_certificate_der: Vec::new(),
         publish_relay_bootstrap: false,

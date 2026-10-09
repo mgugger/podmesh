@@ -8,6 +8,7 @@ use iroh::{
 use protocol::{CapacityOffer, MAX_CAPACITY_MESSAGE_BYTES};
 
 use super::QueryManager;
+use crate::now_secs;
 
 const OFFER_ACK: &[u8] = b"ok";
 
@@ -65,11 +66,4 @@ impl ProtocolHandler for CapacityOfferHandler {
             .await
             .map_err(|error| AcceptError::from_err(std::io::Error::other(error.to_string())))
     }
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }

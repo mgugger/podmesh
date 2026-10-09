@@ -2,6 +2,7 @@
 name = "podmesh-agent"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
@@ -15,6 +16,7 @@ futures = { workspace = true }
 iroh = { workspace = true }
 iroh-support = { workspace = true }
 log = { workspace = true }
+podmesh-metrics = { workspace = true }
 postcard = { workspace = true }
 protocol = { workspace = true }
 redb = { workspace = true }
@@ -29,6 +31,7 @@ reqwest = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }
 axum-support = { workspace = true }
 hex = { workspace = true }
 podmesh-scheduler = { workspace = true }

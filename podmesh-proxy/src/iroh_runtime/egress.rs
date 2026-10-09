@@ -8,19 +8,18 @@
 
 use std::{sync::Arc, time::Duration};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow};
 use iroh::{
     EndpointId,
     endpoint::{RecvStream, SendStream},
 };
 use log::{debug, info};
 use protocol::egress::{EgressTunnelRequest, EgressTunnelResponse};
-use protocol::{DEFAULT_WORKLOAD_STREAM_TIMEOUT, WorkloadStreamKind, write_workload_frame};
-use tokio::io::AsyncReadExt;
+use protocol::{DEFAULT_WORKLOAD_STREAM_TIMEOUT, WorkloadPayload, write_workload_frame};
 
-use super::RuntimeState;
-use super::handlers::write_response;
+use super::handlers::{seal_typed_response, write_typed_response};
 use super::tenant_gate::authorize_egress;
+use super::{ActiveGauge, RuntimeState};
 use crate::egress_target;
 
 /// Longest a tunnel may take to establish its outbound connection.
@@ -39,19 +38,33 @@ const MAX_EGRESS_TUNNEL_BYTES: u64 = 512 * 1024 * 1024;
 pub(super) async fn handle_egress(
     state: Arc<RuntimeState>,
     remote: EndpointId,
+    stable_id: usize,
+    send: SendStream,
+    recv: RecvStream,
+    request: EgressTunnelRequest,
+) -> Result<()> {
+    let _active = ActiveGauge::new(
+        state.metrics.clone(),
+        state.active_egress.clone(),
+        podmesh_metrics::GaugeName::ActiveEgress,
+    );
+    handle_egress_inner(state, remote, stable_id, send, recv, request).await
+}
+
+async fn handle_egress_inner(
+    state: Arc<RuntimeState>,
+    remote: EndpointId,
+    stable_id: usize,
     mut send: SendStream,
     recv: RecvStream,
-    payload: Vec<u8>,
+    request: EgressTunnelRequest,
 ) -> Result<()> {
-    let request: EgressTunnelRequest =
-        postcard::from_bytes(&payload).context("decode egress request")?;
-    ensure!(request.protocol == "tcp", "unsupported egress protocol");
+    request.validate()?;
     // A tunnel spends this proxy's network access, so it is offered only to a
     // tenant that proved itself and whose owner granted this proxy.
-    if let Err(error) = authorize_egress(&state, remote) {
-        let response =
-            postcard::to_allocvec(&EgressTunnelResponse::err("destination not permitted"))?;
-        write_response(&state, &mut send, WorkloadStreamKind::Egress, &response).await?;
+    if let Err(error) = authorize_egress(&state, remote, stable_id) {
+        let response = EgressTunnelResponse::err("destination not permitted");
+        write_typed_response(&state, remote, &mut send, &response).await?;
         return Err(error);
     }
 
@@ -66,9 +79,8 @@ pub(super) async fn handle_egress(
             );
             // The peer learns only that the destination was refused, not which
             // rule refused it, so the tunnel is not usable as a port scanner.
-            let response =
-                postcard::to_allocvec(&EgressTunnelResponse::err("destination not permitted"))?;
-            write_response(&state, &mut send, WorkloadStreamKind::Egress, &response).await?;
+            let response = EgressTunnelResponse::err("destination not permitted");
+            write_typed_response(&state, remote, &mut send, &response).await?;
             return Err(error);
         }
     };
@@ -88,47 +100,48 @@ pub(super) async fn handle_egress(
         Ok(Ok(target)) => target,
         // Both failure modes report the same thing for the same reason.
         Ok(Err(error)) => {
-            let response = postcard::to_allocvec(&EgressTunnelResponse::err("connection failed"))?;
-            write_response(&state, &mut send, WorkloadStreamKind::Egress, &response).await?;
+            let response = EgressTunnelResponse::err("connection failed");
+            write_typed_response(&state, remote, &mut send, &response).await?;
             return Err(error).context("connect egress target");
         }
         Err(_) => {
-            let response = postcard::to_allocvec(&EgressTunnelResponse::err("connection failed"))?;
-            write_response(&state, &mut send, WorkloadStreamKind::Egress, &response).await?;
+            let response = EgressTunnelResponse::err("connection failed");
+            write_typed_response(&state, remote, &mut send, &response).await?;
             return Err(anyhow!("egress target connection timed out"));
         }
     };
-    let response = postcard::to_allocvec(&EgressTunnelResponse::ok())?;
+    let response = EgressTunnelResponse::ok();
+    let envelope = seal_typed_response(&state, remote, &response)?;
     write_workload_frame(
         &mut send,
-        WorkloadStreamKind::Egress,
-        &response,
+        <EgressTunnelResponse as WorkloadPayload>::TYPE.frame_kind(),
+        &envelope,
         DEFAULT_WORKLOAD_STREAM_TIMEOUT,
         &state.cancellation,
     )
     .await?;
 
-    let (target_read, mut target_write) = target.into_split();
-    let mut bounded_recv = recv.take(MAX_EGRESS_TUNNEL_BYTES);
-    let mut bounded_target = target_read.take(MAX_EGRESS_TUNNEL_BYTES);
-    let client_to_target = async {
-        let bytes = tokio::io::copy(&mut bounded_recv, &mut target_write).await?;
-        tokio::io::AsyncWriteExt::shutdown(&mut target_write).await?;
-        Ok::<u64, std::io::Error>(bytes)
-    };
-    let target_to_client = tokio::io::copy(&mut bounded_target, &mut send);
-    // A tunnel that neither side ever closes would hold a stream permit
-    // forever, so the whole relay is bounded in time as well as in bytes.
-    let (sent, received) = tokio::time::timeout(
-        EGRESS_IDLE_TIMEOUT,
-        futures::future::try_join(client_to_target, target_to_client),
+    let (target_read, target_write) = target.into_split();
+    let stats = iroh_support::raw_relay::supervise_raw_relay(
+        recv,
+        send,
+        target_read,
+        target_write,
+        iroh_support::raw_relay::RawRelayLimits {
+            max_bytes_per_direction: MAX_EGRESS_TUNNEL_BYTES,
+            idle_timeout: EGRESS_IDLE_TIMEOUT,
+            max_lifetime: EGRESS_IDLE_TIMEOUT,
+            authority_interval: Duration::from_secs(30),
+        },
+        state.cancellation.clone(),
+        || authorize_egress(&state, remote, stable_id),
     )
-    .await
-    .context("egress tunnel exceeded its maximum lifetime")??;
-    send.finish().context("finish egress response stream")?;
+    .await?;
     debug!(
-        "egress tunnel closed endpoint={} sent={sent} received={received}",
-        remote.fmt_short()
+        "egress tunnel closed endpoint={} sent={} received={}",
+        remote.fmt_short(),
+        stats.left_to_right_bytes,
+        stats.right_to_left_bytes,
     );
     Ok(())
 }

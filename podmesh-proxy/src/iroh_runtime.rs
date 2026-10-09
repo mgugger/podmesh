@@ -5,22 +5,29 @@ mod tenant_gate;
 use crate::routes::RouteTarget;
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
+use axum::body::{Body, Bytes};
+use futures::StreamExt;
 use iroh::{
     Endpoint, EndpointId, RelayMode,
     endpoint::{Connection, presets},
 };
 use log::{debug, info, warn};
 use protocol::{
-    DEFAULT_WORKLOAD_STREAM_TIMEOUT, ENDPOINT_RECORD_VERSION, EndpointRecord, ProxyHttpRequest,
-    ProxyHttpResponse, WORKLOAD_ALPN, WorkloadStreamKind, read_workload_frame,
-    write_workload_frame,
+    DEFAULT_WORKLOAD_STREAM_TIMEOUT, ENDPOINT_RECORD_VERSION, EndpointRecord,
+    IngressRequestMetadata, IngressResponseMetadata, WORKLOAD_ALPN, WorkloadEnvelopeParts,
+    WorkloadPayload, accept_workload_payload, finish_http_body, read_http_body_chunk,
+    read_workload_frame, seal_workload_payload, write_http_body_chunk, write_workload_frame,
 };
 use tokio::{
+    io::split,
     sync::{RwLock as AsyncRwLock, Semaphore, watch},
     task::JoinHandle,
 };
@@ -42,7 +49,8 @@ pub(crate) struct RuntimeState {
     pub endpoint: Endpoint,
     /// This proxy's own keys, used to sign handshakes and its endpoint record.
     pub identity: iroh_support::NodeIdentity,
-    pub connections: AsyncRwLock<HashMap<EndpointId, Connection>>,
+    pub replay_registry: Arc<protocol::PeerReplayRegistry>,
+    pub connections: AsyncRwLock<HashMap<EndpointId, WorkloadConnection>>,
     pub routes: Arc<crate::routes::RouteTable>,
     pub grant_store: ProxyGrantStore,
     /// Tenancy each open connection proved, never what it claimed.
@@ -55,6 +63,16 @@ pub(crate) struct RuntimeState {
     pub cancellation: CancellationToken,
     pub stream_slots: Arc<Semaphore>,
     pub ingress_slots: Arc<Semaphore>,
+    pub metrics: podmesh_metrics::Metrics,
+    pub active_ingress: Arc<AtomicUsize>,
+    pub active_egress: Arc<AtomicUsize>,
+    pub active_websockets: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkloadConnection {
+    connection: Connection,
+    stream_slots: Arc<Semaphore>,
 }
 
 pub struct IrohNodeHandle {
@@ -75,14 +93,53 @@ pub struct ProxyClient {
 }
 
 impl ProxyClient {
-    pub async fn forward(&self, request: ProxyHttpRequest) -> Result<ProxyHttpResponse> {
-        let _permit = tokio::time::timeout(
+    pub async fn forward(
+        &self,
+        request: IngressRequestMetadata,
+        body: Body,
+        on_upgrade: Option<hyper::upgrade::OnUpgrade>,
+    ) -> Result<axum::http::Response<Body>> {
+        let timer = self
+            .state
+            .metrics
+            .operation_started(podmesh_metrics::OperationName::Ingress);
+        let result = self.forward_inner(request, body, on_upgrade).await;
+        finish_operation(timer, &result, &self.state.metrics);
+        result
+    }
+
+    async fn forward_inner(
+        &self,
+        request: IngressRequestMetadata,
+        body: Body,
+        on_upgrade: Option<hyper::upgrade::OnUpgrade>,
+    ) -> Result<axum::http::Response<Body>> {
+        let permit = tokio::time::timeout(
             DEFAULT_WORKLOAD_STREAM_TIMEOUT,
             self.state.ingress_slots.clone().acquire_owned(),
         )
-        .await
-        .context("timed out waiting for ingress stream capacity")?
-        .context("ingress stream limiter closed")?;
+        .await;
+        let permit = match permit {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(error)) => {
+                self.state
+                    .metrics
+                    .record_event(podmesh_metrics::EventName::StreamSaturation);
+                return Err(error).context("ingress stream limiter closed");
+            }
+            Err(error) => {
+                self.state
+                    .metrics
+                    .record_event(podmesh_metrics::EventName::StreamSaturation);
+                return Err(error).context("timed out waiting for ingress stream capacity");
+            }
+        };
+        let _active = ActiveGauge::new(
+            self.state.metrics.clone(),
+            self.state.active_ingress.clone(),
+            podmesh_metrics::GaugeName::ActiveIngress,
+        );
+        let _permit = permit;
         let host = extract_host_header(&request.headers);
         // Every replica of the deployment is a candidate, rotated so
         // consecutive requests spread across them.
@@ -101,11 +158,20 @@ impl ProxyClient {
         // replica that died between its last registration refresh and now does
         // not blackhole the request.
         let mut last_error = None;
+        let mut selected = None;
         for target in &targets {
             let mut attempt = request.clone();
             attempt.target_port = target.port;
-            match self.forward_to(&attempt, target).await {
-                Ok(response) => return Ok(response),
+            match self.open_ingress(&attempt, target).await {
+                Ok((streams, stable_id)) => {
+                    selected = Some((
+                        attempt,
+                        parse_endpoint_id(&target.sidecar_peer_id)?,
+                        stable_id,
+                        streams,
+                    ));
+                    break;
+                }
                 Err(error) => {
                     log::warn!(
                         "ingress to replica {} of manifest {} failed: {error:#}",
@@ -116,16 +182,136 @@ impl ProxyClient {
                 }
             }
         }
-        Err(last_error
-            .unwrap_or_else(|| anyhow!("no replica could serve manifest {}", request.manifest_id)))
+        let (request, selected_endpoint, stable_id, (mut send, mut recv)) =
+            selected.ok_or_else(|| {
+                last_error.unwrap_or_else(|| {
+                    anyhow!("no replica could serve manifest {}", request.manifest_id)
+                })
+            })?;
+        let mut body_progress = protocol::workload_body::HttpBodyProgress::default();
+        let mut body = body.into_data_stream();
+        while let Some(chunk) = body.next().await {
+            write_http_body_chunk(
+                &mut send,
+                &chunk.context("read external ingress request body")?,
+                &mut body_progress,
+                DEFAULT_WORKLOAD_STREAM_TIMEOUT,
+                &self.state.cancellation,
+            )
+            .await?;
+        }
+        finish_http_body(
+            &mut send,
+            DEFAULT_WORKLOAD_STREAM_TIMEOUT,
+            &self.state.cancellation,
+        )
+        .await?;
+        if !request.upgrade_requested {
+            send.finish().context("finish ingress request stream")?;
+        }
+        let (kind, response) = read_workload_frame(
+            &mut recv,
+            DEFAULT_WORKLOAD_STREAM_TIMEOUT,
+            &self.state.cancellation,
+        )
+        .await?;
+        ensure!(
+            kind == <IngressResponseMetadata as WorkloadPayload>::TYPE.frame_kind(),
+            "unexpected ingress response kind"
+        );
+        let accepted = accept_workload_payload::<IngressResponseMetadata>(
+            &response,
+            &self.state.endpoint.id().to_string(),
+            &selected_endpoint.to_string(),
+            now_millis(),
+            &self.state.replay_registry,
+            Instant::now(),
+        )?;
+        let metadata = accepted.payload;
+        if metadata.upgrade_accepted {
+            ensure!(
+                request.upgrade_requested && metadata.status_code == 101,
+                "invalid ingress upgrade transition"
+            );
+            let on_upgrade = on_upgrade.context("external HTTP upgrade handle is missing")?;
+            let state = self.state.clone();
+            tokio::spawn(async move {
+                let _active = ActiveGauge::new(
+                    state.metrics.clone(),
+                    state.active_websockets.clone(),
+                    podmesh_metrics::GaugeName::ActiveWebsockets,
+                );
+                let result = async {
+                    let upgraded = on_upgrade.await.context("complete external HTTP upgrade")?;
+                    let upgraded = hyper_util::rt::TokioIo::new(upgraded);
+                    let (external_read, external_write) = split(upgraded);
+                    iroh_support::raw_relay::supervise_raw_relay(
+                        external_read,
+                        external_write,
+                        recv,
+                        send,
+                        websocket_relay_limits(),
+                        state.cancellation.clone(),
+                        || tenant_gate::authorize_egress(&state, selected_endpoint, stable_id),
+                    )
+                    .await
+                }
+                .await;
+                if let Err(error) = result {
+                    warn!("WebSocket relay ended: {error:#}");
+                }
+            });
+            let mut response = axum::http::Response::builder().status(metadata.status_code);
+            for (name, value) in metadata.headers {
+                response = response.header(name, value);
+            }
+            return response
+                .body(Body::empty())
+                .context("build WebSocket upgrade response");
+        }
+        let cancellation = self.state.cancellation.clone();
+        let response_stream = futures::stream::unfold(
+            Some((recv, protocol::workload_body::HttpBodyProgress::default())),
+            move |state| {
+                let cancellation = cancellation.clone();
+                async move {
+                    let (mut recv, mut progress) = state?;
+                    match read_http_body_chunk(
+                        &mut recv,
+                        &mut progress,
+                        DEFAULT_WORKLOAD_STREAM_TIMEOUT,
+                        &cancellation,
+                    )
+                    .await
+                    {
+                        Ok(Some(chunk)) => Some((
+                            Ok::<Bytes, anyhow::Error>(chunk.into()),
+                            Some((recv, progress)),
+                        )),
+                        Ok(None) => None,
+                        Err(error) => Some((Err(error), None)),
+                    }
+                }
+            },
+        );
+        let mut response = axum::http::Response::builder().status(metadata.status_code);
+        for (name, value) in metadata.headers {
+            response = response.header(name, value);
+        }
+        response
+            .body(Body::from_stream(response_stream))
+            .context("build streamed ingress response")
     }
 
     /// Send one already-routed request to one replica.
-    async fn forward_to(
+    async fn open_ingress(
         &self,
-        request: &ProxyHttpRequest,
+        request: &IngressRequestMetadata,
         target: &RouteTarget,
-    ) -> Result<ProxyHttpResponse> {
+    ) -> Result<(
+        (iroh::endpoint::SendStream, iroh::endpoint::RecvStream),
+        usize,
+    )> {
         let endpoint_id = parse_endpoint_id(&target.sidecar_peer_id)?;
         let connection = self
             .state
@@ -135,32 +321,134 @@ impl ProxyClient {
             .get(&endpoint_id)
             .cloned()
             .ok_or_else(|| anyhow!("registered sidecar connection is unavailable"))?;
-        let (mut send, mut recv) =
-            tokio::time::timeout(DEFAULT_WORKLOAD_STREAM_TIMEOUT, connection.open_bi())
-                .await
-                .context("timed out opening ingress stream")?
-                .context("open ingress stream")?;
-        let payload = postcard::to_allocvec(request).context("serialize ingress request")?;
+        let _connection_permit = connection
+            .stream_slots
+            .clone()
+            .try_acquire_owned()
+            .context("sidecar connection stream limit reached")?;
+        let (mut send, recv) = tokio::time::timeout(
+            DEFAULT_WORKLOAD_STREAM_TIMEOUT,
+            connection.connection.open_bi(),
+        )
+        .await
+        .context("timed out opening ingress stream")?
+        .context("open ingress stream")?;
+        let payload = seal_workload_payload(
+            WorkloadEnvelopeParts {
+                nonce: &crypto::generate_secure_nonce(),
+                now_millis: now_millis(),
+                sender_id: &self.state.endpoint.id().to_string(),
+                recipient_id: &endpoint_id.to_string(),
+                sender_signing_public: self.state.identity.signing_public(),
+                sender_signing_private: self.state.identity.signing_private(),
+                sender_kem_public: Some(self.state.identity.kem_public()),
+            },
+            request,
+        )?;
         write_workload_frame(
             &mut send,
-            WorkloadStreamKind::Ingress,
+            <IngressRequestMetadata as WorkloadPayload>::TYPE.frame_kind(),
             &payload,
             DEFAULT_WORKLOAD_STREAM_TIMEOUT,
             &self.state.cancellation,
         )
         .await?;
-        send.finish().context("finish ingress request")?;
-        let (kind, payload) = read_workload_frame(
-            &mut recv,
-            DEFAULT_WORKLOAD_STREAM_TIMEOUT,
-            &self.state.cancellation,
-        )
-        .await?;
-        ensure!(
-            kind == WorkloadStreamKind::Ingress,
-            "unexpected ingress response kind"
-        );
-        postcard::from_bytes(&payload).context("decode ingress response")
+        Ok(((send, recv), connection.connection.stable_id()))
+    }
+}
+
+pub(crate) struct ActiveGauge {
+    metrics: podmesh_metrics::Metrics,
+    active: Arc<AtomicUsize>,
+    gauge: podmesh_metrics::GaugeName,
+}
+
+impl ActiveGauge {
+    pub(crate) fn new(
+        metrics: podmesh_metrics::Metrics,
+        active: Arc<AtomicUsize>,
+        gauge: podmesh_metrics::GaugeName,
+    ) -> Self {
+        let current = active.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        metrics.set_gauge(gauge, current as u64);
+        Self {
+            metrics,
+            active,
+            gauge,
+        }
+    }
+}
+
+impl Drop for ActiveGauge {
+    fn drop(&mut self) {
+        let previous = self.active.fetch_sub(1, Ordering::AcqRel);
+        self.metrics
+            .set_gauge(self.gauge, previous.saturating_sub(1) as u64);
+    }
+}
+
+pub(crate) fn finish_operation<T>(
+    timer: podmesh_metrics::OperationTimer,
+    result: &Result<T>,
+    metrics: &podmesh_metrics::Metrics,
+) {
+    let (outcome, reason) = match result {
+        Ok(_) => (
+            podmesh_metrics::Outcome::Success,
+            podmesh_metrics::Reason::None,
+        ),
+        Err(error) if error.to_string().contains("replay") => {
+            metrics.record_event(podmesh_metrics::EventName::ReplayRefusal);
+            (
+                podmesh_metrics::Outcome::Refused,
+                podmesh_metrics::Reason::Replay,
+            )
+        }
+        Err(error) if error.to_string().contains("timed out") => (
+            podmesh_metrics::Outcome::Timeout,
+            podmesh_metrics::Reason::Deadline,
+        ),
+        Err(error)
+            if error.to_string().contains("limit") || error.to_string().contains("capacity") =>
+        {
+            (
+                podmesh_metrics::Outcome::Saturated,
+                podmesh_metrics::Reason::Capacity,
+            )
+        }
+        Err(error)
+            if error.to_string().contains("grant")
+                || error.to_string().contains("tenant")
+                || error.to_string().contains("credential") =>
+        {
+            (
+                podmesh_metrics::Outcome::Refused,
+                podmesh_metrics::Reason::Authorization,
+            )
+        }
+        Err(error)
+            if error.to_string().contains("unavailable")
+                || error.to_string().contains("connect") =>
+        {
+            (
+                podmesh_metrics::Outcome::Unreachable,
+                podmesh_metrics::Reason::Unavailable,
+            )
+        }
+        Err(_) => (
+            podmesh_metrics::Outcome::Refused,
+            podmesh_metrics::Reason::Invalid,
+        ),
+    };
+    timer.finish(outcome, reason);
+}
+
+fn websocket_relay_limits() -> iroh_support::raw_relay::RawRelayLimits {
+    iroh_support::raw_relay::RawRelayLimits {
+        max_bytes_per_direction: 512 * 1024 * 1024,
+        idle_timeout: Duration::from_secs(300),
+        max_lifetime: Duration::from_secs(60 * 60),
+        authority_interval: Duration::from_secs(30),
     }
 }
 
@@ -215,6 +503,13 @@ impl IrohNodeHandle {
 }
 
 pub async fn spawn(config: &Config) -> Result<IrohNodeHandle> {
+    spawn_with_metrics(config, podmesh_metrics::Metrics::noop()).await
+}
+
+pub async fn spawn_with_metrics(
+    config: &Config,
+    metrics: podmesh_metrics::Metrics,
+) -> Result<IrohNodeHandle> {
     config.validate()?;
     let relay_server = match &config.workload_relay {
         Some(relay_config) => Some(relay::start(relay_config).await?),
@@ -251,10 +546,13 @@ pub async fn spawn(config: &Config) -> Result<IrohNodeHandle> {
     let state = Arc::new(RuntimeState {
         endpoint: endpoint.clone(),
         identity,
+        replay_registry: Arc::new(protocol::PeerReplayRegistry::new(
+            config.workload_replay_limits,
+        )?),
         connections: AsyncRwLock::new(HashMap::new()),
-        routes: Arc::new(crate::routes::RouteTable::new()),
-        grant_store: ProxyGrantStore::new(),
-        tenants: crate::tenant_sessions::TenantSessions::new(),
+        routes: Arc::new(crate::routes::RouteTable::new().with_metrics(metrics.clone())),
+        grant_store: ProxyGrantStore::new().with_metrics(metrics.clone()),
+        tenants: crate::tenant_sessions::TenantSessions::new().with_metrics(metrics.clone()),
         advertise_addresses: config.advertise_addresses.clone(),
         own_endpoint_record: endpoint_record.clone(),
         known_proxies: AsyncRwLock::new(
@@ -272,7 +570,18 @@ pub async fn spawn(config: &Config) -> Result<IrohNodeHandle> {
         cancellation: cancellation.clone(),
         stream_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_WORKLOAD_STREAMS)),
         ingress_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_INGRESS_STREAMS)),
+        metrics: metrics.clone(),
+        active_ingress: Arc::new(AtomicUsize::new(0)),
+        active_egress: Arc::new(AtomicUsize::new(0)),
+        active_websockets: Arc::new(AtomicUsize::new(0)),
     });
+    metrics.set_gauge(
+        podmesh_metrics::GaugeName::ProxyPeers,
+        state.known_proxies.read().await.len() as u64,
+    );
+    metrics.set_gauge(podmesh_metrics::GaugeName::ActiveIngress, 0);
+    metrics.set_gauge(podmesh_metrics::GaugeName::ActiveEgress, 0);
+    metrics.set_gauge(podmesh_metrics::GaugeName::ActiveWebsockets, 0);
     let task = tokio::spawn(run(state.clone()));
     info!("proxy Iroh endpoint ready endpoint_id={endpoint_id}");
     Ok(IrohNodeHandle {
@@ -345,6 +654,15 @@ async fn connect_configured_proxy(state: Arc<RuntimeState>, record: EndpointReco
 }
 
 async fn announce_proxy(state: &RuntimeState, connection: &Connection) -> Result<()> {
+    let timer = state
+        .metrics
+        .operation_started(podmesh_metrics::OperationName::PeerAnnouncement);
+    let result = announce_proxy_inner(state, connection).await;
+    finish_operation(timer, &result, &state.metrics);
+    result
+}
+
+async fn announce_proxy_inner(state: &RuntimeState, connection: &Connection) -> Result<()> {
     let (mut send, mut recv) =
         tokio::time::timeout(DEFAULT_WORKLOAD_STREAM_TIMEOUT, connection.open_bi())
             .await
@@ -355,10 +673,22 @@ async fn announce_proxy(state: &RuntimeState, connection: &Connection) -> Result
         .read()
         .map_err(|_| anyhow!("proxy EndpointRecord lock poisoned"))?
         .clone();
-    let payload = record.to_bytes(now_secs()?)?;
+    let request = protocol::ProxyAnnouncementRequest { endpoint: record };
+    let payload = seal_workload_payload(
+        WorkloadEnvelopeParts {
+            nonce: &crypto::generate_secure_nonce(),
+            now_millis: now_millis(),
+            sender_id: &state.endpoint.id().to_string(),
+            recipient_id: &connection.remote_id().to_string(),
+            sender_signing_public: state.identity.signing_public(),
+            sender_signing_private: state.identity.signing_private(),
+            sender_kem_public: Some(state.identity.kem_public()),
+        },
+        &request,
+    )?;
     write_workload_frame(
         &mut send,
-        WorkloadStreamKind::ProxyAnnouncement,
+        <protocol::ProxyAnnouncementRequest as WorkloadPayload>::TYPE.frame_kind(),
         &payload,
         DEFAULT_WORKLOAD_STREAM_TIMEOUT,
         &state.cancellation,
@@ -372,19 +702,37 @@ async fn announce_proxy(state: &RuntimeState, connection: &Connection) -> Result
     )
     .await?;
     ensure!(
-        kind == WorkloadStreamKind::ProxyAnnouncement,
+        kind == <protocol::ProxyAnnouncementResponse as WorkloadPayload>::TYPE.frame_kind(),
         "proxy announcement response kind is invalid"
     );
-    let remote_record = EndpointRecord::from_bytes(&response, now_secs()?)?;
+    let accepted = accept_workload_payload::<protocol::ProxyAnnouncementResponse>(
+        &response,
+        &state.endpoint.id().to_string(),
+        &connection.remote_id().to_string(),
+        now_millis(),
+        &state.replay_registry,
+        Instant::now(),
+    )?;
+    let remote_record = accepted.payload.endpoint;
     ensure!(
         remote_record.endpoint_id.as_slice() == connection.remote_id().as_bytes(),
         "proxy announcement response does not match transport"
+    );
+    ensure!(
+        accepted.sender_signing_key
+            == crypto::b64_decode(&remote_record.signing_pubkey)
+                .context("decode proxy announcement response signing key")?,
+        "proxy announcement response envelope key does not match endpoint record"
     );
     state
         .known_proxies
         .write()
         .await
         .insert(connection.remote_id(), remote_record);
+    state.metrics.set_gauge(
+        podmesh_metrics::GaugeName::ProxyPeers,
+        state.known_proxies.read().await.len() as u64,
+    );
     Ok(())
 }
 
@@ -409,7 +757,8 @@ async fn refresh_endpoint_record(state: &RuntimeState) -> Result<()> {
     let connections = state.connections.read().await;
     for proxy_id in proxy_ids {
         if let Some(connection) = connections.get(&proxy_id).cloned()
-            && let Err(error) = announce_proxy(state, &connection).await
+            && let Ok(_permit) = connection.stream_slots.clone().try_acquire_owned()
+            && let Err(error) = announce_proxy(state, &connection.connection).await
         {
             warn!(
                 "failed to refresh proxy announcement endpoint={} error={error}",
@@ -422,14 +771,37 @@ async fn refresh_endpoint_record(state: &RuntimeState) -> Result<()> {
 
 async fn register_connection(state: Arc<RuntimeState>, connection: Connection) {
     let remote = connection.remote_id();
+    let stable_id = connection.stable_id();
+    let connection_state = WorkloadConnection {
+        connection: connection.clone(),
+        stream_slots: Arc::new(Semaphore::new(
+            protocol::MAX_WORKLOAD_STREAMS_PER_CONNECTION,
+        )),
+    };
     {
         let mut connections = state.connections.write().await;
         if !connections.contains_key(&remote) && connections.len() >= MAX_WORKLOAD_CONNECTIONS {
+            state
+                .metrics
+                .record_event(podmesh_metrics::EventName::StreamSaturation);
             connection.close(1u8.into(), b"connection limit reached");
             return;
         }
-        if let Some(previous) = connections.insert(remote, connection.clone()) {
-            previous.close(2u8.into(), b"connection replaced");
+        if connections.contains_key(&remote) {
+            drop(connections);
+            connection.close(2u8.into(), b"duplicate connection");
+            return;
+        }
+        connections.insert(remote, connection_state.clone());
+        if let Err(error) = state.tenants.begin(remote, stable_id) {
+            connections.remove(&remote);
+            drop(connections);
+            connection.close(2u8.into(), b"duplicate connection session");
+            warn!(
+                "workload connection session refused endpoint={} error={error}",
+                remote.fmt_short()
+            );
+            return;
         }
         publish_peers(&connections, &state.peer_tx);
     }
@@ -444,8 +816,16 @@ async fn register_connection(state: Arc<RuntimeState>, connection: Connection) {
             stream = connection.accept_bi() => match stream {
                 Ok((send, recv)) => {
                     let state = state.clone();
+                    let connection_slots = connection_state.stream_slots.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = handlers::handle_stream(state, remote, send, recv).await {
+                        if let Err(error) = handlers::handle_stream(
+                            state,
+                            remote,
+                            stable_id,
+                            connection_slots,
+                            send,
+                            recv,
+                        ).await {
                             warn!("workload stream rejected endpoint={} error={error}", remote.fmt_short());
                         }
                     });
@@ -457,20 +837,21 @@ async fn register_connection(state: Arc<RuntimeState>, connection: Connection) {
             }
         }
     }
-    // Tenancy is proven per connection, so it must not outlive one.
-    state.tenants.forget(&remote);
     let mut connections = state.connections.write().await;
     if connections
         .get(&remote)
-        .is_some_and(|current| current.stable_id() == connection.stable_id())
+        .is_some_and(|current| current.connection.stable_id() == connection.stable_id())
     {
+        // Tenancy is proven per connection, so it disappears atomically with
+        // the current connection rather than during stale-task cleanup.
+        state.tenants.remove_if_current(&remote, stable_id);
         connections.remove(&remote);
         publish_peers(&connections, &state.peer_tx);
     }
 }
 
 fn publish_peers(
-    connections: &HashMap<EndpointId, Connection>,
+    connections: &HashMap<EndpointId, WorkloadConnection>,
     sender: &watch::Sender<Vec<String>>,
 ) {
     let mut peers = connections
@@ -548,4 +929,22 @@ pub(crate) fn now_millis() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn sixty_fifth_connection_stream_is_refused_immediately() {
+        let slots = Arc::new(Semaphore::new(
+            protocol::MAX_WORKLOAD_STREAMS_PER_CONNECTION,
+        ));
+        let permits = (0..protocol::MAX_WORKLOAD_STREAMS_PER_CONNECTION)
+            .map(|_| slots.clone().try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+        assert!(slots.clone().try_acquire_owned().is_err());
+        drop(permits);
+        assert!(slots.try_acquire_owned().is_ok());
+    }
 }

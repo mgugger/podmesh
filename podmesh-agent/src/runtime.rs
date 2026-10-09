@@ -22,11 +22,30 @@ const MAX_LOGGED_CONTAINERS: usize = 16;
 
 #[async_trait]
 pub trait WorkloadRuntime: Send + Sync {
+    fn target_id(&self, deployment: &WorkloadDeployment<'_>) -> Result<String>;
     async fn deploy(&self, deployment: WorkloadDeployment<'_>) -> Result<String>;
     async fn status(&self, runtime_id: &str) -> Result<String>;
     async fn logs(&self, runtime_id: &str, tail: u32) -> Result<String>;
     async fn delete(&self, runtime_id: &str) -> Result<()>;
+    async fn cleanup_failed_deploy(&self, runtime_id: &str, uncertain: bool) -> Result<()> {
+        anyhow::ensure!(
+            !uncertain,
+            "runtime creation outcome is uncertain; operator repair required"
+        );
+        self.delete(runtime_id).await
+    }
 }
+
+#[derive(Debug)]
+pub struct RuntimeOutcomeUnknown;
+
+impl std::fmt::Display for RuntimeOutcomeUnknown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("runtime operation timed out or lost completion; outcome uncertain")
+    }
+}
+
+impl std::error::Error for RuntimeOutcomeUnknown {}
 
 /// One pod to run, and the tenant it belongs to.
 pub struct WorkloadDeployment<'a> {
@@ -90,6 +109,14 @@ impl MockRuntime {
 
 #[async_trait]
 impl WorkloadRuntime for MockRuntime {
+    fn target_id(&self, deployment: &WorkloadDeployment<'_>) -> Result<String> {
+        Ok(deployment.workload_id.to_string())
+    }
+
+    async fn cleanup_failed_deploy(&self, runtime_id: &str, _uncertain: bool) -> Result<()> {
+        self.delete(runtime_id).await
+    }
+
     async fn deploy(&self, deployment: WorkloadDeployment<'_>) -> Result<String> {
         self.deploy_calls.fetch_add(1, Ordering::SeqCst);
         if self
@@ -166,7 +193,8 @@ impl PodmanRuntime {
         command.kill_on_drop(true);
         let output = timeout(RUNTIME_COMMAND_TIMEOUT, command.output())
             .await
-            .map_err(|_| anyhow!("runtime command timed out"))??;
+            .map_err(|_| anyhow!(RuntimeOutcomeUnknown))?
+            .map_err(|error| anyhow!(error).context(RuntimeOutcomeUnknown))?;
         let mut combined = output.stdout;
         combined.extend_from_slice(&output.stderr);
         anyhow::ensure!(
@@ -224,6 +252,10 @@ impl PodmanRuntime {
 
 #[async_trait]
 impl WorkloadRuntime for PodmanRuntime {
+    fn target_id(&self, deployment: &WorkloadDeployment<'_>) -> Result<String> {
+        Self::pod_name(deployment.manifest)
+    }
+
     async fn deploy(&self, deployment: WorkloadDeployment<'_>) -> Result<String> {
         let pod_name = Self::pod_name(deployment.manifest)?;
         let mut file = tempfile::NamedTempFile::new().context("create protected manifest file")?;
@@ -325,6 +357,44 @@ pub fn create_runtime(
     match kind {
         crate::config::RuntimeKind::Podman => Ok(Arc::new(PodmanRuntime::new(workload_network)?)),
         crate::config::RuntimeKind::Mock => Ok(Arc::new(MockRuntime::default())),
+    }
+}
+
+#[cfg(test)]
+mod pending_cleanup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn podman_refuses_to_infer_cleanup_from_an_interrupted_request() {
+        let runtime = PodmanRuntime::new("podmesh").unwrap();
+        let error = runtime
+            .cleanup_failed_deploy("must-not-execute-podman", true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("operator repair required"));
+    }
+
+    #[test]
+    fn podman_resolves_pod_and_deployment_targets_before_execution() {
+        let runtime = PodmanRuntime::new("podmesh").unwrap();
+        for (manifest, expected) in [
+            ("kind: Pod\nmetadata: {name: owned}\nspec: {}", "owned"),
+            (
+                "kind: Deployment\nmetadata: {name: owned}\nspec: {template: {spec: {}}}",
+                "owned-pod",
+            ),
+        ] {
+            assert_eq!(
+                runtime
+                    .target_id(&WorkloadDeployment {
+                        workload_id: "id",
+                        namespace_id: "owner",
+                        manifest: manifest.as_bytes()
+                    })
+                    .unwrap(),
+                expected
+            );
+        }
     }
 }
 

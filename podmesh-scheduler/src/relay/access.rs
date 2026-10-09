@@ -1,11 +1,10 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use anyhow::{Context, Result, ensure};
 use iroh_relay::server::{Access, AccessControl, ClientRequest};
 use protocol::MachineRelayGrant;
 
 use super::MachineRelayConfig;
 use crate::machine::{IssuerRegistry, MemberIssuers};
+use crate::now_secs;
 
 #[derive(Debug, Clone)]
 pub struct MachineRelayAccessControl {
@@ -86,13 +85,6 @@ impl AccessControl for MachineRelayAccessControl {
             }
         }
     }
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[cfg(test)]

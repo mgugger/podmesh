@@ -18,7 +18,7 @@ use std::process::{Command as StdCommand, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use podctl::{ClientOptions, apply_file_with_proxy_urls, delete_file};
+use podctl::{ClientOptions, apply_file_with_proxy_urls, delete_file, discover_workloads};
 use podmesh_agent::sidecar::workload_runtime_name;
 use podmesh_integration_tests::support::{ClientKeyDir, init_tracing, reset_podman_stack_state};
 use reqwest::Client;
@@ -123,6 +123,13 @@ async fn transparent_egress_routes_through_sidecar_and_proxy() -> Result<()> {
         api_base: Some(MACHINE_API_URL.to_string()),
         trust_any_agent: true,
     };
+    wait_for_complete_reconciliation(&options, Duration::from_secs(180)).await?;
+
+    for proxy_url in PODMESH_PROXY_API_URLS.split(',') {
+        podctl::cert::trust_proxy_async_at(key_dir.path(), proxy_url, false)
+            .await
+            .with_context(|| format!("trust local proxy {proxy_url}"))?;
+    }
 
     // Deploy the egress test workload
     let manifest_id = apply_file_with_proxy_urls(
@@ -177,6 +184,34 @@ async fn transparent_egress_routes_through_sidecar_and_proxy() -> Result<()> {
 // ============================================================================
 // Helper functions
 // ============================================================================
+
+async fn wait_for_complete_reconciliation(
+    options: &ClientOptions,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match discover_workloads(options).await {
+            Ok(report)
+                if report.unreachable_agents.is_empty()
+                    && report.unreachable_schedulers.is_empty() =>
+            {
+                return Ok(());
+            }
+            Ok(report) => {
+                last_error = Some(anyhow!(
+                    "mesh view remains partial: unreachable schedulers={:?}, agents={:?}",
+                    report.unreachable_schedulers,
+                    report.unreachable_agents
+                ));
+            }
+            Err(error) => last_error = Some(error),
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("mesh reconciliation did not become complete")))
+}
 
 async fn is_podman_available() -> bool {
     match TokioCommand::new("podman")

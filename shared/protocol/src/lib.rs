@@ -32,7 +32,9 @@ pub use endpoint_record::{
     MAX_ENDPOINT_RECORD_BYTES,
 };
 pub mod http_proxy;
-pub use http_proxy::{ProxyHttpRequest, ProxyHttpResponse};
+pub use http_proxy::{
+    IngressRequestMetadata, IngressResponseMetadata, ProxyHttpRequest, ProxyHttpResponse,
+};
 pub mod machine;
 pub mod machine_relay;
 pub use machine_relay::{
@@ -80,13 +82,25 @@ pub use biscuit_keys::{
     MAX_BISCUIT_TOKEN_BYTES, biscuit_keypair_from_ed25519, biscuit_public_key_from_ed25519,
 };
 pub mod proxy_grant;
+pub mod replay_registry;
+pub use replay_registry::{PeerReplayRegistry, ReplayLimits};
 pub mod relay_token;
+pub mod workload_body;
 pub mod workload_credential;
+pub use workload_body::{
+    HttpBodyProgress, finish_http_body, read_http_body_chunk, write_http_body_chunk,
+};
+pub mod workload_control;
 pub use proxy_grant::{
     MAX_PROXY_GRANT_B64_LEN, MAX_PROXY_GRANT_LIFETIME_SECS, ProxyGrantClaims, mint_proxy_grant,
     proxy_grant_from_b64, proxy_grant_to_b64, verify_proxy_grant,
 };
 pub use relay_token::{derive_tenant_relay_token, tenant_from_relay_token};
+pub use workload_control::{
+    AcceptedWorkloadPayload, ProxyAnnouncementRequest, ProxyAnnouncementResponse,
+    WorkloadEnvelopeParts, WorkloadPayload, WorkloadPayloadType, WorkloadStreamPhase,
+    accept_workload_payload, seal_workload_payload,
+};
 pub use workload_credential::{
     MAX_WORKLOAD_CREDENTIAL_B64_LEN, MAX_WORKLOAD_CREDENTIAL_LIFETIME_SECS,
     WorkloadCredentialClaims, mint_workload_credential, verify_workload_credential,
@@ -94,6 +108,6 @@ pub use workload_credential::{
 };
 pub mod workload_stream;
 pub use workload_stream::{
-    DEFAULT_WORKLOAD_STREAM_TIMEOUT, MESH_DOMAIN_SUFFIX, WORKLOAD_ALPN, WorkloadStreamKind,
-    read_workload_frame, write_workload_frame,
+    DEFAULT_WORKLOAD_STREAM_TIMEOUT, MAX_WORKLOAD_STREAMS_PER_CONNECTION, MESH_DOMAIN_SUFFIX,
+    WORKLOAD_ALPN, WorkloadStreamKind, read_workload_frame, write_workload_frame,
 };

@@ -12,6 +12,46 @@ The mesh is open: any keypair may ask any agent to run a workload. Authority is 
 
 ## Requirements
 
+### Requirement: The agent SHALL expose bounded application metrics only when configured
+
+The agent SHALL accept optional `--metrics-listen` / `PODMESH_METRICS_LISTEN` configuration and
+serve it on a dedicated unauthenticated listener. Missing configuration SHALL mean no socket.
+Explicit bind or collision failure SHALL fail startup before the machine plane begins.
+
+Metrics SHALL cover scheduler attachment, admission, reservation, deploy, update, status, logs,
+delete, reconciliation, runtime restore, and metrics scrape operations. State gauges SHALL report
+absolute active reservation, running workload, and attached scheduler counts from authoritative
+agent state. Replay, store, and fanout saturation events SHALL use fixed aggregate labels only.
+
+#### Scenario: Restart reconstructs agent gauges
+
+- **WHEN** an agent restores persisted workloads
+- **THEN** counters and histograms begin empty
+- **AND** running-workload and reservation gauges reflect the reconstructed current state
+
+#### Scenario: Metrics cannot change workload state
+
+- **WHEN** metric recording fails during admission, deployment, update, or deletion
+- **THEN** the operation retains the same authorization and persistence result
+
+### Requirement: Sidecar metrics configuration SHALL remain outside signed workload metadata
+
+The agent MAY accept `--sidecar-metrics-listen` /
+`PODMESH_AGENT_SIDECAR_METRICS_LISTEN`. When set, injection SHALL add the same address to the sidecar
+as `PODMESH_METRICS_LISTEN` and SHALL declare its TCP container port. The value is non-secret
+deployment configuration and SHALL NOT be added to `PODMESH_SIDECAR_METADATA_B64`.
+
+#### Scenario: Injected sidecar metrics are explicitly enabled
+
+- **WHEN** the agent sidecar metrics setting is `0.0.0.0:9230`
+- **THEN** the injected sidecar receives `PODMESH_METRICS_LISTEN=0.0.0.0:9230`
+- **AND** its container declares TCP port 9230
+
+#### Scenario: Omitted propagation remains disabled
+
+- **WHEN** the agent has no sidecar metrics setting
+- **THEN** it injects neither a metrics environment value nor a metrics container port
+
 ### Requirement: The agent SHALL admit workloads within aggregate limits
 
 The agent SHALL verify the owner signature and decrypt every admission request addressed to its KEM
@@ -26,8 +66,12 @@ size, or replay limits.
 
 #### Scenario: Replayed admission is refused
 
-- **WHEN** an admission request reuses a nonce the agent has already seen
+- **WHEN** an admission request reuses a nonce still retained in the agent's replay cache
 - **THEN** the agent refuses it
+
+Replay history is bounded and process-local. Eviction or restart can remove a nonce before the
+request expires; duplicate refusal is then not guaranteed, although signature, target, freshness,
+and operation-specific state checks remain mandatory.
 
 #### Scenario: Request encrypted to another agent is unusable
 
@@ -39,7 +83,7 @@ size, or replay limits.
 - **WHEN** a request names a different agent as its target
 - **THEN** the agent refuses it and reserves nothing
 
-### Requirement: The agent SHALL refuse a workload that could reach the host or another tenant
+### Requirement: The agent SHALL refuse prohibited privilege and host-access manifest settings
 
 The agent SHALL evaluate every manifest against a deny-by-default pod security policy before
 deploying it, covering `initContainers` and `ephemeralContainers` as well as `containers`. The policy
@@ -53,6 +97,10 @@ subset needs per-tenant naming rules that do not exist yet.
 
 Only the container the agent injects, matched by its exact name, may hold `NET_ADMIN`. A tenant
 container using a similar name SHALL NOT inherit that exemption.
+
+These manifest checks SHALL NOT be described as proof of host confinement or tenant network
+isolation. Direct application traffic on the shared workload network is not governed by proxy
+credential checks, and the host and Podman runtime remain trusted execution boundaries.
 
 #### Scenario: A host escape attempt is refused
 
@@ -114,16 +162,15 @@ another tenant's pod by address. Tenants are separated by owner identity at the
 proxy — relay admission, route ownership, and egress are each gated on the owner
 key — never by network topology.
 
-Separating tenants at layer 3 was tried and removed: it cannot work in the
-deployment podmesh targets, where agents, proxies and schedulers run on
-different machines and a pod must reach a proxy that is not on its network. The
-absence of a network boundary SHALL be stated rather than implied away.
+Layer-3 isolation is outside this PoC's implementation scope, not inherently incompatible with
+multi-host deployment. The absence of a network boundary SHALL be stated rather than implied away.
 
 #### Scenario: The shared network is not relied on for isolation
 
 - **WHEN** two tenants deploy to one agent
 - **THEN** their pods share a network
-- **AND** neither tenant can use the other's routes, relay credential, or egress
+- **AND** direct access to application ports is not isolated by Podmesh
+- **AND** naming another owner does not authorize its mesh operations without its valid credentials
 
 ### Requirement: The agent SHALL report an owner's workloads on request
 
@@ -135,7 +182,8 @@ address.
 The request carries nothing secret and is not bound to one agent, so a scheduler
 can broadcast it to agents the client cannot name — which is the case that
 matters, since a client with no index does not know which agents to ask. Each
-answer SHALL be sealed to the requesting owner, so relaying discloses nothing.
+answer SHALL be sealed to the requesting owner, so relaying does not reveal the list contents.
+The public request and transport metadata are not confidential.
 
 An agent SHALL report only workloads belonging to the signing key.
 
@@ -153,7 +201,8 @@ An agent SHALL report only workloads belonging to the signing key.
 ### Requirement: The agent SHALL host many independent workloads
 
 The agent SHALL store one encrypted record per full workload id. Deleting, restarting, or failing
-one workload SHALL NOT affect any other workload on the same agent.
+one workload SHALL NOT affect another workload's runtime or ownership. Uncertain retained resource
+usage may conservatively reduce available capacity; this SHALL NOT stop existing healthy workloads.
 
 #### Scenario: Deleting one workload leaves others running
 
@@ -164,13 +213,14 @@ one workload SHALL NOT affect any other workload on the same agent.
 #### Scenario: Restart reconciles all records
 
 - **WHEN** the agent restarts
-- **THEN** it decrypts every persisted record and reconciles each workload's containers locally
+- **THEN** it attempts to decrypt every persisted record and resolves each readable workload locally
 
 #### Scenario: One unreadable record does not stop the agent
 
-- **GIVEN** a persisted record that can no longer be reconciled
+- **GIVEN** a persisted record that cannot be read or safely reconciled
 - **WHEN** the agent restarts
-- **THEN** it logs and drops that record, releases its resources, and starts with the rest running
+- **THEN** it retains/quarantines that record instead of assuming its resources are free
+- **AND** healthy sibling workloads remain available while admissions conservatively reflect uncertain usage
 
 #### Scenario: Restart succeeds long after deployment
 
@@ -178,6 +228,60 @@ one workload SHALL NOT affect any other workload on the same agent.
 - **WHEN** the agent restarts and reconciles it
 - **THEN** reconciliation succeeds, because a stored record's structure and signature are checked
   but its freshness is not
+
+### Requirement: Uncertain deployment outcomes SHALL retain ownership and accounting
+
+Before runtime creation can have side effects, the agent SHALL persist a target-bound pending
+record and account for its resources. Runtime failure, timeout, response loss, cancellation or a
+failed final persistence step SHALL NOT silently release accounting or erase the only recoverable
+record. A deployment SHALL become active only after runtime and durable-state confirmation.
+
+Cleanup SHALL target only that workload's agent-derived runtime identity, preserve the original
+failure and use finite operation bounds. State and accounting SHALL be removed only after runtime
+cleanup is confirmed and the record is durably removed. An uncertain remote-runtime outcome SHALL
+remain explicitly repairable; an unconfirmed timeout SHALL NOT be treated as proof of absence.
+
+#### Scenario: Runtime creation partially succeeds before failure
+
+- **WHEN** deployment creates runtime state and then fails
+- **THEN** the agent attempts targeted bounded cleanup and retains charged state until removal is confirmed
+- **AND** no successful deployment receipt is returned
+
+#### Scenario: Cleanup or final persistence fails
+
+- **WHEN** cleanup cannot complete or durable record removal fails
+- **THEN** an actionable owner-bound record and its resource charge remain for retry or restart
+- **AND** the original operation error is not replaced by cleanup diagnostics
+
+#### Scenario: The outer request is cancelled
+
+- **WHEN** dispatch is cancelled after runtime creation may have started
+- **THEN** the prewritten pending state survives without relying on asynchronous drop cleanup
+- **AND** no successful deletion or accounting release is inferred from cancellation
+
+#### Scenario: The runtime result remains uncertain
+
+- **WHEN** local command cancellation does not establish whether remote Podman work has completed
+- **THEN** the agent retains the repair-required record and charge rather than assuming the pod is absent
+
+### Requirement: Pending workload mutations SHALL be serialized per workload
+
+The agent SHALL prevent overlapping create, update and delete side effects for one workload while
+allowing unrelated workloads to operate. A pending or cleanup-required workload SHALL remain
+discoverable by its owner and report its non-active state. Startup or explicit owner cleanup SHALL
+resolve pending failures conservatively instead of blindly redeploying an uncommitted create.
+
+#### Scenario: Delete arrives during creation
+
+- **WHEN** an owner requests deletion while that workload's runtime create remains in flight
+- **THEN** the operation is serialized or refused as busy without reporting successful deletion
+- **AND** resource accounting remains held until the target outcome is resolved
+
+#### Scenario: Cleanup is retried after restart
+
+- **WHEN** the agent restarts with a pending-create or cleanup-required record
+- **THEN** it retains ownership and accounting while resolving that record
+- **AND** it does not recreate an uncommitted failed deployment as a healthy active workload
 
 ### Requirement: The agent SHALL execute workloads through Podman with an injected sidecar
 
@@ -287,3 +391,20 @@ No component SHALL claim that a single-replica workload survives that loss.
 
 - **WHEN** an agent and its key directory are destroyed
 - **THEN** its single-replica workloads are gone and are not recovered elsewhere
+
+### Requirement: Agent tests SHALL cover ownership and failure recovery
+
+Agent changes SHALL be verified with focused ownership, accounting, lifecycle and restart tests
+appropriate to the touched behavior. Real Podman execution SHALL be reported separately from mock
+runtime tests or compilation; an unexecuted test SHALL NOT be reported as passing.
+
+#### Scenario: An agent cannot be reached during reconciliation
+
+- **WHEN** a named agent fails to answer a recovery test
+- **THEN** the view remains explicitly incomplete
+- **AND** restoration is verified before that scenario can pass
+
+#### Scenario: Agent state is destroyed
+
+- **WHEN** an agent and its durable keys are lost rather than temporarily unavailable
+- **THEN** project documentation does not claim relocation, self-healing, or agent-loss recovery

@@ -14,7 +14,6 @@ use dirs::home_dir;
 
 pub mod domain;
 pub mod logging;
-pub mod nonce_helper;
 
 pub use domain::SignatureDomain;
 

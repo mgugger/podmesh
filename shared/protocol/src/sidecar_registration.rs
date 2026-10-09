@@ -193,11 +193,42 @@ pub struct SidecarRegistrationAck {
 
 impl SidecarRegistrationAck {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        self.validate()?;
         Ok(postcard::to_allocvec(self)?)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        Ok(postcard::from_bytes(bytes)?)
+        let value: Self = postcard::from_bytes(bytes)?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.manifest_id.is_empty() && self.manifest_id.len() <= 128,
+            "registration acknowledgement manifest id is invalid"
+        );
+        ensure!(
+            self.message.len() <= 512,
+            "registration acknowledgement message exceeds its limit"
+        );
+        Ok(())
+    }
+}
+
+impl crate::WorkloadPayload for SidecarRegistration {
+    const TYPE: crate::WorkloadPayloadType = crate::WorkloadPayloadType::RegistrationRequest;
+
+    fn validate(&self, _now_secs: u64) -> Result<()> {
+        self.validate()
+    }
+}
+
+impl crate::WorkloadPayload for SidecarRegistrationAck {
+    const TYPE: crate::WorkloadPayloadType = crate::WorkloadPayloadType::RegistrationResponse;
+
+    fn validate(&self, _now_secs: u64) -> Result<()> {
+        self.validate()
     }
 }
 

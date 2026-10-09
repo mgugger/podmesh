@@ -1,13 +1,17 @@
 ---
 agent: 'agent'
-description: 'Check DRY violations'
-tools: ['runCommands', 'edit', 'runTasks', 'search', 'usages', 'problems', 'changes', 'testFailure', 'fetch', 'githubRepo']
+description: 'Review duplication and interface clarity against OpenSpec, and implement when requested.'
+tools: ['read', 'search', 'edit', 'execute']
 ---
 
 # 🔍 Check DRY violations
 
 ## 🎯 Objective
-Analyze the codebase for the main crates: podmesh-scheduler (stateless signed-agent registry and
+Read `openspec/README.md`, relevant source specs/decisions and `openspec/code-inventory.md` first.
+Track accepted work in one OpenSpec change, not a parallel review plan or AI-SDLC audit. Preserve
+distinct authorization rules and public wire formats; report tests actually executed.
+
+Analyze the codebase for the main crates: podmesh-scheduler (stateless capacity discovery and
 selector), podmesh-agent (bounded multi-workload admission, encrypted persistence, Podman, and
 sidecar injection), podmesh-proxy (ingress/egress workload gateway), and podmesh-sidecar (the
 workload traffic companion). Also inspect podctl and the shared crates.

@@ -33,6 +33,7 @@ pub const MAX_CONVERGED_ISSUERS: usize = crate::relay::MAX_TRUSTED_RELAY_ISSUERS
 #[derive(Clone, Debug)]
 pub struct MemberRegistry {
     inner: Arc<RwLock<HashSet<EndpointId>>>,
+    metrics: podmesh_metrics::Metrics,
 }
 
 impl MemberRegistry {
@@ -43,7 +44,17 @@ impl MemberRegistry {
         );
         Ok(Self {
             inner: Arc::new(RwLock::new(seed)),
+            metrics: podmesh_metrics::Metrics::noop(),
         })
+    }
+
+    pub fn with_metrics(mut self, metrics: podmesh_metrics::Metrics) -> Self {
+        metrics.set_gauge(
+            podmesh_metrics::GaugeName::SchedulerPeers,
+            self.len() as u64,
+        );
+        self.metrics = metrics;
+        self
     }
 
     /// Admits a peer. Returns `true` when this call actually added it, so the
@@ -60,6 +71,9 @@ impl MemberRegistry {
             return false;
         }
         if members.len() >= MAX_CONVERGED_MEMBERS {
+            drop(members);
+            self.metrics
+                .record_event(podmesh_metrics::EventName::StoreSaturation);
             log::warn!(
                 "scheduler member limit of {MAX_CONVERGED_MEMBERS} reached; refusing {}",
                 endpoint_id.fmt_short()
@@ -67,6 +81,12 @@ impl MemberRegistry {
             return false;
         }
         members.insert(endpoint_id);
+        let member_count = members.len();
+        drop(members);
+        self.metrics.set_gauge(
+            podmesh_metrics::GaugeName::SchedulerPeers,
+            member_count as u64,
+        );
         true
     }
 
@@ -159,12 +179,19 @@ mod tests {
 
     #[test]
     fn a_peer_is_admitted_exactly_once() {
-        let registry = MemberRegistry::new(HashSet::new()).unwrap();
+        let metrics =
+            podmesh_metrics::Metrics::registered(podmesh_metrics::ComponentName::Scheduler);
+        let registry = MemberRegistry::new(HashSet::new())
+            .unwrap()
+            .with_metrics(metrics.clone());
         let peer = endpoint_id(1);
         assert!(registry.insert(peer));
         assert!(!registry.insert(peer));
         assert!(registry.contains(&peer));
         assert_eq!(registry.len(), 1);
+        assert!(metrics.snapshot().unwrap().gauges().any(|(key, value)| {
+            key.gauge() == podmesh_metrics::GaugeName::SchedulerPeers && *value == 1
+        }));
     }
 
     #[test]

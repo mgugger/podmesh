@@ -134,7 +134,8 @@ async fn offers_are_transport_bound_deduplicated_and_selected_deterministically(
 #[tokio::test]
 async fn pending_bounds_exclusions_and_deadlines_fail_closed() {
     let identity = SchedulerIdentity::ephemeral().unwrap();
-    let manager = QueryManager::new(1, 1, Duration::from_secs(5));
+    let metrics = podmesh_metrics::Metrics::registered(podmesh_metrics::ComponentName::Scheduler);
+    let manager = QueryManager::new(1, 1, Duration::from_secs(5)).with_metrics(metrics.clone());
     let address = reply_address(&identity);
     let excluded = SecretKey::generate();
     let mut requested = criteria();
@@ -161,6 +162,13 @@ async fn pending_bounds_exclusions_and_deadlines_fail_closed() {
             .await
             .is_err()
     );
+    let snapshot = metrics.snapshot().unwrap();
+    assert!(snapshot.events().any(|(key, count)| {
+        key.event() == podmesh_metrics::EventName::StoreSaturation && *count >= 1
+    }));
+    assert!(snapshot.gauges().any(|(key, value)| {
+        key.gauge() == podmesh_metrics::GaugeName::PendingCapacityQueries && *value == 1
+    }));
 
     let eligible = SecretKey::generate();
     assert!(

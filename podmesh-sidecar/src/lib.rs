@@ -30,10 +30,12 @@ const MAX_RELAY_AUTH_TOKEN_BYTES: usize = 4 * 1024;
 pub struct SidecarConfig {
     pub identity: IdentitySource,
     pub proxy_endpoints: Vec<EndpointRecord>,
+    pub workload_replay_limits: protocol::ReplayLimits,
     pub workload_relay_auth_token: Option<String>,
     pub workload_relay_ca_certificates: Vec<Vec<u8>>,
     pub lookup_interval: Duration,
     pub iroh_bind_addr: SocketAddr,
+    pub metrics_listen: Option<SocketAddr>,
     /// Workload name as written in the manifest. Together with the owner key
     /// it derives the routing key the proxy indexes this workload under.
     pub workload_name: String,
@@ -54,6 +56,7 @@ pub struct SidecarConfig {
 
 impl SidecarConfig {
     pub fn validate(&self) -> Result<()> {
+        self.workload_replay_limits.validate()?;
         ensure!(
             !self.proxy_endpoints.is_empty() && self.proxy_endpoints.len() <= MAX_PROXY_ENDPOINTS,
             "sidecar proxy endpoint count is invalid"
@@ -103,6 +106,29 @@ impl SidecarConfig {
             self.replica_count >= 1 && self.replica_index < self.replica_count,
             "sidecar replica identity is invalid"
         );
+        if let Some(metrics_listen) = self.metrics_listen {
+            ensure!(
+                !podmesh_metrics::listeners_conflict(metrics_listen, self.iroh_bind_addr),
+                "sidecar metrics listener conflicts with the Iroh listener"
+            );
+            let mut occupied_ports = vec![self.app_port];
+            if self.enable_egress {
+                occupied_ports.push(crate::egress_proxy::EGRESS_PROXY_PORT);
+            }
+            if let Some(http_proxy_port) = self.http_proxy_port {
+                occupied_ports.push(if http_proxy_port == 0 {
+                    crate::HTTP_CONNECT_PROXY_PORT
+                } else {
+                    http_proxy_port
+                });
+            }
+            ensure!(
+                occupied_ports
+                    .into_iter()
+                    .all(|port| metrics_listen.port() != port),
+                "sidecar metrics listener conflicts with a local listener"
+            );
+        }
         // Without the owner key the sidecar cannot verify a proxy grant, and a
         // sidecar that cannot verify grants would serve tenant traffic to any
         // proxy it can reach.
@@ -168,7 +194,20 @@ pub async fn run_sidecar_with_shutdown(
     shutdown: oneshot::Receiver<()>,
     event_tx: Option<mpsc::UnboundedSender<SidecarEvent>>,
 ) -> Result<()> {
-    iroh_runtime::run(config, shutdown, event_tx).await
+    let metrics_runtime = podmesh_metrics::MetricsRuntime::start(
+        podmesh_metrics::ComponentName::Sidecar,
+        podmesh_metrics::MetricsConfig {
+            listen: config.metrics_listen,
+        },
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await?;
+    let result =
+        iroh_runtime::run_with_metrics(config, shutdown, event_tx, metrics_runtime.metrics()).await;
+    let shutdown_result = metrics_runtime.shutdown().await;
+    result?;
+    shutdown_result?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -198,10 +237,12 @@ mod tests {
         let config = SidecarConfig {
             identity: IdentitySource::ephemeral(),
             proxy_endpoints: vec![endpoint],
+            workload_replay_limits: protocol::ReplayLimits::default(),
             workload_relay_auth_token: None,
             workload_relay_ca_certificates: Vec::new(),
             lookup_interval: Duration::from_secs(1),
             iroh_bind_addr: "127.0.0.1:0".parse().unwrap(),
+            metrics_listen: None,
             workload_name: "egress-only".into(),
             replica_index: 0,
             replica_count: 1,
@@ -244,10 +285,12 @@ mod tests {
         let config = SidecarConfig {
             identity: IdentitySource::ephemeral(),
             proxy_endpoints: vec![endpoint],
+            workload_replay_limits: protocol::ReplayLimits::default(),
             workload_relay_auth_token: None,
             workload_relay_ca_certificates: Vec::new(),
             lookup_interval: Duration::from_secs(1),
             iroh_bind_addr: "127.0.0.1:0".parse().unwrap(),
+            metrics_listen: None,
             workload_name: "unowned".into(),
             replica_index: 0,
             replica_count: 1,

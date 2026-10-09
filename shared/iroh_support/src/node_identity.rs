@@ -10,8 +10,6 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use iroh::SecretKey;
 
-use crate::workload_handshake::HandshakeIdentity;
-
 /// Subdirectory holding the Iroh transport secret.
 pub const TRANSPORT_KEY_SUBDIR: &str = "iroh";
 /// Subdirectory holding the application signing and KEM keys.
@@ -83,15 +81,6 @@ impl NodeIdentity {
 
     pub fn kem_private(&self) -> &[u8] {
         &self.kem_private
-    }
-
-    /// The subset used to sign and verify workload handshakes.
-    pub fn handshake(&self) -> HandshakeIdentity {
-        HandshakeIdentity {
-            signing_public: self.signing_public.clone(),
-            signing_private: self.signing_private.clone(),
-            kem_public: Some(self.kem_public.clone()),
-        }
     }
 }
 

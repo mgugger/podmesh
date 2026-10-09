@@ -17,7 +17,7 @@ fn test_tenant() -> String {
 }
 
 #[tokio::test]
-async fn authenticated_endpoints_exchange_over_proxy_relay() -> Result<()> {
+async fn relay_only_endpoints_continue_when_direct_transport_is_unavailable() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let certificate = generate_simple_self_signed(vec!["localhost".into()])?;
     let certificate_der = certificate.cert.der().to_vec();
@@ -109,6 +109,50 @@ async fn authenticated_endpoints_exchange_over_proxy_relay() -> Result<()> {
     client_endpoint.close().await;
     server_endpoint.close().await;
     server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_endpoints_connect_when_relay_transport_is_unavailable() -> Result<()> {
+    let server = Endpoint::builder(presets::Minimal)
+        .relay_mode(RelayMode::Disabled)
+        .alpns(vec![TEST_ALPN.to_vec()])
+        .bind()
+        .await
+        .context("bind direct-only server endpoint")?;
+    let client = Endpoint::builder(presets::Minimal)
+        .relay_mode(RelayMode::Disabled)
+        .bind()
+        .await
+        .context("bind direct-only client endpoint")?;
+
+    let server_task = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let incoming = server.accept().await.context("direct server closed")?;
+            let connection = incoming.await?;
+            let (mut send, mut recv) = connection.accept_bi().await?;
+            let request = recv.read_to_end(16).await?;
+            send.write_all(&request).await?;
+            send.finish()?;
+            let _ = connection.closed().await;
+            Ok::<(), anyhow::Error>(())
+        }
+    });
+    let connection = tokio::time::timeout(TEST_TIMEOUT, client.connect(server.addr(), TEST_ALPN))
+        .await
+        .context("direct-only connection timed out")??;
+    let (mut send, mut recv) = connection.open_bi().await?;
+    send.write_all(b"direct").await?;
+    send.finish()?;
+    ensure!(
+        recv.read_to_end(16).await? == b"direct",
+        "direct-only echo mismatch"
+    );
+    connection.close(0u8.into(), b"direct exchange complete");
+    server_task.await??;
+    client.close().await;
+    server.close().await;
     Ok(())
 }
 

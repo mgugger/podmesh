@@ -27,7 +27,9 @@ const MAX_ATTACHED: usize = 8;
 ///
 /// The listener is bound here and handed to the server, so there is no window
 /// in which another process could take the port.
-async fn start_client_api(rate_limit_per_minute: u32) -> Result<String> {
+async fn start_client_api(
+    rate_limit_per_minute: u32,
+) -> Result<(String, podmesh_metrics::Metrics)> {
     let temp = tempfile::tempdir()?;
     let identity = SchedulerIdentity::load(temp.path())?;
     let config = common::config(HashSet::from([identity.endpoint_id()]), Vec::new());
@@ -70,7 +72,9 @@ async fn start_client_api(rate_limit_per_minute: u32) -> Result<String> {
         MAX_ATTACHED,
     );
 
+    let metrics = podmesh_metrics::Metrics::registered(podmesh_metrics::ComponentName::Scheduler);
     let router = ClientApi::new(capacity, forwarder, identity, endpoint)
+        .with_metrics(metrics.clone())
         .with_rate_limit(rate_limit_per_minute)
         .router();
 
@@ -82,7 +86,7 @@ async fn start_client_api(rate_limit_per_minute: u32) -> Result<String> {
         let _keep_alive = (gossip, coordinator, temp);
         let _ = axum::serve(listener, axum_support::with_connect_info(router)).await;
     });
-    Ok(base)
+    Ok((base, metrics))
 }
 
 fn now_secs() -> u64 {
@@ -96,7 +100,7 @@ fn now_secs() -> u64 {
 /// selection is the request that most needs a ceiling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selection_is_throttled_per_peer() -> Result<()> {
-    let base = start_client_api(TEST_RATE_LIMIT).await?;
+    let (base, metrics) = start_client_api(TEST_RATE_LIMIT).await?;
     let client = reqwest::Client::new();
 
     let mut refused = false;
@@ -121,6 +125,13 @@ async fn selection_is_throttled_per_peer() -> Result<()> {
         refused,
         "a caller past its budget must be refused rather than fanning out again"
     );
+    let snapshot = metrics.snapshot().context("scheduler metrics snapshot")?;
+    anyhow::ensure!(
+        snapshot.events().any(|(key, count)| {
+            key.event() == podmesh_metrics::EventName::RateLimitRefusal && *count == 1
+        }),
+        "the rate-limit decision owner must emit one bounded refusal event"
+    );
     Ok(())
 }
 
@@ -128,7 +139,7 @@ async fn selection_is_throttled_per_peer() -> Result<()> {
 /// the same budget — and refused before the body is even considered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn control_relay_is_throttled_per_peer() -> Result<()> {
-    let base = start_client_api(TEST_RATE_LIMIT).await?;
+    let (base, _) = start_client_api(TEST_RATE_LIMIT).await?;
     let client = reqwest::Client::new();
     let agent = "a".repeat(64);
 
@@ -154,7 +165,7 @@ async fn control_relay_is_throttled_per_peer() -> Result<()> {
 /// traffic, or a busy scheduler gets pulled out of its pool.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_and_ready_are_never_throttled() -> Result<()> {
-    let base = start_client_api(TEST_RATE_LIMIT).await?;
+    let (base, _) = start_client_api(TEST_RATE_LIMIT).await?;
     let client = reqwest::Client::new();
 
     for _ in 0..(TEST_RATE_LIMIT + 6) {

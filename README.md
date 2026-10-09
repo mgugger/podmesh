@@ -1,13 +1,35 @@
 # Podmesh
 
+Project requirements, accepted decisions, and work tracking live in [OpenSpec](openspec/README.md).
+This README and the deployment guide explain those specs. The workflow retains adaptive planning,
+clarification, approval checkpoints and review using OpenSpec artifacts, without a parallel AI-DLC tree.
+
+## Bounded observability
+
+Schedulers, agents, proxies, and sidecars can expose process-local application metrics with
+`--metrics-listen <IP:PORT>` or `PODMESH_METRICS_LISTEN=<IP:PORT>`. Metrics are disabled by default;
+an explicitly configured address is an unauthenticated operator endpoint, and bind failure stops
+startup rather than silently disabling requested telemetry.
+
+`GET /metrics` returns OpenMetrics text 1.0. `GET /health` reports only the dedicated metrics
+listener, not scheduler, agent, proxy, sidecar, storage, relay, or traffic readiness. The four fixed
+families use only closed aggregate labels and never include workload manifests, identities, hosts,
+URLs, destinations, credentials, grants, tokens, payloads, raw errors, paths, methods, or caller
+addresses. Recording and scrape failures cannot change business behavior.
+
+The registry is process-local and not persisted. Counters and histograms reset on restart; gauges
+are reconstructed from current runtime state. This MVP defines finite listener and cardinality
+bounds, not a production latency, throughput, availability, or recovery SLO. See the deployment
+guide for sample ports, network exposure, and direct scrape commands.
+
 Podmesh runs multi-tenant workloads across an open mesh of execution agents. A namespace is
 identified by its Ed25519 public key. Complete workload specifications are encrypted by `podctl` for
 the selected execution agent and relayed through a scheduler; the scheduler carries opaque bytes.
 
 The mesh is deliberately open: anyone with a keypair can ask a scheduler to place a workload, and no
-component authenticates *who* is deploying. What is protected is everything after that — reading,
-altering, or deleting a workload requires the namespace private key, and a workload cannot reach the
-host or another tenant.
+operator admission policy restricts new owner identities. Owner signatures authorize lifecycle
+operations; mesh traffic uses owner-issued credentials. The selected agent and host remain trusted
+with execution plaintext, and shared workload networking does not isolate tenants' application ports.
 
 See [Trust Model](#trust-model) for what this does and does not protect, including the parts that are
 explicitly out of scope for the first release.
@@ -117,15 +139,26 @@ Nothing has to be copied between components by hand:
   `GET /api/v1/workload_relay_bootstrap`, which matters because a sidecar carries exactly one token.
 - `podctl` bootstraps proxy endpoint records, its own tenant's derived relay token, and relay CA
   certificates from `PODMESH_PROXY_URL`. It never receives the mesh secret those tokens derive from;
-  proxies share that among themselves over a separate endpoint.
+  proxies share that among themselves over a separate endpoint. Before using any value, `podctl`
+  requires an explicit local binding from the proxy URL to its endpoint id and signing key.
 
 A record is signed by whichever key the responder chose, so a signature alone proves only internal
-consistency, never identity. Two places therefore pin identity rather than trusting the response:
+consistency, never identity. Three places therefore pin identity rather than trusting the response:
 
 - A scheduler binds each peer URL to one endpoint id and signing key — configured up front, or
   remembered from the first observation. A later mismatch is refused, not silently accepted.
 - `podctl` checks every capacity offer against the owner's list of trusted agent signing keys before
   producing any ciphertext, because the offer names the key the workload is sealed to.
+- `podctl cert trust-proxy --proxy-url <url>` explicitly records a proxy's complete URL, endpoint id,
+  and signing key before apply or grant may authorize it. A later mismatch is refused until the owner
+  runs the same command with `--replace`.
+
+Proxy trust and agent keys share the versioned `~/.podmesh/trusted_agents` registry. Legacy bare
+agent-key files are read as before and migrate on the first trust mutation; unique keys are kept but
+comments are dropped. Unix permissions are narrowed to `0600` before reading. Removal is idempotent,
+concurrent writers are last-successful-writer-wins, and a reported directory-sync failure requires
+listing/reloading trust before retry because the complete rename may already be visible. The typed
+header deliberately makes older `podctl` binaries fail instead of silently ignoring proxy entries.
 
 The relay bootstrap endpoint discloses a live token in cleartext and is therefore opt-in, and at most
 one proxy in a deployment serves it.
@@ -142,7 +175,8 @@ replicas if that is unacceptable. Single-replica workloads do not recover offlin
 ### What is protected
 
 - Capacity queries and offers are public, signed, bounded, and short-lived. They carry no workload
-  or tenant data.
+  manifest plaintext. Selection exposes resource requirements, agent identities, exclusions, and
+  candidate counts; workload confidentiality does not imply metadata confidentiality.
 - Admission requests, deployment grants, receipts, status, logs, and deletion are encrypted
   end-to-end between `podctl` and the selected agent, using an ephemeral-static X25519 exchange whose
   AEAD key is derived from the shared secret together with both public keys. Low-order recipient keys
@@ -157,9 +191,9 @@ replicas if that is unacceptable. Single-replica workloads do not recover offlin
   request would choose the recipient — and therefore who can read the plaintext.
 - The selected agent necessarily sees plaintext while executing the workload. Other agents, the
   scheduler, and proxies do not receive the execution specification.
-- A workload cannot reach the host or another tenant: the agent evaluates every manifest against a
-  deny-by-default pod security policy covering privileged execution, capabilities, host namespaces,
-  host ports, and volumes of every kind, across `containers` and `initContainers` alike.
+- The agent checks manifests for prohibited privilege and host-access settings, including host
+  namespaces, host ports, and volumes, across `containers` and `initContainers`. These policy checks
+  are not a guarantee of host confinement or tenant network isolation.
 - A scheduler admitted only by gossip announcement can use a peer's machine relay for itself, but
   cannot admit anyone else onto it: the announcement binds its signing key to its endpoint, and a
   relay honours such a grant only when the subject is that endpoint — which the transport has already
@@ -167,11 +201,12 @@ replicas if that is unacceptable. Single-replica workloads do not recover offlin
 - A sidecar proves its tenancy rather than asserting it. `podctl` mints an owner-signed workload
   credential at deploy time and seals it into the execution specification; the sidecar presents it
   during the proxy handshake, and the proxy verifies it against the owner key. Because that key is
-  also the credential's signing root, naming a tenant is worthless without the tenant's private key.
+  also the credential's signing root, naming a tenant is insufficient without a valid owner-issued
+  credential. The credential is a bearer token; its holder need not possess the owner's private key.
 - A routing key belongs to exactly one tenant. It is derived from the owner key and workload name,
   recomputed by the proxy, and must match the tenancy the connection proved — so claiming a route
-  needs the tenant's private key, not merely its public one. Hostnames are first-claim-wins per
-  owner and are never reassigned.
+  needs a valid owner-issued workload credential, not merely the public owner key. Hostnames are
+  first-claim-wins per owner and are never reassigned.
 - Egress tunnels are authorised by tenant: the connection must have proven an owner, and that owner
   must hold a live grant for this proxy. Destinations are not filtered by address, because app parts
   legitimately live on private networks once components run on different machines.
@@ -187,6 +222,16 @@ replicas if that is unacceptable. Single-replica workloads do not recover offlin
 - Proxies authenticate to sidecars with owner-signed, expiring Biscuit grants minted by `podctl`
   and posted to `POST /api/v1/proxy_grant`. A grant binds the tenant owner key, the proxy endpoint
   id, and an expiry. Grants are not used for external ingress.
+- Every workload control request and response uses a signed, addressed, fresh, operation-specific
+  envelope with bounded replay detection. Duplicate nonces are refused while retained; saturation
+  can evict still-valid entries, and process restart clears history. This is not an exactly-once
+  guarantee. Replay defaults are 10000 peers, 1000 nonces per peer, 128-byte
+  nonces, and 120 seconds. Lower values can be configured with
+  `PODMESH_WORKLOAD_REPLAY_MAX_PEERS`, `PODMESH_WORKLOAD_REPLAY_NONCES_PER_PEER`,
+  `PODMESH_WORKLOAD_REPLAY_MAX_NONCE_BYTES`, and `PODMESH_WORKLOAD_REPLAY_RETENTION_SECS`.
+- HTTP bodies stream through Iroh in 64 KiB chunks up to 16 MiB. WebSocket upgrades are supported as
+  opaque bytes after a signed status 101 transition, bounded to 512 MiB per direction, five minutes
+  idle, and one hour total. Application signing keys are verified per envelope, not session-pinned.
 
 ### What is not protected in this release
 
@@ -200,14 +245,21 @@ These are deliberate scope choices, not oversights:
   exists elsewhere. What it may not do is hold capacity without deploying — see below.
 - **Tenants share a workload network.** One tenant's pod can reach another's by address. Tenant
   separation is enforced by owner identity at the proxy — relay credentials, route ownership and
-  egress are each bound to the owner key — not by network topology, which cannot be a boundary once
-  agents, proxies and schedulers run on different machines.
+  egress are each bound to the owner key. This does not authorize or filter direct traffic to
+  application ports. Network isolation is outside this PoC, not inherently incompatible with
+  multi-host deployment.
 - **Ingress is plain HTTP.** Terminate TLS in front of the proxy if you need it.
 - **`POST /api/v1/proxy_grant` is unauthenticated.** A grant authenticates itself, so this cannot
   forge authority for an owner whose key you lack. It is rate limited per peer so it cannot be used
-  to cheaply fill the bounded grant store.
-- **Proxies are not trusted with workload plaintext.** Traffic confidentiality through a proxy
-  requires TLS or another end-to-end protocol terminating in the workload.
+  without a request budget, but new self-created owner identities can still consume grant capacity.
+- **Application traffic is not automatically end-to-end encrypted.** Iroh encrypts the
+  sidecar-to-proxy hop; a traffic proxy can read application bytes unless an additional end-to-end
+  protocol protects them. External ingress is HTTP. TLS terminated in front of the proxy protects
+  that external hop, not application confidentiality from the proxy. Execution specifications
+  remain encrypted to the selected agent and are not delivered to proxies.
+- **Proxy grants are in memory.** Proxy restart loses them; an owner must repost grants with
+  `podctl cert grant-proxy` before affected traffic can resume. An unchanged `podctl apply` can
+  return before reposting grants. Manual recovery is accepted for this PoC.
 - **One installation, one tenant.** `podctl` holds a single namespace identity; multi-tenant
   deployments are supported, a multi-tenant CLI is not.
 - **No immediate credential revocation.** Re-applying renews expiring proxy grants and workload
@@ -216,6 +268,13 @@ These are deliberate scope choices, not oversights:
 - **Biscuit attenuation is not implemented.** Grants are used as-is.
 - **The agent drives a Podman socket equivalent to host control.** The pod security policy is what
   stands between a tenant manifest and the host.
+
+Statelessness applies to scheduler workload coordination, not to the entire system: agents retain
+local workload records and keys, owners retain keys and catalogs, and proxies hold volatile grants.
+Decentralization means client-driven placement and multiple scheduler entry points without a central
+workload database or leader. It does not provide Byzantine availability, independent-host attestation,
+or bootstrap-free discovery. The precise guarantees and unresolved implementation gaps are recorded
+in the [PoC scope](docs/poc-scope.md).
 
 ## Build And Run
 
@@ -245,6 +304,21 @@ cross-architecture build rather than producing one silently.
 ```bash
 cargo test -p podmesh-integration-tests --features podman-tests
 ```
+
+## Verification
+
+This is a greenfield PoC. Use normal development checks:
+
+```bash
+cargo test --quiet --locked --workspace
+cargo clippy --locked --workspace --all-targets -- -D warnings
+```
+
+Unit, integration, adversarial and property tests run in the default workspace suite. For real
+containers, follow the [Podman walkthrough](deploy/README.md) and enable `podman-tests` after
+building current images and starting the Podman socket. CI runs normal checks directly; its manual
+`run_podman` input enables real container tests. Keep results and untested assumptions with the
+relevant OpenSpec change. The [PoC scope](docs/poc-scope.md) describes what is and is not protected.
 
 ## Crates
 

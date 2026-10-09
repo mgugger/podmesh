@@ -5,13 +5,15 @@
 //! are the thing an operator copies, and a silent regression in them is not
 //! visible from any Rust test that only exercises the code.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, process::Command};
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
 const ROOTFUL: &str = include_str!("../../deploy/podmesh_rootful.yml");
 const ROOTLESS: &str = include_str!("../../deploy/podmesh_rootless.yml");
+const BUILD_CONTAINERS: &str = include_str!("../../deploy/build_containers.sh");
+const CONTAINERFILE: &str = include_str!("../../deploy/Containerfile");
 
 fn documents(name: &str, manifest: &str) -> Result<Vec<serde_yaml::Value>> {
     serde_yaml::Deserializer::from_str(manifest)
@@ -165,6 +167,135 @@ fn published_host_ports_do_not_collide() -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn application_metrics_ports_are_explicit_private_and_consistent() -> Result<()> {
+    let expected = BTreeMap::from([
+        ("scheduler-1", 9200_u64),
+        ("scheduler-2", 9201),
+        ("scheduler-3", 9202),
+        ("agent-1", 9210),
+        ("agent-2", 9211),
+        ("agent-3", 9212),
+        ("proxy-1", 9220),
+        ("proxy-2", 9221),
+        ("proxy-3", 9222),
+    ]);
+
+    for (manifest_name, manifest) in [("rootful", ROOTFUL), ("rootless", ROOTLESS)] {
+        let documents = documents(manifest_name, manifest)?;
+        for (container_name, expected_port) in &expected {
+            let (_, container) = containers(&documents)
+                .into_iter()
+                .find(|(name, _)| name == container_name)
+                .with_context(|| format!("{manifest_name}: missing {container_name}"))?;
+            let environment = env_of(container);
+            ensure!(
+                environment.get("PODMESH_METRICS_LISTEN")
+                    == Some(&format!("0.0.0.0:{expected_port}")),
+                "{manifest_name}: {container_name} has the wrong application metrics address"
+            );
+            if container_name.starts_with("agent-") {
+                ensure!(
+                    environment.get("PODMESH_AGENT_SIDECAR_METRICS_LISTEN")
+                        == Some(&"0.0.0.0:9230".to_string()),
+                    "{manifest_name}: {container_name} does not propagate sidecar metrics"
+                );
+            }
+            let metrics_port = container
+                .get("ports")
+                .and_then(serde_yaml::Value::as_sequence)
+                .and_then(|ports| {
+                    ports.iter().find(|port| {
+                        port.get("containerPort")
+                            .and_then(serde_yaml::Value::as_u64)
+                            == Some(*expected_port)
+                    })
+                })
+                .with_context(|| {
+                    format!("{manifest_name}: {container_name} has no metrics container port")
+                })?;
+            ensure!(
+                metrics_port.get("hostPort").is_none(),
+                "{manifest_name}: {container_name} publishes unauthenticated metrics to the host"
+            );
+        }
+        ensure!(
+            containers(&documents).into_iter().all(|(name, _)| {
+                !name.contains("prometheus") && !name.contains("metrics-helper")
+            }),
+            "{manifest_name}: metrics must not add a collector or helper container"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn container_build_tags_are_scoped_validated_and_native_only() -> Result<()> {
+    ensure!(
+        BUILD_CONTAINERS.contains("IMAGE_TAG=${PODMESH_IMAGE_TAG:-latest}"),
+        "container builds must preserve latest as the operator default"
+    );
+    ensure!(
+        BUILD_CONTAINERS.contains("podmesh/scheduler:$IMAGE_TAG")
+            && BUILD_CONTAINERS.contains("podmesh/agent:$IMAGE_TAG")
+            && BUILD_CONTAINERS.contains("podmesh/proxy:$IMAGE_TAG")
+            && BUILD_CONTAINERS.contains("podmesh/sidecar:$IMAGE_TAG"),
+        "all four runtime images must use the validated image tag"
+    );
+    ensure!(
+        BUILD_CONTAINERS.contains("cross-architecture builds are unsupported"),
+        "image build must retain native architecture refusal"
+    );
+    ensure!(
+        BUILD_CONTAINERS.contains("podman image inspect --format '{{.Id}}'")
+            && BUILD_CONTAINERS.contains("built $image=$image_id"),
+        "container builds must report the built image identities"
+    );
+
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .context("integration package has no workspace parent")?;
+    let result = Command::new("sh")
+        .arg("deploy/build_containers.sh")
+        .current_dir(workspace)
+        .env("PODMESH_IMAGE_TAG", "../unsafe")
+        .output()
+        .context("run container tag validation")?;
+    ensure!(
+        !result.status.success()
+            && String::from_utf8_lossy(&result.stderr).contains("invalid PODMESH_IMAGE_TAG"),
+        "unsafe image tag was not refused before Podman build"
+    );
+    Ok(())
+}
+
+#[test]
+fn final_images_copy_only_runtime_assets() -> Result<()> {
+    let final_stages = CONTAINERFILE
+        .split("FROM scratch AS ")
+        .skip(1)
+        .collect::<Vec<_>>();
+    ensure!(
+        final_stages.len() == 4,
+        "Containerfile must have exactly four final scratch stages"
+    );
+    for stage in final_stages {
+        let name = stage.lines().next().unwrap_or_default();
+        ensure!(
+            stage
+                .lines()
+                .filter(|line| line.starts_with("COPY "))
+                .all(|line| {
+                    line.contains("/etc/ssl/certs/ca-certificates.crt")
+                        || line.contains("/out/podmesh-")
+                        || line.contains("/out/podman")
+                }),
+            "final image {name} copies a non-runtime asset"
+        );
     }
     Ok(())
 }

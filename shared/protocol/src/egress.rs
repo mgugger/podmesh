@@ -3,7 +3,11 @@
 //! This module defines the message types used for tunneling outbound connections
 //! from sidecar containers through proxy nodes to external destinations.
 
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
+
+pub const MAX_EGRESS_HOST_LEN: usize = 253;
+pub const MAX_EGRESS_ERROR_LEN: usize = 512;
 
 /// Default port for the sidecar's transparent proxy listener.
 pub const EGRESS_PROXY_PORT: u16 = 15001;
@@ -55,6 +59,16 @@ impl EgressTunnelRequest {
             protocol: "tcp".to_string(),
         }
     }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.target_host.is_empty() && self.target_host.len() <= MAX_EGRESS_HOST_LEN,
+            "egress target host length is invalid"
+        );
+        ensure!(self.target_port != 0, "egress target port is invalid");
+        ensure!(self.protocol == "tcp", "unsupported egress protocol");
+        Ok(())
+    }
 }
 
 /// Response indicating whether the egress tunnel was established.
@@ -81,6 +95,36 @@ impl EgressTunnelResponse {
             success: false,
             error: Some(message.into()),
         }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.success == self.error.is_none(),
+            "egress response success and error disagree"
+        );
+        ensure!(
+            self.error
+                .as_ref()
+                .is_none_or(|error| !error.is_empty() && error.len() <= MAX_EGRESS_ERROR_LEN),
+            "egress response error length is invalid"
+        );
+        Ok(())
+    }
+}
+
+impl crate::WorkloadPayload for EgressTunnelRequest {
+    const TYPE: crate::WorkloadPayloadType = crate::WorkloadPayloadType::EgressRequest;
+
+    fn validate(&self, _now_secs: u64) -> Result<()> {
+        self.validate()
+    }
+}
+
+impl crate::WorkloadPayload for EgressTunnelResponse {
+    const TYPE: crate::WorkloadPayloadType = crate::WorkloadPayloadType::EgressResponse;
+
+    fn validate(&self, _now_secs: u64) -> Result<()> {
+        self.validate()
     }
 }
 

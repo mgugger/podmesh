@@ -63,6 +63,9 @@ pub struct Config {
     #[arg(long, env = "PODMESH_SCHEDULER_LISTEN", default_value = "0.0.0.0:3000")]
     pub listen: String,
 
+    #[arg(long = "metrics-listen", env = "PODMESH_METRICS_LISTEN")]
+    pub application_metrics_listen: Option<std::net::SocketAddr>,
+
     /// Requests per minute a single peer address may make against the client
     /// API.
     ///
@@ -91,6 +94,33 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     provision_relay_credentials(&mut config, &identity)?;
     identity.validate_relay_trust(&config.relay)?;
     let machine_config = config.machine.validate(identity.endpoint_id())?;
+    if let Some(metrics_listen) = config.application_metrics_listen {
+        let application_listen = listener.local_addr()?;
+        let listeners = [
+            application_listen,
+            machine_config.bind_addr,
+            config.relay.http_listen,
+            config.relay.https_listen,
+            config.relay.qad_listen,
+            config.relay.metrics_listen,
+        ];
+        anyhow::ensure!(
+            listeners
+                .into_iter()
+                .all(|other| !podmesh_metrics::listeners_conflict(metrics_listen, other)),
+            "scheduler metrics listener conflicts with an existing listener"
+        );
+    }
+    let cancellation = CancellationToken::new();
+    let metrics_runtime = podmesh_metrics::MetricsRuntime::start(
+        podmesh_metrics::ComponentName::Scheduler,
+        podmesh_metrics::MetricsConfig {
+            listen: config.application_metrics_listen,
+        },
+        cancellation.clone(),
+    )
+    .await?;
+    let metrics = metrics_runtime.metrics();
     let local_relay_audience = config.relay.canonical_audience()?;
     let configured_relay_urls =
         iroh::RelayMap::try_from_iter(machine_config.relay_urls.iter().map(String::as_str))?
@@ -128,18 +158,20 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         machine_config.max_agent_fanout,
         machine_config.query_timeout,
     )
-    .with_relay_grant_issuer(identity.clone(), local_relay_audience);
+    .with_relay_grant_issuer(identity.clone(), local_relay_audience)
+    .with_metrics(metrics.clone());
     let queries = machine::QueryManager::new(
         machine_config.max_pending_queries,
         machine_config.max_offers_per_query,
         machine_config.query_timeout,
-    );
+    )
+    .with_metrics(metrics.clone());
     let placement = machine::PlacementHandler::new(
         machine_config.max_pending_queries,
         machine_config.query_timeout,
     );
     let locations = machine::LocationRegistry::new();
-    let mut scheduler_gossip = match machine::SchedulerGossip::start(
+    let mut scheduler_gossip = match machine::SchedulerGossip::start_with_metrics(
         machine::SchedulerGossipServices {
             endpoint: machine_endpoint.clone(),
             attachments: attachments.handler(),
@@ -150,6 +182,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             lookup: identity.peer_lookup(),
         },
         &machine_config,
+        metrics.clone(),
     )
     .await
     {
@@ -207,7 +240,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     );
     log::info!("scheduler Iroh endpoint started: {}", machine_endpoint.id());
 
-    let cancellation = CancellationToken::new();
     let http_cancellation = cancellation.clone();
     // Started unconditionally: even a scheduler with no configured peers must
     // announce itself, or a mesh it was dialled into cannot learn its address.
@@ -238,6 +270,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         api_identity,
         machine_endpoint.clone(),
     )
+    .with_metrics(metrics)
     .with_reconciliation(reconciliation)
     .with_rate_limit(config.client_rate_limit_per_minute)
     .router();
@@ -259,6 +292,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             shutdown_gossip(scheduler_gossip).await?;
             shutdown_machine_endpoint(&machine_endpoint).await?;
             shutdown_relay(relay_server).await?;
+            metrics_runtime.shutdown().await?;
             Ok(())
         }
         scheduler_result = &mut http_server => {
@@ -267,6 +301,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             shutdown_gossip(scheduler_gossip).await?;
             shutdown_machine_endpoint(&machine_endpoint).await?;
             shutdown_relay(relay_server).await?;
+            metrics_runtime.shutdown().await?;
             scheduler_result?;
             anyhow::bail!("scheduler HTTP service stopped unexpectedly")
         }
@@ -279,6 +314,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             shutdown_gossip(scheduler_gossip).await?;
             shutdown_machine_endpoint(&machine_endpoint).await?;
             shutdown_relay(relay_server).await?;
+            metrics_runtime.shutdown().await?;
             relay_result
                 .map_err(|error| anyhow::anyhow!("scheduler relay supervisor task failed: {error}"))?
                 .map_err(|error| anyhow::anyhow!("scheduler relay stopped unexpectedly: {error}"))?;
@@ -293,6 +329,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             shutdown_gossip(scheduler_gossip).await?;
             shutdown_machine_endpoint(&machine_endpoint).await?;
             shutdown_relay(relay_server).await?;
+            metrics_runtime.shutdown().await?;
             gossip_result
                 .context("scheduler gossip receiver task failed")??;
             anyhow::bail!("scheduler gossip stopped unexpectedly")
@@ -306,6 +343,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             shutdown_gossip(scheduler_gossip).await?;
             shutdown_machine_endpoint(&machine_endpoint).await?;
             shutdown_relay(relay_server).await?;
+            metrics_runtime.shutdown().await?;
             coordinator_result
                 .context("capacity coordinator task failed")??;
             anyhow::bail!("capacity coordinator stopped unexpectedly")

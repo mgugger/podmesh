@@ -14,11 +14,7 @@ use rustls_pki_types::{CertificateDer, pem::PemObject};
 mod node_identity;
 pub use node_identity::{APPLICATION_KEY_SUBDIR, NodeIdentity, TRANSPORT_KEY_SUBDIR};
 
-mod workload_handshake;
-pub use workload_handshake::{
-    HandshakeIdentity, VerifiedWorkloadHandshake, build_workload_handshake_request,
-    build_workload_handshake_response, verify_workload_handshake,
-};
+pub mod raw_relay;
 
 pub mod relay_credentials;
 pub use relay_credentials::{RelayTlsMaterial, ensure_relay_mesh_secret, ensure_relay_tls};

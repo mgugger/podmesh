@@ -29,12 +29,20 @@ const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub async fn run(
+pub async fn run_with_metrics(
     config: SidecarConfig,
     mut shutdown: oneshot::Receiver<()>,
     event_tx: Option<mpsc::UnboundedSender<SidecarEvent>>,
+    metrics: podmesh_metrics::Metrics,
 ) -> Result<()> {
     config.validate()?;
+    metrics.set_gauge(podmesh_metrics::GaugeName::ProxySessions, 0);
+    metrics.set_gauge(podmesh_metrics::GaugeName::ActiveIngress, 0);
+    metrics.set_gauge(podmesh_metrics::GaugeName::ActiveEgress, 0);
+    metrics.set_gauge(podmesh_metrics::GaugeName::ActiveWebsockets, 0);
+    let replay_registry = Arc::new(protocol::PeerReplayRegistry::new(
+        config.workload_replay_limits,
+    )?);
     let identity = Arc::new(config.identity.load()?);
     let endpoint = bind_endpoint(&config, &identity).await?;
     let cancellation = CancellationToken::new();
@@ -44,6 +52,7 @@ pub async fn run(
         .build()
         .context("build sidecar HTTP client")?;
     let stream_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_INCOMING_STREAMS));
+    let stream_metrics = streams::StreamMetrics::new(metrics.clone());
     let connect_slots = Arc::new(Semaphore::new(MAX_PARALLEL_CONNECTION_ATTEMPTS));
     let (candidate_tx, mut candidate_rx) = mpsc::channel::<EndpointRecord>(MAX_PROXY_CANDIDATES);
     let (connected_tx, mut connected_rx) = mpsc::channel(MAX_PROXY_CANDIDATES);
@@ -83,6 +92,8 @@ pub async fn run(
                         record,
                         cancellation.clone(),
                         connect_slots.clone(),
+                        replay_registry.clone(),
+                        metrics.clone(),
                         connected_tx.clone(),
                     );
                 }
@@ -97,6 +108,10 @@ pub async fn run(
                         }
                         notify(&event_tx, SidecarEvent::Connected { peer_id: id.to_string() });
                         notify(&event_tx, SidecarEvent::ProxyPeerDiscovered { peer_id: id.to_string() });
+                        metrics.set_gauge(
+                            podmesh_metrics::GaugeName::ProxySessions,
+                            sessions.len() as u64,
+                        );
                         if let Err(error) = connection::register(endpoint.id(), &config, &session, &cancellation).await {
                             log::warn!("initial sidecar registration failed endpoint={} error={error}", id.fmt_short());
                         }
@@ -105,6 +120,11 @@ pub async fn run(
                         // it, so it must not be able to reach the application.
                         tokio::spawn(streams::serve_connection(
                             session.connection.clone(),
+                            session.stream_slots.clone(),
+                            session.identity.clone(),
+                            session.replay_registry.clone(),
+                            session.proxy_grant.clone(),
+                            stream_metrics.clone(),
                             config.clone(),
                             http_client.clone(),
                             stream_slots.clone(),
@@ -119,6 +139,10 @@ pub async fn run(
                 if let Some(session) = sessions.remove(&id) {
                     candidates.insert(id, session.record);
                 }
+                metrics.set_gauge(
+                    podmesh_metrics::GaugeName::ProxySessions,
+                    sessions.len() as u64,
+                );
             }
             _ = reconnect.tick() => {
                 for (id, record) in candidates.clone() {
@@ -130,6 +154,8 @@ pub async fn run(
                             record,
                             cancellation.clone(),
                             connect_slots.clone(),
+                            replay_registry.clone(),
+                            metrics.clone(),
                             connected_tx.clone(),
                         );
                     }
@@ -162,9 +188,10 @@ pub async fn run(
             Some(tunnel) = tunnel_rx.recv() => {
                 if let Some(session) = sessions.values().find(|session| session.verified) {
                     tokio::spawn(streams::open_egress(
-                        session.connection.clone(),
+                        session.clone(),
                         tunnel,
                         cancellation.clone(),
+                        stream_metrics.clone(),
                         event_tx.clone(),
                     ));
                 } else {
@@ -231,6 +258,7 @@ async fn bind_endpoint(
     builder.bind().await.context("bind sidecar Iroh endpoint")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_connection_attempt(
     endpoint: Endpoint,
     identity: Arc<iroh_support::NodeIdentity>,
@@ -238,18 +266,74 @@ fn spawn_connection_attempt(
     record: EndpointRecord,
     cancellation: CancellationToken,
     slots: Arc<Semaphore>,
+    replay_registry: Arc<protocol::PeerReplayRegistry>,
+    metrics: podmesh_metrics::Metrics,
     sender: mpsc::Sender<(EndpointRecord, Result<ProxySession>)>,
 ) {
     tokio::spawn(async move {
+        let timer = metrics.operation_started(podmesh_metrics::OperationName::ProxyConnection);
         let result = match slots.acquire_owned().await {
             Ok(_permit) => {
-                connection::connect(&endpoint, &identity, &config, record.clone(), &cancellation)
-                    .await
+                connection::connect(
+                    &endpoint,
+                    &identity,
+                    &config,
+                    record.clone(),
+                    replay_registry,
+                    metrics.clone(),
+                    &cancellation,
+                )
+                .await
             }
             Err(_) => Err(anyhow::anyhow!("proxy connection limiter closed")),
         };
+        finish_operation(timer, &result, &metrics);
         let _ = sender.send((record, result)).await;
     });
+}
+
+fn finish_operation<T>(
+    timer: podmesh_metrics::OperationTimer,
+    result: &Result<T>,
+    metrics: &podmesh_metrics::Metrics,
+) {
+    let (outcome, reason) = match result {
+        Ok(_) => (
+            podmesh_metrics::Outcome::Success,
+            podmesh_metrics::Reason::None,
+        ),
+        Err(error) if error.to_string().contains("replay") => {
+            metrics.record_event(podmesh_metrics::EventName::ReplayRefusal);
+            (
+                podmesh_metrics::Outcome::Refused,
+                podmesh_metrics::Reason::Replay,
+            )
+        }
+        Err(error) if error.to_string().contains("timed out") => (
+            podmesh_metrics::Outcome::Timeout,
+            podmesh_metrics::Reason::Deadline,
+        ),
+        Err(error) if error.to_string().contains("limit") => {
+            metrics.record_event(podmesh_metrics::EventName::StreamSaturation);
+            (
+                podmesh_metrics::Outcome::Saturated,
+                podmesh_metrics::Reason::Capacity,
+            )
+        }
+        Err(error)
+            if error.to_string().contains("grant") || error.to_string().contains("credential") =>
+        {
+            (
+                podmesh_metrics::Outcome::Refused,
+                podmesh_metrics::Reason::Authorization,
+            )
+        }
+        Err(_) => (
+            podmesh_metrics::Outcome::Unreachable,
+            podmesh_metrics::Reason::Unavailable,
+        ),
+    };
+    timer.finish(outcome, reason);
 }
 
 fn start_local_proxies(

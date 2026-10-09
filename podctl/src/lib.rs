@@ -11,6 +11,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+mod bootstrap;
 pub mod catalog;
 pub mod cert;
 pub mod trust;
@@ -98,13 +99,8 @@ impl std::fmt::Display for AdmissionCapacityRefusal {
 impl std::error::Error for AdmissionCapacityRefusal {}
 
 fn is_capacity_refusal(reason: &str) -> bool {
-    matches!(
-        reason,
-        "agent workload limit reached"
-            | "agent reservation limit reached"
-            | "insufficient capacity"
-            | "pending reservation limit reached; retry once admissions settle"
-    )
+    protocol::agent::AdmissionRefusal::from_reason(reason)
+        .is_some_and(protocol::agent::AdmissionRefusal::is_capacity)
 }
 
 fn service_mesh_renewal_due(placement: &ReplicaPlacement, now: u64) -> bool {
@@ -120,12 +116,6 @@ fn service_mesh_renewal_due(placement: &ReplicaPlacement, now: u64) -> bool {
 struct WorkloadRelayBootstrap {
     auth_token: String,
     ca_certificate_b64: String,
-}
-
-/// Response body of the proxy's `GET /api/v1/endpoint_record`.
-#[derive(Deserialize)]
-struct ProxyEndpointRecord {
-    endpoint_record_b64: String,
 }
 
 /// Collects proxy endpoint records and workload relay credentials directly from
@@ -145,6 +135,7 @@ struct ProxyEndpointRecord {
 async fn bootstrap_from_proxies(
     proxy_urls: &str,
     namespace_id: &str,
+    key_dir: &Path,
 ) -> Result<(Vec<String>, String, Vec<Vec<u8>>)> {
     let urls: Vec<&str> = proxy_urls
         .split(',')
@@ -160,37 +151,31 @@ async fn bootstrap_from_proxies(
     let mut endpoints = Vec::with_capacity(urls.len());
     let mut certificates = Vec::new();
     let mut auth_token: Option<String> = None;
+    let proxy_trust = trust::load_registry(key_dir)?;
 
     for url in urls {
-        let base = url.trim_end_matches('/');
-        let record: ProxyEndpointRecord = client
-            .get(format!("{base}/api/v1/endpoint_record"))
-            .send()
-            .await
-            .with_context(|| format!("reach proxy {url}"))?
-            .error_for_status()
-            .with_context(|| format!("proxy {url} did not serve its endpoint record"))?
-            .json()
-            .await
-            .with_context(|| format!("decode endpoint record from proxy {url}"))?;
-        endpoints.push(record.endpoint_record_b64);
+        let observed = bootstrap::fetch_proxy_identity(&client, url, now_secs()).await?;
+        proxy_trust.authorize_proxy(&observed.identity)?;
+        let base = observed.identity.origin.as_str();
+        endpoints.push(observed.endpoint_record_b64);
 
-        let response = client
-            .get(format!("{base}/api/v1/workload_relay_bootstrap"))
-            .query(&[("owner", namespace_id)])
-            .send()
-            .await
-            .with_context(|| format!("reach proxy {url}"))?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
+        let (status, body) = bootstrap::send_bounded(
+            client
+                .get(format!("{base}/api/v1/workload_relay_bootstrap"))
+                .query(&[("owner", namespace_id)]),
+        )
+        .await
+        .with_context(|| format!("reach proxy {url}"))?;
+        if status == reqwest::StatusCode::NOT_FOUND {
             // This proxy adopted its token from a peer rather than publishing
             // it, which is the intended posture for all but one proxy.
             continue;
         }
-        let bootstrap: WorkloadRelayBootstrap = response
-            .error_for_status()
-            .with_context(|| format!("proxy {url} refused to publish relay credentials"))?
-            .json()
-            .await
+        anyhow::ensure!(
+            status.is_success(),
+            "proxy {url} refused to publish relay credentials: status {status}"
+        );
+        let bootstrap: WorkloadRelayBootstrap = serde_json::from_slice(&body)
             .with_context(|| format!("decode relay bootstrap from proxy {url}"))?;
 
         match &auth_token {
@@ -491,7 +476,7 @@ async fn apply_file_internal(
         if let Some(explicit) = explicit_proxy_config {
             explicit
         } else if let Some(proxy_urls) = proxy_urls.as_deref() {
-            bootstrap_from_proxies(proxy_urls, &namespace_id).await?
+            bootstrap_from_proxies(proxy_urls, &namespace_id, &key_dir).await?
         } else {
             let endpoints = if annotations.proxy_endpoints.is_empty() {
                 std::env::var("PODMESH_PROXY_ENDPOINTS")
@@ -567,8 +552,14 @@ async fn apply_file_internal(
                     resources: &resources,
                 },
                 &placement,
-                (&owner_public, &owner_private),
-                (&response_kem_public, &response_kem_private),
+                OwnerSigningKeys {
+                    public: &owner_public,
+                    private: &owner_private,
+                },
+                ResponseKemKeys {
+                    public: &response_kem_public,
+                    private: &response_kem_private,
+                },
             )
             .await
             {
@@ -661,8 +652,14 @@ async fn apply_file_internal(
                 },
                 &agent,
                 &agent_endpoint_id,
-                (&owner_public, &owner_private),
-                (&response_kem_public, &response_kem_private),
+                OwnerSigningKeys {
+                    public: &owner_public,
+                    private: &owner_private,
+                },
+                ResponseKemKeys {
+                    public: &response_kem_public,
+                    private: &response_kem_private,
+                },
             )
             .await;
             match result {
@@ -697,7 +694,7 @@ async fn apply_file_internal(
     Ok(deployment_id)
 }
 
-/// Everything that is identical across the replicas of one deployment.
+/// Deployment inputs and placement identity for one replica.
 struct ReplicaRequest<'a> {
     api_base: &'a str,
     namespace_id: &'a str,
@@ -712,14 +709,83 @@ struct ReplicaRequest<'a> {
     resources: &'a protocol::ManifestResources,
 }
 
+#[derive(Clone, Copy)]
+struct OwnerSigningKeys<'a> {
+    public: &'a [u8],
+    private: &'a [u8],
+}
+
+struct ResponseKemKeys<'a> {
+    public: &'a [u8],
+    private: &'a [u8],
+}
+
+struct PreparedExecution {
+    capsule: EncryptedWorkloadCapsule,
+    credential_expires_at_secs: u64,
+}
+
+impl ReplicaRequest<'_> {
+    fn prepare_execution(
+        &self,
+        owner: OwnerSigningKeys<'_>,
+        agent_kem_pubkey: &str,
+        now: u64,
+    ) -> Result<PreparedExecution> {
+        let credential_expires_at_secs = now + WORKLOAD_CREDENTIAL_TTL_SECS;
+        let credential = protocol::mint_workload_credential(
+            owner.private,
+            owner.public,
+            &protocol::WorkloadCredentialClaims {
+                tenant_owner: self.namespace_id.to_string(),
+                manifest_id: protocol::route_id(owner.public, self.workload_name),
+                issued_at_secs: now,
+                expires_at_secs: credential_expires_at_secs,
+                token_id: uuid::Uuid::new_v4().to_string(),
+            },
+            now,
+        )
+        .context("mint workload credential")?;
+        let execution = ExecutionSpec {
+            workload_name: self.workload_name.to_string(),
+            replica_index: self.replica_index,
+            replica_count: self.replica_count,
+            manifest: self.manifest.to_vec(),
+            proxy_endpoints: self.proxy_endpoints.to_vec(),
+            workload_credential_b64: protocol::workload_credential_to_b64(&credential),
+            workload_relay_auth_token: self.workload_relay_auth_token.to_string(),
+            workload_relay_ca_certificates: self.workload_relay_ca_certificates.to_vec(),
+        };
+        let execution_bytes = postcard::to_allocvec(&execution)?;
+        let mut dek = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut dek);
+        let (ciphertext, nonce) = crypto::encrypt_payload_with_key(&dek, &execution_bytes)?;
+        let agent_kem = crypto::b64_decode(agent_kem_pubkey)?;
+        Ok(PreparedExecution {
+            capsule: EncryptedWorkloadCapsule {
+                ciphertext,
+                nonce: nonce.to_vec(),
+                wrapped_dek: crypto::encrypt_payload_for_recipient(&agent_kem, &dek)?,
+            },
+            credential_expires_at_secs,
+        })
+    }
+}
+
 async fn update_replica(
     request: ReplicaRequest<'_>,
     placement: &ReplicaPlacement,
-    owner_keys: (&[u8], &[u8]),
-    response_kem_keys: (&[u8], &[u8]),
+    owner_keys: OwnerSigningKeys<'_>,
+    response_kem_keys: ResponseKemKeys<'_>,
 ) -> Result<ReplicaPlacement> {
-    let (owner_public, owner_private) = owner_keys;
-    let (response_kem_public, response_kem_private) = response_kem_keys;
+    let OwnerSigningKeys {
+        public: owner_public,
+        private: owner_private,
+    } = owner_keys;
+    let ResponseKemKeys {
+        public: response_kem_public,
+        private: response_kem_private,
+    } = response_kem_keys;
     let workload_id =
         protocol::workload_id(owner_public, request.workload_name, request.replica_index);
     anyhow::ensure!(
@@ -727,34 +793,8 @@ async fn update_replica(
         "catalog workload identity does not match requested update"
     );
 
-    let now = now_secs();
-    let workload_credential = protocol::mint_workload_credential(
-        owner_private,
-        owner_public,
-        &protocol::WorkloadCredentialClaims {
-            tenant_owner: request.namespace_id.to_string(),
-            manifest_id: protocol::route_id(owner_public, request.workload_name),
-            issued_at_secs: now,
-            expires_at_secs: now + WORKLOAD_CREDENTIAL_TTL_SECS,
-            token_id: uuid::Uuid::new_v4().to_string(),
-        },
-        now,
-    )?;
-    let execution = ExecutionSpec {
-        workload_name: request.workload_name.to_string(),
-        replica_index: request.replica_index,
-        replica_count: request.replica_count,
-        manifest: request.manifest.to_vec(),
-        proxy_endpoints: request.proxy_endpoints.to_vec(),
-        workload_credential_b64: protocol::workload_credential_to_b64(&workload_credential),
-        workload_relay_auth_token: request.workload_relay_auth_token.to_string(),
-        workload_relay_ca_certificates: request.workload_relay_ca_certificates.to_vec(),
-    };
-    let execution_bytes = postcard::to_allocvec(&execution)?;
-    let mut dek = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut dek);
-    let (ciphertext, nonce) = crypto::encrypt_payload_with_key(&dek, &execution_bytes)?;
-    let agent_kem = crypto::b64_decode(&placement.agent_kem_pubkey)?;
+    let prepared =
+        request.prepare_execution(owner_keys, &placement.agent_kem_pubkey, now_secs())?;
     let issued_at_secs = now_secs();
     let request_id = uuid::Uuid::new_v4().to_string();
     let grant = DeploymentGrant {
@@ -765,11 +805,7 @@ async fn update_replica(
         target_node_id: placement.agent_signing_pubkey.clone(),
         response_kem_pubkey: crypto::b64_encode(response_kem_public),
         reservation_id: request_id.clone(),
-        capsule: EncryptedWorkloadCapsule {
-            ciphertext,
-            nonce: nonce.to_vec(),
-            wrapped_dek: crypto::encrypt_payload_for_recipient(&agent_kem, &dek)?,
-        },
+        capsule: prepared.capsule,
         issued_at_secs,
         expires_at_secs: issued_at_secs + REQUEST_TTL_SECS,
         nonce: uuid::Uuid::new_v4().to_string(),
@@ -835,7 +871,7 @@ async fn update_replica(
     updated.revision_id = response.receipt.revision_id.clone();
     updated.receipt = response.receipt;
     updated.api_base = request.api_base.to_string();
-    updated.service_mesh_expires_at_secs = now + WORKLOAD_CREDENTIAL_TTL_SECS;
+    updated.service_mesh_expires_at_secs = prepared.credential_expires_at_secs;
     updated.update_state = ReplicaUpdateState::Active;
     Ok(updated)
 }
@@ -845,11 +881,17 @@ async fn deploy_replica(
     request: ReplicaRequest<'_>,
     agent: &CapacityOffer,
     agent_endpoint_id: &str,
-    owner_keys: (&[u8], &[u8]),
-    response_kem_keys: (&[u8], &[u8]),
+    owner_keys: OwnerSigningKeys<'_>,
+    response_kem_keys: ResponseKemKeys<'_>,
 ) -> Result<ReplicaPlacement> {
-    let (owner_public, owner_private) = owner_keys;
-    let (response_kem_public, response_kem_private) = response_kem_keys;
+    let OwnerSigningKeys {
+        public: owner_public,
+        private: owner_private,
+    } = owner_keys;
+    let ResponseKemKeys {
+        public: response_kem_public,
+        private: response_kem_private,
+    } = response_kem_keys;
     let workload_id =
         protocol::workload_id(owner_public, request.workload_name, request.replica_index);
 
@@ -899,38 +941,7 @@ async fn deploy_replica(
         "reservation response binding mismatch"
     );
 
-    // Minted here because only podctl holds the owner's private key. It is what
-    // lets a proxy tell this workload's sidecar from anyone else naming the
-    // same owner, whose public key is not a secret.
-    let now = now_secs();
-    let workload_credential = protocol::mint_workload_credential(
-        owner_private,
-        owner_public,
-        &protocol::WorkloadCredentialClaims {
-            tenant_owner: request.namespace_id.to_string(),
-            manifest_id: protocol::route_id(owner_public, request.workload_name),
-            issued_at_secs: now,
-            expires_at_secs: now + WORKLOAD_CREDENTIAL_TTL_SECS,
-            token_id: uuid::Uuid::new_v4().to_string(),
-        },
-        now,
-    )
-    .context("mint workload credential")?;
-    let execution = ExecutionSpec {
-        workload_name: request.workload_name.to_string(),
-        replica_index: request.replica_index,
-        replica_count: request.replica_count,
-        manifest: request.manifest.to_vec(),
-        proxy_endpoints: request.proxy_endpoints.to_vec(),
-        workload_credential_b64: protocol::workload_credential_to_b64(&workload_credential),
-        workload_relay_auth_token: request.workload_relay_auth_token.to_string(),
-        workload_relay_ca_certificates: request.workload_relay_ca_certificates.to_vec(),
-    };
-    let execution_bytes = postcard::to_allocvec(&execution)?;
-    let mut dek = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut dek);
-    let (ciphertext, nonce) = crypto::encrypt_payload_with_key(&dek, &execution_bytes)?;
-    let agent_kem = crypto::b64_decode(&agent.kem_pubkey)?;
+    let prepared = request.prepare_execution(owner_keys, &agent.kem_pubkey, now_secs())?;
     let issued_at_secs = now_secs();
     let grant = DeploymentGrant {
         version: AGENT_PROTOCOL_VERSION,
@@ -940,11 +951,7 @@ async fn deploy_replica(
         target_node_id: agent.signing_pubkey.clone(),
         response_kem_pubkey: crypto::b64_encode(response_kem_public),
         reservation_id: reservation.reservation_id,
-        capsule: EncryptedWorkloadCapsule {
-            ciphertext,
-            nonce: nonce.to_vec(),
-            wrapped_dek: crypto::encrypt_payload_for_recipient(&agent_kem, &dek)?,
-        },
+        capsule: prepared.capsule,
         issued_at_secs,
         expires_at_secs: issued_at_secs + REQUEST_TTL_SECS,
         nonce: uuid::Uuid::new_v4().to_string(),
@@ -973,7 +980,7 @@ async fn deploy_replica(
         agent_endpoint: agent.agent_endpoint.clone(),
         agent_kem_pubkey: agent.kem_pubkey.clone(),
         agent_signing_pubkey: agent.signing_pubkey.clone(),
-        service_mesh_expires_at_secs: now + WORKLOAD_CREDENTIAL_TTL_SECS,
+        service_mesh_expires_at_secs: prepared.credential_expires_at_secs,
         update_state: ReplicaUpdateState::Active,
     })
 }
@@ -1520,6 +1527,74 @@ fn render_table(catalogs: &[DeploymentCatalog]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::{prelude::*, test_runner::RngSeed};
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(0x504f_444d_4553_4805),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn prepared_execution_preserves_identity_and_recipient_binding(
+            name in "[a-z][a-z0-9-]{0,30}",
+            replica_index in 0u32..64,
+            issued_at in 1_700_000_000u64..1_800_000_000,
+        ) {
+            let owner_dir = tempfile::tempdir().unwrap();
+            let agent_dir = tempfile::tempdir().unwrap();
+            let other_dir = tempfile::tempdir().unwrap();
+            let (owner_public, owner_private) = owner_keys(owner_dir.path()).unwrap();
+            let (agent_public, agent_private) = response_keys(agent_dir.path()).unwrap();
+            let (_, other_private) = response_keys(other_dir.path()).unwrap();
+            let namespace = crypto::b64_encode(&owner_public);
+            let raw = format!("kind: Pod\nmetadata: {{name: {name}}}\nspec:\n  containers:\n    - {{name: app, image: nginx:alpine}}\n");
+            let (manifest, resources) = protocol::validate_and_measure_manifest(raw.as_bytes()).unwrap();
+            let revision = protocol::revision_id(&manifest);
+            let certificates = vec![vec![1, 2, 3]];
+            let request = ReplicaRequest {
+                api_base: "http://localhost:3000",
+                namespace_id: &namespace,
+                workload_name: &name,
+                manifest: &manifest,
+                revision_id: &revision,
+                replica_index,
+                replica_count: 64,
+                proxy_endpoints: &[],
+                workload_relay_auth_token: "test-relay-token",
+                workload_relay_ca_certificates: &certificates,
+                resources: &resources,
+            };
+            let prepared = request.prepare_execution(
+                OwnerSigningKeys { public: &owner_public, private: &owner_private },
+                &crypto::b64_encode(&agent_public),
+                issued_at,
+            ).unwrap();
+            let capsule = prepared.capsule;
+            prop_assert!(crypto::decrypt_payload_from_recipient_blob(&capsule.wrapped_dek, &other_private).is_err());
+            let dek: [u8; 32] = crypto::decrypt_payload_from_recipient_blob(&capsule.wrapped_dek, &agent_private).unwrap().try_into().unwrap();
+            let plaintext = crypto::decrypt_payload_with_key(&dek, &capsule.nonce, &capsule.ciphertext).unwrap();
+            let execution: ExecutionSpec = postcard::from_bytes(&plaintext).unwrap();
+            prop_assert_eq!(&execution.workload_name, &name);
+            prop_assert_eq!(execution.replica_index, replica_index);
+            prop_assert_eq!(execution.replica_count, 64);
+            prop_assert_eq!(&execution.manifest, &manifest);
+            prop_assert_eq!(protocol::revision_id(&execution.manifest), revision);
+            prop_assert_eq!(execution.proxy_endpoints.len(), 0);
+            prop_assert_eq!(execution.workload_relay_auth_token, "test-relay-token");
+            prop_assert_eq!(execution.workload_relay_ca_certificates, certificates);
+            let credential = protocol::workload_credential_from_b64(&execution.workload_credential_b64).unwrap();
+            let route = protocol::route_id(&owner_public, &name);
+            prop_assert!(protocol::verify_workload_credential(&credential, &namespace, &route, issued_at).is_ok());
+            prop_assert_eq!(prepared.credential_expires_at_secs, issued_at + WORKLOAD_CREDENTIAL_TTL_SECS);
+            prop_assert!(protocol::verify_workload_credential(&credential, &namespace, &route, prepared.credential_expires_at_secs + 60).is_err());
+            prop_assert!(protocol::verify_workload_credential(&credential, &namespace, "different-workload", issued_at).is_err());
+            let mut tampered = capsule.ciphertext;
+            tampered[0] ^= 1;
+            prop_assert!(crypto::decrypt_payload_with_key(&dek, &capsule.nonce, &tampered).is_err());
+        }
+    }
 
     #[test]
     fn canonical_manifest_requires_name_and_is_stable() {

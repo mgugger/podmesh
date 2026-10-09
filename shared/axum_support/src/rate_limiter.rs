@@ -70,6 +70,7 @@ pub struct RateLimiterState {
     buckets: Mutex<LruCache<IpAddr, TokenBucket>>,
     max_tokens: f64,
     refill_rate: f64, // tokens per second
+    on_refused: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl RateLimiterState {
@@ -87,14 +88,19 @@ impl RateLimiterState {
             )),
             max_tokens,
             refill_rate,
+            on_refused: None,
         }
+    }
+
+    pub fn with_refusal_callback(mut self, callback: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.on_refused = Some(callback);
+        self
     }
 
     /// Check if a request from the given address should be allowed.
     pub fn check(&self, ip: IpAddr) -> bool {
         let mut buckets = self.buckets.lock();
-
-        if let Some(bucket) = buckets.get_mut(&ip) {
+        let allowed = if let Some(bucket) = buckets.get_mut(&ip) {
             bucket.try_consume(self.refill_rate, self.max_tokens)
         } else {
             // New address: start from a full bucket and spend one token on this
@@ -103,7 +109,12 @@ impl RateLimiterState {
             bucket.tokens -= 1.0;
             buckets.put(ip, bucket);
             true
+        };
+        drop(buckets);
+        if !allowed && let Some(callback) = &self.on_refused {
+            callback();
         }
+        allowed
     }
 }
 
@@ -153,6 +164,13 @@ pub fn create_rate_limiter(requests_per_minute: u32) -> Arc<RateLimiterState> {
     Arc::new(RateLimiterState::new(requests_per_minute))
 }
 
+pub fn create_rate_limiter_with_callback(
+    requests_per_minute: u32,
+    callback: Arc<dyn Fn() + Send + Sync>,
+) -> Arc<RateLimiterState> {
+    Arc::new(RateLimiterState::new(requests_per_minute).with_refusal_callback(callback))
+}
+
 /// Apply per-IP rate limiting to `router`, or leave it untouched when
 /// `requests_per_minute` is zero.
 ///
@@ -160,12 +178,24 @@ pub fn create_rate_limiter(requests_per_minute: u32) -> Arc<RateLimiterState> {
 /// deployment where every caller shares one source address, without the call
 /// site growing a conditional.
 pub fn with_rate_limit(router: axum::Router, requests_per_minute: u32) -> axum::Router {
+    with_rate_limit_callback(router, requests_per_minute, None)
+}
+
+pub fn with_rate_limit_callback(
+    router: axum::Router,
+    requests_per_minute: u32,
+    callback: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> axum::Router {
     if requests_per_minute == 0 {
         log::warn!("rate_limiter: disabled by configuration; this listener will not be throttled");
         return router;
     }
+    let limiter = match callback {
+        Some(callback) => create_rate_limiter_with_callback(requests_per_minute, callback),
+        None => create_rate_limiter(requests_per_minute),
+    };
     router.layer(axum::middleware::from_fn_with_state(
-        create_rate_limiter(requests_per_minute),
+        limiter,
         rate_limit_middleware,
     ))
 }
@@ -193,6 +223,22 @@ mod tests {
             assert!(limiter.check(ip(2)));
         }
         assert!(!limiter.check(ip(2)));
+    }
+
+    #[tokio::test]
+    async fn refusal_callback_runs_only_for_rejected_requests() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let refusals = Arc::new(AtomicUsize::new(0));
+        let callback_refusals = refusals.clone();
+        let limiter = Arc::new(RateLimiterState::new(1).with_refusal_callback(Arc::new(
+            move || {
+                callback_refusals.fetch_add(1, Ordering::Relaxed);
+            },
+        )));
+        assert!(limiter.check(ip(7)));
+        assert!(!limiter.check(ip(7)));
+        assert_eq!(refusals.load(Ordering::Relaxed), 1);
     }
 
     #[test]

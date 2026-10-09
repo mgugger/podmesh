@@ -29,7 +29,7 @@ pub enum SignatureDomain {
     EndpointRecord,
     MachineRelayGrant,
     AgentAttachmentHello,
-    WorkloadHandshake,
+    WorkloadEnvelope,
     SidecarRegistration,
 }
 
@@ -58,7 +58,7 @@ impl SignatureDomain {
             Self::EndpointRecord => "podmesh/sig/v1/endpoint-record",
             Self::MachineRelayGrant => "podmesh/sig/v1/machine-relay-grant",
             Self::AgentAttachmentHello => "podmesh/sig/v1/agent-attachment-hello",
-            Self::WorkloadHandshake => "podmesh/sig/v1/workload-handshake",
+            Self::WorkloadEnvelope => "podmesh/sig/v1/workload-envelope",
             Self::SidecarRegistration => "podmesh/sig/v1/sidecar-registration",
         }
     }
@@ -100,7 +100,7 @@ mod tests {
         SignatureDomain::EndpointRecord,
         SignatureDomain::MachineRelayGrant,
         SignatureDomain::AgentAttachmentHello,
-        SignatureDomain::WorkloadHandshake,
+        SignatureDomain::WorkloadEnvelope,
         SignatureDomain::SidecarRegistration,
     ];
 

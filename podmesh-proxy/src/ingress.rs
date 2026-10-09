@@ -1,14 +1,13 @@
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
-use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use axum::{
     Router,
-    body::{Body, to_bytes},
+    body::Body,
     extract::State,
-    http::{HeaderName, HeaderValue, Request, Response, StatusCode},
+    http::{HeaderValue, Request, Response, StatusCode},
     routing::any,
 };
 use axum_support::{parse_socket_addr, spawn_tcp_listener};
@@ -17,9 +16,8 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 use crate::iroh_runtime::ProxyClient;
+use protocol::IngressRequestMetadata;
 use protocol::MESH_DOMAIN_SUFFIX;
-use protocol::ProxyHttpRequest;
-const MAX_PROXY_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct IngressServer {
     join: JoinHandle<()>,
@@ -218,12 +216,20 @@ impl SidecarForwarder for ProxySidecarForwarder {
     async fn forward(
         &self,
         app_id: &str,
-        request: Request<Body>,
+        mut request: Request<Body>,
     ) -> Result<Response<Body>, SidecarError> {
+        let upgrade_requested = request
+            .headers()
+            .get(axum::http::header::CONNECTION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+            })
+            && request.headers().contains_key(axum::http::header::UPGRADE);
+        let on_upgrade = upgrade_requested.then(|| hyper::upgrade::on(&mut request));
         let (parts, body) = request.into_parts();
-        let body_bytes = to_bytes(body, MAX_PROXY_BODY_BYTES)
-            .await
-            .map_err(|err| SidecarError::ForwardFailed(format!("read body failed: {err}")))?;
         let path_and_query = parts
             .uri
             .path_and_query()
@@ -237,31 +243,17 @@ impl SidecarForwarder for ProxySidecarForwarder {
                 Some((name.as_str().to_string(), header_value))
             })
             .collect();
-        let proxy_request = ProxyHttpRequest {
+        let proxy_request = IngressRequestMetadata {
             manifest_id: app_id.to_string(),
             method: parts.method.to_string(),
             path_and_query,
             headers,
-            body: body_bytes.to_vec(),
             target_port: 0,
+            upgrade_requested,
         };
-        let proxy_response = self
-            .proxy
-            .forward(proxy_request)
+        self.proxy
+            .forward(proxy_request, body, on_upgrade)
             .await
-            .map_err(|err| SidecarError::ForwardFailed(err.to_string()))?;
-        let status =
-            StatusCode::from_u16(proxy_response.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
-        let mut builder = Response::builder().status(status);
-        for (name, value) in proxy_response.headers {
-            if let (Ok(header_name), Ok(header_value)) =
-                (HeaderName::from_str(&name), HeaderValue::from_str(&value))
-            {
-                builder = builder.header(header_name, header_value);
-            }
-        }
-        builder
-            .body(Body::from(proxy_response.body))
-            .map_err(|err| SidecarError::ForwardFailed(format!("build response failed: {err}")))
+            .map_err(|err| SidecarError::ForwardFailed(err.to_string()))
     }
 }

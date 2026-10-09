@@ -58,6 +58,26 @@ impl ProxyEndpointDiscoveryResponse {
         validate_endpoint_records(&response.endpoints, now_secs)?;
         Ok(response)
     }
+
+    pub fn validate(&self, now_secs: u64) -> Result<()> {
+        validate_endpoint_records(&self.endpoints, now_secs)
+    }
+}
+
+impl crate::WorkloadPayload for ProxyDiscoveryRequest {
+    const TYPE: crate::WorkloadPayloadType = crate::WorkloadPayloadType::ProxyDiscoveryRequest;
+
+    fn validate(&self, _now_secs: u64) -> Result<()> {
+        self.validate()
+    }
+}
+
+impl crate::WorkloadPayload for ProxyEndpointDiscoveryResponse {
+    const TYPE: crate::WorkloadPayloadType = crate::WorkloadPayloadType::ProxyDiscoveryResponse;
+
+    fn validate(&self, now_secs: u64) -> Result<()> {
+        self.validate(now_secs)
+    }
 }
 
 fn validate_endpoint_records(records: &[EndpointRecord], now_secs: u64) -> Result<()> {

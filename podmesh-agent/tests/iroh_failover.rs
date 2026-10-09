@@ -131,6 +131,8 @@ impl SchedulerNode {
 fn agent_config(root: &std::path::Path, records: &[protocol::EndpointRecord]) -> Result<Config> {
     Ok(Config {
         listen: "127.0.0.1:0".into(),
+        metrics_listen: None,
+        sidecar_metrics_listen: None,
         key_dir: root.join("keys"),
         state_path: root.join("state.redb"),
         runtime: RuntimeKind::Mock,

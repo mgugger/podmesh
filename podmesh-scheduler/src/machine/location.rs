@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::now_secs;
 use anyhow::{Context, Result};
 use iroh::EndpointId;
 use tokio::sync::{Mutex, watch};
@@ -172,13 +173,6 @@ impl LocationResponder {
         let _ = tokio::time::timeout(self.operation_timeout, connection.closed()).await;
         Ok(())
     }
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[cfg(test)]

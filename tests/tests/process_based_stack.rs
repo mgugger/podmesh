@@ -56,8 +56,10 @@ fn build_proxy_config(
 ) -> ProxyConfig {
     ProxyConfig {
         proxy_endpoints,
+        workload_replay_limits: protocol::ReplayLimits::default(),
         identity: podmesh_proxy::IdentitySource::ephemeral(),
         iroh_bind_addr: format!("127.0.0.1:{iroh_port}").parse().unwrap(),
+        metrics_listen: None,
         workload_relay: None,
         workload_relay_certificate_der: Vec::new(),
         publish_relay_bootstrap: false,
@@ -230,6 +232,7 @@ fn build_sidecar_config(
     let cfg = SidecarConfig {
         identity: podmesh_sidecar::IdentitySource::ephemeral(),
         proxy_endpoints,
+        workload_replay_limits: protocol::ReplayLimits::default(),
         workload_credential_b64: Some(podmesh_integration_tests::support::workload_credential(
             owner_sk,
             owner_b64,
@@ -239,6 +242,7 @@ fn build_sidecar_config(
         workload_relay_ca_certificates: Vec::new(),
         lookup_interval: Duration::from_secs(2),
         iroh_bind_addr: "127.0.0.1:0".parse()?,
+        metrics_listen: None,
         workload_name: DEMO_WORKLOAD_NAME.to_string(),
         manifest_id: demo_manifest_id(owner_b64),
         replica_index: 0,

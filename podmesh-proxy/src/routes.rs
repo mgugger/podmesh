@@ -74,11 +74,19 @@ struct Inner {
 #[derive(Default)]
 pub struct RouteTable {
     inner: RwLock<Inner>,
+    metrics: podmesh_metrics::Metrics,
 }
 
 impl RouteTable {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_metrics(mut self, metrics: podmesh_metrics::Metrics) -> Self {
+        metrics.set_gauge(podmesh_metrics::GaugeName::RouteKeys, 0);
+        metrics.set_gauge(podmesh_metrics::GaugeName::RouteBackends, 0);
+        self.metrics = metrics;
+        self
     }
 
     /// Install or refresh a registration.
@@ -87,6 +95,38 @@ impl RouteTable {
     /// hostnames it claims, already belongs to a different owner. Silently
     /// taking over would be a cross-tenant hijack.
     pub fn register(
+        &self,
+        registration: &SidecarRegistration,
+        registered_at: u64,
+        max_entries: usize,
+    ) -> Result<()> {
+        let timer = self
+            .metrics
+            .operation_started(podmesh_metrics::OperationName::RouteUpdate);
+        let result = self.register_inner(registration, registered_at, max_entries);
+        self.refresh_metrics();
+        match &result {
+            Ok(()) => timer.finish(
+                podmesh_metrics::Outcome::Success,
+                podmesh_metrics::Reason::None,
+            ),
+            Err(error) if error.to_string().contains("capacity") => {
+                self.metrics
+                    .record_event(podmesh_metrics::EventName::StoreSaturation);
+                timer.finish(
+                    podmesh_metrics::Outcome::Saturated,
+                    podmesh_metrics::Reason::Capacity,
+                );
+            }
+            Err(_) => timer.finish(
+                podmesh_metrics::Outcome::Refused,
+                podmesh_metrics::Reason::Policy,
+            ),
+        }
+        result
+    }
+
+    fn register_inner(
         &self,
         registration: &SidecarRegistration,
         registered_at: u64,
@@ -225,6 +265,18 @@ impl RouteTable {
     /// Pruning is per replica: one dead replica is removed while its siblings
     /// keep serving, and the entry only disappears once every replica is gone.
     pub fn prune(&self, now_millis: u64, ttl: Duration) {
+        let timer = self
+            .metrics
+            .operation_started(podmesh_metrics::OperationName::RouteUpdate);
+        self.prune_inner(now_millis, ttl);
+        self.refresh_metrics();
+        timer.finish(
+            podmesh_metrics::Outcome::Success,
+            podmesh_metrics::Reason::None,
+        );
+    }
+
+    fn prune_inner(&self, now_millis: u64, ttl: Duration) {
         let Ok(mut inner) = self.inner.write() else {
             log::error!("routing table lock poisoned; skipping prune");
             return;
@@ -249,6 +301,42 @@ impl RouteTable {
             .read()
             .map(|inner| inner.by_manifest.len())
             .unwrap_or(0)
+    }
+
+    pub fn total_backends(&self) -> usize {
+        self.inner
+            .read()
+            .map(|inner| {
+                inner
+                    .by_manifest
+                    .values()
+                    .map(|entry| entry.backends.len())
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    fn refresh_metrics(&self) {
+        let (route_keys, route_backends) = self
+            .inner
+            .read()
+            .map(|inner| {
+                (
+                    inner.by_manifest.len(),
+                    inner
+                        .by_manifest
+                        .values()
+                        .map(|entry| entry.backends.len())
+                        .sum::<usize>(),
+                )
+            })
+            .unwrap_or_default();
+        self.metrics
+            .set_gauge(podmesh_metrics::GaugeName::RouteKeys, route_keys as u64);
+        self.metrics.set_gauge(
+            podmesh_metrics::GaugeName::RouteBackends,
+            route_backends as u64,
+        );
     }
 
     /// Routing keys with at least one live backend, for reporting.
@@ -338,11 +426,22 @@ mod tests {
 
     #[test]
     fn an_owner_can_refresh_its_own_entry() {
-        let table = RouteTable::new();
+        let metrics = podmesh_metrics::Metrics::registered(podmesh_metrics::ComponentName::Proxy);
+        let table = RouteTable::new().with_metrics(metrics.clone());
         let first = single(1, "demo", "demo.example", "peer-a");
         table.register(&first, 0, MAX_ENTRIES).unwrap();
         table.register(&first, 10, MAX_ENTRIES).unwrap();
         assert_eq!(table.backend_count(&first.manifest_id), 1);
+        let snapshot = metrics.snapshot().unwrap();
+        assert!(snapshot.gauges().any(|(key, value)| {
+            key.gauge() == podmesh_metrics::GaugeName::RouteKeys && *value == 1
+        }));
+        assert!(snapshot.gauges().any(|(key, value)| {
+            key.gauge() == podmesh_metrics::GaugeName::RouteBackends && *value == 1
+        }));
+        assert!(snapshot.operations().any(|(key, value)| {
+            key.operation() == podmesh_metrics::OperationName::RouteUpdate && value.count() == 2
+        }));
     }
 
     /// Every replica registers the same routing key. The table must hold one

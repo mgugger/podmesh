@@ -195,6 +195,8 @@ async fn start_agent(scheduler_endpoint: &str) -> Result<TestAgent> {
     let temp = tempfile::tempdir()?;
     let config = Config {
         listen: "127.0.0.1:0".into(),
+        metrics_listen: None,
+        sidecar_metrics_listen: None,
         key_dir: temp.path().join("keys"),
         state_path: temp.path().join("state.redb"),
         runtime: RuntimeKind::Mock,

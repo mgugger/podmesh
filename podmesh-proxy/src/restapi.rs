@@ -9,7 +9,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use axum_support::{parse_socket_addr, spawn_tcp_server, with_rate_limit};
+use axum_support::{parse_socket_addr, spawn_tcp_server, with_rate_limit_callback};
 
 use crate::relay_bootstrap_api::{get_workload_relay_bootstrap, get_workload_relay_mesh_secret};
 use serde::Serialize;
@@ -76,6 +76,7 @@ pub struct RestServerOptions {
     pub relay_bootstrap: Option<WorkloadRelayBootstrap>,
     /// Per-peer request budget. Zero disables throttling.
     pub rate_limit_per_minute: u32,
+    pub metrics: podmesh_metrics::Metrics,
 }
 
 #[derive(Clone)]
@@ -85,6 +86,7 @@ pub(crate) struct RestState {
     local_peer_id: String,
     pub(crate) endpoint_record: Arc<RwLock<protocol::EndpointRecord>>,
     grant_store: ProxyGrantStore,
+    metrics: podmesh_metrics::Metrics,
     pub(crate) relay_bootstrap: Option<WorkloadRelayBootstrap>,
 }
 
@@ -133,6 +135,7 @@ pub fn spawn_rest_server(options: RestServerOptions) -> Result<JoinHandle<()>> {
         grant_store,
         relay_bootstrap,
         rate_limit_per_minute,
+        metrics,
     } = options;
 
     let addr = parse_socket_addr(&host, port)?;
@@ -142,6 +145,7 @@ pub fn spawn_rest_server(options: RestServerOptions) -> Result<JoinHandle<()>> {
         local_peer_id,
         endpoint_record,
         grant_store,
+        metrics: metrics.clone(),
         relay_bootstrap,
     };
 
@@ -162,7 +166,15 @@ pub fn spawn_rest_server(options: RestServerOptions) -> Result<JoinHandle<()>> {
 
     // Liveness stays outside the limiter so an orchestrator polling health is
     // never throttled by unrelated client traffic.
-    let app = with_rate_limit(limited, rate_limit_per_minute).merge(
+    let rate_metrics = metrics;
+    let app = with_rate_limit_callback(
+        limited,
+        rate_limit_per_minute,
+        Some(Arc::new(move || {
+            rate_metrics.record_event(podmesh_metrics::EventName::RateLimitRefusal);
+        })),
+    )
+    .merge(
         Router::new()
             .route("/healthz", get(healthz))
             .with_state(health_state),
@@ -247,9 +259,16 @@ async fn post_proxy_grant(
     State(state): State<RestState>,
     Json(body): Json<PostProxyGrantBody>,
 ) -> impl IntoResponse {
+    let timer = state
+        .metrics
+        .operation_started(podmesh_metrics::OperationName::ProxyGrant);
     let encoded = match protocol::proxy_grant_from_b64(&body.grant_b64) {
         Ok(encoded) => encoded,
         Err(error) => {
+            timer.finish(
+                podmesh_metrics::Outcome::Refused,
+                podmesh_metrics::Reason::Invalid,
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ApiError {
@@ -267,23 +286,35 @@ async fn post_proxy_grant(
         .grant_store
         .accept(&body.owner_pubkey_b64, encoded, &state.local_peer_id, now)
     {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(CertAck {
-                ok: true,
-                owner_pubkey: body.owner_pubkey_b64,
-                message: "proxy grant accepted".to_string(),
-            }),
-        )
-            .into_response(),
-        Err(_error) => (
-            StatusCode::BAD_REQUEST,
-            // Only a generic reason is returned; the detail goes to the log,
-            // because this endpoint is reachable by anyone.
-            Json(ApiError {
-                error: "proxy grant rejected".into(),
-            }),
-        )
-            .into_response(),
+        Ok(()) => {
+            timer.finish(
+                podmesh_metrics::Outcome::Success,
+                podmesh_metrics::Reason::None,
+            );
+            (
+                StatusCode::OK,
+                Json(CertAck {
+                    ok: true,
+                    owner_pubkey: body.owner_pubkey_b64,
+                    message: "proxy grant accepted".to_string(),
+                }),
+            )
+                .into_response()
+        }
+        Err(_error) => {
+            timer.finish(
+                podmesh_metrics::Outcome::Refused,
+                podmesh_metrics::Reason::Authorization,
+            );
+            (
+                StatusCode::BAD_REQUEST,
+                // Only a generic reason is returned; the detail goes to the log,
+                // because this endpoint is reachable by anyone.
+                Json(ApiError {
+                    error: "proxy grant rejected".into(),
+                }),
+            )
+                .into_response()
+        }
     }
 }

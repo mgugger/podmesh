@@ -12,6 +12,7 @@ use protocol::{MAX_CAPACITY_MESSAGE_BYTES, PlacementError, PlacementRequest, Pla
 use tokio::sync::Semaphore;
 
 use super::{CapacityCriteria, CapacityService};
+use crate::now_secs;
 
 #[derive(Clone)]
 pub struct PlacementHandler {
@@ -108,13 +109,6 @@ impl ProtocolHandler for PlacementHandler {
             .await
             .map_err(|error| AcceptError::from_err(std::io::Error::other(error.to_string())))
     }
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[cfg(test)]
