@@ -8,4 +8,5 @@ RUN mkdir -p "$RUSTUP_HOME" "$CARGO_HOME" \
     && pacman -Scc --noconfirm \
     && rm -rf /var/cache/pacman/pkg/* \
     && rustup default stable \
+    && rustup component add rust-analyzer \
     && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"

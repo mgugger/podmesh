@@ -3,6 +3,16 @@
   "build": {
     "dockerfile": "Dockerfile"
   },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer"
+      ],
+      "settings": {
+        "rust-analyzer.server.path": "/usr/lib/rustup/bin/rust-analyzer"
+      }
+    }
+  },
   "runArgs": ["--privileged"],
   "postCreateCommand": "chmod +x .devcontainer/setup-podman-storage.sh && .devcontainer/setup-podman-storage.sh"
 }
