@@ -21,7 +21,7 @@ license = "GPL-3.0-only"
 iroh = { version = "=1.0.3", default-features = false, features = ["tls-ring"] }
 iroh-gossip = { version = "=0.101.0", default-features = false, features = ["net"] }
 iroh-relay = { version = "=1.0.3", default-features = false, features = ["server", "tls-ring"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1"
 biscuit-auth = { version = "=6.0.0", default-features = false, features = ["datalog-macro"] }
 tokio = { version = "1" }
