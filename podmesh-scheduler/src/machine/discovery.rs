@@ -137,8 +137,10 @@ pub async fn run_peer_discovery(
                                     "admitted scheduler {} ({url}) into the gossip mesh",
                                     endpoint_id.fmt_short()
                                 );
-                                discovered.push(endpoint_id);
                             }
+                            // Membership is authorization, not proof that the first dial worked.
+                            // Retry with refreshed addresses when bootstrap preceded relay readiness.
+                            discovered.push(endpoint_id);
                         }
                         // A peer that is down is the normal case during a
                         // rolling start, so this stays at debug level.

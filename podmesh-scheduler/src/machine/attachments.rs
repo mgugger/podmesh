@@ -45,7 +45,7 @@ pub struct AttachmentManager {
 #[derive(Clone)]
 struct RelayGrantIssuer {
     identity: super::SchedulerIdentity,
-    audience: String,
+    audiences: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -85,8 +85,34 @@ impl AttachmentManager {
         identity: super::SchedulerIdentity,
         audience: String,
     ) -> Self {
-        self.relay_issuer = Some(RelayGrantIssuer { identity, audience });
+        self.relay_issuer = Some(RelayGrantIssuer {
+            identity,
+            audiences: vec![audience],
+        });
         self
+    }
+
+    pub fn with_relay_grant_audiences(
+        mut self,
+        identity: super::SchedulerIdentity,
+        audiences: Vec<String>,
+    ) -> Result<Self> {
+        ensure!(
+            !audiences.is_empty()
+                && audiences.len() <= protocol::scheduler_mesh::MAX_ATTACHMENT_RELAY_GRANTS,
+            "attachment relay audience count is out of bounds"
+        );
+        let audiences = iroh::RelayMap::try_from_iter(audiences.iter().map(String::as_str))
+            .context("parse attachment relay audiences")?
+            .urls::<Vec<_>>()
+            .into_iter()
+            .map(|url| url.to_string())
+            .collect();
+        self.relay_issuer = Some(RelayGrantIssuer {
+            identity,
+            audiences,
+        });
+        Ok(self)
     }
 
     pub fn handler(&self) -> AgentAttachmentHandler {
@@ -259,19 +285,20 @@ impl AttachmentManager {
     ) -> Result<AgentAttachmentAck> {
         let relay_grants = self
             .relay_issuer
-            .as_ref()
-            .map(|issuer| {
-                issuer
-                    .identity
-                    .issue_relay_grant(
-                        endpoint_id,
-                        MachineRole::Agent,
-                        issuer.audience.clone(),
-                        now_secs,
-                    )?
-                    .to_auth_token(now_secs)
+            .iter()
+            .flat_map(|issuer| {
+                issuer.audiences.iter().map(move |audience| {
+                    issuer
+                        .identity
+                        .issue_relay_grant(
+                            endpoint_id,
+                            MachineRole::Agent,
+                            audience.clone(),
+                            now_secs,
+                        )?
+                        .to_auth_token(now_secs)
+                })
             })
-            .into_iter()
             .collect::<Result<Vec<_>>>()?;
         Ok(AgentAttachmentAck {
             version: SCHEDULER_MESH_PROTOCOL_VERSION,
@@ -361,6 +388,54 @@ impl AgentAttachmentHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_grants_cover_canonical_configured_audiences() -> Result<()> {
+        let identity = super::super::SchedulerIdentity::ephemeral()?;
+        let subject = iroh::SecretKey::generate().public();
+        let manager = AttachmentManager::new(8, 8, Duration::from_secs(2))
+            .with_relay_grant_audiences(
+                identity.clone(),
+                vec![
+                    "https://relay-one.example.test".into(),
+                    "https://relay-two.example.test/".into(),
+                ],
+            )?;
+        let now = now_secs();
+        let ack = manager.acknowledgement(subject, now)?;
+        assert_eq!(ack.relay_grants.len(), 2);
+        let mut audiences = std::collections::HashSet::new();
+        for token in ack.relay_grants {
+            let grant = protocol::MachineRelayGrant::from_auth_token(&token, now)?;
+            grant.verify(
+                &[identity.signing_public().to_vec()],
+                subject.as_bytes(),
+                &grant.relay_audience,
+                now,
+            )?;
+            assert_eq!(grant.role, MachineRole::Agent);
+            assert!(ack.refresh_after_secs < grant.expires_at_secs);
+            audiences.insert(grant.relay_audience);
+        }
+        assert_eq!(
+            audiences,
+            std::collections::HashSet::from([
+                "https://relay-one.example.test/".into(),
+                "https://relay-two.example.test/".into(),
+            ])
+        );
+        assert!(
+            AttachmentManager::new(8, 8, Duration::from_secs(2))
+                .with_relay_grant_audiences(identity.clone(), vec![])
+                .is_err()
+        );
+        assert!(
+            AttachmentManager::new(8, 8, Duration::from_secs(2))
+                .with_relay_grant_audiences(identity, vec!["not a relay URL".into()])
+                .is_err()
+        );
+        Ok(())
+    }
 
     fn agent(seed: u16) -> EndpointId {
         let mut bytes = [0u8; 32];

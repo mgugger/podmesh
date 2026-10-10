@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kvm-app
+spec:
+  selector:
+    matchLabels:
+      run: kvm-app
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        run: kvm-app
+    spec:
+      containers:
+        - name: app
+          image: localhost/podmesh-kvm/app:spike
+          imagePullPolicy: Never
+          resources:
+            limits:
+              memory: "64Mi"
+              cpu: "100m"
+              ephemeral-storage: "256Mi"
+          ports:
+            - containerPort: 8081
+          securityContext:
+            runAsUser: 1000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kvm-app
+spec:
+  selector:
+    run: kvm-app
+  ports:
+    - name: http
+      port: 8081
+      targetPort: 8081
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kvm-app
+spec:
+  rules:
+    - host: kvm-app.mesh.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kvm-app
+                port:
+                  number: 8081

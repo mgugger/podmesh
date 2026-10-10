@@ -26,7 +26,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 
 # Egress proxy dependencies
-rustables = "0.8"
+rustables = "0.8.8"
 libc = "0.2"
 socket2 = "0.5"
 ipnetwork = "0.21"
@@ -37,4 +37,3 @@ sha2 = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-

@@ -158,7 +158,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         machine_config.max_agent_fanout,
         machine_config.query_timeout,
     )
-    .with_relay_grant_issuer(identity.clone(), local_relay_audience)
+    .with_relay_grant_audiences(identity.clone(), machine_config.relay_urls.clone())?
     .with_metrics(metrics.clone());
     let queries = machine::QueryManager::new(
         machine_config.max_pending_queries,

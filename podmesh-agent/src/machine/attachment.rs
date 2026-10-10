@@ -23,6 +23,7 @@ pub async fn run_scheduler_attachment(
     cancellation: CancellationToken,
 ) -> Result<()> {
     let mut backoff = config.reconnect_initial;
+    let mut has_relay_grants = false;
     loop {
         if cancellation.is_cancelled() {
             return Ok(());
@@ -37,6 +38,7 @@ pub async fn run_scheduler_attachment(
             &service,
             &seen,
             &cancellation,
+            &mut has_relay_grants,
         )
         .await
         {
@@ -88,11 +90,26 @@ async fn run_session(
     service: &AgentService,
     seen: &Arc<Mutex<SeenQueries>>,
     cancellation: &CancellationToken,
+    has_relay_grants: &mut bool,
 ) -> Result<()> {
     let expected_scheduler = super::record_endpoint_id(scheduler)?;
+    let mut scheduler_addr = endpoint_addr(scheduler)?;
+    if !*has_relay_grants {
+        // Relay actors capture credentials when created; bootstrap must not create one
+        // before the scheduler has issued its authenticated grants.
+        let mut direct = iroh::EndpointAddr::new(expected_scheduler);
+        for address in scheduler_addr.ip_addrs() {
+            direct = direct.with_ip_addr(*address);
+        }
+        scheduler_addr = direct;
+        ensure!(
+            scheduler_addr.ip_addrs().next().is_some(),
+            "initial scheduler attachment requires a direct address to obtain relay grants"
+        );
+    }
     let connection = tokio::time::timeout(
         config.operation_timeout,
-        endpoint.connect(endpoint_addr(scheduler)?, AGENT_CAPACITY_ALPN),
+        endpoint.connect(scheduler_addr, AGENT_CAPACITY_ALPN),
     )
     .await
     .context("scheduler attachment connect timed out")?
@@ -121,9 +138,11 @@ async fn run_session(
     .context("read attachment acknowledgement")?;
     let ack = AgentAttachmentAck::from_bytes(&ack_bytes, now_secs())?;
     install_relay_grants(endpoint, config, &ack).await?;
+    *has_relay_grants = true;
     log::info!(
-        "agent attached to scheduler {}",
-        expected_scheduler.fmt_short()
+        "agent attached to scheduler {} (relay address advertised: {})",
+        expected_scheduler.fmt_short(),
+        hello.agent_endpoint.relay_url.is_some()
     );
     service
         .metrics()
@@ -135,6 +154,10 @@ async fn run_session(
     tokio::pin!(refresh);
     loop {
         tokio::select! {
+            _ = endpoint.online(), if hello.agent_endpoint.relay_url.is_none() => {
+                connection.close(0u8.into(), b"publish authenticated relay address");
+                return Ok(());
+            }
             _ = cancellation.cancelled() => {
                 connection.close(0u8.into(), b"agent shutdown");
                 return Ok(());

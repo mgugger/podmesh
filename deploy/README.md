@@ -42,6 +42,99 @@ Every command and every output below was run against this repository.
 
 ---
 
+## Opt-in KVM mesh
+
+The feature-gated libkrun harness supports the original **two-VM feasibility slice** and an
+**eight-VM direct-connectivity mesh**: three schedulers, three independent Podman agents configured
+with 0/2/1 attachments, and two proxies. The mesh verifies three distinct-agent replicas, both
+proxy ingress paths, single-proxy transparent egress phases, status/logs/update/rediscovery,
+scheduler-1 replacement with identity preserved, existing ingress while control processes are
+stopped, deletion, and owned-resource cleanup. The separate forced-relay pass is experimental and
+has not passed complete scheduler reconciliation; it is not a verified relay guarantee.
+
+The host must be Linux x86_64 with usable `/dev/kvm`, libkrun 1.19.6 and libkrunfw 5.6.2, Rust
+and the `x86_64-unknown-linux-musl` target, `musl-gcc`, `strip`, `curl`, `chroot`, `mkfs.ext4`,
+`ip`, `timeout`, and an SSH client. Image construction and VM network setup need root privileges
+and permission to create the run-owned network namespace, veth, bridge, and TAP devices. The image
+builder downloads a checksum-pinned Alpine 3.23.6 minirootfs; guest package repository versions
+are recorded in `target/kvm/packages.txt`.
+
+Build the guest disk as root and build the guest binaries, including the tiny HTTP fixture:
+
+```bash
+sudo sh tests/kvm/build-image.sh
+sh tests/kvm/build-binaries.sh
+cargo build --locked -p podmesh-integration-tests --features kvm-tests --bin kvm-spike
+```
+
+The supervisor needs root for KVM access and run-owned network setup. Boot both guests and run
+the focused capability probe:
+
+```bash
+sudo target/debug/kvm-spike probe target/kvm/agent.raw
+```
+
+Run the actual scheduler/proxy/agent workload scenario:
+
+```bash
+sudo target/debug/kvm-spike run target/kvm/agent.raw target/kvm/bin
+```
+
+Run the eight-VM distributed mesh:
+
+```bash
+sudo target/debug/kvm-spike mesh target/kvm/agent.raw target/kvm/bin
+```
+
+Like the Podman tests, Cargo KVM tests are disabled by default and enabled explicitly. Enabled
+tests fail on missing prerequisites or artifacts; they are not ignored or silently skipped.
+The direct and experimental forced-relay tests run serially. To run just the verified direct test:
+
+```bash
+cargo test --locked -j 2 -p podmesh-integration-tests --features kvm-tests \
+  --test kvm_mesh eight_vm_direct_mesh -- --nocapture
+```
+
+Run with the required network/KVM privileges. Build before starting VMs; `-j 2` limits this
+command's build concurrency, not unrelated editor builds.
+
+Every mesh run prints per-phase timings, including boot, artifact injection, deployment, update,
+delete, and teardown. For command-level timings without printing command arguments or credentials,
+set `RUST_LOG=podmesh_integration_tests::kvm=debug`.
+The experimental `mesh ... --forced-relay` option additionally requires host `nft` and installs
+only a run-owned bridge filter. Its current reconciliation failure is recorded in the OpenSpec
+verification note; direct success must not be interpreted as relay proof.
+
+The harness owns a private namespace and temporary per-run directory; normal exit and handled
+failures stop the workers and remove the network. Shutdown requests run concurrently after guest
+sync; lost SSH poweroff acknowledgements have a two-second bound rather than eight serial
+30-second waits. Workers have a shared ten-second exit deadline, then any remaining owned worker
+is explicitly terminated and reaped with a warning. SIGKILL/host failure still requires manual
+cleanup; no stale-resource cleanup or retained-run interactive UI is implemented yet.
+Each guest disk has 4 GiB apparent capacity.
+On this host the sparse base occupied about 178.5 MB (170.2 MiB); both private disks together
+allocated 224,784,384 bytes after boot. The full workload slice completed in 124.2 seconds. Each
+VM now uses one vCPU. Scheduler/proxy guests use 256 MiB RAM and agent guests use 512 MiB:
+**2816 MiB (2.75 GiB) total guest RAM**, down from 8 GiB. The mixed-role control guest in the
+two-VM slice uses 512 MiB. Startup checks Linux MemAvailable and visible cgroup-v2 ancestor
+headroom for the guest budget plus a 1024 MiB host reserve before creating run resources.
+This point-in-time check does not reserve memory, include all VMM overhead, or prevent
+Codespaces platform shutdowns or races with unrelated builds.
+Teardown prints each worker's high-water RSS, including VMM overhead; these individual peaks
+are not a simultaneous total or guest working-set minimum. The lean two-VM workload slice
+passed in 82.9s and the lean eight-VM direct Cargo test passed in 91.7s. Observed mesh worker
+peaks were 218-299 MiB for schedulers, 216-217 MiB for proxies and 532-534 MiB for agents.
+The earlier eight-VM direct run completed in **87.9 seconds** after measured
+shutdown and fixture fixes (previously 436.8 seconds). VM boot took 3.4 seconds and teardown
+12.7 seconds in that warm-cache run; host/cache conditions affect these measurements.
+The HTTP fixture handles SIGTERM as container PID 1 instead of making Podman wait its stop timeout
+for every update/delete. Production shutdown and workload timeout settings are unchanged.
+All guests currently share one agent-capable base image. Replacing a
+binary does not rebuild that image. The existing container walkthrough and default test suite
+remain separate and unchanged.
+
+---
+
 ## Step 1 — Prerequisites
 
 You need Podman with its API socket running, a network for the mesh, the four container images, and

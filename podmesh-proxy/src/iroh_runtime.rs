@@ -615,10 +615,17 @@ async fn run(state: Arc<RuntimeState>) {
     }
     let mut prune = tokio::time::interval(ROUTE_PRUNE_INTERVAL);
     let mut endpoint_refresh = tokio::time::interval(ENDPOINT_RECORD_REFRESH_INTERVAL);
+    let mut relay_address_refreshed = false;
     endpoint_refresh.tick().await;
     loop {
         tokio::select! {
             _ = state.cancellation.cancelled() => break,
+            _ = state.endpoint.online(), if !relay_address_refreshed => {
+                relay_address_refreshed = true;
+                if let Err(error) = refresh_endpoint_record(&state).await {
+                    warn!("failed to publish ready proxy relay address: {error}");
+                }
+            }
             _ = prune.tick() => state.routes.prune(now_millis(), SIDECAR_REGISTRATION_TTL),
             _ = endpoint_refresh.tick() => {
                 if let Err(error) = refresh_endpoint_record(&state).await {

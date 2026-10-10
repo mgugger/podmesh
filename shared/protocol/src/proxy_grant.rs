@@ -167,6 +167,12 @@ pub fn verify_proxy_grant(
             &[string(expected_proxy_endpoint)],
         ))?
         .fact(fact("request_time", &[int_term(to_i64(now_secs)?)]))?
+        .fact(fact(
+            "latest_issue_time",
+            &[int_term(to_i64(
+                now_secs.saturating_add(MAX_PROXY_GRANT_CLOCK_SKEW_SECS),
+            )?)],
+        ))?
         .code(PROXY_GRANT_POLICY)?
         .build(&token)?;
     authorizer
@@ -195,8 +201,8 @@ allow if tenant_owner($tenant), request_tenant_owner($tenant),
   subject_peer($proxy), request_subject_peer($proxy),
   role("proxy"),
   operation("proxy_service"),
-  issued_at($issued), expires_at($expires), request_time($now),
-  $issued <= $now, $now <= $expires,
+  issued_at($issued), expires_at($expires), request_time($now), latest_issue_time($latest),
+  $issued <= $latest, $now <= $expires,
   token_id($token_id);
 deny if true;
 "#;

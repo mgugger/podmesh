@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use iroh::{
-    Endpoint, SecretKey,
+    Endpoint, RelayMap, RelayMode, SecretKey,
     endpoint::{QuicTransportConfig, VarInt, presets},
     tls::CaTlsConfig,
 };
@@ -34,7 +34,8 @@ impl AgentIdentity {
             .build();
         let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(self.secret.clone())
-            .clear_relay_transports()
+            // Keep the transport available for authenticated grants installed after attachment.
+            .relay_mode(RelayMode::Custom(RelayMap::empty()))
             .transport_config(transport)
             .bind_addr(config.bind_addr)?;
         if !config.relay_ca_certificates.is_empty() {

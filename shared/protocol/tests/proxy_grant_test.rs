@@ -76,6 +76,32 @@ fn an_expired_grant_is_rejected() {
 }
 
 #[test]
+fn future_issue_times_obey_the_documented_skew_bound() {
+    let (public, private) = owner();
+    let owner_b64 = crypto::b64_encode(&public);
+    let bound = protocol::proxy_grant::MAX_PROXY_GRANT_CLOCK_SKEW_SECS;
+    for offset in [1, bound, bound + 1] {
+        let mut claims = claims(&public, PROXY, 3600);
+        claims.issued_at_secs = NOW + offset;
+        let grant = mint_proxy_grant(&private, &public, &claims, NOW + offset).unwrap();
+        assert_eq!(
+            verify_proxy_grant(&grant, &public, &owner_b64, PROXY, NOW).is_ok(),
+            offset <= bound,
+            "issue-time offset {offset}"
+        );
+    }
+}
+
+#[test]
+fn issue_time_skew_does_not_extend_expiry() {
+    let (public, private) = owner();
+    let grant = mint_proxy_grant(&private, &public, &claims(&public, PROXY, 60), NOW).unwrap();
+    let owner_b64 = crypto::b64_encode(&public);
+    verify_proxy_grant(&grant, &public, &owner_b64, PROXY, NOW + 60).unwrap();
+    assert!(verify_proxy_grant(&grant, &public, &owner_b64, PROXY, NOW + 61).is_err());
+}
+
+#[test]
 fn an_owner_cannot_mint_an_unbounded_grant() {
     let (public, private) = owner();
     let forever = claims(&public, PROXY, protocol::MAX_PROXY_GRANT_LIFETIME_SECS + 1);
