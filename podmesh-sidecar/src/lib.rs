@@ -11,12 +11,18 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
+mod authorization;
+pub mod connector_control;
+pub mod dns;
 pub mod egress_nft;
 pub mod egress_proxy;
 pub mod http_connect_proxy;
 mod identity;
 mod iroh_runtime;
 pub mod manifest_routes;
+pub mod peer_connector;
+pub mod service_cache;
+mod workload_network;
 
 pub use http_connect_proxy::HTTP_CONNECT_PROXY_PORT;
 pub use identity::IdentitySource;
@@ -29,6 +35,9 @@ const MAX_RELAY_AUTH_TOKEN_BYTES: usize = 4 * 1024;
 #[derive(Clone, Debug)]
 pub struct SidecarConfig {
     pub identity: IdentitySource,
+    /// Private in-workload control socket; no machine-plane membership.
+    pub connector_socket: Option<std::path::PathBuf>,
+    pub service_catalog: Option<protocol::service_discovery::ServiceCatalog>,
     pub proxy_endpoints: Vec<EndpointRecord>,
     pub workload_replay_limits: protocol::ReplayLimits,
     pub workload_relay_auth_token: Option<String>,
@@ -47,7 +56,8 @@ pub struct SidecarConfig {
     pub app_port: u16,
     pub routes: Vec<SidecarRouteSpec>,
     pub owner_public_key_b64: Option<String>,
-    /// Owner-signed proof of tenancy, presented during the proxy handshake.
+    /// Scoped enrollment delegation or a pre-enrolled endpoint identity.
+    /// Only the verified endpoint-bound child is presented during handshakes.
     pub workload_credential_b64: Option<String>,
     pub enable_egress: bool,
     pub skip_egress_nft: bool,
@@ -57,6 +67,9 @@ pub struct SidecarConfig {
 impl SidecarConfig {
     pub fn validate(&self) -> Result<()> {
         self.workload_replay_limits.validate()?;
+        if let Some(path) = &self.connector_socket {
+            connector_control::validate_socket_path(path)?;
+        }
         ensure!(
             !self.proxy_endpoints.is_empty() && self.proxy_endpoints.len() <= MAX_PROXY_ENDPOINTS,
             "sidecar proxy endpoint count is invalid"
@@ -236,6 +249,8 @@ mod tests {
         let owner = [3u8; crypto::ED25519_PUBLIC_KEY_SIZE];
         let config = SidecarConfig {
             identity: IdentitySource::ephemeral(),
+            connector_socket: None,
+            service_catalog: None,
             proxy_endpoints: vec![endpoint],
             workload_replay_limits: protocol::ReplayLimits::default(),
             workload_relay_auth_token: None,
@@ -284,6 +299,8 @@ mod tests {
         .unwrap();
         let config = SidecarConfig {
             identity: IdentitySource::ephemeral(),
+            connector_socket: None,
+            service_catalog: None,
             proxy_endpoints: vec![endpoint],
             workload_replay_limits: protocol::ReplayLimits::default(),
             workload_relay_auth_token: None,

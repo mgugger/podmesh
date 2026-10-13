@@ -14,6 +14,7 @@ use std::{
 mod bootstrap;
 pub mod catalog;
 pub mod cert;
+mod peer_bootstrap;
 pub mod trust;
 
 use catalog::{DeploymentCatalog, ReplicaPlacement, ReplicaUpdateState};
@@ -467,6 +468,7 @@ async fn apply_file_internal(
                 replica.revision_id == revision_id && !service_mesh_renewal_due(replica, now_secs())
             })
     }) {
+        peer_bootstrap::bootstrap(&key_dir, &deployment_id, options).await?;
         return Ok(deployment_id);
     }
     let annotations = protocol::PodmeshAnnotations::from_manifest_yaml(
@@ -566,6 +568,15 @@ async fn apply_file_internal(
                 Ok(updated) => {
                     catalog.replicas[placement_index] = updated;
                     catalog::save(&key_dir, &catalog)?;
+                    // Deployment responses no longer wait for issuer enrollment.
+                    // Do not destroy the next replica while this replacement is
+                    // still pending its bound credential and discovery startup.
+                    peer_bootstrap::wait_ready(
+                        &key_dir,
+                        &catalog.replicas[placement_index],
+                        options.api_base(),
+                    )
+                    .await?;
                 }
                 Err(error) => failures.push(format!(
                     "replica {} on {}: {error:#}",
@@ -691,6 +702,7 @@ async fn apply_file_internal(
         catalog::save(&key_dir, &catalog)?;
     }
 
+    peer_bootstrap::bootstrap(&key_dir, &deployment_id, options).await?;
     Ok(deployment_id)
 }
 
@@ -729,30 +741,56 @@ impl ReplicaRequest<'_> {
     fn prepare_execution(
         &self,
         owner: OwnerSigningKeys<'_>,
+        agent_signing_pubkey: &str,
         agent_kem_pubkey: &str,
         now: u64,
     ) -> Result<PreparedExecution> {
         let credential_expires_at_secs = now + WORKLOAD_CREDENTIAL_TTL_SECS;
-        let credential = protocol::mint_workload_credential(
+        let delegation = protocol::workload_identity::EnrollmentDelegation::mint(
             owner.private,
-            owner.public,
-            &protocol::WorkloadCredentialClaims {
+            protocol::workload_identity::EnrollmentScope {
                 tenant_owner: self.namespace_id.to_string(),
                 manifest_id: protocol::route_id(owner.public, self.workload_name),
-                issued_at_secs: now,
-                expires_at_secs: credential_expires_at_secs,
+                workload_id: protocol::workload_id(
+                    owner.public,
+                    self.workload_name,
+                    self.replica_index,
+                ),
+                revision_id: self.revision_id.to_string(),
+                issuer_public_key_b64: agent_signing_pubkey.to_string(),
                 token_id: uuid::Uuid::new_v4().to_string(),
+                issued_at_secs: now,
+                expires_at_secs: None,
+                max_child_lifetime_secs: protocol::workload_identity::MAX_IDENTITY_LIFETIME_SECS,
             },
             now,
         )
-        .context("mint workload credential")?;
+        .context("mint scoped workload enrollment delegation")?;
+        let services = protocol::service_discovery::workload_services(self.manifest)?;
+        let service_catalog = if services.is_empty() {
+            None
+        } else {
+            Some(
+                protocol::service_discovery::ServiceCatalog {
+                    version: protocol::service_discovery::SERVICE_RECORD_VERSION,
+                    owner: self.namespace_id.to_string(),
+                    workload_name: self.workload_name.to_string(),
+                    manifest_id: protocol::route_id(owner.public, self.workload_name),
+                    revision_id: self.revision_id.to_string(),
+                    services,
+                    signature: String::new(),
+                }
+                .sign(owner.private)?,
+            )
+        };
         let execution = ExecutionSpec {
             workload_name: self.workload_name.to_string(),
             replica_index: self.replica_index,
             replica_count: self.replica_count,
             manifest: self.manifest.to_vec(),
             proxy_endpoints: self.proxy_endpoints.to_vec(),
-            workload_credential_b64: protocol::workload_credential_to_b64(&credential),
+            service_catalog,
+            workload_credential_b64: delegation.to_b64()?,
             workload_relay_auth_token: self.workload_relay_auth_token.to_string(),
             workload_relay_ca_certificates: self.workload_relay_ca_certificates.to_vec(),
         };
@@ -793,8 +831,12 @@ async fn update_replica(
         "catalog workload identity does not match requested update"
     );
 
-    let prepared =
-        request.prepare_execution(owner_keys, &placement.agent_kem_pubkey, now_secs())?;
+    let prepared = request.prepare_execution(
+        owner_keys,
+        &placement.agent_signing_pubkey,
+        &placement.agent_kem_pubkey,
+        now_secs(),
+    )?;
     let issued_at_secs = now_secs();
     let request_id = uuid::Uuid::new_v4().to_string();
     let grant = DeploymentGrant {
@@ -941,7 +983,12 @@ async fn deploy_replica(
         "reservation response binding mismatch"
     );
 
-    let prepared = request.prepare_execution(owner_keys, &agent.kem_pubkey, now_secs())?;
+    let prepared = request.prepare_execution(
+        owner_keys,
+        &agent.signing_pubkey,
+        &agent.kem_pubkey,
+        now_secs(),
+    )?;
     let issued_at_secs = now_secs();
     let grant = DeploymentGrant {
         version: AGENT_PROTOCOL_VERSION,
@@ -1007,7 +1054,7 @@ async fn command(
         namespace_id: crypto::b64_encode(&owner_public),
         workload_id: workload_id.clone(),
         target_node_id: placement.agent_signing_pubkey.clone(),
-        operation,
+        operation: operation.clone(),
         log_tail: tail.map(|value| value.min(10_000) as u32),
         response_kem_pubkey: crypto::b64_encode(&response_kem_public),
         issued_at_secs,
@@ -1031,6 +1078,28 @@ async fn command(
             && response.agent_node_id == placement.agent_signing_pubkey,
         "workload response binding mismatch"
     );
+    if operation == WorkloadOperation::ConnectorInspect && response.ok {
+        let connector = protocol::workload_connector::ConnectorResponse::from_bytes(
+            response.payload.as_bytes(),
+        )?;
+        let identity = connector
+            .identity
+            .as_ref()
+            .context("connector identity report missing")?;
+        identity.verify(
+            &command.namespace_id,
+            workload_id,
+            &protocol::workload_connector::inspection_challenge(&command.nonce),
+            now_secs(),
+        )?;
+        if let Some(credential) = &identity.credential {
+            anyhow::ensure!(
+                credential.delegation.scope.issuer_public_key_b64 == placement.agent_signing_pubkey
+                    && credential.delegation.scope.revision_id == placement.revision_id,
+                "connector enrollment does not match selected issuer/revision"
+            );
+        }
+    }
     Ok(response)
 }
 
@@ -1055,7 +1124,7 @@ async fn command_all(
     let catalog = catalog::load(key_dir, identifier)?;
     let mut outcomes = Vec::with_capacity(catalog.replicas.len());
     for placement in &catalog.replicas {
-        let result = command(key_dir, placement, operation, tail, api_base).await;
+        let result = command(key_dir, placement, operation.clone(), tail, api_base).await;
         outcomes.push(ReplicaOutcome {
             replica_index: placement.replica_index,
             agent_endpoint_id: placement.agent_endpoint_id.clone(),
@@ -1186,6 +1255,38 @@ pub async fn get_pod(identifier: &str, options: &ClientOptions) -> Result<String
     )
     .await?;
     render_replica_payloads(&outcomes, "status")
+}
+
+/// Inspect the connectors inside all replicas through encrypted owner-agent
+/// control. These reports prove key possession, NOT owner-authorized endpoint
+/// membership; callers must not use them as discovery seeds without enrollment.
+pub async fn get_connector_identities(
+    identifier: &str,
+    options: &ClientOptions,
+) -> Result<Vec<protocol::workload_connector::ConnectorIdentityReport>> {
+    let key_dir = key_dir()?;
+    let (_, outcomes) = command_all(
+        &key_dir,
+        identifier,
+        WorkloadOperation::ConnectorInspect,
+        None,
+        options.api_base(),
+    )
+    .await?;
+    // Attempt every replica and preserve contextual partial-failure diagnostics.
+    render_replica_payloads(&outcomes, "connector inspection")?;
+    outcomes
+        .into_iter()
+        .map(|outcome| {
+            let response = outcome.result?;
+            let connector = protocol::workload_connector::ConnectorResponse::from_bytes(
+                response.payload.as_bytes(),
+            )?;
+            connector
+                .identity
+                .context("connector identity report missing")
+        })
+        .collect()
 }
 
 pub async fn get_logs(
@@ -1568,6 +1669,7 @@ mod tests {
             };
             let prepared = request.prepare_execution(
                 OwnerSigningKeys { public: &owner_public, private: &owner_private },
+                &crypto::b64_encode(&owner_public),
                 &crypto::b64_encode(&agent_public),
                 issued_at,
             ).unwrap();
@@ -1584,12 +1686,14 @@ mod tests {
             prop_assert_eq!(execution.proxy_endpoints.len(), 0);
             prop_assert_eq!(execution.workload_relay_auth_token, "test-relay-token");
             prop_assert_eq!(execution.workload_relay_ca_certificates, certificates);
-            let credential = protocol::workload_credential_from_b64(&execution.workload_credential_b64).unwrap();
+            let delegation = protocol::workload_identity::EnrollmentDelegation::from_b64(&execution.workload_credential_b64).unwrap();
             let route = protocol::route_id(&owner_public, &name);
-            prop_assert!(protocol::verify_workload_credential(&credential, &namespace, &route, issued_at).is_ok());
+            let workload = protocol::workload_id(&owner_public, &name, replica_index);
+            prop_assert!(delegation.verify_scope(&namespace, &route, &workload, Some(&namespace), Some(issued_at)).is_ok());
             prop_assert_eq!(prepared.credential_expires_at_secs, issued_at + WORKLOAD_CREDENTIAL_TTL_SECS);
-            prop_assert!(protocol::verify_workload_credential(&credential, &namespace, &route, prepared.credential_expires_at_secs + 60).is_err());
-            prop_assert!(protocol::verify_workload_credential(&credential, &namespace, "different-workload", issued_at).is_err());
+            prop_assert!(delegation.verify(Some(prepared.credential_expires_at_secs + 60)).is_ok());
+            prop_assert!(delegation.scope.expires_at_secs.is_none());
+            prop_assert!(delegation.verify_scope(&namespace, "different-workload", &workload, None, Some(issued_at)).is_err());
             let mut tampered = capsule.ciphertext;
             tampered[0] ^= 1;
             prop_assert!(crypto::decrypt_payload_with_key(&dek, &capsule.nonce, &tampered).is_err());

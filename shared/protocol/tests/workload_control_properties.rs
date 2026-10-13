@@ -174,13 +174,20 @@ proptest! {
 #[test]
 fn tp03_registry_is_total_unique_and_paired() {
     let names = WorkloadPayloadType::ALL.map(WorkloadPayloadType::wire_name);
-    assert_eq!(names.into_iter().collect::<HashSet<_>>().len(), 12);
+    assert_eq!(
+        names.into_iter().collect::<HashSet<_>>().len(),
+        WorkloadPayloadType::ALL.len()
+    );
+    assert_eq!(
+        WorkloadPayloadType::PeerRequest.response(),
+        Some(WorkloadPayloadType::PeerResponse)
+    );
     assert_eq!(
         WorkloadPayloadType::ALL
             .into_iter()
             .filter(|item| item.response().is_some())
             .count(),
-        6
+        WorkloadPayloadType::ALL.len() / 2
     );
 }
 

@@ -27,10 +27,11 @@ pub struct SidecarMetadata {
     pub owner_public_key_b64: String,
     /// Initial tenant proxy identities and dialable addresses.
     pub proxy_endpoints: Vec<EndpointRecord>,
-    /// Owner-signed proof that this pod serves `manifest_id` for this owner.
-    ///
-    /// Without it the sidecar can only claim a tenant, which any caller can do,
-    /// so a proxy would have no way to tell it from an impostor.
+    #[serde(default)]
+    pub service_catalog: Option<crate::service_discovery::ServiceCatalog>,
+    /// Owner-signed, replica/revision-scoped enrollment delegation naming the
+    /// selected agent issuer. This is not itself workload-session authority;
+    /// the connector must receive a child bound to its generated endpoint keys.
     pub workload_credential_b64: String,
     /// Workload relay credential delivered only inside the encrypted execution specification.
     pub workload_relay_auth_token: String,
@@ -78,11 +79,33 @@ impl SidecarMetadata {
         // reconcile after a restart, long after the credential was minted, and
         // refusing then would delete a healthy long-running workload. Expiry is
         // enforced by the proxy, which is where the authorisation happens.
-        crate::verify_workload_credential_structure(
-            &crate::workload_credential_from_b64(&self.workload_credential_b64)?,
+        let delegation = crate::workload_identity::EnrollmentDelegation::from_b64(
+            &self.workload_credential_b64,
+        )?;
+        delegation.verify_scope(
             &self.owner_public_key_b64,
             &self.manifest_id,
+            &crate::workload_id(&owner, &self.workload_name, self.replica_index),
+            None,
+            None,
         )?;
+        anyhow::ensure!(
+            delegation.scope.revision_id
+                == crate::revision_id(&crypto::b64_decode(&self.manifest_b64)?),
+            "sidecar enrollment revision mismatch"
+        );
+        if let Some(catalog) = &self.service_catalog {
+            catalog.verify(&self.owner_public_key_b64)?;
+            anyhow::ensure!(
+                catalog.manifest_id == self.manifest_id
+                    && catalog.revision_id == delegation.scope.revision_id
+                    && catalog.services
+                        == crate::service_discovery::workload_services(&crypto::b64_decode(
+                            &self.manifest_b64
+                        )?)?,
+                "sidecar service catalog mismatch"
+            );
+        }
         anyhow::ensure!(
             self.workload_relay_auth_token.len() >= 32
                 && self.workload_relay_auth_token.len() <= 4 * 1024,

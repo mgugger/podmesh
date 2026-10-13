@@ -1,4 +1,11 @@
-//! Owner-signed proof that a sidecar speaks for a tenant.
+//! Legacy bearer-credential codec retained for historical/negative tests.
+//!
+//! THIS IS NOT WORKLOAD-SESSION AUTHORIZATION. Live sessions use
+//! `workload_identity::WorkloadIdentity::verify_session`, which requires both
+//! transport and application key binding. Proxies and sidecars do not accept
+//! this format as a fallback.
+//!
+//! Historical implementation (superseded by scoped endpoint enrollment):
 //!
 //! A proxy must decide whether the endpoint talking to it really belongs to the
 //! tenant it names. Nothing about the connection settles that on its own: a

@@ -76,12 +76,18 @@ pub async fn handle_stream(
         match kind {
             WorkloadStreamKind::Handshake => {
                 let accepted = accept_typed_request::<protocol::machine::WorkloadHandshakeRequest>(
-                    &state, remote, &payload,
+                    &state, remote, stable_id, &payload,
                 )?;
                 // The owner key in a handshake is a claim anybody can make. The
                 // credential is what settles it: it verifies only against the
                 // owner's own key, so recording the tenant here is safe.
-                prove_tenant(&state, remote, stable_id, &accepted.payload)?;
+                prove_tenant(
+                    &state,
+                    remote,
+                    stable_id,
+                    &accepted.payload,
+                    &accepted.sender_signing_key,
+                )?;
                 let grant = state.grant_store.live_grant(
                     &accepted.payload.tenant_owner_pubkey,
                     &state.endpoint.id().to_string(),
@@ -93,8 +99,9 @@ pub async fn handle_stream(
                 write_typed_response(&state, remote, &mut send, &response).await
             }
             WorkloadStreamKind::Registration => {
-                let accepted =
-                    accept_typed_request::<SidecarRegistration>(&state, remote, &payload)?;
+                let accepted = accept_typed_request::<SidecarRegistration>(
+                    &state, remote, stable_id, &payload,
+                )?;
                 let registration = accepted.payload;
                 let (accepted, message) =
                     match install_registration(&state, &registration, remote, stable_id) {
@@ -127,8 +134,9 @@ pub async fn handle_stream(
             WorkloadStreamKind::ProxyDiscovery => {
                 // The request names an owner, but only what this connection proved
                 // decides whose proxies it may enumerate.
-                let accepted =
-                    accept_typed_request::<ProxyDiscoveryRequest>(&state, remote, &payload)?;
+                let accepted = accept_typed_request::<ProxyDiscoveryRequest>(
+                    &state, remote, stable_id, &payload,
+                )?;
                 let request = accepted.payload;
                 let proven = live_tenant(&state, remote, stable_id).ok();
                 let authorized = proven.as_ref().is_some_and(|tenant| {
@@ -167,7 +175,7 @@ pub async fn handle_stream(
             }
             WorkloadStreamKind::Egress => {
                 let accepted = accept_typed_request::<protocol::egress::EgressTunnelRequest>(
-                    &state, remote, &payload,
+                    &state, remote, stable_id, &payload,
                 )?;
                 super::egress::handle_egress(
                     state.clone(),
@@ -182,7 +190,7 @@ pub async fn handle_stream(
             WorkloadStreamKind::Ingress => Err(anyhow!("proxy does not accept ingress operations")),
             WorkloadStreamKind::ProxyAnnouncement => {
                 let accepted = accept_typed_request::<protocol::ProxyAnnouncementRequest>(
-                    &state, remote, &payload,
+                    &state, remote, stable_id, &payload,
                 )?;
                 let record = accepted.payload.endpoint;
                 ensure!(
@@ -224,16 +232,30 @@ pub async fn handle_stream(
 fn accept_typed_request<T: WorkloadPayload>(
     state: &RuntimeState,
     remote: EndpointId,
+    stable_id: usize,
     payload: &[u8],
 ) -> Result<protocol::AcceptedWorkloadPayload<T>> {
-    accept_workload_payload(
+    let accepted = accept_workload_payload::<T>(
         payload,
         &state.endpoint.id().to_string(),
         &remote.to_string(),
         now_millis(),
         &state.replay_registry,
         Instant::now(),
-    )
+    )?;
+    if T::TYPE != protocol::WorkloadPayloadType::HandshakeRequest
+        && T::TYPE != protocol::WorkloadPayloadType::ProxyAnnouncementRequest
+    {
+        let proven = state.tenants.proven_live(&remote, stable_id, now_secs()?)?;
+        let identity =
+            protocol::workload_identity::WorkloadIdentity::from_bytes(&proven.credential)?;
+        ensure!(
+            identity.claims.signing_public_key_b64
+                == crypto::b64_encode(&accepted.sender_signing_key),
+            "workload envelope uses an unauthorized application key"
+        );
+    }
+    Ok(accepted)
 }
 
 pub(super) async fn write_typed_response<T: WorkloadPayload>(
@@ -297,6 +319,16 @@ pub(super) fn install_registration(
     ensure!(
         proven.manifest_id == registration.manifest_id,
         "registration names a different workload than this connection proved"
+    );
+    let identity = protocol::workload_identity::WorkloadIdentity::from_bytes(&proven.credential)?;
+    ensure!(
+        identity.delegation.scope.workload_id
+            == protocol::workload_id(
+                &crypto::b64_decode(&registration.owner_pubkey)?,
+                &registration.workload_name,
+                registration.replica_index,
+            ),
+        "registration names another replica than its credential authorizes"
     );
     ensure!(
         state.grant_store.holds_live_grant(

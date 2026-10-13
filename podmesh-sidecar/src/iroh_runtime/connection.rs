@@ -30,15 +30,18 @@ pub struct ProxySession {
     pub metrics: podmesh_metrics::Metrics,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn connect(
     endpoint: &Endpoint,
     identity: &iroh_support::NodeIdentity,
     config: &SidecarConfig,
     record: EndpointRecord,
     replay_registry: Arc<protocol::PeerReplayRegistry>,
+    authorization: &crate::authorization::WorkloadAuthorization,
     metrics: podmesh_metrics::Metrics,
     cancellation: &CancellationToken,
 ) -> Result<ProxySession> {
+    authorization.credential(now_secs()?)?;
     let address = iroh_support::endpoint_addr(&record, now_secs()?)?;
     let expected = address.id;
     let connection = tokio::time::timeout(
@@ -60,6 +63,7 @@ pub async fn connect(
         config,
         &connection,
         &replay_registry,
+        authorization,
         cancellation,
     )
     .await;
@@ -205,12 +209,33 @@ async fn discover_inner(
     Ok(accepted.payload.endpoints)
 }
 
+pub async fn refresh_authorization(
+    identity: &iroh_support::NodeIdentity,
+    config: &SidecarConfig,
+    session: &ProxySession,
+    authorization: &crate::authorization::WorkloadAuthorization,
+    cancellation: &CancellationToken,
+) -> Result<Vec<u8>> {
+    authenticate(
+        identity.endpoint_id(),
+        identity,
+        config,
+        &session.connection,
+        &session.replay_registry,
+        authorization,
+        cancellation,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn authenticate(
     local_endpoint: EndpointId,
     identity: &iroh_support::NodeIdentity,
     config: &SidecarConfig,
     connection: &Connection,
     replay_registry: &protocol::PeerReplayRegistry,
+    authorization: &crate::authorization::WorkloadAuthorization,
     cancellation: &CancellationToken,
 ) -> Result<Vec<u8>> {
     // The owner key alone is public, so it is sent together with the credential
@@ -219,12 +244,9 @@ async fn authenticate(
         .owner_public_key_b64
         .as_deref()
         .context("sidecar was injected without a tenant owner key")?;
-    let credential = config
-        .workload_credential_b64
-        .as_deref()
-        .context("sidecar was injected without a workload credential")?;
+    let credential = authorization.credential(now_secs()?)?;
     let request =
-        protocol::machine::WorkloadHandshakeRequest::new(owner, &config.manifest_id, credential);
+        protocol::machine::WorkloadHandshakeRequest::new(owner, &config.manifest_id, &credential);
     let accepted = request_response::<_, protocol::machine::WorkloadHandshakeResponse>(
         local_endpoint,
         connection,

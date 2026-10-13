@@ -1,3 +1,5 @@
+mod enrollment;
+
 use crate::{
     config::Config,
     runtime::WorkloadRuntime,
@@ -93,6 +95,7 @@ struct Inner {
     runtime: Arc<dyn WorkloadRuntime>,
     runtime_operations: Semaphore,
     runtime_operation_timeout: Duration,
+    enrollment_notify: tokio::sync::Notify,
     store: Arc<dyn WorkloadStore>,
     state: Mutex<WorkloadState>,
     mutations: RwLock<HashSet<String>>,
@@ -338,6 +341,7 @@ impl AgentService {
                 runtime,
                 runtime_operations,
                 runtime_operation_timeout,
+                enrollment_notify: tokio::sync::Notify::new(),
                 store,
                 state: Mutex::new(WorkloadState::default()),
                 mutations: RwLock::new(HashSet::new()),
@@ -822,6 +826,20 @@ impl AgentService {
             protocol::revision_id(&spec.manifest) == grant.revision_id,
             "revision identity mismatch"
         );
+        let delegation = protocol::workload_identity::EnrollmentDelegation::from_b64(
+            &spec.workload_credential_b64,
+        )?;
+        delegation.verify_scope(
+            &grant.namespace_id,
+            &protocol::route_id(&namespace, &spec.workload_name),
+            &grant.workload_id,
+            Some(&self.signing_pubkey_b64()),
+            None,
+        )?;
+        anyhow::ensure!(
+            delegation.scope.revision_id == grant.revision_id,
+            "enrollment revision mismatch"
+        );
         Ok(spec)
     }
 
@@ -842,6 +860,7 @@ impl AgentService {
                     namespace_id,
                     sidecar_image: &self.inner.config.sidecar_image,
                     proxy_endpoints: &execution.proxy_endpoints,
+                    service_catalog: execution.service_catalog.as_ref(),
                     workload_credential_b64: &execution.workload_credential_b64,
                     workload_relay_auth_token: &execution.workload_relay_auth_token,
                     workload_relay_ca_certificates: &execution.workload_relay_ca_certificates,
@@ -1014,7 +1033,9 @@ impl AgentService {
             .lock()
             .await
             .active
-            .insert(grant.workload_id.clone(), stored);
+            .insert(grant.workload_id.clone(), stored.clone());
+        drop(_mutation);
+        self.inner.enrollment_notify.notify_one();
         let receipt = DeploymentReceipt {
             version: AGENT_PROTOCOL_VERSION,
             namespace_id: grant.namespace_id,
@@ -1274,6 +1295,8 @@ impl AgentService {
             .await
             .active
             .insert(request.workload_id.clone(), updated.clone());
+        drop(_mutation);
+        self.inner.enrollment_notify.notify_one();
         let response = self.update_response(
             &request,
             &updated,
@@ -1375,7 +1398,9 @@ impl AgentService {
 
     pub(crate) async fn command(&self, command: WorkloadCommand) -> Result<Vec<u8>> {
         let operation = match command.operation {
-            WorkloadOperation::Status => podmesh_metrics::OperationName::Status,
+            WorkloadOperation::Status
+            | WorkloadOperation::ConnectorInspect
+            | WorkloadOperation::SeedPeer(_) => podmesh_metrics::OperationName::Status,
             WorkloadOperation::Logs => podmesh_metrics::OperationName::Logs,
             WorkloadOperation::Delete => podmesh_metrics::OperationName::Delete,
         };
@@ -1453,12 +1478,71 @@ impl AgentService {
             _ if matches!(active.phase, StoredWorkloadPhase::Updating { .. }) => {
                 Err(anyhow!("workload is updating"))
             }
-            WorkloadOperation::Status | WorkloadOperation::Logs if active.runtime_id.is_empty() => {
+            WorkloadOperation::Status
+            | WorkloadOperation::Logs
+            | WorkloadOperation::ConnectorInspect
+            | WorkloadOperation::SeedPeer(_)
+                if active.runtime_id.is_empty() =>
+            {
                 Err(anyhow!("workload is starting"))
             }
             WorkloadOperation::Status => {
                 self.runtime_operation("status", self.inner.runtime.status(&active.runtime_id))
                     .await
+            }
+            WorkloadOperation::ConnectorInspect => {
+                use protocol::workload_connector::{ConnectorRequest, inspection_challenge};
+                let challenge = inspection_challenge(&command.nonce);
+                let response = self
+                    .runtime_operation(
+                        "connector inspect",
+                        self.inner.runtime.connector_exchange(
+                            &active.runtime_id,
+                            ConnectorRequest::inspect(challenge),
+                        ),
+                    )
+                    .await;
+                response.and_then(|response| {
+                    response.validate()?;
+                    let identity = response
+                        .identity
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("workload connector is unavailable"))?;
+                    identity.verify(
+                        &command.namespace_id,
+                        &command.workload_id,
+                        &challenge,
+                        now_secs(),
+                    )?;
+                    // Preserve the backend-independent response for owner inspection.
+                    Ok(String::from_utf8(response.to_bytes()?)?)
+                })
+            }
+            WorkloadOperation::SeedPeer(record) => {
+                use protocol::workload_connector::{ConnectorRequest, inspection_challenge};
+                record.verify(&command.namespace_id, now_secs())?;
+                let challenge = inspection_challenge(&command.nonce);
+                let response = self
+                    .runtime_operation(
+                        "peer seed delivery",
+                        self.inner.runtime.connector_exchange(
+                            &active.runtime_id,
+                            ConnectorRequest::seed(challenge, *record),
+                        ),
+                    )
+                    .await?;
+                response.validate()?;
+                let report = response
+                    .identity
+                    .as_ref()
+                    .context("peer seed delivery was refused")?;
+                report.verify(
+                    &command.namespace_id,
+                    &command.workload_id,
+                    &challenge,
+                    now_secs(),
+                )?;
+                Ok(String::from_utf8(response.to_bytes()?)?)
             }
             WorkloadOperation::Logs => {
                 self.runtime_operation(
@@ -1776,22 +1860,32 @@ mod tests {
     use std::path::PathBuf;
 
     /// The credential podctl would have minted for this workload.
-    fn test_workload_credential(owner_public: &[u8], owner_private: &[u8], name: &str) -> String {
+    fn test_workload_credential(
+        owner_public: &[u8],
+        owner_private: &[u8],
+        name: &str,
+        issuer: &str,
+        manifest: &[u8],
+    ) -> String {
         let now = now_secs();
-        let encoded = protocol::mint_workload_credential(
+        protocol::workload_identity::EnrollmentDelegation::mint(
             owner_private,
-            owner_public,
-            &protocol::WorkloadCredentialClaims {
+            protocol::workload_identity::EnrollmentScope {
                 tenant_owner: crypto::b64_encode(owner_public),
                 manifest_id: protocol::route_id(owner_public, name),
+                workload_id: protocol::workload_id(owner_public, name, 0),
+                revision_id: protocol::revision_id(manifest),
+                issuer_public_key_b64: issuer.into(),
+                token_id: crypto::generate_secure_nonce(),
                 issued_at_secs: now,
-                expires_at_secs: now + 3600,
-                token_id: format!("credential-{name}"),
+                expires_at_secs: None,
+                max_child_lifetime_secs: 3600,
             },
             now,
         )
-        .expect("mint test workload credential");
-        protocol::workload_credential_to_b64(&encoded)
+        .expect("mint test enrollment delegation")
+        .to_b64()
+        .unwrap()
     }
 
     fn test_proxy_endpoints() -> Vec<EndpointRecord> {
@@ -2004,7 +2098,14 @@ mod tests {
             replica_count: 1,
             manifest: manifest.clone(),
             proxy_endpoints: test_proxy_endpoints(),
-            workload_credential_b64: test_workload_credential(&owner_public, &owner_private, name),
+            service_catalog: None,
+            workload_credential_b64: test_workload_credential(
+                &owner_public,
+                &owner_private,
+                name,
+                &service.signing_pubkey_b64(),
+                &manifest,
+            ),
             workload_relay_auth_token: "r".repeat(32),
             workload_relay_ca_certificates: Vec::new(),
         };
@@ -2569,10 +2670,13 @@ mod tests {
             replica_count: 1,
             manifest: manifest.clone(),
             proxy_endpoints: test_proxy_endpoints(),
+            service_catalog: None,
             workload_credential_b64: test_workload_credential(
                 &workload.owner_public,
                 &workload.owner_private,
                 &workload.name,
+                &service.signing_pubkey_b64(),
+                &manifest,
             ),
             workload_relay_auth_token: "r".repeat(32),
             workload_relay_ca_certificates: Vec::new(),
@@ -3111,6 +3215,261 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn enrollment_supervisor_is_woken_after_durable_deployment_and_stops_cleanly() {
+        use protocol::workload_connector::ConnectorRequest;
+        let (service, _temp, runtime) = test_service_with_runtime(1_000, 4).await;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let supervisor = service.enrollment_supervisor(cancellation.clone());
+        let workload = deploy_test_workload(&service, "wake-enrollment", 200).await;
+        let stored = service.inner.state.lock().await.active[&workload.workload_id].clone();
+        assert!(matches!(stored.phase, StoredWorkloadPhase::Active));
+        runtime
+            .enable_connector(&workload.workload_id)
+            .await
+            .unwrap();
+        service.inner.enrollment_notify.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let response = runtime
+                    .connector_exchange(&workload.workload_id, ConnectorRequest::inspect([5; 32]))
+                    .await
+                    .unwrap();
+                if response.identity.unwrap().credential.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("enrollment must not wait for the periodic interval");
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(1), supervisor)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn enrollment_renews_offline_and_preserves_key_binding_across_agent_restart() {
+        use protocol::workload_connector::ConnectorRequest;
+        use protocol::workload_identity::{EnrollmentDelegation, WorkloadIdentity};
+        let (service, _temp, runtime) = test_service_with_runtime(1_000, 4).await;
+        let workload = deploy_test_workload(&service, "enrolled", 200).await;
+        runtime
+            .enable_connector(&workload.workload_id)
+            .await
+            .unwrap();
+        let stored = service.inner.state.lock().await.active[&workload.workload_id].clone();
+        let report = runtime
+            .connector_exchange(&workload.workload_id, ConnectorRequest::inspect([1; 32]))
+            .await
+            .unwrap()
+            .identity
+            .unwrap();
+        let delegation = EnrollmentDelegation::from_b64(
+            &service
+                .decode_execution(&stored.grant)
+                .unwrap()
+                .workload_credential_b64,
+        )
+        .unwrap();
+        let endpoint = report
+            .endpoint
+            .endpoint_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let short = WorkloadIdentity::mint(
+            &service.inner.signing_private,
+            delegation.clone(),
+            endpoint.clone(),
+            report.endpoint.signing_pubkey.clone(),
+            now_secs(),
+            10,
+        )
+        .unwrap();
+        runtime
+            .connector_exchange(
+                &workload.workload_id,
+                ConnectorRequest::install([2; 32], short),
+            )
+            .await
+            .unwrap();
+        // No owner private key or podctl participates in renewal.
+        service.enroll_stored(&stored).await.unwrap();
+        let report = runtime
+            .connector_exchange(&workload.workload_id, ConnectorRequest::inspect([3; 32]))
+            .await
+            .unwrap()
+            .identity
+            .unwrap();
+        let identity = report.credential.unwrap();
+        assert!(identity.claims.expires_at_secs > now_secs() + 300);
+        assert_eq!(identity.delegation, delegation);
+        identity
+            .verify_session(
+                &crypto::b64_encode(&workload.owner_public),
+                &delegation.scope.manifest_id,
+                &endpoint,
+                &crypto::b64_decode(&report.endpoint.signing_pubkey).unwrap(),
+                now_secs(),
+            )
+            .unwrap();
+        let config = service.inner.config.clone();
+        drop(service);
+        let restarted = AgentService::new(config, runtime.clone()).await.unwrap();
+        let stored = restarted.inner.state.lock().await.active[&workload.workload_id].clone();
+        restarted.enroll_stored(&stored).await.unwrap();
+        // Losing/changing keys without a new owner generation must not turn a
+        // copied standing delegation into authority for another endpoint.
+        runtime
+            .enable_connector(&workload.workload_id)
+            .await
+            .unwrap();
+        let error = restarted
+            .enroll_stored(&stored)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("keys changed"), "{error}");
+        let report = runtime
+            .connector_exchange(&workload.workload_id, ConnectorRequest::inspect([4; 32]))
+            .await
+            .unwrap()
+            .identity
+            .unwrap();
+        assert!(report.credential.is_none());
+        let deleted = command_test_workload(
+            &restarted,
+            &workload,
+            WorkloadOperation::Delete,
+            "delete-enrolled",
+        )
+        .await;
+        assert!(deleted.ok);
+        assert!(
+            restarted
+                .inner
+                .store
+                .load_enrollment(&workload.workload_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn connector_inspection_verifies_backend_evidence_before_returning_it() {
+        use protocol::workload_connector::{
+            ConnectorIdentityReport, ConnectorResponse, inspection_challenge,
+        };
+        let (service, _temp, runtime) = test_service_with_runtime(1_000, 4).await;
+        let workload = deploy_test_workload(&service, "owned", 200).await;
+        let unavailable = command_test_workload(
+            &service,
+            &workload,
+            WorkloadOperation::ConnectorInspect,
+            "unsupported",
+        )
+        .await;
+        assert!(!unavailable.ok);
+        let identity = iroh_support::NodeIdentity::ephemeral();
+        let report_for = |nonce: &str| {
+            let now = now_secs();
+            ConnectorIdentityReport {
+                owner_public_key_b64: crypto::b64_encode(&workload.owner_public),
+                workload_name: workload.name.clone(),
+                workload_id: workload.workload_id.clone(),
+                manifest_id: protocol::route_id(&workload.owner_public, &workload.name),
+                replica_index: 0,
+                replica_count: 1,
+                challenge: inspection_challenge(nonce),
+                endpoint: EndpointRecord {
+                    version: ENDPOINT_RECORD_VERSION,
+                    endpoint_id: identity.endpoint_id().as_bytes().to_vec(),
+                    relay_url: None,
+                    direct_addresses: vec!["127.0.0.1:1234".into()],
+                    signing_pubkey: String::new(),
+                    issued_at_secs: now,
+                    expires_at_secs: now + 60,
+                    signature: String::new(),
+                }
+                .sign(identity.signing_public(), identity.signing_private(), now)
+                .unwrap(),
+                credential_expires_at_secs: None,
+                credential: None,
+                service_record: None,
+                transport_signature: String::new(),
+            }
+            .sign(&identity.transport_secret().to_bytes(), now)
+            .unwrap()
+        };
+        let report = report_for("inspect-good");
+        runtime
+            .set_connector_response(
+                &workload.workload_id,
+                ConnectorResponse::identity(report.clone()),
+            )
+            .await
+            .unwrap();
+        let result = command_test_workload(
+            &service,
+            &workload,
+            WorkloadOperation::ConnectorInspect,
+            "inspect-good",
+        )
+        .await;
+        assert!(result.ok, "{}", result.payload);
+        assert_eq!(
+            ConnectorResponse::from_bytes(result.payload.as_bytes())
+                .unwrap()
+                .identity
+                .unwrap(),
+            report
+        );
+        // A valid old signature does not satisfy the fresh owner challenge.
+        let result = command_test_workload(
+            &service,
+            &workload,
+            WorkloadOperation::ConnectorInspect,
+            "inspect-fresh",
+        )
+        .await;
+        assert!(!result.ok);
+        let mut spoofed = report_for("inspect-spoofed");
+        spoofed.endpoint.endpoint_id = iroh::SecretKey::generate().public().as_bytes().to_vec();
+        runtime
+            .set_connector_response(&workload.workload_id, ConnectorResponse::identity(spoofed))
+            .await
+            .unwrap();
+        let result = command_test_workload(
+            &service,
+            &workload,
+            WorkloadOperation::ConnectorInspect,
+            "inspect-spoofed",
+        )
+        .await;
+        assert!(!result.ok);
+        let mut foreign = report_for("inspect-foreign");
+        foreign.owner_public_key_b64 = crypto::b64_encode(&[8; 32]);
+        runtime
+            .set_connector_response(&workload.workload_id, ConnectorResponse::identity(foreign))
+            .await
+            .unwrap();
+        let result = command_test_workload(
+            &service,
+            &workload,
+            WorkloadOperation::ConnectorInspect,
+            "inspect-foreign",
+        )
+        .await;
+        assert!(!result.ok);
+    }
+
     /// The spec requires that a non-owner lifecycle command is refused *and*
     /// that the refusal does not reveal whether the workload exists.
     #[tokio::test]
@@ -3121,14 +3480,14 @@ mod tests {
 
         let (attacker_public, attacker_private) = crypto::generate_signing_keypair();
         let (attacker_kem_public, _) = crypto::generate_kem_keypair();
-        let signed = |workload_id: String, nonce: &str| {
+        let signed = |workload_id: String, nonce: &str, operation: WorkloadOperation| {
             WorkloadCommand {
                 version: AGENT_PROTOCOL_VERSION,
                 request_id: nonce.to_string(),
                 namespace_id: crypto::b64_encode(&attacker_public),
                 workload_id,
                 target_node_id: service.signing_pubkey_b64(),
-                operation: WorkloadOperation::Delete,
+                operation,
                 log_tail: None,
                 response_kem_pubkey: crypto::b64_encode(&attacker_kem_public),
                 issued_at_secs: now_secs(),
@@ -3142,23 +3501,36 @@ mod tests {
 
         // An existing workload owned by somebody else, and one that does not
         // exist at all, must fail the same way.
-        let existing = service
-            .command(signed(workload.workload_id.clone(), "attack-existing"))
-            .await
-            .unwrap_err()
-            .to_string();
-        let absent = service
-            .command(signed(
-                protocol::workload_id(&attacker_public, "absent", 0),
-                "attack-absent",
-            ))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            existing, absent,
-            "the refusal must not disclose whether the workload exists"
-        );
+        for (index, operation) in [
+            WorkloadOperation::Delete,
+            WorkloadOperation::ConnectorInspect,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let existing = service
+                .command(signed(
+                    workload.workload_id.clone(),
+                    &format!("attack-existing-{index}"),
+                    operation.clone(),
+                ))
+                .await
+                .unwrap_err()
+                .to_string();
+            let absent = service
+                .command(signed(
+                    protocol::workload_id(&attacker_public, "absent", 0),
+                    &format!("attack-absent-{index}"),
+                    operation,
+                ))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                existing, absent,
+                "the refusal must not disclose whether the workload exists"
+            );
+        }
 
         // The victim's workload is untouched.
         assert!(

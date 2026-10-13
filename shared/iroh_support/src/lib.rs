@@ -65,6 +65,13 @@ pub fn load_ca_certificates(paths: &[PathBuf]) -> Result<Vec<CertificateDer<'sta
 
 pub fn endpoint_addr(record: &EndpointRecord, now_secs: u64) -> Result<EndpointAddr> {
     record.verify(now_secs)?;
+    endpoint_addr_hint(record)
+}
+
+/// Address-only bootstrap from a stored signed hint. Live session authority is
+/// mandatory after dialing; expiry is never bypassed for service admission.
+pub fn endpoint_addr_hint(record: &EndpointRecord) -> Result<EndpointAddr> {
+    record.verify_structure()?;
     let endpoint_bytes: [u8; protocol::IROH_ENDPOINT_ID_BYTES] = record
         .endpoint_id
         .as_slice()

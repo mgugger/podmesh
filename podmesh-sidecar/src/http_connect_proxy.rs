@@ -148,14 +148,20 @@ impl HttpConnectProxy {
 
     /// Starts the HTTP CONNECT proxy listener
     pub async fn run(&self) -> Result<()> {
+        self.run_bound(self.bind()?).await
+    }
+
+    pub fn bind(&self) -> Result<TcpListener> {
         let addr: SocketAddr = format!("{}:{}", self.config.listen_host, self.config.listen_port)
             .parse()
             .context("invalid listen address")?;
+        let listener =
+            std::net::TcpListener::bind(addr).context("failed to bind HTTP CONNECT proxy")?;
+        listener.set_nonblocking(true)?;
+        Ok(TcpListener::from_std(listener)?)
+    }
 
-        let listener = TcpListener::bind(addr)
-            .await
-            .context("failed to bind HTTP CONNECT proxy")?;
-
+    pub async fn run_bound(&self, listener: TcpListener) -> Result<()> {
         log::info!(
             "HTTP CONNECT proxy listening on {}:{}",
             self.config.listen_host,

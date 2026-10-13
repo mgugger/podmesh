@@ -45,8 +45,10 @@ pub mod manifest_policy;
 pub mod manifest_resources;
 pub use manifest_resources::{ManifestResources, validate_and_measure_manifest};
 pub mod manifest_yaml;
+pub mod peer_control;
 pub mod placement;
 pub mod podmesh_annotations;
+pub mod service_discovery;
 pub mod sidecar_metadata;
 pub use placement::{
     PLACEMENT_PROTOCOL_VERSION, PlacementError, PlacementRequest, PlacementResponse,
@@ -90,7 +92,9 @@ pub mod workload_credential;
 pub use workload_body::{
     HttpBodyProgress, finish_http_body, read_http_body_chunk, write_http_body_chunk,
 };
+pub mod workload_connector;
 pub mod workload_control;
+pub mod workload_identity;
 pub use proxy_grant::{
     MAX_PROXY_GRANT_B64_LEN, MAX_PROXY_GRANT_LIFETIME_SECS, ProxyGrantClaims, mint_proxy_grant,
     proxy_grant_from_b64, proxy_grant_to_b64, verify_proxy_grant,

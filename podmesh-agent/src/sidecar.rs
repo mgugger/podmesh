@@ -4,7 +4,7 @@ use protocol::sidecar_metadata::{METADATA_BLOB_ENV_VAR, SidecarMetadata};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 
-const SIDECAR_NAME: &str = "podmesh-sidecar";
+pub(crate) const SIDECAR_NAME: &str = "podmesh-sidecar";
 const RUNTIME_NAME_PREFIX: &str = "podmesh-";
 const MAX_DNS_LABEL_LEN: usize = 63;
 const PODMAN_WORKLOAD_SUFFIX_LEN: usize = "-pod".len();
@@ -26,6 +26,7 @@ pub struct SidecarInjection<'a> {
     pub namespace_id: &'a str,
     pub sidecar_image: &'a str,
     pub proxy_endpoints: &'a [EndpointRecord],
+    pub service_catalog: Option<&'a protocol::service_discovery::ServiceCatalog>,
     pub workload_credential_b64: &'a str,
     pub workload_relay_auth_token: &'a str,
     pub workload_relay_ca_certificates: &'a [Vec<u8>],
@@ -41,6 +42,7 @@ pub fn inject(manifest: &[u8], injection: SidecarInjection<'_>) -> Result<Vec<u8
         namespace_id,
         sidecar_image,
         proxy_endpoints,
+        service_catalog,
         workload_credential_b64,
         workload_relay_auth_token,
         workload_relay_ca_certificates,
@@ -58,6 +60,7 @@ pub fn inject(manifest: &[u8], injection: SidecarInjection<'_>) -> Result<Vec<u8
         manifest_b64: crypto::b64_encode(&original),
         owner_public_key_b64: namespace_id.to_string(),
         proxy_endpoints: proxy_endpoints.to_vec(),
+        service_catalog: service_catalog.cloned(),
         workload_credential_b64: workload_credential_b64.to_string(),
         workload_relay_auth_token: workload_relay_auth_token.to_string(),
         workload_relay_ca_certificates: workload_relay_ca_certificates.to_vec(),
@@ -66,6 +69,8 @@ pub fn inject(manifest: &[u8], injection: SidecarInjection<'_>) -> Result<Vec<u8
     let metadata_blob = crypto::b64_encode(&serde_json::to_vec(&metadata)?);
     let mut environment = vec![
         json!({ "name": METADATA_BLOB_ENV_VAR, "value": metadata_blob }),
+        json!({ "name": "PODMESH_CONNECTOR_SOCKET", "value": protocol::workload_connector::DEFAULT_CONNECTOR_SOCKET }),
+        json!({ "name": "PODMESH_CONNECTOR_IDENTITY_DIR", "value": "/var/lib/podmesh-connector/identity" }),
         json!({ "name": "PODMESH_ENABLE_EGRESS", "value": "true" }),
         json!({ "name": "RUST_LOG", "value": "info" }),
     ];
@@ -154,22 +159,26 @@ mod tests {
     }
 
     /// Credential the owner would have minted for this workload at deploy time.
-    fn test_credential(owner_public: &[u8], owner_private: &[u8]) -> String {
+    fn test_credential(owner_public: &[u8], owner_private: &[u8], manifest: &[u8]) -> String {
         let now = crate::service::now_secs();
-        let encoded = protocol::mint_workload_credential(
+        protocol::workload_identity::EnrollmentDelegation::mint(
             owner_private,
-            owner_public,
-            &protocol::WorkloadCredentialClaims {
+            protocol::workload_identity::EnrollmentScope {
                 tenant_owner: crypto::b64_encode(owner_public),
                 manifest_id: protocol::route_id(owner_public, "demo"),
+                workload_id: protocol::workload_id(owner_public, "demo", 0),
+                revision_id: protocol::revision_id(manifest),
+                issuer_public_key_b64: crypto::b64_encode(owner_public),
+                token_id: "generation-1".into(),
                 issued_at_secs: now,
-                expires_at_secs: now + 3600,
-                token_id: "credential-1".into(),
+                expires_at_secs: None,
+                max_child_lifetime_secs: 3600,
             },
             now,
         )
-        .unwrap();
-        protocol::workload_credential_to_b64(&encoded)
+        .unwrap()
+        .to_b64()
+        .unwrap()
     }
 
     fn test_injection<'a>(
@@ -185,6 +194,7 @@ mod tests {
             namespace_id: owner,
             sidecar_image: "podmesh/sidecar:latest",
             proxy_endpoints,
+            service_catalog: None,
             workload_credential_b64: credential,
             workload_relay_auth_token: "r".repeat(32).leak(),
             workload_relay_ca_certificates: &[],
@@ -231,7 +241,7 @@ spec:
             test_injection(
                 &test_proxy_endpoints(),
                 &crypto::b64_encode(&owner_public),
-                &test_credential(&owner_public, &owner_private),
+                &test_credential(&owner_public, &owner_private, manifest),
             ),
         )
         .unwrap();
@@ -263,7 +273,7 @@ spec:
 "#;
         let (owner_public, owner_private) = test_owner();
         let owner = crypto::b64_encode(&owner_public);
-        let credential = test_credential(&owner_public, &owner_private);
+        let credential = test_credential(&owner_public, &owner_private, manifest);
         let endpoints = test_proxy_endpoints();
         let output = inject(manifest, test_injection(&endpoints, &owner, &credential)).unwrap();
 
@@ -273,6 +283,12 @@ spec:
             .pointer("/spec/containers/1")
             .expect("sidecar container");
         assert_eq!(sidecar["name"], SIDECAR_NAME);
+        assert!(sidecar["env"].as_array().unwrap().iter().any(|entry| {
+            entry["name"] == "PODMESH_CONNECTOR_SOCKET"
+                && entry["value"] == protocol::workload_connector::DEFAULT_CONNECTOR_SOCKET
+        }));
+        assert!(value.pointer("/spec/containers/0/env").is_none());
+        assert!(sidecar.get("volumeMounts").is_none());
 
         let blob = sidecar["env"]
             .as_array()
@@ -313,7 +329,7 @@ spec:
 "#;
         let (owner_public, owner_private) = test_owner();
         let owner = crypto::b64_encode(&owner_public);
-        let credential = test_credential(&owner_public, &owner_private);
+        let credential = test_credential(&owner_public, &owner_private, manifest);
         let endpoints = test_proxy_endpoints();
         let mut injection = test_injection(&endpoints, &owner, &credential);
         injection.metrics_listen = Some("0.0.0.0:9230".parse().unwrap());
@@ -376,7 +392,7 @@ spec:
             test_injection(
                 &test_proxy_endpoints(),
                 &crypto::b64_encode(&owner_public),
-                &test_credential(&owner_public, &owner_private),
+                &test_credential(&owner_public, &owner_private, manifest),
             ),
         )
         .unwrap();

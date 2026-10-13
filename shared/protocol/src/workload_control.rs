@@ -93,10 +93,12 @@ pub enum WorkloadPayloadType {
     EgressResponse,
     ProxyAnnouncementRequest,
     ProxyAnnouncementResponse,
+    PeerRequest,
+    PeerResponse,
 }
 
 impl WorkloadPayloadType {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 14] = [
         Self::HandshakeRequest,
         Self::HandshakeResponse,
         Self::RegistrationRequest,
@@ -109,6 +111,8 @@ impl WorkloadPayloadType {
         Self::EgressResponse,
         Self::ProxyAnnouncementRequest,
         Self::ProxyAnnouncementResponse,
+        Self::PeerRequest,
+        Self::PeerResponse,
     ];
 
     pub const fn wire_name(self) -> &'static str {
@@ -125,6 +129,8 @@ impl WorkloadPayloadType {
             Self::EgressResponse => "podmesh.workload.egress.response.v1",
             Self::ProxyAnnouncementRequest => "podmesh.workload.announcement.request.v1",
             Self::ProxyAnnouncementResponse => "podmesh.workload.announcement.response.v1",
+            Self::PeerRequest => "podmesh.peer.control.request.v1",
+            Self::PeerResponse => "podmesh.peer.control.response.v1",
         }
     }
 
@@ -136,7 +142,10 @@ impl WorkloadPayloadType {
 
     pub const fn frame_kind(self) -> WorkloadStreamKind {
         match self {
-            Self::HandshakeRequest | Self::HandshakeResponse => WorkloadStreamKind::Handshake,
+            Self::HandshakeRequest
+            | Self::HandshakeResponse
+            | Self::PeerRequest
+            | Self::PeerResponse => WorkloadStreamKind::Handshake,
             Self::RegistrationRequest | Self::RegistrationResponse => {
                 WorkloadStreamKind::Registration
             }
@@ -174,6 +183,7 @@ impl WorkloadPayloadType {
             Self::IngressRequest => Some(Self::IngressResponse),
             Self::EgressRequest => Some(Self::EgressResponse),
             Self::ProxyAnnouncementRequest => Some(Self::ProxyAnnouncementResponse),
+            Self::PeerRequest => Some(Self::PeerResponse),
             _ => None,
         }
     }
@@ -423,7 +433,7 @@ mod tests {
                 .into_iter()
                 .filter(|payload_type| payload_type.is_request())
                 .count(),
-            6
+            WorkloadPayloadType::ALL.len() / 2
         );
         for payload_type in WorkloadPayloadType::ALL {
             assert_eq!(
@@ -439,6 +449,8 @@ mod tests {
 
     #[test]
     fn every_concrete_payload_has_one_compile_time_type() {
+        assert_payload_type::<crate::peer_control::PeerRequest>(WorkloadPayloadType::PeerRequest);
+        assert_payload_type::<crate::peer_control::PeerResponse>(WorkloadPayloadType::PeerResponse);
         assert_payload_type::<crate::machine::WorkloadHandshakeRequest>(
             WorkloadPayloadType::HandshakeRequest,
         );

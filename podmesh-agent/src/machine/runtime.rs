@@ -16,6 +16,7 @@ pub struct AgentMachine {
     router: Router,
     cancellation: CancellationToken,
     supervisor: JoinHandle<Result<()>>,
+    enrollment: Option<tokio_util::task::AbortOnDropHandle<Result<()>>>,
 }
 
 impl AgentMachine {
@@ -39,6 +40,9 @@ impl AgentMachine {
             .spawn();
         let cancellation = CancellationToken::new();
         let signing_pubkey = service.signing_pubkey_b64();
+        // This task uses workload authority, not scheduler membership. Its
+        // lifetime is supervised here alongside the agent's other services.
+        let enrollment = service.enrollment_supervisor(cancellation.clone());
         let seen = Arc::new(Mutex::new(SeenQueries::new(validated.max_seen_queries)));
         let supervisor = spawn_attachments(
             endpoint.clone(),
@@ -60,6 +64,7 @@ impl AgentMachine {
             router,
             cancellation,
             supervisor,
+            enrollment: Some(enrollment),
         })
     }
 
@@ -68,11 +73,27 @@ impl AgentMachine {
     }
 
     pub async fn join(&mut self) -> Result<Result<()>, tokio::task::JoinError> {
-        (&mut self.supervisor).await
+        tokio::select! {
+            result = &mut self.supervisor => result,
+            result = async {
+                match self.enrollment.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                self.enrollment.take();
+                result.map(|result| result.and_then(|()| Err(anyhow::anyhow!("workload enrollment supervisor stopped unexpectedly"))))
+            },
+        }
     }
 
     pub async fn shutdown(self) -> Result<()> {
         self.cancellation.cancel();
+        if let Some(enrollment) = self.enrollment {
+            enrollment
+                .await
+                .context("join workload enrollment supervisor")??;
+        }
         self.router.shutdown().await?;
         self.endpoint.close().await;
         self.supervisor

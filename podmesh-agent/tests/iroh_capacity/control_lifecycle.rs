@@ -58,20 +58,23 @@ pub async fn exercise_control_lifecycle<T: ControlTransport>(
         replica_count: 1,
         manifest: manifest.clone(),
         proxy_endpoints: vec![test_proxy_endpoint()?],
-        workload_credential_b64: protocol::workload_credential_to_b64(
-            &protocol::mint_workload_credential(
-                &owner_private,
-                &owner_public,
-                &protocol::WorkloadCredentialClaims {
-                    tenant_owner: namespace_id.clone(),
-                    manifest_id: protocol::route_id(&owner_public, "iroh-control"),
-                    issued_at_secs: now_secs(),
-                    expires_at_secs: now_secs() + 3600,
-                    token_id: "iroh-control-credential".into(),
-                },
-                now_secs(),
-            )?,
-        ),
+        service_catalog: None,
+        workload_credential_b64: protocol::workload_identity::EnrollmentDelegation::mint(
+            &owner_private,
+            protocol::workload_identity::EnrollmentScope {
+                tenant_owner: namespace_id.clone(),
+                manifest_id: protocol::route_id(&owner_public, "iroh-control"),
+                workload_id: workload_id.clone(),
+                revision_id: protocol::revision_id(&manifest),
+                issuer_public_key_b64: offer.signing_pubkey.clone(),
+                token_id: "iroh-control-generation".into(),
+                issued_at_secs: now_secs(),
+                expires_at_secs: None,
+                max_child_lifetime_secs: 3600,
+            },
+            now_secs(),
+        )?
+        .to_b64()?,
         workload_relay_auth_token: "r".repeat(32),
         workload_relay_ca_certificates: Vec::new(),
     };

@@ -1,4 +1,10 @@
-use std::{fs, io::ErrorKind, net::SocketAddr, path::Path, time::Duration};
+use std::{
+    fs,
+    io::ErrorKind,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -62,6 +68,14 @@ use protocol::{
 #[derive(Parser, Debug)]
 #[command(name = "podmesh-sidecar", author, version, about = " Podmesh sidecar")]
 struct Args {
+    #[command(subcommand)]
+    command: Option<ConnectorCommand>,
+    /// Private connector control socket inside the workload boundary.
+    #[arg(long = "connector-socket", env = "PODMESH_CONNECTOR_SOCKET")]
+    connector_socket: Option<PathBuf>,
+    /// Persistent workload-owned identity directory (containers or guest VMs).
+    #[arg(long = "identity-dir", env = "PODMESH_CONNECTOR_IDENTITY_DIR")]
+    identity_dir: Option<PathBuf>,
     #[arg(long, env = "lookup_interval_secs", default_value_t = 15)]
     lookup_interval_secs: u64,
     #[arg(
@@ -124,6 +138,12 @@ struct Args {
     workload_replay_retention_secs: u64,
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum ConnectorCommand {
+    /// Exchange one bounded local control frame on stdin/stdout, without a shell.
+    ConnectorControl,
+}
+
 impl TryFrom<Args> for SidecarConfig {
     type Error = anyhow::Error;
 
@@ -165,7 +185,12 @@ impl TryFrom<Args> for SidecarConfig {
         });
 
         Ok(Self {
-            identity: podmesh_sidecar::IdentitySource::ephemeral(),
+            identity: args
+                .identity_dir
+                .map(podmesh_sidecar::IdentitySource::Persistent)
+                .unwrap_or_else(podmesh_sidecar::IdentitySource::ephemeral),
+            connector_socket: args.connector_socket,
+            service_catalog: metadata.service_catalog.clone(),
             proxy_endpoints: metadata.proxy_endpoints.clone(),
             workload_replay_limits: protocol::ReplayLimits {
                 max_peers: args.workload_replay_max_peers,
@@ -205,6 +230,24 @@ async fn main() {
 async fn run() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
+    if matches!(args.command, Some(ConnectorCommand::ConnectorControl)) {
+        use protocol::workload_connector::{
+            CONNECTOR_CONTROL_TIMEOUT, ConnectorRequest, DEFAULT_CONNECTOR_SOCKET, read_frame,
+            write_frame,
+        };
+        let path = args
+            .connector_socket
+            .as_deref()
+            .unwrap_or_else(|| Path::new(DEFAULT_CONNECTOR_SOCKET));
+        return tokio::time::timeout(CONNECTOR_CONTROL_TIMEOUT, async {
+            let request =
+                ConnectorRequest::from_bytes(&read_frame(&mut tokio::io::stdin()).await?)?;
+            let response = podmesh_sidecar::connector_control::exchange(path, &request).await?;
+            write_frame(&mut tokio::io::stdout(), &response.to_bytes()?).await
+        })
+        .await
+        .context("connector control adapter timed out")?;
+    }
     let cfg = SidecarConfig::try_from(args)?;
     run_sidecar(cfg).await
 }

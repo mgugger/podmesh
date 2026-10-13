@@ -11,11 +11,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use podctl::{
-    ClientOptions, apply_file_with_proxy_urls, delete_file, discover_workloads, get_logs, get_pod,
+    ClientOptions, apply_file_with_proxy_urls, delete_file, discover_workloads,
+    get_connector_identities, get_logs, get_pod,
 };
 use podmesh_agent::sidecar::workload_runtime_name;
 use podmesh_integration_tests::support::{ClientKeyDir, init_tracing, reset_podman_stack_state};
 use protocol::MESH_DOMAIN_SUFFIX;
+
+#[path = "complete_rootless_stack/dns.rs"]
+mod dns;
 use reqwest::Client;
 use serde_json::Value;
 use serial_test::serial;
@@ -136,13 +140,14 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
     log::info!("podctl applied manifest {manifest_id}");
     // `podctl` returns the deployment id, while the agent names the pod after
     // the per-replica workload id. Derive the latter to find the containers.
-    let (owner_public, _owner_private) = crypto::load_or_create_signing_keypair(key_dir.path())
+    let (owner_public, owner_private) = crypto::load_or_create_signing_keypair(key_dir.path())
         .context("load namespace signing key")?;
     let workload_id =
         protocol::workload_id(&owner_public, SAMPLE_WORKLOAD_NAME, SAMPLE_REPLICA_INDEX);
     workload_guard.set(workload_id.clone());
 
     wait_for_workload_containers(&workload_id, Duration::from_secs(180)).await?;
+    wait_for_connector_identities(&manifest_id, &options, 1, Duration::from_secs(60)).await?;
     verify_metrics_target(&format!("{}-pod:9230", workload_runtime_name(&workload_id))).await?;
     wait_for_podmesh_proxy_response(&client, Duration::from_secs(120)).await?;
 
@@ -203,7 +208,18 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
     let source = std::fs::read_to_string(&sample_manifest)?;
     std::fs::write(
         &replica_manifest,
-        source.replacen("  replicas: 1", "  replicas: 3", 1),
+        source
+            .replacen("  replicas: 1", "  replicas: 3", 1)
+            .replacen(
+                "      port: 80\n      targetPort: 80",
+                "      port: 18081\n      targetPort: 80",
+                1,
+            )
+            .replacen(
+                "                  number: 80",
+                "                  number: 18081",
+                1,
+            ),
     )?;
     let replica_deployment_id = apply_file_with_proxy_urls(
         replica_manifest.to_path_buf(),
@@ -231,6 +247,8 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
                 == 3,
         "replicas were not placed on three distinct agents"
     );
+    wait_for_connector_identities(&replica_deployment_id, &options, 3, Duration::from_secs(60))
+        .await?;
     wait_for_podmesh_proxy_response(&client, Duration::from_secs(120)).await?;
     sleep(Duration::from_secs(5)).await;
 
@@ -284,6 +302,8 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
     stop_traffic.store(true, Ordering::SeqCst);
     traffic_task.await?;
     update_result.context("three-replica sequential update failed")?;
+    wait_for_connector_identities(&replica_deployment_id, &options, 3, Duration::from_secs(60))
+        .await?;
     anyhow::ensure!(
         successful_requests.load(Ordering::SeqCst) > 0
             && failed_requests.load(Ordering::SeqCst) == 0,
@@ -292,6 +312,95 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
         failed_requests.load(Ordering::SeqCst)
     );
     wait_for_podmesh_proxy_response(&client, Duration::from_secs(120)).await?;
+    // Keep the existing uninterrupted-update regression before destructive
+    // proxy/replica outage tests; restored ingress is checked separately below.
+    let probe_manifest = workspace.join("tests/sample_manifests/transparent_egress_test.yml");
+    let probe_id = protocol::workload_id(&owner_public, "egress-test", 0);
+    workload_guard.set(probe_id.clone());
+    apply_file_with_proxy_urls(
+        probe_manifest.clone(),
+        &options,
+        PODMESH_PROXY_API_URLS.to_string(),
+    )
+    .await
+    .context("DNS client workload apply failed")?;
+    let name = podmesh_sidecar::service_cache::ServiceKey {
+        manifest_id: protocol::route_id(&owner_public, SAMPLE_WORKLOAD_NAME),
+        name: "my-nginx-svc".into(),
+    }
+    .fqdn()?;
+    dns::probe(&probe_id, &name, 18081)
+        .await
+        .context("initial workload-local DNS/peer routing after update")?;
+    let proxies = capture_podman_containers()
+        .await?
+        .into_iter()
+        .filter(|container| {
+            container
+                .names
+                .iter()
+                .any(|name| name.starts_with("podmesh-proxies-proxy-"))
+        })
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        proxies.len() == 3,
+        "expected exactly three proxies for the offline DNS check"
+    );
+    for proxy in &proxies {
+        run_podman_command([
+            "stop",
+            "--time",
+            "2",
+            proxy
+                .names
+                .first()
+                .context("proxy container name missing")?,
+        ])
+        .await?;
+    }
+    dns::probe(&probe_id, &name, 18081)
+        .await
+        .context("DNS/peer TCP with every proxy stopped")?;
+    let stopped_pod = format!("{}-pod", workload_runtime_name(&replica_ids[0]));
+    run_podman_command(["pod", "stop", &stopped_pod]).await?;
+    dns::probe(&probe_id, &name, 18081)
+        .await
+        .context("stopped-replica setup retry without proxies")?;
+    sleep(Duration::from_secs(125)).await;
+    dns::probe(&probe_id, &name, 18081)
+        .await
+        .context("expired-replica DNS/peer availability without proxies")?;
+    run_podman_command(["pod", "start", &stopped_pod]).await?;
+    for proxy in &proxies {
+        run_podman_command([
+            "start",
+            proxy
+                .names
+                .first()
+                .context("proxy container name missing")?,
+        ])
+        .await?;
+    }
+    // Proxy grants are deliberately in-memory; restore authorization before ingress.
+    for proxy_url in PODMESH_PROXY_API_URLS.split(',') {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match podctl::cert::grant_proxy_async(proxy_url, &owner_public, &owner_private, 30)
+                .await
+            {
+                Ok(_) => break,
+                Err(error) if Instant::now() >= deadline => {
+                    return Err(
+                        error.context("restore proxy authorization after offline DNS check")
+                    );
+                }
+                Err(_) => sleep(Duration::from_millis(300)).await,
+            }
+        }
+    }
+    wait_for_podmesh_proxy_response(&client, Duration::from_secs(120)).await?;
+    delete_file(probe_manifest, true, &options).await?;
+    wait_for_workload_teardown(&probe_id, Duration::from_secs(90)).await?;
     delete_file(replica_update.to_path_buf(), true, &options)
         .await
         .context("three-replica delete failed")?;
@@ -303,6 +412,65 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
     stack_guard.shutdown().await?;
 
     Ok(())
+}
+
+/// Owner-agent control reaches each in-workload connector via remote Podman
+/// exec. Self-signed reports are inspection evidence, not enrolled membership.
+async fn wait_for_connector_identities(
+    deployment: &str,
+    options: &ClientOptions,
+    replicas: usize,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error = anyhow!("workload connectors have not started");
+    while Instant::now() < deadline {
+        match get_connector_identities(deployment, options).await {
+            Ok(reports) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs();
+                if reports.iter().any(|report| {
+                    report
+                        .credential
+                        .as_ref()
+                        .is_none_or(|identity| identity.verify(Some(now)).is_err())
+                }) {
+                    last_error = anyhow!("workload endpoint enrollment is pending");
+                    sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                anyhow::ensure!(reports.len() == replicas, "unexpected connector count");
+                anyhow::ensure!(
+                    reports
+                        .iter()
+                        .map(|report| &report.endpoint.endpoint_id)
+                        .collect::<HashSet<_>>()
+                        .len()
+                        == replicas,
+                    "workload connectors share endpoint identities"
+                );
+                anyhow::ensure!(
+                    reports
+                        .iter()
+                        .map(|report| report.replica_index)
+                        .collect::<HashSet<_>>()
+                        == (0..replicas as u32).collect(),
+                    "connector reports do not cover the placed replicas"
+                );
+                anyhow::ensure!(
+                    reports
+                        .iter()
+                        .all(|report| report.replica_count == replicas as u32),
+                    "connector replica count mismatch"
+                );
+                return Ok(());
+            }
+            Err(error) => last_error = error,
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    Err(last_error.context("timed out inspecting in-workload connectors"))
 }
 
 async fn is_podman_available() -> bool {

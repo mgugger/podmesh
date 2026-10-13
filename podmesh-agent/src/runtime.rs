@@ -11,6 +11,11 @@ use std::{
 };
 use tokio::{process::Command, sync::RwLock, time::timeout};
 
+mod connector;
+mod connector_mock;
+
+use protocol::workload_connector::{ConnectorError, ConnectorRequest, ConnectorResponse};
+
 const RUNTIME_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_RUNTIME_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_WORKLOAD_NETWORK_LEN: usize = 128;
@@ -27,6 +32,17 @@ pub trait WorkloadRuntime: Send + Sync {
     async fn status(&self, runtime_id: &str) -> Result<String>;
     async fn logs(&self, runtime_id: &str, tail: u32) -> Result<String>;
     async fn delete(&self, runtime_id: &str) -> Result<()>;
+    /// Transport one bounded request to the connector INSIDE this workload.
+    /// Backends may use container exec or a guest-local channel. This transport
+    /// is not an identity issuer and never grants machine-plane membership.
+    async fn connector_exchange(
+        &self,
+        _runtime_id: &str,
+        request: ConnectorRequest,
+    ) -> Result<ConnectorResponse> {
+        request.validate()?;
+        Ok(ConnectorResponse::error(ConnectorError::Unsupported))
+    }
     async fn cleanup_failed_deploy(&self, runtime_id: &str, uncertain: bool) -> Result<()> {
         anyhow::ensure!(
             !uncertain,
@@ -62,6 +78,8 @@ pub struct MockRuntime {
     /// Namespace each workload was deployed for, so tests can assert that pods
     /// are placed per tenant.
     tenants: RwLock<HashMap<String, String>>,
+    connector_responses: RwLock<HashMap<String, ConnectorResponse>>,
+    connector_nodes: RwLock<HashMap<String, connector_mock::MockConnector>>,
     deploy_calls: AtomicUsize,
     fail_deploys: AtomicUsize,
     status_delay_millis: AtomicUsize,
@@ -85,6 +103,20 @@ impl MockRuntime {
         let mut ids: Vec<String> = self.workloads.read().await.keys().cloned().collect();
         ids.sort();
         ids
+    }
+
+    /// Explicit mock response; reports are still verified by the agent service.
+    pub async fn set_connector_response(
+        &self,
+        runtime_id: &str,
+        response: ConnectorResponse,
+    ) -> Result<()> {
+        response.to_bytes()?;
+        self.connector_responses
+            .write()
+            .await
+            .insert(runtime_id.to_owned(), response);
+        Ok(())
     }
 
     pub fn deploy_count(&self) -> usize {
@@ -136,6 +168,22 @@ impl WorkloadRuntime for MockRuntime {
             deployment.workload_id.to_string(),
             deployment.namespace_id.to_string(),
         );
+        if deployment
+            .manifest
+            .windows(b"PODMESH_SIDECAR_METADATA_B64".len())
+            .any(|bytes| bytes == b"PODMESH_SIDECAR_METADATA_B64")
+        {
+            // Exercise production enrollment/bootstrap in ordinary owner-flow
+            // tests rather than bypassing it with unsupported mock responses.
+            self.enable_connector(deployment.workload_id).await?;
+            let mut nodes = self.connector_nodes.write().await;
+            if nodes
+                .get(deployment.workload_id)
+                .is_some_and(|node| !node.network_configured())
+            {
+                nodes.remove(deployment.workload_id);
+            }
+        }
         Ok(deployment.workload_id.to_string())
     }
 
@@ -164,8 +212,35 @@ impl WorkloadRuntime for MockRuntime {
         Ok(String::new())
     }
 
+    async fn connector_exchange(
+        &self,
+        runtime_id: &str,
+        request: ConnectorRequest,
+    ) -> Result<ConnectorResponse> {
+        request.validate()?;
+        anyhow::ensure!(
+            self.workloads.read().await.contains_key(runtime_id),
+            "workload not found"
+        );
+        if let Some(response) = self
+            .connector_responses
+            .read()
+            .await
+            .get(runtime_id)
+            .cloned()
+        {
+            return Ok(response);
+        }
+        Ok(self
+            .mock_connector_exchange(runtime_id, request)
+            .await?
+            .unwrap_or_else(|| ConnectorResponse::error(ConnectorError::Unsupported)))
+    }
+
     async fn delete(&self, runtime_id: &str) -> Result<()> {
         self.workloads.write().await.remove(runtime_id);
+        self.connector_responses.write().await.remove(runtime_id);
+        self.connector_nodes.write().await.remove(runtime_id);
         Ok(())
     }
 }
@@ -252,6 +327,14 @@ impl PodmanRuntime {
 
 #[async_trait]
 impl WorkloadRuntime for PodmanRuntime {
+    async fn connector_exchange(
+        &self,
+        runtime_id: &str,
+        request: ConnectorRequest,
+    ) -> Result<ConnectorResponse> {
+        self.exchange_connector(runtime_id, request).await
+    }
+
     fn target_id(&self, deployment: &WorkloadDeployment<'_>) -> Result<String> {
         Self::pod_name(deployment.manifest)
     }

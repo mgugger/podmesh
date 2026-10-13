@@ -20,14 +20,23 @@ pub(super) fn prove_tenant(
     remote: EndpointId,
     stable_id: usize,
     handshake: &protocol::machine::WorkloadHandshakeRequest,
+    signing_key: &[u8],
 ) -> Result<()> {
     let owner = &handshake.tenant_owner_pubkey;
     let manifest_id = &handshake.manifest_id;
     let encoded = &handshake.workload_credential_b64;
     let credential = protocol::workload_credential_from_b64(encoded)?;
-    protocol::verify_workload_credential(&credential, owner, manifest_id, now_secs()?)
-        .context("verify workload credential")?;
-    state.tenants.prove_once(
+    let identity = protocol::workload_identity::WorkloadIdentity::from_bytes(&credential)?;
+    identity
+        .verify_session(
+            owner,
+            manifest_id,
+            &remote.to_string(),
+            signing_key,
+            now_secs()?,
+        )
+        .context("verify endpoint-bound workload identity")?;
+    state.tenants.prove_bound(
         remote,
         stable_id,
         crate::tenant_sessions::ProvenTenant {
@@ -35,6 +44,7 @@ pub(super) fn prove_tenant(
             manifest_id: manifest_id.clone(),
             credential,
         },
+        now_secs()?,
     )
 }
 

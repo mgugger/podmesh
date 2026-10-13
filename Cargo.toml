@@ -20,6 +20,10 @@ license = "GPL-3.0-only"
 [workspace.dependencies]
 iroh = { version = "=1.0.3", default-features = false, features = ["tls-ring"] }
 iroh-gossip = { version = "=0.101.0", default-features = false, features = ["net"] }
+hickory-proto = "=0.26.1"
+hickory-server = { version = "=0.26.1", default-features = false }
+hickory-resolver = "=0.26.1"
+data-encoding = "2"
 iroh-relay = { version = "=1.0.3", default-features = false, features = ["server", "tls-ring"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1"

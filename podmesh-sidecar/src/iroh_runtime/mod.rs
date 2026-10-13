@@ -44,8 +44,61 @@ pub async fn run_with_metrics(
         config.workload_replay_limits,
     )?);
     let identity = Arc::new(config.identity.load()?);
+    let owner = config
+        .owner_public_key_b64
+        .as_deref()
+        .context("workload owner missing")?;
+    let workload_id = protocol::workload_id(
+        &crypto::b64_decode(owner)?,
+        &config.workload_name,
+        config.replica_index,
+    );
+    let authorization = Arc::new(crate::authorization::WorkloadAuthorization::new(
+        config
+            .workload_credential_b64
+            .as_deref()
+            .context("workload enrollment authority missing")?,
+        owner,
+        &config.manifest_id,
+        &workload_id,
+        identity.endpoint_id().to_string(),
+        identity.signing_public().to_vec(),
+    )?);
+    let mut authority_changes = authorization.subscribe();
     let endpoint = bind_endpoint(&config, &identity).await?;
+    let connector_control = match &config.connector_socket {
+        Some(path) => Some(crate::connector_control::ConnectorControl::bind(path).await?),
+        None => None,
+    };
     let cancellation = CancellationToken::new();
+    let _cancel_on_drop = cancellation.clone().drop_guard();
+    let network = if config.service_catalog.is_some() {
+        let directory = match &config.identity {
+            crate::IdentitySource::Persistent(path) => Some(path.clone()),
+            _ => None,
+        };
+        Some(crate::workload_network::WorkloadNetwork::new(
+            owner.to_string(),
+            config.service_catalog.clone(),
+            config.replica_index,
+            endpoint.clone(),
+            identity.clone(),
+            authorization.clone(),
+            directory,
+            cancellation.clone(),
+        )?)
+    } else {
+        None
+    };
+    let dns_servers = match &network {
+        Some(network) => {
+            crate::workload_network::bind_dns(network, !config.skip_egress_nft).await?
+        }
+        None => Vec::new(),
+    };
+    let mut network_task = network.as_ref().map(|network| {
+        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(network.clone().run()))
+    });
     let http_client = Client::builder()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .timeout(HTTP_REQUEST_TIMEOUT)
@@ -58,7 +111,8 @@ pub async fn run_with_metrics(
     let (connected_tx, mut connected_rx) = mpsc::channel(MAX_PROXY_CANDIDATES);
     let (disconnected_tx, mut disconnected_rx) = mpsc::channel(MAX_PROXY_CANDIDATES);
     let (tunnel_tx, mut tunnel_rx) = mpsc::channel(256);
-    let (egress_cleanup, listener_tasks) = start_local_proxies(&config, tunnel_tx)?;
+    let (egress_cleanup, listener_tasks) =
+        start_local_proxies(&config, tunnel_tx, network.is_some(), dns_servers.len() > 1)?;
 
     let mut candidates = HashMap::<EndpointId, EndpointRecord>::new();
     let mut connecting = HashSet::<EndpointId>::new();
@@ -68,14 +122,74 @@ pub async fn run_with_metrics(
             .try_send(record)
             .map_err(|_| anyhow::anyhow!("initial proxy candidate queue is full"))?;
     }
+    let mut connector_task = if let Some(control) = connector_control {
+        let context = crate::connector_control::ConnectorContext {
+            owner: config
+                .owner_public_key_b64
+                .clone()
+                .context("connector owner missing")?,
+            workload_name: config.workload_name.clone(),
+            replica_index: config.replica_index,
+            replica_count: config.replica_count,
+            endpoint: endpoint.clone(),
+            identity: identity.clone(),
+            authorization: authorization.clone(),
+            network: network.clone(),
+        };
+        Some(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+            control.serve(context, cancellation.clone()),
+        )))
+    } else {
+        None
+    };
     let config = Arc::new(config);
+    let mut connector_result = Ok(());
     let mut reconnect = tokio::time::interval(PROXY_RECONNECT_INTERVAL);
     let mut registration = tokio::time::interval(REGISTRATION_REFRESH_INTERVAL);
     let mut discovery = tokio::time::interval(config.lookup_interval);
 
+    let runtime_result = async {
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
+            result = async {
+                match network_task.as_mut() { Some(task) => task.await.context("workload network task failed")?, None => std::future::pending::<Result<()>>().await }
+            } => {
+                network_task = None;
+                result?;
+                return Err(anyhow::anyhow!("workload networking stopped unexpectedly"));
+            },
+            result = authority_changes.changed() => {
+                result.context("workload authority channel closed")?;
+                for session in sessions.values_mut() {
+                    match connection::refresh_authorization(&identity, &config, session, &authorization, &cancellation).await {
+                        Ok(grant) => session.proxy_grant = grant,
+                        Err(error) => {
+                            log::warn!("workload session authority refresh failed: {error}");
+                            session.connection.close(2u8.into(), b"authority refresh failed");
+                        }
+                    }
+                }
+                // Enrollment should wake initial connections immediately rather
+                // than wait for the periodic reconnect timer.
+                for (id, record) in candidates.clone() {
+                    if !sessions.contains_key(&id) && connecting.insert(id) {
+                        spawn_connection_attempt(endpoint.clone(), identity.clone(), config.clone(), record,
+                            cancellation.clone(), connect_slots.clone(), replay_registry.clone(),
+                            authorization.clone(), metrics.clone(), connected_tx.clone());
+                    }
+                }
+            },
+            result = async {
+                match connector_task.as_mut() {
+                    Some(task) => task.await.context("connector control task failed")?,
+                    None => std::future::pending::<Result<()>>().await,
+                }
+            } => {
+                connector_task = None;
+                connector_result = result.and_then(|()| Err(anyhow::anyhow!("connector control stopped unexpectedly")));
+                break;
+            },
             Some(record) = candidate_rx.recv() => {
                 let address = iroh_support::endpoint_addr(&record, now_secs())?;
                 let id = address.id;
@@ -93,6 +207,7 @@ pub async fn run_with_metrics(
                         cancellation.clone(),
                         connect_slots.clone(),
                         replay_registry.clone(),
+                        authorization.clone(),
                         metrics.clone(),
                         connected_tx.clone(),
                     );
@@ -102,7 +217,17 @@ pub async fn run_with_metrics(
                 let id = endpoint_id(&record)?;
                 connecting.remove(&id);
                 match result {
-                    Ok(session) => {
+                    Ok(mut session) => {
+                        // A credential can renew while the initial handshake is
+                        // in flight. Install the latest authority before routing.
+                        match connection::refresh_authorization(&identity, &config, &session, &authorization, &cancellation).await {
+                            Ok(grant) => session.proxy_grant = grant,
+                            Err(error) => {
+                                session.connection.close(2u8.into(), b"authority verification failed");
+                                log::warn!("connected workload authority is no longer valid: {error}");
+                                continue;
+                            }
+                        }
                         if let Some(previous) = sessions.insert(id, session.clone()) {
                             previous.connection.close(2u8.into(), b"proxy session replaced");
                         }
@@ -155,6 +280,7 @@ pub async fn run_with_metrics(
                             cancellation.clone(),
                             connect_slots.clone(),
                             replay_registry.clone(),
+                            authorization.clone(),
                             metrics.clone(),
                             connected_tx.clone(),
                         );
@@ -186,6 +312,11 @@ pub async fn run_with_metrics(
                 }
             }
             Some(tunnel) = tunnel_rx.recv() => {
+                if let Some(network) = &network && network.is_internal_destination(&tunnel.dest_host) {
+                    let network = network.clone();
+                    tokio::spawn(async move { if let Err(error) = network.forward(tunnel).await { log::debug!("internal service connection failed: {error}"); } });
+                    continue;
+                }
                 if let Some(session) = sessions.values().find(|session| session.verified) {
                     tokio::spawn(streams::open_egress(
                         session.clone(),
@@ -205,7 +336,31 @@ pub async fn run_with_metrics(
         }
     }
 
+    Ok::<(), anyhow::Error>(())
+    }.await;
+
     cancellation.cancel();
+    if let Some(task) = connector_task {
+        connector_result = match task.await {
+            Ok(result) => result,
+            Err(error) => {
+                Err(anyhow::Error::new(error).context("connector control shutdown failed"))
+            }
+        };
+    }
+    if let Some(task) = network_task {
+        let _ = task.await;
+    }
+    for dns in dns_servers {
+        if let Err(error) = dns.shutdown().await {
+            log::warn!("DNS shutdown failed: {error}");
+        }
+    }
+    if let Some(network) = &network
+        && let Err(error) = network.shutdown().await
+    {
+        log::warn!("peer shutdown failed: {error}");
+    }
     endpoint.close().await;
     for task in listener_tasks {
         task.abort();
@@ -214,7 +369,7 @@ pub async fn run_with_metrics(
     if egress_cleanup && let Err(error) = egress_nft::cleanup_egress_rules() {
         log::warn!("failed to clean up sidecar egress rules: {error}");
     }
-    Ok(())
+    runtime_result.and(connector_result)
 }
 
 async fn bind_endpoint(
@@ -267,6 +422,7 @@ fn spawn_connection_attempt(
     cancellation: CancellationToken,
     slots: Arc<Semaphore>,
     replay_registry: Arc<protocol::PeerReplayRegistry>,
+    authorization: Arc<crate::authorization::WorkloadAuthorization>,
     metrics: podmesh_metrics::Metrics,
     sender: mpsc::Sender<(EndpointRecord, Result<ProxySession>)>,
 ) {
@@ -280,6 +436,7 @@ fn spawn_connection_attempt(
                     &config,
                     record.clone(),
                     replay_registry,
+                    &authorization,
                     metrics.clone(),
                     &cancellation,
                 )
@@ -339,30 +496,20 @@ fn finish_operation<T>(
 fn start_local_proxies(
     config: &SidecarConfig,
     tunnel_tx: mpsc::Sender<egress_proxy::TunnelRequest>,
+    dns: bool,
+    ipv6_dns: bool,
 ) -> Result<(bool, Vec<JoinHandle<()>>)> {
-    let cleanup = if config.enable_egress && !config.skip_egress_nft {
-        ensure!(
-            egress_nft::has_net_admin_capability(),
-            "transparent egress requires CAP_NET_ADMIN"
-        );
-        egress_nft::setup_egress_rules(&egress_nft::EgressNftConfig::default())?;
-        true
-    } else {
-        false
-    };
-    let mut tasks = Vec::new();
-    if config.enable_egress {
+    let bound_proxy = if config.enable_egress || dns {
         let proxy = egress_proxy::EgressProxy::new(
             egress_proxy::EgressProxyConfig::default(),
             tunnel_tx.clone(),
         );
-        tasks.push(tokio::spawn(async move {
-            if let Err(error) = proxy.run().await {
-                log::error!("transparent egress proxy failed: {error}");
-            }
-        }));
-    }
-    if let Some(port) = config.http_proxy_port {
+        let listener = proxy.bind()?;
+        Some((proxy, listener))
+    } else {
+        None
+    };
+    let bound_http = if let Some(port) = config.http_proxy_port {
         let proxy = http_connect_proxy::HttpConnectProxy::new(
             http_connect_proxy::HttpConnectProxyConfig {
                 listen_port: if port == 0 {
@@ -374,8 +521,41 @@ fn start_local_proxies(
             },
             tunnel_tx,
         );
+        let listener = proxy.bind()?;
+        Some((proxy, listener))
+    } else {
+        None
+    };
+    let cleanup = if (config.enable_egress || dns) && !config.skip_egress_nft {
+        ensure!(
+            egress_nft::has_net_admin_capability(),
+            "transparent egress requires CAP_NET_ADMIN"
+        );
+        let rules = egress_nft::EgressNftConfig {
+            dns_port: dns.then_some(egress_nft::DNS_PORT),
+            ipv6_dns,
+            redirect_external: config.enable_egress,
+            ..egress_nft::EgressNftConfig::default()
+        };
+        if let Err(error) = egress_nft::setup_egress_rules(&rules) {
+            let _ = egress_nft::cleanup_egress_rules();
+            return Err(error);
+        }
+        true
+    } else {
+        false
+    };
+    let mut tasks = Vec::new();
+    if let Some((proxy, listener)) = bound_proxy {
         tasks.push(tokio::spawn(async move {
-            if let Err(error) = proxy.run().await {
+            if let Err(error) = proxy.run_bound(listener).await {
+                log::error!("transparent egress proxy failed: {error}");
+            }
+        }));
+    }
+    if let Some((proxy, listener)) = bound_http {
+        tasks.push(tokio::spawn(async move {
+            if let Err(error) = proxy.run_bound(listener).await {
                 log::error!("HTTP CONNECT proxy failed: {error}");
             }
         }));

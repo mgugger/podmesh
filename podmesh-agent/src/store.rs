@@ -4,6 +4,16 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 const WORKLOADS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("workloads");
+const ENROLLMENT_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("workload_enrollment_v1");
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct EnrollmentBinding {
+    pub workload_id: String,
+    pub delegation_digest: String,
+    pub endpoint_id: String,
+    pub signing_public_key_b64: String,
+}
 pub const STORED_WORKLOAD_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +66,12 @@ pub(crate) trait WorkloadStore: Send + Sync {
     fn load_all(&self) -> Result<Vec<(String, Result<StoredWorkload>)>>;
     fn save(&self, workload: &StoredWorkload) -> Result<()>;
     fn remove(&self, workload_id: &str) -> Result<()>;
+    fn load_enrollment(&self, _workload_id: &str) -> Result<Option<EnrollmentBinding>> {
+        Ok(None)
+    }
+    fn save_enrollment(&self, _binding: &EnrollmentBinding) -> Result<()> {
+        anyhow::bail!("enrollment persistence is unsupported")
+    }
 }
 
 /// Mode for the state file. It holds encrypted tenant records.
@@ -134,6 +150,7 @@ impl AgentStore {
         let db = Database::create(path)?;
         let write = db.begin_write()?;
         write.open_table(WORKLOADS_TABLE)?;
+        write.open_table(ENROLLMENT_TABLE)?;
         write.commit()?;
         Ok(Self {
             db,
@@ -184,11 +201,43 @@ impl AgentStore {
         Ok(())
     }
 
+    fn load_enrollment(&self, workload_id: &str) -> Result<Option<EnrollmentBinding>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(ENROLLMENT_TABLE)?;
+        let Some(blob) = table.get(workload_id)? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(blob.value().len() <= 4096, "enrollment state exceeds limit");
+        let plaintext =
+            crypto::decrypt_payload_from_recipient_blob(blob.value(), &self.kem_private)?;
+        let binding: EnrollmentBinding = postcard::from_bytes(&plaintext)?;
+        anyhow::ensure!(
+            binding.workload_id == workload_id,
+            "enrollment binding key mismatch"
+        );
+        Ok(Some(binding))
+    }
+
+    fn save_enrollment(&self, binding: &EnrollmentBinding) -> Result<()> {
+        let plaintext = postcard::to_allocvec(binding)?;
+        anyhow::ensure!(plaintext.len() <= 1024, "enrollment binding exceeds limit");
+        let blob = crypto::encrypt_payload_for_recipient(&self.kem_public, &plaintext)?;
+        let write = self.db.begin_write()?;
+        {
+            write
+                .open_table(ENROLLMENT_TABLE)?
+                .insert(binding.workload_id.as_str(), blob.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
     pub fn remove(&self, workload_id: &str) -> Result<()> {
         let write = self.db.begin_write()?;
         {
             let mut table = write.open_table(WORKLOADS_TABLE)?;
             table.remove(workload_id)?;
+            write.open_table(ENROLLMENT_TABLE)?.remove(workload_id)?;
         }
         write.commit()?;
         Ok(())
@@ -196,6 +245,13 @@ impl AgentStore {
 }
 
 impl WorkloadStore for AgentStore {
+    fn load_enrollment(&self, workload_id: &str) -> Result<Option<EnrollmentBinding>> {
+        Self::load_enrollment(self, workload_id)
+    }
+    fn save_enrollment(&self, binding: &EnrollmentBinding) -> Result<()> {
+        Self::save_enrollment(self, binding)
+    }
+
     fn load_all(&self) -> Result<Vec<(String, Result<StoredWorkload>)>> {
         Self::load_all(self)
     }

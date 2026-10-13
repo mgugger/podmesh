@@ -65,6 +65,198 @@ fn build_workload_config(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connector_inspection_runs_inside_the_workload_without_a_live_proxy() -> Result<()> {
+    use protocol::workload_connector::{ConnectorRequest, inspection_challenge};
+    let (owner, owner_private, owner_public) = fresh_tenant_owner();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let (proxy_public, proxy_private) = crypto::generate_signing_keypair();
+    // Only a dial hint is configured; no proxy process or grant issuer runs.
+    let proxy_record = protocol::EndpointRecord {
+        version: protocol::ENDPOINT_RECORD_VERSION,
+        endpoint_id: iroh::SecretKey::generate().public().as_bytes().to_vec(),
+        relay_url: None,
+        direct_addresses: vec![format!("127.0.0.1:{}", allocate_udp_port())],
+        signing_pubkey: String::new(),
+        issued_at_secs: now,
+        expires_at_secs: now + 300,
+        signature: String::new(),
+    }
+    .sign(&proxy_public, &proxy_private, now)?;
+    let dir = tempfile::tempdir()?;
+    let socket = dir.path().join("control/control.sock");
+    let workload_id = protocol::workload_id(&owner_public, DEMO_WORKLOAD_NAME, 0);
+    let mut previous = None;
+    for attempt in 0..3 {
+        let (mut config, _, _) = build_sidecar_config(
+            &owner,
+            &owner_private,
+            vec![proxy_record.clone()],
+            allocate_tcp_port(),
+        )?;
+        let parent = protocol::workload_identity::WorkloadIdentity::from_b64(
+            config.workload_credential_b64.as_deref().unwrap(),
+        )?
+        .delegation;
+        config.workload_credential_b64 = Some(parent.to_b64()?);
+        config.identity = podmesh_sidecar::IdentitySource::Persistent(dir.path().join("identity"));
+        config.connector_socket = Some(socket.clone());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(run_sidecar_with_shutdown(config, shutdown_rx, None));
+        let challenge = inspection_challenge(&format!("inspection-{attempt}"));
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match podmesh_sidecar::connector_control::exchange(
+                    &socket,
+                    &ConnectorRequest::inspect(challenge),
+                )
+                .await
+                {
+                    Ok(response) => return Ok::<_, anyhow::Error>(response),
+                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await;
+        if attempt == 2 {
+            task.abort();
+            ensure!(
+                task.await.unwrap_err().is_cancelled(),
+                "sidecar cancellation did not terminate the task"
+            );
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while socket.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+        } else {
+            let _ = shutdown_tx.send(());
+            tokio::time::timeout(Duration::from_secs(5), task).await???;
+        }
+        ensure!(
+            !socket.exists(),
+            "connector socket survived shutdown/cancellation"
+        );
+        let report = result??
+            .identity
+            .ok_or_else(|| anyhow!("connector report missing"))?;
+        report.verify(&owner, &workload_id, &challenge, now)?;
+        let keys = (report.endpoint.endpoint_id, report.endpoint.signing_pubkey);
+        if let Some(previous) = &previous {
+            assert_eq!(previous, &keys);
+        }
+        previous = Some(keys);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn local_identity_installation_renews_a_live_proxy_session() -> Result<()> {
+    use protocol::workload_connector::ConnectorRequest;
+    use protocol::workload_identity::WorkloadIdentity;
+    let (owner, private, public) = fresh_tenant_owner();
+    let mut proxy = start_workload(Vec::new(), true).await?;
+    provision_proxy_cert(proxy.rest_port, &public, &private, Duration::from_secs(10)).await?;
+    let app_port = allocate_tcp_port();
+    let app = spawn_test_app(app_port, "renewed-authority".into()).await?;
+    let directory = tempfile::tempdir()?;
+    let socket = directory.path().join("control/control.sock");
+    let (mut config, host, _) = build_sidecar_config(
+        &owner,
+        &private,
+        vec![proxy.endpoint_record.clone()],
+        app_port,
+    )?;
+    config.connector_socket = Some(socket.clone());
+    let node = config.identity.load()?;
+    config.workload_credential_b64 = Some(workload_credential_with_lifetime(
+        &private,
+        &owner,
+        &node,
+        10,
+        "live-renewal",
+    )?);
+    let initial = WorkloadIdentity::from_b64(config.workload_credential_b64.as_deref().unwrap())?;
+    let (shutdown, shutdown_rx) = oneshot::channel();
+    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(run_sidecar_with_shutdown(config, shutdown_rx, Some(events)));
+    let result: Result<()> = async {
+        wait_for_sidecar_peer_ready(&mut event_rx, &proxy.peer_id, Duration::from_secs(10)).await?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let renewed = WorkloadIdentity::mint(
+            &private,
+            initial.delegation.clone(),
+            node.endpoint_id().to_string(),
+            crypto::b64_encode(node.signing_public()),
+            now,
+            60,
+        )?;
+        let response = podmesh_sidecar::connector_control::exchange(
+            &socket,
+            &ConnectorRequest::install([6; 32], renewed.clone()),
+        )
+        .await?;
+        ensure!(
+            response
+                .identity
+                .as_ref()
+                .and_then(|report| report.credential.as_ref())
+                == Some(&renewed),
+            "installation was not acknowledged"
+        );
+        let wrong = WorkloadIdentity::mint(
+            &private,
+            initial.delegation,
+            iroh::SecretKey::generate().public().to_string(),
+            crypto::b64_encode(node.signing_public()),
+            now,
+            60,
+        )?;
+        let refused = podmesh_sidecar::connector_control::exchange(
+            &socket,
+            &ConnectorRequest::install([7; 32], wrong),
+        )
+        .await?;
+        ensure!(
+            refused.error.is_some(),
+            "wrong endpoint identity was installed"
+        );
+        let remaining = initial.claims.expires_at_secs.saturating_sub(now);
+        tokio::time::sleep(Duration::from_secs(remaining + 1)).await;
+        let client = Client::new();
+        let address = proxy
+            .workload
+            .ingress_address()
+            .ok_or_else(|| anyhow!("proxy ingress unavailable"))?;
+        let body = wait_for_ingress_response(
+            &client,
+            &format!("http://{address}/hello"),
+            &host,
+            Duration::from_secs(5),
+        )
+        .await?;
+        ensure!(
+            body == "renewed-authority",
+            "renewed session lost application routing"
+        );
+        Ok(())
+    }
+    .await;
+    let _ = shutdown.send(());
+    let shutdown_result = task.await?;
+    app.abort();
+    let _ = app.await;
+    proxy.workload.close().await;
+    shutdown_result?;
+    result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn ingress_proxies_requests_via_sidecar() -> Result<()> {
     init_tracing();
@@ -690,15 +882,21 @@ fn build_sidecar_config_full(
     http_proxy_port: Option<u16>,
 ) -> Result<(SidecarConfig, String, String)> {
     let (routes, ingress_host, service_host) = demo_routes(owner_b64, app_port)?;
+    let identity = podmesh_sidecar::IdentitySource::ephemeral();
+    let credential = podmesh_integration_tests::identity::workload_identity(
+        owner_sk,
+        owner_b64,
+        DEMO_WORKLOAD_NAME,
+        &identity.load()?,
+        0,
+    );
     let cfg = SidecarConfig {
-        identity: podmesh_sidecar::IdentitySource::ephemeral(),
+        identity,
+        connector_socket: None,
+        service_catalog: None,
         proxy_endpoints: bootstrap_peers,
         workload_replay_limits: protocol::ReplayLimits::default(),
-        workload_credential_b64: Some(podmesh_integration_tests::support::workload_credential(
-            owner_sk,
-            owner_b64,
-            DEMO_WORKLOAD_NAME,
-        )),
+        workload_credential_b64: Some(credential),
         workload_relay_auth_token: None,
         workload_relay_ca_certificates: Vec::new(),
         lookup_interval: Duration::from_secs(2),
@@ -722,26 +920,24 @@ fn build_sidecar_config_full(
 fn workload_credential_with_lifetime(
     owner_sk: &[u8],
     owner_b64: &str,
+    identity: &iroh_support::NodeIdentity,
     lifetime_secs: u64,
     token_id: &str,
 ) -> Result<String> {
-    let owner_pk = crypto::b64_decode(owner_b64)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
-    let encoded = protocol::mint_workload_credential(
+    let issued = if lifetime_secs == 0 { now - 1 } else { now };
+    Ok(podmesh_integration_tests::identity::workload_identity_at(
         owner_sk,
-        &owner_pk,
-        &protocol::WorkloadCredentialClaims {
-            tenant_owner: owner_b64.to_string(),
-            manifest_id: protocol::route_id(&owner_pk, DEMO_WORKLOAD_NAME),
-            issued_at_secs: now,
-            expires_at_secs: now + lifetime_secs,
-            token_id: token_id.to_string(),
-        },
-        now,
-    )?;
-    Ok(protocol::workload_credential_to_b64(&encoded))
+        owner_b64,
+        DEMO_WORKLOAD_NAME,
+        identity,
+        0,
+        issued,
+        lifetime_secs.max(1),
+        token_id,
+    ))
 }
 
 fn demo_routes(owner_b64: &str, app_port: u16) -> Result<(Vec<SidecarRouteSpec>, String, String)> {
@@ -939,6 +1135,7 @@ async fn renewed_workload_credential_reconnects_after_expired_authority_is_refus
         initial.workload_credential_b64 = Some(workload_credential_with_lifetime(
             &owner_sk,
             &owner_b64,
+            &initial.identity.load()?,
             4,
             "initial-short-lived",
         )?);
@@ -980,6 +1177,7 @@ async fn renewed_workload_credential_reconnects_after_expired_authority_is_refus
         expired.workload_credential_b64 = Some(workload_credential_with_lifetime(
             &owner_sk,
             &owner_b64,
+            &expired.identity.load()?,
             0,
             "already-expired",
         )?);
@@ -1006,7 +1204,11 @@ async fn renewed_workload_credential_reconnects_after_expired_authority_is_refus
         )?;
         renewed.lookup_interval = Duration::from_secs(1);
         renewed.workload_credential_b64 = Some(workload_credential_with_lifetime(
-            &owner_sk, &owner_b64, 60, "renewed",
+            &owner_sk,
+            &owner_b64,
+            &renewed.identity.load()?,
+            60,
+            "renewed",
         )?);
         let (shutdown, shutdown_rx) = oneshot::channel();
         let renewed_task =
@@ -1140,6 +1342,14 @@ async fn ingress_balances_across_every_replica() -> Result<()> {
             )?;
             cfg.replica_index = replica_index;
             cfg.replica_count = REPLICAS;
+            cfg.workload_credential_b64 =
+                Some(podmesh_integration_tests::identity::workload_identity(
+                    &owner_sk,
+                    &owner_b64,
+                    DEMO_WORKLOAD_NAME,
+                    &cfg.identity.load()?,
+                    replica_index,
+                ));
             ingress_host = host;
 
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -1225,7 +1435,7 @@ async fn ingress_balances_across_every_replica() -> Result<()> {
 async fn a_sidecar_cannot_register_under_a_tenant_whose_key_it_does_not_hold() -> Result<()> {
     init_tracing();
     let (victim_b64, _victim_sk, victim_pk) = fresh_tenant_owner();
-    let (_impostor_b64, impostor_sk, _impostor_pk) = fresh_tenant_owner();
+    let (impostor_b64, impostor_sk, _impostor_pk) = fresh_tenant_owner();
 
     let mut handle = start_workload(Vec::new(), false).await?;
     let test_result: Result<()> = async {
@@ -1245,27 +1455,19 @@ async fn a_sidecar_cannot_register_under_a_tenant_whose_key_it_does_not_hold() -
         // Everything names the victim; only the credential is signed by another
         // key, which is all an impostor could actually obtain.
         let (mut sidecar_cfg, _, _) = build_sidecar_config(
-            &victim_b64,
+            &impostor_b64,
             &impostor_sk,
             vec![handle.endpoint_record.clone()],
             app_port,
         )?;
         sidecar_cfg.lookup_interval = Duration::from_secs(1);
-
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let sidecar_task = tokio::spawn(async move {
-            let _ = run_sidecar_with_shutdown(sidecar_cfg, shutdown_rx, Some(event_tx)).await;
-        });
-
-        let drain_deadline = tokio::time::sleep(Duration::from_secs(10));
-        tokio::pin!(drain_deadline);
-        loop {
-            tokio::select! {
-                Some(_event) = event_rx.recv() => {}
-                _ = &mut drain_deadline => break,
-            }
-        }
+        sidecar_cfg.owner_public_key_b64 = Some(victim_b64.clone());
+        sidecar_cfg.manifest_id = demo_manifest_id(&victim_b64);
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let error = run_sidecar_with_shutdown(sidecar_cfg, shutdown_rx, None)
+            .await
+            .unwrap_err();
+        ensure!(error.to_string().contains("scope mismatch"), "{error}");
 
         let manifest_id = demo_manifest_id(&victim_b64);
         if let Some(table) = handle.workload.routes().as_ref() {
@@ -1274,9 +1476,6 @@ async fn a_sidecar_cannot_register_under_a_tenant_whose_key_it_does_not_hold() -
                 "a sidecar without the tenant's key registered under that tenant's routing key"
             );
         }
-
-        let _ = shutdown_tx.send(());
-        let _ = sidecar_task.await;
         Ok(())
     }
     .await;

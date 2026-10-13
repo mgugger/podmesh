@@ -1687,6 +1687,7 @@ dependencies = [
  "prefix-trie",
  "rand 0.10.2",
  "ring",
+ "serde",
  "thiserror 2.0.17",
  "tinyvec",
  "tracing",
@@ -1718,6 +1719,29 @@ dependencies = [
  "thiserror 2.0.17",
  "tokio",
  "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
+name = "hickory-server"
+version = "0.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "130236ba6abba90da6a7acf7a87b27d862b592c3145dc74bc47bf86d8ff198ec"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cfg-if",
+ "data-encoding",
+ "futures-util",
+ "hickory-net",
+ "hickory-proto",
+ "ipnet",
+ "prefix-trie",
+ "serde",
+ "thiserror 2.0.17",
+ "time",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -3335,6 +3359,7 @@ dependencies = [
  "env_logger",
  "futures",
  "hex",
+ "hickory-proto",
  "hyper",
  "hyper-util",
  "iroh",
@@ -3455,10 +3480,15 @@ name = "podmesh-sidecar"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "crypto",
+ "data-encoding",
  "env_logger",
  "futures",
+ "hickory-proto",
+ "hickory-resolver",
+ "hickory-server",
  "httparse",
  "ipnetwork",
  "iroh",
@@ -3477,6 +3507,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "socket2 0.5.10",
+ "tempfile",
  "tokio",
  "tokio-util",
 ]

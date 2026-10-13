@@ -463,6 +463,32 @@ podmesh-853b7f7d0b23ba67315293cdcce6212aac49f0871f3d9ac9608-pod
 ]
 ```
 
+To inspect the live connector inside every replica:
+
+```bash
+./target/debug/podctl get connectors my-nginx
+```
+
+This owner-authorized command follows the existing encrypted agent-control path. The agent uses
+bounded remote Podman exec to call the connector's own adapter, without a shell or a public control
+port. Each result binds its actual Iroh EndpointId and application signing key to the replica and a
+fresh request challenge. Enrolled reports include public endpoint-bound credentials, never workload
+or issuer signing secrets, transport secrets or relay admission tokens.
+
+`apply` automatically grants the selected agent replica/revision-scoped enrollment authority. The
+connector generates its own keys; the agent verifies fresh proof and installs a one-hour child
+credential, renewing it near expiry without podctl. A pending self-signed report is not authority;
+an enrolled chain must also verify its subject keys, scope and current validity. Legacy bearer
+credentials cannot authorize workload sessions.
+
+Injected identity keys live in the sidecar's writable layer and survive a normal container restart.
+Losing that layer requires a new owner-authorized generation; no managed persistent volume is
+provisioned and tenant volumes remain prohibited. Deletion stops honest-agent issuance, but existing
+children expire naturally rather than being instantly revoked. Standing issuer authority assumes
+the owner-approved execution agent remains trusted. Proxy grants retain their separate finite
+lifetime/manual recovery limitations. No VM backend, confidential attestation, internal DNS or direct
+tenant peer routing is enabled yet.
+
 Logs are fetched per replica, container by container, through the scheduler relay. A deployment can
 be addressed by name or by its 64-hex deployment ID:
 

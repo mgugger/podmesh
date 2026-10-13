@@ -129,7 +129,12 @@ impl EgressProxy {
     /// This function runs indefinitely, accepting connections on the proxy port
     /// and forwarding them to the tunnel channel for processing.
     pub async fn run(&self) -> Result<()> {
-        let addr = SocketAddr::from(([0, 0, 0, 0], self.config.listen_port));
+        self.run_bound(self.bind()?).await
+    }
+    pub fn bind(&self) -> Result<TcpListener> {
+        // NAT redirects only pod-local traffic here; never expose a tenant's
+        // tunnel dispatcher to other pods on the shared runtime network.
+        let addr = SocketAddr::from(([127, 0, 0, 1], self.config.listen_port));
 
         // Create the listener socket with transparent proxy options
         let socket =
@@ -171,6 +176,9 @@ impl EgressProxy {
             addr
         );
 
+        Ok(listener)
+    }
+    pub async fn run_bound(&self, listener: TcpListener) -> Result<()> {
         let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
         loop {
             match listener.accept().await {

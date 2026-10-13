@@ -289,7 +289,9 @@ pub struct ExecutionSpec {
     pub replica_count: u32,
     pub manifest: Vec<u8>,
     pub proxy_endpoints: Vec<crate::EndpointRecord>,
-    /// Owner-signed proof that this workload belongs to the deploying tenant.
+    pub service_catalog: Option<crate::service_discovery::ServiceCatalog>,
+    /// Owner-signed scoped enrollment delegation. Retains its wire field name;
+    /// a delegated endpoint-bound child is required for workload sessions.
     pub workload_credential_b64: String,
     pub workload_relay_auth_token: String,
     pub workload_relay_ca_certificates: Vec<Vec<u8>>,
@@ -595,12 +597,16 @@ pub struct DeploymentReceipt {
     pub signature: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkloadOperation {
     Status,
     Logs,
     Delete,
+    /// Owner-authorized inspection of the in-workload network connector.
+    /// Returns self-signed identity evidence, never tenant membership authority.
+    ConnectorInspect,
+    SeedPeer(Box<crate::service_discovery::ReplicaServiceRecord>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

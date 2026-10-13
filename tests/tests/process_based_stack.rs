@@ -229,15 +229,21 @@ fn build_sidecar_config(
     app_port: u16,
 ) -> Result<(SidecarConfig, String, String)> {
     let (routes, ingress_host, service_host) = demo_routes(owner_b64, app_port)?;
+    let identity = podmesh_sidecar::IdentitySource::ephemeral();
+    let credential = podmesh_integration_tests::identity::workload_identity(
+        owner_sk,
+        owner_b64,
+        DEMO_WORKLOAD_NAME,
+        &identity.load()?,
+        0,
+    );
     let cfg = SidecarConfig {
-        identity: podmesh_sidecar::IdentitySource::ephemeral(),
+        identity,
+        connector_socket: None,
+        service_catalog: None,
         proxy_endpoints,
         workload_replay_limits: protocol::ReplayLimits::default(),
-        workload_credential_b64: Some(podmesh_integration_tests::support::workload_credential(
-            owner_sk,
-            owner_b64,
-            DEMO_WORKLOAD_NAME,
-        )),
+        workload_credential_b64: Some(credential),
         workload_relay_auth_token: None,
         workload_relay_ca_certificates: Vec::new(),
         lookup_interval: Duration::from_secs(2),

@@ -8,6 +8,7 @@ authors = ["Podmesh"]
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 httparse = { workspace = true }
 futures = { workspace = true }
 clap = { workspace = true, features = ["env"] }
@@ -15,7 +16,7 @@ crypto = { workspace = true }
 iroh = { workspace = true }
 iroh-support = { workspace = true }
 rustls-pki-types = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 log = { workspace = true }
 podmesh-metrics = { workspace = true }
 env_logger = { workspace = true }
@@ -24,6 +25,10 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+hickory-proto = { workspace = true }
+hickory-server = { workspace = true }
+hickory-resolver = { workspace = true }
+data-encoding = { workspace = true }
 
 # Egress proxy dependencies
 rustables = "0.8.8"
@@ -35,5 +40,6 @@ postcard = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

@@ -120,7 +120,63 @@ impl TenantSessions {
             .flatten()
     }
 
-    /// Return a tenant only while its owner-signed workload credential remains live.
+    /// Install/renew only endpoint-bound authority for the same workload keys.
+    pub fn prove_bound(
+        &self,
+        endpoint: EndpointId,
+        stable_id: usize,
+        tenant: ProvenTenant,
+        now: u64,
+    ) -> Result<()> {
+        use protocol::workload_identity::WorkloadIdentity;
+        let identity = WorkloadIdentity::from_bytes(&tenant.credential)?;
+        identity.verify_session(
+            &tenant.owner_pubkey,
+            &tenant.manifest_id,
+            &endpoint.to_string(),
+            &crypto::b64_decode(&identity.claims.signing_public_key_b64)?,
+            now,
+        )?;
+        let mut sessions = self
+            .inner
+            .write()
+            .map_err(|_| anyhow!("tenant session lock poisoned"))?;
+        let session = sessions
+            .get_mut(&endpoint)
+            .context("connection is no longer active")?;
+        anyhow::ensure!(
+            session.stable_id == stable_id,
+            "operation belongs to a stale connection"
+        );
+        if let Some(old) = &session.tenant {
+            let previous = WorkloadIdentity::from_bytes(&old.credential)?;
+            anyhow::ensure!(
+                old.owner_pubkey == tenant.owner_pubkey
+                    && old.manifest_id == tenant.manifest_id
+                    && previous.delegation.scope.workload_id
+                        == identity.delegation.scope.workload_id
+                    && previous.claims.signing_public_key_b64
+                        == identity.claims.signing_public_key_b64,
+                "workload renewal changes proven identity"
+            );
+            anyhow::ensure!(
+                identity.claims.issued_at_secs >= previous.claims.issued_at_secs
+                    && identity.claims.expires_at_secs >= previous.claims.expires_at_secs,
+                "workload renewal regresses authority"
+            );
+        }
+        session.tenant = Some(tenant);
+        self.metrics.set_gauge(
+            podmesh_metrics::GaugeName::TenantSessions,
+            sessions
+                .values()
+                .filter(|session| session.tenant.is_some())
+                .count() as u64,
+        );
+        Ok(())
+    }
+
+    /// Return a tenant only while its endpoint-bound credential remains live.
     pub fn proven_live(
         &self,
         endpoint: &EndpointId,
@@ -130,13 +186,17 @@ impl TenantSessions {
         let tenant = self
             .proven(endpoint, stable_id)
             .context("operation on a connection that proved no tenant")?;
-        protocol::verify_workload_credential(
-            &tenant.credential,
-            &tenant.owner_pubkey,
-            &tenant.manifest_id,
-            now_secs,
-        )
-        .context("workload credential is no longer valid")?;
+        let identity =
+            protocol::workload_identity::WorkloadIdentity::from_bytes(&tenant.credential)?;
+        identity
+            .verify_session(
+                &tenant.owner_pubkey,
+                &tenant.manifest_id,
+                &endpoint.to_string(),
+                &crypto::b64_decode(&identity.claims.signing_public_key_b64)?,
+                now_secs,
+            )
+            .context("workload credential is no longer valid")?;
         Ok(tenant)
     }
 
@@ -183,18 +243,32 @@ mod tests {
         let (public, private) = crypto::generate_signing_keypair();
         let owner = crypto::b64_encode(&public);
         let manifest_id = protocol::route_id(&public, "workload");
-        let credential = protocol::mint_workload_credential(
+        let delegation = protocol::workload_identity::EnrollmentDelegation::mint(
             &private,
-            &public,
-            &protocol::WorkloadCredentialClaims {
+            protocol::workload_identity::EnrollmentScope {
                 tenant_owner: owner.clone(),
                 manifest_id: manifest_id.clone(),
-                issued_at_secs: NOW,
-                expires_at_secs: NOW + lifetime_secs,
+                workload_id: protocol::workload_id(&public, "workload", 0),
+                revision_id: protocol::revision_id(b"test"),
+                issuer_public_key_b64: owner.clone(),
                 token_id: "tenant-session-test".into(),
+                issued_at_secs: NOW,
+                expires_at_secs: None,
+                max_child_lifetime_secs: 3600,
             },
             NOW,
         )
+        .unwrap();
+        let credential = protocol::workload_identity::WorkloadIdentity::mint(
+            &private,
+            delegation,
+            endpoint(1).to_string(),
+            owner.clone(),
+            NOW,
+            lifetime_secs,
+        )
+        .unwrap()
+        .to_bytes()
         .unwrap();
         ProvenTenant {
             owner_pubkey: owner,
@@ -277,6 +351,100 @@ mod tests {
         assert!(
             sessions
                 .proven_live(&endpoint(1), FIRST_CONNECTION, NOW + 11)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bound_renewal_preserves_workload_keys_and_never_accepts_bearer_authority() {
+        let sessions = TenantSessions::new();
+        sessions.begin(endpoint(1), FIRST_CONNECTION).unwrap();
+        let (public, private) = crypto::generate_signing_keypair();
+        let owner = crypto::b64_encode(&public);
+        let manifest = protocol::route_id(&public, "workload");
+        let parent = protocol::workload_identity::EnrollmentDelegation::mint(
+            &private,
+            protocol::workload_identity::EnrollmentScope {
+                tenant_owner: owner.clone(),
+                manifest_id: manifest.clone(),
+                workload_id: protocol::workload_id(&public, "workload", 0),
+                revision_id: protocol::revision_id(b"test"),
+                issuer_public_key_b64: owner.clone(),
+                token_id: "renewal-test".into(),
+                issued_at_secs: NOW,
+                expires_at_secs: None,
+                max_child_lifetime_secs: 3600,
+            },
+            NOW,
+        )
+        .unwrap();
+        let make = |at, signer: String, peer: EndpointId| ProvenTenant {
+            owner_pubkey: owner.clone(),
+            manifest_id: manifest.clone(),
+            credential: protocol::workload_identity::WorkloadIdentity::mint(
+                &private,
+                parent.clone(),
+                peer.to_string(),
+                signer,
+                at,
+                600,
+            )
+            .unwrap()
+            .to_bytes()
+            .unwrap(),
+        };
+        sessions
+            .prove_bound(
+                endpoint(1),
+                FIRST_CONNECTION,
+                make(NOW, owner.clone(), endpoint(1)),
+                NOW,
+            )
+            .unwrap();
+        sessions
+            .prove_bound(
+                endpoint(1),
+                FIRST_CONNECTION,
+                make(NOW + 300, owner.clone(), endpoint(1)),
+                NOW + 300,
+            )
+            .unwrap();
+        sessions
+            .proven_live(&endpoint(1), FIRST_CONNECTION, NOW + 800)
+            .unwrap();
+        assert!(
+            sessions
+                .prove_bound(
+                    endpoint(1),
+                    FIRST_CONNECTION,
+                    make(NOW, owner.clone(), endpoint(1)),
+                    NOW + 300
+                )
+                .is_err()
+        );
+        assert!(
+            sessions
+                .prove_bound(
+                    endpoint(1),
+                    FIRST_CONNECTION,
+                    make(NOW + 301, crypto::b64_encode(&[8; 32]), endpoint(1)),
+                    NOW + 301
+                )
+                .is_err()
+        );
+        assert!(
+            sessions
+                .prove_bound(
+                    endpoint(1),
+                    FIRST_CONNECTION,
+                    make(NOW + 301, owner.clone(), endpoint(2)),
+                    NOW + 301
+                )
+                .is_err()
+        );
+        assert!(
+            sessions
+                .prove_bound(endpoint(1), FIRST_CONNECTION, tenant("bearer"), NOW)
                 .is_err()
         );
     }

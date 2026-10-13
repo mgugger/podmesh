@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use podctl::{
-    ClientOptions, OutputFormat, apply_file, cert, delete_deployment, delete_file, get_logs,
-    get_pod, get_pods, list_workloads, namespace_id,
+    ClientOptions, OutputFormat, apply_file, cert, delete_deployment, delete_file,
+    get_connector_identities, get_logs, get_pod, get_pods, list_workloads, namespace_id,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -94,6 +94,11 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum GetResource {
+    /// Inspect in-workload endpoint identities (not enrollment credentials)
+    Connectors {
+        /// Deployment id or workload name
+        deployment: String,
+    },
     /// List all pods/workloads
     #[command(alias = "pod")]
     Pods {
@@ -137,6 +142,14 @@ async fn main() -> anyhow::Result<()> {
             writeln!(std::io::stdout(), "Deleted {deployment_id}")?;
         }
         Commands::Get { resource } => match resource {
+            GetResource::Connectors { deployment } => {
+                let identities = get_connector_identities(&deployment, &options).await?;
+                writeln!(
+                    std::io::stdout(),
+                    "{}",
+                    serde_json::to_string_pretty(&identities)?
+                )?;
+            }
             GetResource::Pods { name: Some(name) } => {
                 let response = get_pod(&name, &options).await?;
                 writeln!(std::io::stdout(), "{response}")?;
@@ -178,6 +191,14 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connector_inspection_is_a_get_operation() {
+        let cli = Cli::try_parse_from(["podctl", "get", "connectors", "demo"]).unwrap();
+        assert!(matches!(cli.command, Commands::Get {
+            resource: GetResource::Connectors { deployment }
+        } if deployment == "demo"));
+    }
 
     #[test]
     fn cert_proxy_trust_commands_parse() {
