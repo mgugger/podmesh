@@ -29,8 +29,8 @@ use crate::scheduler_node::{TestScheduler, config as scheduler_config};
 pub const MESH_TIMEOUT: Duration = Duration::from_secs(30);
 const RELAY_URL: &str = "https://relay.example.test/";
 const MAX_ATTACHED_AGENTS: usize = 16;
-/// Query lifetime used by the harness. Exposed so a test can assert that
-/// placement finishes well inside it rather than sleeping to expiry.
+/// Query lifetime used by the harness. This bounds capacity collection, not
+/// the complete apply flow (deployment and DNS bootstrap have separate waits).
 pub const MESH_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 const AGENT_CPU_MILLI: u32 = 8_000;
 const AGENT_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;

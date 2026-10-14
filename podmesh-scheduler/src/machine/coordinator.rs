@@ -82,19 +82,13 @@ impl CapacityService {
             return Err(error);
         }
         let wait = Duration::from_secs(begun.query.expires_at_secs.saturating_sub(now));
-        let mut offers = begun.offers.clone();
-        let enough = begun.target_offers;
-        tokio::select! {
-            _ = self.cancellation.cancelled() => {
-                anyhow::bail!("scheduler capacity request cancelled during shutdown")
-            }
-            // `wait_for` checks the current value before suspending, so an offer
-            // that arrived while the query was being published is not missed.
-            result = offers.wait_for(|collected| *collected >= enough) => {
-                let _ = result;
-            }
-            _ = tokio::time::sleep(wait) => {}
-        }
+        wait_for_offers(
+            begun.offers.clone(),
+            begun.target_offers,
+            wait,
+            &self.cancellation,
+        )
+        .await?;
         let selection_timer = self
             .metrics
             .operation_started(podmesh_metrics::OperationName::CapacitySelection);
@@ -111,6 +105,26 @@ impl CapacityService {
         }
         Ok(selected)
     }
+}
+
+async fn wait_for_offers(
+    mut offers: tokio::sync::watch::Receiver<usize>,
+    enough: usize,
+    wait: Duration,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    tokio::select! {
+        _ = cancellation.cancelled() => {
+            anyhow::bail!("scheduler capacity request cancelled during shutdown")
+        }
+        // Check the current value too: offers arriving while the query was
+        // being published must not be missed.
+        result = offers.wait_for(|collected| *collected >= enough) => {
+            let _ = result;
+        }
+        _ = tokio::time::sleep(wait) => {}
+    }
+    Ok(())
 }
 
 pub struct CapacityCoordinator {
@@ -205,3 +219,7 @@ impl CapacityCoordinator {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "coordinator_tests.rs"]
+mod tests;

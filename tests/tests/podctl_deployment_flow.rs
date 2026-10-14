@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result};
 use podctl::ClientOptions;
 use podmesh_integration_tests::{
-    mesh::{MESH_QUERY_TIMEOUT, MESH_TIMEOUT, TestMesh, test_proxy_endpoint},
+    mesh::{MESH_TIMEOUT, TestMesh, test_proxy_endpoint},
     support::{self, ClientKeyDir},
 };
 use serial_test::serial;
@@ -419,35 +419,6 @@ fn assert_sidecar_injected(manifest: &[u8]) -> Result<()> {
                 .iter()
                 .any(|value| value.as_str() == Some("NET_ADMIN"))),
         "the sidecar needs NET_ADMIN to install transparent egress rules"
-    );
-    Ok(())
-}
-
-/// Placement must cost what the mesh actually takes to answer, not the query
-/// lifetime.
-///
-/// A selection that always slept to expiry would make every replica of every
-/// deployment pay that timeout in series: a 64-replica apply would spend over
-/// five minutes on timers alone, regardless of how fast the agents responded.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn placement_returns_as_soon_as_the_mesh_has_answered() -> Result<()> {
-    let (mesh, _key_dir, options) = mesh_with_client(3).await?;
-    let (_dir, path) = manifest("fast-placement", 3)?;
-
-    let started = std::time::Instant::now();
-    timeout(TEST_TIMEOUT, apply(&path, &options))
-        .await
-        .context("apply timed out")??;
-    let elapsed = started.elapsed();
-
-    assert_eq!(mesh.total_deployed_workloads().await, 3);
-    // Three replicas are placed in series, so a scheduler that slept out every
-    // query would need at least three whole query lifetimes.
-    assert!(
-        elapsed < MESH_QUERY_TIMEOUT,
-        "placing 3 replicas took {elapsed:?}, which is at least one full query \
-         lifetime ({MESH_QUERY_TIMEOUT:?}) — the early exit is not working"
     );
     Ok(())
 }

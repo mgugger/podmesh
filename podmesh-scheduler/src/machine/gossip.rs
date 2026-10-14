@@ -200,6 +200,11 @@ impl SchedulerGossip {
             let mut seen = SeenQueries::new(max_seen);
             loop {
                 tokio::select! {
+                    // Router shutdown closes the subscription as well as
+                    // cancelling this task. Prefer intentional cancellation
+                    // when both are ready, rather than reporting a receive
+                    // failure during a clean shutdown.
+                    biased;
                     _ = receiver_cancellation.cancelled() => return Ok(()),
                     event = receiver.next() => match event {
                         Some(Ok(Event::Received(message))) => {

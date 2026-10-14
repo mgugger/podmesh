@@ -85,6 +85,35 @@ async fn authorized_schedulers_exchange_queries_and_unauthorized_peer_is_closed(
     Ok(())
 }
 
+/// Immediate shutdown can make cancellation and subscription closure ready
+/// together, especially when the receiver has not yet been scheduled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn immediate_gossip_shutdown_is_not_a_subscription_failure() -> Result<()> {
+    for _ in 0..32 {
+        let lookup = MemoryLookup::new();
+        let node = endpoint(&SecretKey::generate(), &lookup).await?;
+        let config = config(HashSet::from([node.id()]), Vec::new());
+        let queries = QueryManager::new(8, 8, TEST_TIMEOUT);
+        let gossip = SchedulerGossip::start(
+            SchedulerGossipServices {
+                endpoint: node.clone(),
+                attachments: AttachmentManager::new(8, 8, TEST_TIMEOUT).handler(),
+                offers: queries.offer_handler(),
+                placement: PlacementHandler::new(8, TEST_TIMEOUT),
+                locations: LocationRegistry::new(),
+                member_issuers: MemberIssuers::new(),
+                lookup,
+            },
+            &config,
+        )
+        .await?;
+        let result = timeout(TEST_TIMEOUT, gossip.shutdown()).await?;
+        timeout(TEST_TIMEOUT, node.close()).await?;
+        result.context("intentional gossip shutdown reported a receive failure")?;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn scheduler_rejoins_after_partition_with_the_same_identity() -> Result<()> {
     let lookup = MemoryLookup::new();
