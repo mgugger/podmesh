@@ -103,7 +103,6 @@ async fn transparent_egress_routes_through_sidecar_and_proxy() -> Result<()> {
 
     // Start the podmesh stack
     let mut stack_guard = PodmanKubeGuard::launch(&stack_manifest).await?;
-    let mut workload_guard = WorkloadGuard::default();
 
     let client = Client::builder()
         .timeout(HTTP_PROBE_TIMEOUT)
@@ -119,6 +118,13 @@ async fn transparent_egress_routes_through_sidecar_and_proxy() -> Result<()> {
     // of the stack under test, so there is no separate identity to pin.
     let key_dir = ClientKeyDir::with_trusted_agents(&[])?;
     key_dir.activate();
+    let (network_owner, _) = crypto::load_or_create_signing_keypair(key_dir.path())?;
+    let _tenant_network = podmesh_integration_tests::support::TenantNetworkGuard::prepare(
+        &network_owner,
+        &["podmesh-control", "podmesh-proxies"],
+    )
+    .await?;
+    let mut workload_guard = WorkloadGuard::default();
     let options = ClientOptions {
         api_base: Some(MACHINE_API_URL.to_string()),
         trust_any_agent: true,

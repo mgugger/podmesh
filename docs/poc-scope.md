@@ -12,8 +12,9 @@ The [OpenSpec capabilities](../openspec/specs/) own requirements; this document 
 - **Statelessness:** schedulers hold no authoritative or durable workload state. Agents retain local
   records and keys, owners retain keys/catalogs, and proxies hold volatile grants.
 - **Zero trust:** guarantees are scoped to owner-agent control and sidecar-proxy authorization.
-  The selected host controls execution plaintext. Shared networking does not isolate application
-  ports, and approved proxies can read traffic unless applications protect it end to end.
+  The selected host controls execution plaintext. Tenant networks separate workload bridge membership,
+  not all routed or proxy-mediated application traffic. Approved proxies can read traffic unless
+  applications protect it end to end.
 - **Identity-based authorization:** owner signatures authorize lifecycle operations; bearer workload
   credentials and endpoint-bound proxy grants authorize mesh traffic. Any new owner may request
   capacity; identity validation is not an operator admission or quota policy.
@@ -30,6 +31,10 @@ One normalized Pod or Deployment per replica, plus supported Service/Ingress doc
 clustering, desired-state controller, autonomous relocation/scaling, persistent volumes, UDP routing
 or mixed-version compatibility. External ingress is plain HTTP. Host/Podman and configured bootstrap
 remain trusted boundaries. Traffic proxies use their own network reach on a tenant's behalf.
+Podman creates managed tenant networks on deployment and retains unused networks for explicit
+operator cleanup; owner churn can exhaust network/address pools. Operators supply reachable mesh
+endpoints and routing/firewall policy. Local tests explicitly connect required infrastructure to
+tenant networks; production runtime does not.
 
 Proxy grants may remain in memory; restart can require `podctl cert grant-proxy`. Explicit apply
 renews credentials in their renewal window. Complete agent/key loss is unrecoverable. No production

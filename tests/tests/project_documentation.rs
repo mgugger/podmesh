@@ -362,7 +362,7 @@ fn ordinary_checks_and_poc_limits_are_consistent() -> Result<()> {
     for required in [
         "greenfield",
         "mixed-version",
-        "shared networking",
+        "tenant networks",
         "plain http",
         "bearer workload",
         "bootstrap",

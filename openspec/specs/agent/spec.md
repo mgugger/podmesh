@@ -101,8 +101,8 @@ Only the container the agent injects, matched by its exact name, may hold `NET_A
 container using a similar name SHALL NOT inherit that exemption.
 
 These manifest checks SHALL NOT be described as proof of host confinement or tenant network
-isolation. Direct application traffic on the shared workload network is not governed by proxy
-credential checks, and the host and Podman runtime remain trusted execution boundaries.
+isolation. Direct application traffic is not governed by proxy credential checks; tenant bridges
+are not a complete routing/firewall policy, and the host and Podman runtime remain trusted execution boundaries.
 
 #### Scenario: A host escape attempt is refused
 
@@ -157,22 +157,49 @@ is expected to host.
 - **THEN** further reservations from that namespace are refused while other
   namespaces are still admitted
 
-### Requirement: The workload network SHALL NOT be treated as a tenant boundary
+### Requirement: Podman workloads SHALL use managed tenant-scoped networks
 
-All workload pods on an agent share one runtime network, so a pod can reach
-another tenant's pod by address. Tenants are separated by owner identity at the
-proxy — relay admission, route ownership, and egress are each gated on the owner
-key — never by network topology.
+The Podman runtime SHALL create/reuse a managed network per authenticated owner per Podman instance
+on deployment, selecting it exclusively for that owner's pods. `--workload-network-prefix` defaults
+to `podmesh-tenant`; a stable owner-key digest determines the suffix. Concurrent creation SHALL be
+safe and incompatible existing networks SHALL be refused. Infrastructure connectivity is operator
+configuration, not automatic runtime behavior.
 
-Layer-3 isolation is outside this PoC's implementation scope, not inherently incompatible with
-multi-host deployment. The absence of a network boundary SHALL be stated rather than implied away.
+#### Scenario: Deployment creates a missing tenant network
 
-#### Scenario: The shared network is not relied on for isolation
+- **WHEN** an authenticated owner deploys and its network does not exist
+- **THEN** the runtime creates a DNS-enabled, non-internal bridge with managed/tenant labels
+- **AND** it deploys the pod exclusively on that network without attaching infrastructure
+- **AND** admission and capacity queries alone do not allocate networks
 
-- **WHEN** two tenants deploy to one agent
-- **THEN** their pods share a network
-- **AND** direct access to application ports is not isolated by Podmesh
-- **AND** naming another owner does not authorize its mesh operations without its valid credentials
+#### Scenario: Agents share a tenant network safely
+
+- **WHEN** agents using one Podman instance concurrently deploy workloads for the same owner
+- **THEN** they use the same managed network
+- **AND** deleting one workload does not remove that network or sibling workloads
+
+#### Scenario: Different tenants do not share the selected bridge
+
+- **WHEN** different owners deploy to one Podman instance
+- **THEN** their workloads select distinct managed networks
+- **AND** naming another owner does not authorize its mesh operations without valid credentials
+
+#### Scenario: A conflicting network is refused
+
+- **WHEN** the derived network name exists with incompatible ownership or configuration
+- **THEN** deployment fails rather than using or modifying that network
+
+#### Scenario: Unused networks are retained
+
+- **WHEN** the last workload is deleted
+- **THEN** the network remains for explicit operator cleanup; automatic reclamation is not implemented
+
+#### Scenario: Topology does not replace authorization or firewall policy
+
+- **WHEN** workloads use separate tenant bridges
+- **THEN** owner credentials remain required for mesh operations
+- **AND** operators supply reachable proxy/relay endpoints and routing/firewall policy
+- **AND** documentation does not claim prevention of host-routed or proxy-mediated cross-tenant traffic
 
 ### Requirement: The agent SHALL report an owner's workloads on request
 

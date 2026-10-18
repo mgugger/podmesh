@@ -14,7 +14,7 @@ acceptance remain pending; container-free checks alone still do not prove kernel
 ## Container-free checks
 
 ```sh
-cargo test --locked -p podmesh-sidecar --test local_dns --test local_peer_dns --test production_dns
+cargo test --locked -p podmesh-sidecar --test local_dns --test local_peer_dns --test production_dns --test peer_stream_isolation
 ```
 
 Fixtures use production catalog, credential, record and envelope validators, not an authorization
@@ -26,8 +26,11 @@ bypass. They start no containers, do not modify host DNS/routes/nftables, and ne
 - `local_peer_dns`: three real loopback Iroh endpoints, sparse introduction, paginated discovery,
   replica-specific remote TCP responses, Service targetPort translation, setup-only retry, expiry
   and foreign-tenant wire refusal.
+- `peer_stream_isolation`: a failed sync/catalog validation on a cached transport does not reset
+  an already-established service tunnel, and subsequent synchronization remains usable.
 - `production_dns`: normal sidecar startup, signed seed installation through connector control,
-  local DNS, durable mapping and internal HTTP CONNECT dispatch over real Iroh. Its remote
+  refusal of older sibling catalogs for the local deployment, local DNS, durable mapping and
+  internal HTTP CONNECT dispatch over real Iroh. Its remote
   application listens on a different loopback alias, so local fallback cannot satisfy the probe.
   No live proxy is available. Kernel interception is explicitly disabled for this test.
 
@@ -41,8 +44,9 @@ bypass. They start no containers, do not modify host DNS/routes/nftables, and ne
   authorize arbitrary names or target ports. Replica leases require bound Biscuit credentials and
   application-key signatures; bare endpoint records and bearer credentials are insufficient.
 - Owner control explicitly selects catalog/generation replacements. Ordinary gossip cannot choose
-  a new owner intent. Agent control/runtime exec mediates seed delivery; machine peers do not become
-  discovery members. Bootstrap failure retains recorded placements so `podctl apply` can retry.
+  a new owner intent. Seeds for the local deployment must match its configured execution catalog;
+  an older sibling seed cannot roll back the replacement's own catalog. Agent control/runtime exec
+  mediates seed delivery; machine peers do not become discovery members. Bootstrap failure retains recorded placements so `podctl apply` can retry.
   Sequential updates wait for each replacement's live enrolled record at the requested revision
   before replacing the next replica; a deployment response itself is not enrollment readiness.
 - `workload_network.rs` refreshes leases every ten seconds and on authority changes, synchronizing
@@ -50,7 +54,8 @@ bypass. They start no containers, do not modify host DNS/routes/nftables, and ne
   Stale signed hints can bootstrap synchronization only, never authorize application traffic.
   Up to 32 outbound peer connections and 32 incoming sessions are retained with bounded stream
   admission and idle shutdown. Every stream still carries fresh signed, currently verified authority.
-  Valid older anti-entropy snapshots are ignored without aborting batches or regressing state.
+  Setup/synchronization failures are stream-scoped and do not close the shared transport underneath
+  other authorized service tunnels. Valid older anti-entropy snapshots are ignored without aborting batches or regressing state.
 - VIP mappings, discovery sequence and bounded signed hints are persisted as atomic private files
   beside connector identity. Eligible live backend records are not restored from disk. Writable-layer
   storage survives normal restart, not container recreation; managed volumes remain unimplemented.
@@ -107,7 +112,8 @@ is checked separately. Bare-host rootful deployment-manifest execution and kerne
 acceptance are still pending (those forwarding behaviors are covered in-process).
 Managed identity volumes, DNS/discovery-specific readiness/metrics, arbitrary application UDP,
 synthetic IPv6 service transport, physical multi-host acceptance, autonomous rescheduling and VM
-attestation are not delivered. Existing trusted-host/shared-network limitations still apply.
+attestation are not delivered. Trusted-host and routing/firewall limitations still apply; tenant
+bridges do not prevent proxy-mediated access to destinations the proxy can reach.
 
 ## VM/libkrun regression checks
 

@@ -7,6 +7,11 @@ use std::sync::{Mutex, Once, OnceLock};
 use anyhow::{Context, Result, anyhow};
 use tokio::process::Command;
 
+#[cfg(feature = "podman-tests")]
+mod podman_network;
+#[cfg(feature = "podman-tests")]
+pub use podman_network::TenantNetworkGuard;
+
 static INIT_LOGGING: Once = Once::new();
 /// Single volume the deploy manifests mount into every component.
 const PODMESH_STATE_VOLUME: &str = "podmesh-state";

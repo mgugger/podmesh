@@ -100,7 +100,6 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
     let sample_manifest = workspace.join(SAMPLE_MANIFEST_PATH);
 
     let mut stack_guard = PodmanKubeGuard::launch(&stack_manifest).await?;
-    let mut workload_guard = WorkloadGuard::default();
 
     let client = Client::builder()
         .timeout(HTTP_PROBE_TIMEOUT)
@@ -130,6 +129,15 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
             .with_context(|| format!("trust local proxy {proxy_url}"))?;
     }
 
+    let (owner_public, owner_private) = crypto::load_or_create_signing_keypair(key_dir.path())
+        .context("load namespace signing key")?;
+    let tenant_network = podmesh_integration_tests::support::TenantNetworkGuard::prepare(
+        &owner_public,
+        &["podmesh-control", "podmesh-proxies"],
+    )
+    .await?;
+    let mut workload_guard = WorkloadGuard::default();
+
     let manifest_id = apply_file_with_proxy_urls(
         sample_manifest.clone(),
         &options,
@@ -140,15 +148,17 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
     log::info!("podctl applied manifest {manifest_id}");
     // `podctl` returns the deployment id, while the agent names the pod after
     // the per-replica workload id. Derive the latter to find the containers.
-    let (owner_public, owner_private) = crypto::load_or_create_signing_keypair(key_dir.path())
-        .context("load namespace signing key")?;
     let workload_id =
         protocol::workload_id(&owner_public, SAMPLE_WORKLOAD_NAME, SAMPLE_REPLICA_INDEX);
     workload_guard.set(workload_id.clone());
 
     wait_for_workload_containers(&workload_id, Duration::from_secs(180)).await?;
     wait_for_connector_identities(&manifest_id, &options, 1, Duration::from_secs(60)).await?;
-    verify_metrics_target(&format!("{}-pod:9230", workload_runtime_name(&workload_id))).await?;
+    verify_metrics_target_on_network(
+        &format!("{}-pod:9230", workload_runtime_name(&workload_id)),
+        &tenant_network.name,
+    )
+    .await?;
     wait_for_podmesh_proxy_response(&client, Duration::from_secs(120)).await?;
 
     let status = get_pod(&manifest_id, &options)
@@ -433,11 +443,12 @@ async fn live_podman_two_tier_frontend_queries_postgres_on_distinct_agent() -> R
         is_podman_available().await,
         "podman-tests requires the podman CLI"
     );
-    ensure_podman_network(PODMESH_NETWORK).await?;
-
     let mesh = tokio::time::timeout(
         podmesh_integration_tests::mesh::MESH_TIMEOUT,
-        podmesh_integration_tests::mesh::TestMesh::start_podman(2, PODMESH_NETWORK),
+        podmesh_integration_tests::mesh::TestMesh::start_podman(
+            2,
+            podmesh_agent::config::DEFAULT_WORKLOAD_NETWORK_PREFIX,
+        ),
     )
     .await
     .context("start two-agent Podman mesh timed out")??;
@@ -486,6 +497,8 @@ async fn live_podman_two_tier_frontend_queries_postgres_on_distinct_agent() -> R
     let frontend_manifest = workspace.join("deploy/demo_two_tier_frontend.yml");
     let db_workload_id = protocol::workload_id(&owner_public, "postgres-db", 0);
     let frontend_workload_id = protocol::workload_id(&owner_public, "demo-frontend", 0);
+    let _tenant_network =
+        podmesh_integration_tests::support::TenantNetworkGuard::prepare(&owner_public, &[]).await?;
     let mut workload_guard = WorkloadGuard::default();
     workload_guard.set(db_workload_id.clone());
     workload_guard.set(frontend_workload_id.clone());
@@ -980,12 +993,16 @@ async fn run_podman_command<const N: usize>(args: [&str; N]) -> Result<String> {
 }
 
 async fn verify_metrics_target(target: &str) -> Result<()> {
+    verify_metrics_target_on_network(target, PODMESH_NETWORK).await
+}
+
+async fn verify_metrics_target_on_network(target: &str, network: &str) -> Result<()> {
     let output = TokioCommand::new("podman")
         .args([
             "run",
             "--rm",
             "--network",
-            PODMESH_NETWORK,
+            network,
             "docker.io/curlimages/curl:latest",
             "--fail",
             "--silent",

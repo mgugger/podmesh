@@ -65,7 +65,8 @@ dashboard, alert, trace service, metric volume, queue, or retention system.
 #### Scenario: Unauthenticated metrics are not host-published
 
 - **WHEN** either sample stack is started
-- **THEN** application metrics are reachable from the `podmesh` network
+- **THEN** control-plane application metrics are reachable from the `podmesh` network
+- **AND** workload sidecar metrics are reachable from their tenant network
 - **AND** no application-metrics port is published to the host
 
 ### Requirement: Gate 8 SHALL use direct bounded scrapes without a resident collector
@@ -170,9 +171,11 @@ reaching ingress, and tearing the stack down. It SHALL NOT instruct the operator
 secret.
 
 It SHALL state plainly what the local stack does not protect: ingress is plain HTTP, the scheduler
-API is unauthenticated, the proxy accepts grants from anyone, tenants share one workload network and
-one state volume, egress tunnels are not filtered by destination address, and the agents drive a
-Podman socket that is equivalent to host control.
+API is unauthenticated, the proxy accepts grants from anyone, agent state uses one shared volume,
+egress tunnels are not filtered by destination address, and the agents drive a Podman socket that
+is equivalent to host control. It SHALL explain on-demand tenant networks, retained unused networks,
+and how the local trial makes proxy/control endpoints reachable without attaching workloads to the
+control network. Test-only infrastructure attachments SHALL NOT become production runtime behavior.
 
 #### Scenario: Operator follows the README
 

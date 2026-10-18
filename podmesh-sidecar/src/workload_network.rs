@@ -93,6 +93,15 @@ impl WorkloadNetwork {
     }
     pub fn seed(&self, record: ReplicaServiceRecord) -> Result<()> {
         let now = system_clock()();
+        // A sibling introduced during rolling update may still advertise the
+        // previous revision. Seed control can replace remote catalogs, but only
+        // deployment metadata selects this workload's own execution catalog.
+        if let Some(own) = &self.catalog {
+            ensure!(
+                own.manifest_id != record.catalog.manifest_id || own == &record.catalog,
+                "peer seed conflicts with this workload's configured catalog"
+            );
+        }
         self.cache
             .lock()
             .map_err(|_| anyhow::anyhow!("service cache poisoned"))?

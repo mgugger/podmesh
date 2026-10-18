@@ -5,7 +5,7 @@ pub const DEFAULT_CPU_MILLI: u32 = 4_000;
 pub const DEFAULT_MEMORY_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub const DEFAULT_STORAGE_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_WORKLOADS: usize = 100;
-pub const DEFAULT_WORKLOAD_NETWORK: &str = "podmesh";
+pub const DEFAULT_WORKLOAD_NETWORK_PREFIX: &str = "podmesh-tenant";
 /// Share of capacity that admissions which have not deployed may hold.
 ///
 /// A reservation is one signed message and is not checked against a real
@@ -49,11 +49,10 @@ pub struct Config {
     #[arg(long, value_enum, default_value_t = RuntimeKind::Podman)]
     pub runtime: RuntimeKind,
 
-    /// Network for workload pods.
-    ///
-    /// Every tenant's pods share it, so this is a transport, not a boundary:
-    /// tenants are separated by owner identity at the proxy, not by topology.
-    #[arg(long, default_value = DEFAULT_WORKLOAD_NETWORK)]
+    /// Prefix for managed per-tenant Podman networks, created on deployment.
+    /// Proxy/relay endpoints must be reachable from these networks. Unused
+    /// networks are retained for explicit operator cleanup.
+    #[arg(long = "workload-network-prefix", default_value = DEFAULT_WORKLOAD_NETWORK_PREFIX)]
     pub workload_network: String,
 
     /// Share of capacity that pending reservations may hold, as a percentage.
@@ -95,4 +94,20 @@ pub struct Config {
 
     #[command(flatten)]
     pub machine: crate::machine::MachineConfig,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tenant_network_prefix_is_the_standard_configuration() {
+        let default = Config::try_parse_from(["podmesh-agent"]).unwrap();
+        assert_eq!(default.workload_network, DEFAULT_WORKLOAD_NETWORK_PREFIX);
+        let custom =
+            Config::try_parse_from(["podmesh-agent", "--workload-network-prefix", "lab-tenants"])
+                .unwrap();
+        assert_eq!(custom.workload_network, "lab-tenants");
+        assert!(Config::try_parse_from(["podmesh-agent", "--workload-network", "shared"]).is_err());
+    }
 }

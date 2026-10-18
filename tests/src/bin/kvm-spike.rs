@@ -245,7 +245,6 @@ async fn exercise(run: &KvmRun, binaries: &Path) -> Result<()> {
     cp /opt/podmesh/podmesh-kvm-http /tmp/app-root/app
     tar -C /tmp/app-root -cf /tmp/app.tar .
     podman import --change 'ENTRYPOINT ["/app"]' /tmp/app.tar localhost/podmesh-kvm/app:spike
-    podman network create podmesh
     "#;
     run.ssh(1, preload, None)
         .await
@@ -1218,7 +1217,6 @@ async fn exercise_mesh(
     cp /opt/podmesh/podmesh-kvm-http /tmp/app-root/app
     tar -C /tmp/app-root -cf /tmp/app.tar .
     podman import --change 'ENTRYPOINT ["/app"]' /tmp/app.tar localhost/podmesh-kvm/app:spike
-    podman network create podmesh
     "#;
     for agent in ["agent-1", "agent-2", "agent-3"] {
         run.ssh(mesh_guest(run, agent)?, preload, None)

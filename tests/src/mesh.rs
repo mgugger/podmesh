@@ -104,8 +104,8 @@ impl TestMesh {
         })
     }
 
-    /// Starts a scheduler and `agent_count` agents backed by the real Podman runtime.
-    pub async fn start_podman(agent_count: usize, workload_network: &str) -> Result<Self> {
+    /// Starts real Podman agents sharing a tenant-network name prefix.
+    pub async fn start_podman(agent_count: usize, network_prefix: &str) -> Result<Self> {
         anyhow::ensure!(
             (1..=MAX_ATTACHED_AGENTS).contains(&agent_count),
             "agent_count must be between 1 and {MAX_ATTACHED_AGENTS}"
@@ -121,7 +121,7 @@ impl TestMesh {
         let scheduler_endpoint = crypto::b64_encode(&record.to_bytes(now_secs())?);
         let mut agents = Vec::with_capacity(agent_count);
         for _ in 0..agent_count {
-            agents.push(start_podman_agent(&scheduler_endpoint, workload_network).await?);
+            agents.push(start_podman_agent(&scheduler_endpoint, network_prefix).await?);
         }
         timeout(MESH_TIMEOUT, async {
             while scheduler.attachments.len().await != agent_count {
@@ -285,7 +285,7 @@ async fn start_agent_with_runtime(
     })
 }
 
-async fn start_podman_agent(scheduler_endpoint: &str, workload_network: &str) -> Result<TestAgent> {
+async fn start_podman_agent(scheduler_endpoint: &str, network_prefix: &str) -> Result<TestAgent> {
     let temp = tempfile::tempdir()?;
     let config = Config {
         listen: "127.0.0.1:0".into(),
@@ -294,7 +294,7 @@ async fn start_podman_agent(scheduler_endpoint: &str, workload_network: &str) ->
         key_dir: temp.path().join("keys"),
         state_path: temp.path().join("state.redb"),
         runtime: RuntimeKind::Podman,
-        workload_network: workload_network.into(),
+        workload_network: network_prefix.into(),
         max_reserved_capacity_percent: podmesh_agent::config::DEFAULT_MAX_RESERVED_CAPACITY_PERCENT,
         sidecar_image: "podmesh/sidecar:latest".into(),
         capacity_cpu_milli: AGENT_CPU_MILLI,
@@ -325,7 +325,7 @@ async fn start_podman_agent(scheduler_endpoint: &str, workload_network: &str) ->
         },
     };
     let podman_runtime =
-        podmesh_agent::runtime::create_runtime(RuntimeKind::Podman, workload_network)?;
+        podmesh_agent::runtime::create_runtime(RuntimeKind::Podman, network_prefix)?;
     let service = AgentService::new(config.clone(), podman_runtime).await?;
     let signing_pubkey =
         crypto::b64_encode(&crypto::load_or_create_signing_keypair(&config.key_dir)?.0);

@@ -13,12 +13,14 @@ use tokio::{process::Command, sync::RwLock, time::timeout};
 
 mod connector;
 mod connector_mock;
+mod network;
+
+pub use network::{MANAGED_NETWORK_LABEL, TENANT_NETWORK_LABEL, tenant_network_name};
 
 use protocol::workload_connector::{ConnectorError, ConnectorRequest, ConnectorResponse};
 
 const RUNTIME_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_RUNTIME_OUTPUT_BYTES: usize = 1024 * 1024;
-const MAX_WORKLOAD_NETWORK_LEN: usize = 128;
 /// Upper bound on the containers whose logs a single request may collect.
 /// A workload pod holds an application container plus the injected sidecar;
 /// the bound keeps a hostile manifest from turning one request into hundreds
@@ -250,21 +252,14 @@ impl WorkloadRuntime for MockRuntime {
 }
 
 pub struct PodmanRuntime {
-    network: String,
+    network_prefix: String,
 }
 
 impl PodmanRuntime {
-    pub fn new(network: &str) -> Result<Self> {
-        anyhow::ensure!(
-            !network.is_empty()
-                && network.len() <= MAX_WORKLOAD_NETWORK_LEN
-                && network.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-                }),
-            "invalid workload network"
-        );
+    pub fn new(network_prefix: &str) -> Result<Self> {
+        network::validate_prefix(network_prefix)?;
         Ok(Self {
-            network: network.to_string(),
+            network_prefix: network_prefix.to_string(),
         })
     }
 
@@ -349,12 +344,13 @@ impl WorkloadRuntime for PodmanRuntime {
         file.as_file_mut()
             .set_permissions(std::fs::Permissions::from_mode(0o600))?;
         std::io::Write::write_all(&mut file, deployment.manifest)?;
+        let network = self.ensure_tenant_network(deployment.namespace_id).await?;
         Self::output(
             Command::new("podman")
                 .arg("kube")
                 .arg("play")
                 .arg("--network")
-                .arg(&self.network)
+                .arg(&network)
                 .arg("--replace")
                 .arg(file.path()),
         )
@@ -439,10 +435,10 @@ impl WorkloadRuntime for PodmanRuntime {
 
 pub fn create_runtime(
     kind: crate::config::RuntimeKind,
-    workload_network: &str,
+    network_prefix: &str,
 ) -> Result<Arc<dyn WorkloadRuntime>> {
     match kind {
-        crate::config::RuntimeKind::Podman => Ok(Arc::new(PodmanRuntime::new(workload_network)?)),
+        crate::config::RuntimeKind::Podman => Ok(Arc::new(PodmanRuntime::new(network_prefix)?)),
         crate::config::RuntimeKind::Mock => Ok(Arc::new(MockRuntime::default())),
     }
 }
@@ -490,11 +486,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validates_workload_network_name() {
+    fn validates_workload_network_prefix() {
         assert!(PodmanRuntime::new("podmesh").is_ok());
         assert!(PodmanRuntime::new("mesh.test_1").is_ok());
         assert!(PodmanRuntime::new("").is_err());
         assert!(PodmanRuntime::new("mesh network").is_err());
-        assert!(PodmanRuntime::new(&"a".repeat(MAX_WORKLOAD_NETWORK_LEN + 1)).is_err());
+        assert!(PodmanRuntime::new(&"a".repeat(64)).is_err());
     }
 }

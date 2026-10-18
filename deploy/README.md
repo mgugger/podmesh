@@ -137,8 +137,9 @@ remain separate and unchanged.
 
 ## Step 1 — Prerequisites
 
-You need Podman with its API socket running, a network for the mesh, the four container images, and
-the `podctl` binary.
+You need Podman with its API socket running, a control-plane network for the local mesh, the four
+container images, and the `podctl` binary. `podmesh` below is the infrastructure network; agents
+create tenant workload networks on demand.
 
 ```bash
 podman --version                      # 6.0.1 was used here
@@ -163,7 +164,10 @@ localhost/podmesh/sidecar:latest
 ```
 
 The agent injects `podmesh/sidecar:latest` into every workload pod, so that image must exist locally
-before you deploy anything.
+before you deploy anything. The documented image builder uses optimized release binaries. If you
+manually replace runtime binaries for development, retain optimization: unoptimized container
+runtimes can miss enrollment/peer deadlines even with working networking. The Rust test harness
+itself can remain a normal debug build; do not weaken runtime deadlines to accommodate debug images.
 
 ## Step 2 — Start the mesh
 
@@ -309,10 +313,11 @@ Worth knowing before you point anything real at it:
   kind, host namespaces, host ports, tenant-added capabilities and explicit privileged settings are
   refused. Manifest checks do not certify host confinement; the injected sidecar may add `NET_ADMIN`.
 * **All nine components share one state volume**, so they are not isolated from each other.
-* **Tenants share one workload network**, so one tenant's pod can reach another's by address. This
-  is by design: mesh operations are authorized by owner identity at the proxy, while direct traffic
-  to application ports is not isolated. Network isolation is outside this PoC, not incompatible
-  with multi-host deployment.
+* **Workloads use tenant-specific networks**, created on deployment and reused per owner within
+  each Podman instance. `--workload-network-prefix` defaults to `podmesh-tenant`. Separate bridges
+  are not a complete firewall: host routing and proxy-mediated egress still matter, and mesh
+  operations still require owner credentials. Unused managed networks are retained; operators
+  must remove verified unused networks explicitly to avoid exhausting network/address pools.
 * **Egress tunnels are not filtered by destination address.** A workload whose owner granted a
   proxy can tunnel anywhere that proxy can reach, including its own loopback services and cloud
   instance metadata. Authorisation is by tenant, not by address, so run proxies where that reach is
@@ -412,11 +417,38 @@ If you prefer to wire things explicitly, unset `PODMESH_PROXY_URL` and supply
 
 ## Step 5 — Deploy a workload
 
-This is the "kubectl apply" of podmesh.
+This is the "kubectl apply" of podmesh. Workloads create their own tenant network rather than
+joining `podmesh`. Production operators must advertise proxy/relay endpoints reachable from those
+networks. For this disposable local trial only, define the following helper to connect the local
+proxy/control pod sandboxes to the managed tenant networks, retaining their DNS aliases:
 
 ```bash
+connect_lab_tenant_networks() {
+  for network in $(podman network ls --filter label=io.podmesh.managed=true --format '{{.Name}}'); do
+    for pod in podmesh-control podmesh-proxies; do
+      infra=$(podman pod inspect --format '{{.InfraContainerID}}' "$pod") || return
+      attached=$(podman inspect --format '{{json .NetworkSettings.Networks}}' "$infra") || return
+      if ! printf '%s' "$attached" | grep -Fq "\"$network\""; then
+        podman network connect --alias "$pod" "$network" "$infra" || return
+      fi
+    done
+  done
+}
+
 ./target/debug/podctl --trust-any-agent apply -f deploy/demo_deployment.yml
+connect_lab_tenant_networks
 ```
+
+Use the same rootless/rootful Podman instance as the stack (run the helper's Podman commands as
+root for the rootful trial). This helper deliberately exposes test infrastructure to all managed
+local tenant networks; do not use it as a production network policy. Background enrollment and
+sidecar registration can complete once connectivity is installed. Automated tests prepare the
+network and restart their disposable proxy pod before apply, so signed Iroh records immediately
+include the tenant-facing interface; a live local trial may need to wait for address refresh.
+
+After deleting workloads and stopping the lab stack, list retained networks with
+`podman network ls --filter label=io.podmesh.managed=true`, then remove verified unused networks
+with `podman network rm <network>`. Do not force removal of networks used by another agent.
 
 ```
 Applied workload 477185c50bd648ece5c827c1c2255f0e271f55d195c9112965d3c333b9f1e6f4
@@ -540,6 +572,7 @@ deployment with a different replica count is rejected rather than silently chang
 
 sed 's/replicas: 1/replicas: 3/' deploy/demo_deployment.yml > /tmp/demo3.yml
 ./target/debug/podctl --trust-any-agent apply -f /tmp/demo3.yml
+connect_lab_tenant_networks
 ```
 
 `podctl` asks for one agent per replica, passing `?exclude=` with the agents it already picked, so
@@ -626,6 +659,7 @@ on one agent and a frontend (`deploy/demo_two_tier_frontend.yml`) on a different
 ```bash
 ./target/debug/podctl --trust-any-agent apply -f deploy/demo_two_tier_db.yml
 ./target/debug/podctl --trust-any-agent apply -f deploy/demo_two_tier_frontend.yml
+connect_lab_tenant_networks
 ./target/debug/podctl get pods
 curl -H 'Host: demo-frontend.mesh.local' http://127.0.0.1:8080/
 ```

@@ -29,7 +29,8 @@ the selected execution agent and relayed through a scheduler; the scheduler carr
 The mesh is deliberately open: anyone with a keypair can ask a scheduler to place a workload, and no
 operator admission policy restricts new owner identities. Owner signatures authorize lifecycle
 operations; mesh traffic uses owner-issued credentials. The selected agent and host remain trusted
-with execution plaintext, and shared workload networking does not isolate tenants' application ports.
+with execution plaintext. Workloads use on-demand tenant-specific Podman networks, not a complete
+cross-tenant routing/firewall policy.
 
 See [Trust Model](#trust-model) for what this does and does not protect, including the parts that are
 explicitly out of scope for the first release.
@@ -243,11 +244,13 @@ These are deliberate scope choices, not oversights:
   none is access controlled. A rate limit bounds how fast anyone may call, not who may.
   One tenant may consume an agent by genuinely deploying to it; the assumption is that capacity
   exists elsewhere. What it may not do is hold capacity without deploying — see below.
-- **Tenants share a workload network.** One tenant's pod can reach another's by address. Tenant
-  separation is enforced by owner identity at the proxy — relay credentials, route ownership and
-  egress are each bound to the owner key. This does not authorize or filter direct traffic to
-  application ports. Network isolation is outside this PoC, not inherently incompatible with
-  multi-host deployment.
+- **Tenant networks are not a complete firewall.** On deployment, Podman creates/reuses a managed
+  DNS-enabled bridge per owner per Podman instance. `--workload-network-prefix` defaults to
+  `podmesh-tenant`; workloads do not join the control network. Host routing, exposed services and
+  proxy-mediated egress still need operator policy. Owner identity continues to authorize mesh
+  operations. Operators must supply reachable proxy/relay endpoints; the local trial explicitly
+  attaches its test infrastructure. Unused tenant networks are retained for explicit operator
+  cleanup, so tenant churn can exhaust network/address pools.
 - **Ingress is plain HTTP.** Terminate TLS in front of the proxy if you need it.
 - **`POST /api/v1/proxy_grant` is unauthenticated.** A grant authenticates itself, so this cannot
   forge authority for an owner whose key you lack. It is rate limited per peer so it cannot be used

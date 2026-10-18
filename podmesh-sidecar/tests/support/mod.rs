@@ -28,7 +28,7 @@ impl Authority {
         self.catalog_named(target, "api")
     }
     pub fn catalog_named(&self, target: u16, name: &str) -> ServiceCatalog {
-        ServiceCatalog {
+        self.sign_catalog(ServiceCatalog {
             version: SERVICE_RECORD_VERSION,
             owner: self.owner.clone(),
             workload_name: "demo".into(),
@@ -42,9 +42,10 @@ impl Authority {
                 }],
             }],
             signature: String::new(),
-        }
-        .sign(&self.owner_private)
-        .unwrap()
+        })
+    }
+    pub fn sign_catalog(&self, catalog: ServiceCatalog) -> ServiceCatalog {
+        catalog.sign(&self.owner_private).unwrap()
     }
     pub fn record(
         &self,

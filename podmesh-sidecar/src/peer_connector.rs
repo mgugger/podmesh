@@ -404,7 +404,9 @@ impl PeerConnector {
         match tokio::time::timeout(PEER_TIMEOUT, result).await {
             Ok(Ok((send, recv, response))) => Ok((connection, send, recv, response)),
             result => {
-                connection.close(1u8.into(), b"peer setup failed");
+                // The cached transport may carry other service/sync streams.
+                // Dropping this operation's streams bounds its failure; closing
+                // the connection here would reset unrelated authorized traffic.
                 match result {
                     Ok(Err(error)) => Err(error),
                     Err(_) => anyhow::bail!("peer setup timed out"),

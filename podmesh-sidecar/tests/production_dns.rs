@@ -67,6 +67,20 @@ async fn production_path(relay_configured: bool) -> Result<()> {
             now,
             120,
         );
+        // A rolling update can introduce an older sibling after this workload
+        // has already selected its new execution catalog. The seed must not
+        // overwrite this workload's own catalog or stop its lease renewal.
+        let mut stale_catalog = catalog.clone();
+        stale_catalog.revision_id = protocol::revision_id(b"previous application revision");
+        let stale_catalog = authority.sign_catalog(stale_catalog);
+        let stale_record = authority.record(
+            &stale_catalog,
+            &remote_node,
+            remote_record.endpoint.direct_addresses.clone(),
+            1,
+            now,
+            120,
+        );
         let remote = PeerConnector::start(
             remote_endpoint,
             remote_node,
@@ -142,6 +156,16 @@ async fn production_path(relay_configured: bool) -> Result<()> {
             ensure!(
                 report.credential.is_some(),
                 "sidecar did not publish bound authority"
+            );
+            let stale_response = podmesh_sidecar::connector_control::exchange(
+                &socket,
+                &ConnectorRequest::seed([3; 32], stale_record),
+            )
+            .await?;
+            ensure!(
+                stale_response.error
+                    == Some(protocol::workload_connector::ConnectorError::Rejected),
+                "an old sibling seed replaced this workload's own execution catalog"
             );
             let response = podmesh_sidecar::connector_control::exchange(
                 &socket,
