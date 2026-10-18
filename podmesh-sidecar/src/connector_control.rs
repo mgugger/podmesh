@@ -39,6 +39,7 @@ pub(crate) struct ConnectorContext {
     pub identity: Arc<NodeIdentity>,
     pub authorization: Arc<crate::authorization::WorkloadAuthorization>,
     pub network: Option<Arc<crate::workload_network::WorkloadNetwork>>,
+    pub require_relay_hint: bool,
 }
 
 impl ConnectorContext {
@@ -81,7 +82,9 @@ impl ConnectorContext {
                 .map(|identity| identity.claims.expires_at_secs),
             credential,
             service_record: match &self.network {
-                Some(network) => network.record()?,
+                Some(network) => network.record()?.filter(|record| {
+                    !self.require_relay_hint || record.endpoint.relay_url.is_some()
+                }),
                 None => None,
             },
             transport_signature: String::new(),
@@ -324,6 +327,7 @@ mod tests {
             identity,
             authorization,
             network: None,
+            require_relay_hint: false,
         }
     }
 

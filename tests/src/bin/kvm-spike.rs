@@ -87,12 +87,30 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Some("mesh") if args.len() == 4 || (args.len() == 5 && args[4] == "--forced-relay") => {
+        Some(mode @ ("mesh" | "two-tier"))
+            if (mode == "mesh"
+                && (args.len() == 4 || (args.len() == 5 && args[4] == "--forced-relay")))
+                || (mode == "two-tier"
+                    && (args.len() == 5 || (args.len() == 6 && args[5] == "--forced-relay"))) =>
+        {
+            let postgres = (mode == "two-tier").then(|| Path::new(&args[4]));
+            if let Some(archive) = postgres {
+                ensure!(archive.is_file(), "missing PostgreSQL image archive");
+            }
             let mut timer = PhaseTimer::new();
-            let mut run =
-                KvmRun::launch_mesh(Path::new(&args[2]), &std::env::current_exe()?).await?;
+            let mut run = if postgres.is_some() {
+                KvmRun::launch_two_tier_mesh(Path::new(&args[2]), &std::env::current_exe()?).await?
+            } else {
+                KvmRun::launch_mesh(Path::new(&args[2]), &std::env::current_exe()?).await?
+            };
             timer.mark("eight-VM boot and pinned SSH");
-            let result = exercise_mesh(&mut run, Path::new(&args[3]), args.len() == 5).await;
+            let result = exercise_mesh(
+                &mut run,
+                Path::new(&args[3]),
+                args.last().is_some_and(|arg| arg == "--forced-relay"),
+                postgres,
+            )
+            .await;
             timer.mark("mesh scenario");
             if result.is_err() {
                 for (index, guest) in run.guests.iter().enumerate() {
@@ -113,7 +131,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         _ => bail!(
-            "usage: kvm-spike probe <guest.raw> | run <guest.raw> <binary-directory> | mesh <guest.raw> <binary-directory> [--forced-relay]"
+            "usage: kvm-spike probe <guest.raw> | run <guest.raw> <binary-directory> | mesh <guest.raw> <binary-directory> [--forced-relay] | two-tier <guest.raw> <binary-directory> <postgres.tar> [--forced-relay]"
         ),
     }
 }
@@ -220,10 +238,10 @@ async fn exercise(run: &KvmRun, binaries: &Path) -> Result<()> {
     wait_http(&client, &format!("{proxy_url}/healthz")).await?;
 
     let preload = r#"
-    mkdir -p /tmp/sidecar-root /tmp/app-root/bin /tmp/app-root/lib /tmp/app-root/www
-    cp /opt/podmesh/podmesh-sidecar /tmp/sidecar-root/podmesh-sidecar
+    mkdir -p /tmp/sidecar-root/usr/local/bin /tmp/app-root/bin /tmp/app-root/lib /tmp/app-root/www
+    cp /opt/podmesh/podmesh-sidecar /tmp/sidecar-root/usr/local/bin/podmesh-sidecar
     tar -C /tmp/sidecar-root -cf /tmp/sidecar.tar .
-    podman import --change 'ENTRYPOINT ["/podmesh-sidecar"]' /tmp/sidecar.tar localhost/podmesh-kvm/sidecar:spike
+    podman import --change 'ENTRYPOINT ["/usr/local/bin/podmesh-sidecar"]' /tmp/sidecar.tar localhost/podmesh-kvm/sidecar:spike
     cp /opt/podmesh/podmesh-kvm-http /tmp/app-root/app
     tar -C /tmp/app-root -cf /tmp/app.tar .
     podman import --change 'ENTRYPOINT ["/app"]' /tmp/app.tar localhost/podmesh-kvm/app:spike
@@ -319,7 +337,7 @@ async fn exercise(run: &KvmRun, binaries: &Path) -> Result<()> {
         .ssh(
             1,
             &format!(
-                "podman exec {sidecar} /podmesh-sidecar --help >/dev/null; podman exec {app} /app http://{control}:3000/health"
+                "podman exec {sidecar} /usr/local/bin/podmesh-sidecar --help >/dev/null; podman exec {app} /app http://{control}:3000/health"
             ),
             None,
         )
@@ -404,7 +422,7 @@ async fn exercise(run: &KvmRun, binaries: &Path) -> Result<()> {
     );
     podctl::get_pod(&id, &options).await?;
     podctl::get_logs(&id, Some(20), &options).await?;
-    podctl::delete_file(manifest, true, &options).await?;
+    podctl::delete_file(manifest, false, &options).await?;
     let remaining = run
         .ssh(1, "podman pod ps --format '{{.Name}}'", None)
         .await?;
@@ -585,25 +603,7 @@ async fn verify_proxy_egress(
     let runtime = podmesh_agent::sidecar::workload_runtime_name(&workload_id);
     let app = format!("{runtime}-pod-app");
     let sidecar = format!("{runtime}-pod-podmesh-sidecar");
-    let mut selected_agent = None;
-    let deadline = Instant::now() + Duration::from_secs(90);
-    while Instant::now() < deadline {
-        for agent in ["agent-1", "agent-2", "agent-3"] {
-            let index = mesh_guest(run, agent)?;
-            let pods = run
-                .ssh(index, "podman pod ps --format '{{.Name}}'", None)
-                .await?;
-            if pods.lines().any(|pod| pod.starts_with(&runtime)) {
-                selected_agent = Some(index);
-                break;
-            }
-        }
-        if selected_agent.is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    let agent = selected_agent.context("single-proxy egress pod never appeared on an agent")?;
+    let agent = workload_guest(run, &runtime).await?;
     let readiness_deadline = Instant::now() + Duration::from_secs(60);
     let mut sidecar_logs = String::new();
     while Instant::now() < readiness_deadline {
@@ -650,7 +650,9 @@ async fn verify_proxy_egress(
         proxy_logs.contains("egress tunnel"),
         "missing proxy egress handling evidence via {workload_name}"
     );
-    podctl::delete_file(manifest, true, options).await?;
+    podctl::delete_file(manifest, false, options)
+        .await
+        .with_context(|| format!("delete single-proxy egress workload {workload_name}"))?;
     let remaining = run
         .ssh(agent, "podman pod ps --format '{{.Name}}'", None)
         .await?;
@@ -661,7 +663,402 @@ async fn verify_proxy_egress(
     Ok(())
 }
 
-async fn exercise_mesh(run: &mut KvmRun, binaries: &Path, forced_relay: bool) -> Result<()> {
+async fn workload_guest(run: &KvmRun, runtime: &str) -> Result<usize> {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while Instant::now() < deadline {
+        for agent in ["agent-1", "agent-2", "agent-3"] {
+            let index = mesh_guest(run, agent)?;
+            let pods = run
+                .ssh(index, "podman pod ps --format '{{.Name}}'", None)
+                .await?;
+            if pods.lines().any(|pod| pod == format!("{runtime}-pod")) {
+                return Ok(index);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    bail!("workload {runtime} never appeared on an agent")
+}
+
+async fn wait_workload_http(
+    run: &KvmRun,
+    guest: usize,
+    app: &str,
+    url: &str,
+    expected: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        match run
+            .ssh(guest, &format!("podman exec {app} /app {url}"), None)
+            .await
+        {
+            Ok(response) => {
+                ensure!(
+                    response.trim() == expected,
+                    "DNS sample reached an unexpected backend: {response:?}"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                ensure!(
+                    Instant::now() < deadline,
+                    "DNS sample HTTP readiness deadline: {error:#}"
+                );
+                log::debug!("DNS sample HTTP not ready: {error:#}");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+}
+
+async fn verify_workload_dns(
+    run: &KvmRun,
+    options: &podctl::ClientOptions,
+    owner_public: &[u8],
+    proxy_urls: &[String],
+    forced_relay: bool,
+) -> Result<()> {
+    let backend_manifest = run.directory().join("workload-dns-backend.yml");
+    let client_manifest = run.directory().join("workload-dns-client.yml");
+    fs::write(
+        &backend_manifest,
+        include_bytes!("../../kvm/workload-dns-backend.yml"),
+    )?;
+    fs::write(
+        &client_manifest,
+        include_bytes!("../../kvm/workload-dns-client.yml"),
+    )?;
+    for manifest in [&backend_manifest, &client_manifest] {
+        let id =
+            podctl::apply_file_with_proxy_urls(manifest.clone(), options, proxy_urls.join(","))
+                .await
+                .context("deploy DNS sample workload")?;
+        for report in podctl::get_connector_identities(&id, options).await? {
+            println!(
+                "DNS sample bootstrap {}: current relay={}, published relay={}, published addresses={:?}",
+                report.workload_name,
+                report.endpoint.relay_url.is_some(),
+                report
+                    .service_record
+                    .as_ref()
+                    .is_some_and(|record| record.endpoint.relay_url.is_some()),
+                report
+                    .service_record
+                    .as_ref()
+                    .map(|record| &record.endpoint.direct_addresses),
+            );
+        }
+    }
+    let backend = podmesh_agent::sidecar::workload_runtime_name(&protocol::workload_id(
+        owner_public,
+        "dns-backend",
+        0,
+    ));
+    let source = podmesh_agent::sidecar::workload_runtime_name(&protocol::workload_id(
+        owner_public,
+        "dns-client",
+        0,
+    ));
+    let backend_guest = workload_guest(run, &backend).await?;
+    let source_guest = workload_guest(run, &source).await?;
+    ensure!(
+        backend_guest != source_guest,
+        "DNS sample client/backend must occupy different agent VMs"
+    );
+    let backend_app = format!("{backend}-pod-app");
+    let source_app = format!("{source}-pod-app");
+    let hostname = run
+        .ssh(
+            backend_guest,
+            &format!("podman inspect {backend_app} --format '{{{{.Config.Hostname}}}}'"),
+            None,
+        )
+        .await?;
+    ensure!(
+        hostname.trim() == format!("{backend}-pod"),
+        "backend runtime did not use its own pod hostname"
+    );
+    let expected = format!("podmesh-kvm-response:{}", hostname.trim());
+    wait_workload_http(
+        run,
+        backend_guest,
+        &backend_app,
+        "http://127.0.0.1:8081/",
+        &expected,
+    )
+    .await?;
+    wait_workload_http(
+        run,
+        source_guest,
+        &source_app,
+        "http://127.0.0.1:8082/",
+        "podmesh-kvm-response",
+    )
+    .await?;
+    ensure!(
+        run.ssh(
+            source_guest,
+            &format!("podman exec {source_app} /app http://127.0.0.1:8081/"),
+            None,
+        )
+        .await
+        .is_err(),
+        "DNS client unexpectedly serves the backend target port"
+    );
+    let fqdn = podmesh_sidecar::service_cache::ServiceKey {
+        manifest_id: protocol::route_id(owner_public, "dns-backend"),
+        name: "echo".into(),
+    }
+    .fqdn()?;
+    let url = format!("http://{fqdn}:18081/");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let resolved = loop {
+        match run
+            .ssh(
+                source_guest,
+                &format!("podman exec {source_app} /app resolve {fqdn}:18081"),
+                None,
+            )
+            .await
+        {
+            Ok(resolved) => break resolved,
+            Err(error) => {
+                ensure!(
+                    Instant::now() < deadline,
+                    "DNS sample resolution deadline: {error:#}"
+                );
+                log::debug!("DNS sample resolution not ready: {error:#}");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    };
+    let addresses = resolved
+        .lines()
+        .map(str::parse::<std::net::SocketAddr>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    ensure!(
+        !addresses.is_empty()
+            && addresses.iter().all(|address| {
+                matches!(address.ip(), std::net::IpAddr::V4(ip) if ip.octets()[..3] == [198, 18, 0])
+                    && address.port() == 18081
+            }),
+        "DNS sample did not resolve exclusively to synthetic service VIPs: {resolved:?}"
+    );
+    println!(
+        "DNS sample resolved {fqdn} to {}; client={} backend={}",
+        addresses[0], run.guests[source_guest].name, run.guests[backend_guest].name,
+    );
+    wait_workload_http(run, source_guest, &source_app, &url, expected.trim()).await?;
+    if forced_relay {
+        run.block_relays(true).await?;
+        let blocked = run
+            .ssh(
+                source_guest,
+                &format!("podman exec {source_app} /app {url}"),
+                None,
+            )
+            .await;
+        run.block_relays(false).await?;
+        ensure!(
+            blocked.is_err(),
+            "cross-VM DNS service traffic bypassed the blocked relay path"
+        );
+        wait_workload_http(run, source_guest, &source_app, &url, expected.trim()).await?;
+    }
+    println!(
+        "DNS sample: {} -> {} via {fqdn}:18081 -> 8081, VIP={}, backend={}",
+        run.guests[source_guest].name,
+        run.guests[backend_guest].name,
+        addresses[0].ip(),
+        expected.trim()
+    );
+    for manifest in [client_manifest, backend_manifest] {
+        podctl::delete_file(manifest, false, options)
+            .await
+            .context("delete DNS sample workload")?;
+    }
+    for guest in [source_guest, backend_guest] {
+        let pods = run
+            .ssh(guest, "podman pod ps --format '{{.Name}}'", None)
+            .await?;
+        ensure!(
+            !pods
+                .lines()
+                .any(|pod| pod == format!("{source}-pod") || pod == format!("{backend}-pod")),
+            "DNS sample pod remained after deletion"
+        );
+    }
+    Ok(())
+}
+
+async fn verify_two_tier(
+    run: &KvmRun,
+    options: &podctl::ClientOptions,
+    owner: &ClientKeyDir,
+    client: &reqwest::Client,
+    proxy_urls: &[String],
+    postgres_image: &Path,
+    forced_relay: bool,
+) -> Result<()> {
+    let archive = fs::read(postgres_image).context("read PostgreSQL image archive")?;
+    for agent in ["agent-1", "agent-2", "agent-3"] {
+        run.ssh(
+            mesh_guest(run, agent)?,
+            "cat > /tmp/postgres.tar; podman load -i /tmp/postgres.tar; rm /tmp/postgres.tar; podman image exists docker.io/library/postgres:16-alpine",
+            Some(&archive),
+        )
+        .await
+        .with_context(|| format!("preload PostgreSQL image on {agent}"))?;
+    }
+    let db_manifest = run.directory().join("demo_two_tier_db.yml");
+    let frontend_manifest = run.directory().join("demo_two_tier_frontend.yml");
+    fs::write(
+        &db_manifest,
+        include_bytes!("../../../deploy/demo_two_tier_db.yml"),
+    )?;
+    fs::write(
+        &frontend_manifest,
+        include_bytes!("../../../deploy/demo_two_tier_frontend.yml"),
+    )?;
+    let database =
+        podctl::apply_file_with_proxy_urls(db_manifest.clone(), options, proxy_urls.join(","))
+            .await
+            .context("deploy two-tier PostgreSQL")?;
+    let frontend = podctl::apply_file_with_proxy_urls(
+        frontend_manifest.clone(),
+        options,
+        proxy_urls.join(","),
+    )
+    .await
+    .context("deploy two-tier frontend")?;
+    let db_catalog = podctl::catalog::load(owner.path(), &database)?;
+    let frontend_catalog = podctl::catalog::load(owner.path(), &frontend)?;
+    ensure!(
+        db_catalog.replicas.len() == 1
+            && frontend_catalog.replicas.len() == 1
+            && db_catalog.replicas[0].agent_endpoint_id
+                != frontend_catalog.replicas[0].agent_endpoint_id,
+        "two-tier anti-affinity did not select distinct agents"
+    );
+    let db_runtime =
+        podmesh_agent::sidecar::workload_runtime_name(&db_catalog.replicas[0].receipt.workload_id);
+    let frontend_runtime = podmesh_agent::sidecar::workload_runtime_name(
+        &frontend_catalog.replicas[0].receipt.workload_id,
+    );
+    let db_guest = workload_guest(run, &db_runtime).await?;
+    let frontend_guest = workload_guest(run, &frontend_runtime).await?;
+    ensure!(
+        db_guest != frontend_guest,
+        "two-tier pods co-located on one VM"
+    );
+    let frontend_app = format!("{frontend_runtime}-pod-frontend");
+    run.ssh(
+        frontend_guest,
+        &format!("podman cp /opt/podmesh/podmesh-kvm-http {frontend_app}:/tmp/podmesh-kvm-http"),
+        None,
+    )
+    .await?;
+    let resolved = run
+        .ssh(
+            frontend_guest,
+            &format!(
+                "podman exec {frontend_app} /tmp/podmesh-kvm-http resolve postgres-db.svc.podmesh.internal:5432"
+            ),
+            None,
+        )
+        .await?;
+    let addresses = resolved
+        .lines()
+        .map(str::parse::<std::net::SocketAddr>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    ensure!(
+        !addresses.is_empty()
+            && addresses.iter().all(|address| {
+                matches!(address.ip(), std::net::IpAddr::V4(ip) if ip.octets()[..3] == [198, 18, 0])
+                    && address.port() == 5432
+            }),
+        "two-tier database alias did not resolve exclusively to synthetic VIPs: {resolved:?}"
+    );
+    let url = format!("http://{}:8080/", mesh_address(run, "proxy-1")?);
+    let wait_ingress = || async {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let pending = match client
+                .get(&url)
+                .header("Host", "demo-frontend.mesh.local")
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    let status = response.status();
+                    let body = response.text().await?;
+                    if status.is_success()
+                        && body.trim() == "DB_RESULT=podmesh-two-tier-postgres-ok"
+                    {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    format!("status={status}, body={body:?}")
+                }
+                Err(error) => error.to_string(),
+            };
+            ensure!(
+                Instant::now() < deadline,
+                "two-tier SQL ingress readiness deadline: {pending}"
+            );
+            eprintln!("two-tier SQL ingress pending: {pending}");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    };
+    wait_ingress().await?;
+    let query = format!(
+        r#"podman exec --env PGCONNECT_TIMEOUT=5 {frontend_app} sh -c 'exec psql -h "$DB_HOST" -p "$DB_PORT" -tAc "$1"' sh "SELECT 'podmesh-two-tier-postgres-ok';""#
+    );
+    if forced_relay {
+        run.block_relays(true).await?;
+        let blocked = run.ssh(frontend_guest, &query, None).await;
+        run.block_relays(false).await?;
+        ensure!(
+            blocked.is_err(),
+            "fresh two-tier SQL query bypassed blocked relay transport"
+        );
+        wait_ingress().await?;
+    }
+    let result = run.ssh(frontend_guest, &query, None).await?;
+    ensure!(
+        result.trim() == "podmesh-two-tier-postgres-ok",
+        "fresh two-tier SQL query returned an unexpected result"
+    );
+    println!(
+        "two-tier VM: frontend={} database={}, DNS={}, ingress DB_RESULT=podmesh-two-tier-postgres-ok",
+        run.guests[frontend_guest].name, run.guests[db_guest].name, addresses[0]
+    );
+    for manifest in [frontend_manifest, db_manifest] {
+        podctl::delete_file(manifest, false, options)
+            .await
+            .context("delete two-tier workload")?;
+    }
+    for guest in [frontend_guest, db_guest] {
+        let pods = run
+            .ssh(guest, "podman pod ps --format '{{.Name}}'", None)
+            .await?;
+        ensure!(
+            !pods.lines().any(|pod| {
+                pod == format!("{frontend_runtime}-pod") || pod == format!("{db_runtime}-pod")
+            }),
+            "two-tier pod remained after acknowledged deletion"
+        );
+    }
+    Ok(())
+}
+
+async fn exercise_mesh(
+    run: &mut KvmRun,
+    binaries: &Path,
+    forced_relay: bool,
+    postgres_image: Option<&Path>,
+) -> Result<()> {
     let mut timer = PhaseTimer::new();
     ensure!(
         run.guests.len() == MESH_GUESTS.len(),
@@ -814,10 +1211,10 @@ async fn exercise_mesh(run: &mut KvmRun, binaries: &Path, forced_relay: bool) ->
     timer.mark("proxy bootstrap");
 
     let preload = r#"
-    mkdir -p /tmp/sidecar-root /tmp/app-root
-    cp /opt/podmesh/podmesh-sidecar /tmp/sidecar-root/podmesh-sidecar
+    mkdir -p /tmp/sidecar-root/usr/local/bin /tmp/app-root
+    cp /opt/podmesh/podmesh-sidecar /tmp/sidecar-root/usr/local/bin/podmesh-sidecar
     tar -C /tmp/sidecar-root -cf /tmp/sidecar.tar .
-    podman import --change 'ENTRYPOINT ["/podmesh-sidecar"]' /tmp/sidecar.tar localhost/podmesh-kvm/sidecar:spike
+    podman import --change 'ENTRYPOINT ["/usr/local/bin/podmesh-sidecar"]' /tmp/sidecar.tar localhost/podmesh-kvm/sidecar:spike
     cp /opt/podmesh/podmesh-kvm-http /tmp/app-root/app
     tar -C /tmp/app-root -cf /tmp/app.tar .
     podman import --change 'ENTRYPOINT ["/app"]' /tmp/app.tar localhost/podmesh-kvm/app:spike
@@ -842,6 +1239,11 @@ async fn exercise_mesh(run: &mut KvmRun, binaries: &Path, forced_relay: bool) ->
             "configured mesh attachment count differs from the approved topology"
         );
     }
+    let (capacity_cpu, capacity_memory) = if postgres_image.is_some() {
+        (2000, 1_073_741_824u64)
+    } else {
+        (1000, 536_870_912u64)
+    };
     for agent in ["agent-1", "agent-2", "agent-3"] {
         let scheduler = MESH_ATTACHMENTS
             .iter()
@@ -850,7 +1252,7 @@ async fn exercise_mesh(run: &mut KvmRun, binaries: &Path, forced_relay: bool) ->
             .context("agent is not attached by the approved mesh topology")?;
         let index = mesh_guest(run, agent)?;
         let command = format!(
-            "#!/bin/sh\nset -eu\nexport RUST_LOG=info,tracing::span=warn,iroh=warn\nexec /opt/podmesh/podmesh-agent --key-dir /var/lib/podmesh/{agent} --state-path /var/lib/podmesh/{agent}/state.redb --listen 0.0.0.0:3100 --machine-bind 0.0.0.0:5011 --scheduler-url http://{}:3000 --machine-relay-url {relay_urls} --machine-relay-ca-certificate {cert_paths} --sidecar-image localhost/podmesh-kvm/sidecar:spike --capacity-cpu-milli 1000 --capacity-memory-bytes 536870912 --capacity-storage-bytes 4294967296\n",
+            "#!/bin/sh\nset -eu\nexport RUST_LOG=info,tracing::span=warn,iroh=warn\nexec /opt/podmesh/podmesh-agent --key-dir /var/lib/podmesh/{agent} --state-path /var/lib/podmesh/{agent}/state.redb --listen 0.0.0.0:3100 --machine-bind 0.0.0.0:5011 --scheduler-url http://{}:3000 --machine-relay-url {relay_urls} --machine-relay-ca-certificate {cert_paths} --sidecar-image localhost/podmesh-kvm/sidecar:spike --capacity-cpu-milli {capacity_cpu} --capacity-memory-bytes {capacity_memory} --capacity-storage-bytes 4294967296\n",
             mesh_address(run, scheduler)?
         );
         run.put(index, "/opt/podmesh/agent-command", command.as_bytes())
@@ -950,6 +1352,27 @@ async fn exercise_mesh(run: &mut KvmRun, binaries: &Path, forced_relay: bool) ->
         }
         timer.mark("forced-relay reconciliation readiness");
     }
+    if let Some(archive) = postgres_image {
+        verify_two_tier(
+            run,
+            &options,
+            &owner,
+            &client,
+            &proxy_urls,
+            archive,
+            forced_relay,
+        )
+        .await
+        .context("real two-tier VM sample")?;
+        if forced_relay {
+            ensure!(
+                run.forced_relay_dropped_packets().await? > 0,
+                "two-tier forced-relay filter observed no direct UDP attempts"
+            );
+        }
+        timer.mark("real PostgreSQL/frontend VM sample");
+        return Ok(());
+    }
     let manifest = run.directory().join("workload-mesh.yml");
     std::fs::write(&manifest, include_bytes!("../../kvm/workload-mesh.yml"))?;
     let deployment_id =
@@ -1002,6 +1425,10 @@ async fn exercise_mesh(run: &mut KvmRun, binaries: &Path, forced_relay: bool) ->
         timer.mark("relay-negative control and restored ingress");
     }
     timer.mark("both proxy ingress paths");
+    verify_workload_dns(run, &options, &owner_public, &proxy_urls, forced_relay)
+        .await
+        .context("cross-VM workload DNS sample")?;
+    timer.mark("cross-VM workload DNS discovery and TCP");
     for (proxy_name, name) in [("proxy-1", "egress-p1"), ("proxy-2", "egress-p2")] {
         verify_proxy_egress(run, &client, &options, &owner, proxy_name, name).await?;
         timer.mark(name);
@@ -1077,11 +1504,24 @@ async fn exercise_mesh(run: &mut KvmRun, binaries: &Path, forced_relay: bool) ->
                 .await?,
         "scheduler-1 identity changed across restart"
     );
-    let recovered_status = podctl::get_pod(&deployment_id, &options).await?;
-    ensure!(
-        serde_json::from_str::<Vec<serde_json::Value>>(&recovered_status)?.len() == 3,
-        "scheduler-1 did not recover all replica locations after restart"
-    );
+    tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            let pending = match podctl::get_pod(&deployment_id, &options).await {
+                Ok(status) => {
+                    let count = serde_json::from_str::<Vec<serde_json::Value>>(&status)?.len();
+                    if count == 3 {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    format!("recovered {count} of 3 replicas")
+                }
+                Err(error) => format!("{error:#}"),
+            };
+            eprintln!("scheduler-1 mesh recovery pending: {pending}");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .context("scheduler-1 did not recover all replica locations after restart")??;
     timer.mark("scheduler-1 replacement and recovery");
 
     for name in [
@@ -1129,7 +1569,7 @@ async fn exercise_mesh(run: &mut KvmRun, binaries: &Path, forced_relay: bool) ->
     }
 
     timer.mark("traffic with control processes stopped and resumed");
-    podctl::delete_file(update_manifest, true, &options).await?;
+    podctl::delete_file(update_manifest, false, &options).await?;
     for agent in ["agent-1", "agent-2", "agent-3"] {
         let pods = run
             .ssh(

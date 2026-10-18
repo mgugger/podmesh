@@ -1,3 +1,40 @@
+## MODIFIED Requirements
+
+### Requirement: The VM DNS sample SHALL prove cross-workload discovery
+The opt-in VM mesh SHALL deploy separate same-owner client/backend workloads on different agent
+VMs. The client SHALL use its ordinary application resolver to obtain a synthetic internal VIP
+and reach the backend through a distinct Service/targetPort mapping. Its local listener SHALL
+not satisfy the backend request. These checks SHALL NOT imply a native VM workload backend or
+separate physical hosts.
+
+#### Scenario: Application discovers a remote backend
+- **WHEN** the client resolves the backend's canonical internal name and connects to its Service port
+- **THEN** it receives a synthetic service VIP and the remote backend's pod-specific response
+- **AND** the client has no listener on that backend target port
+
+#### Scenario: Cross-VM service traffic requires the forced relay
+- **GIVEN** the VM test denies direct UDP paths and the DNS sample has succeeded
+- **WHEN** the test temporarily blocks relay transport
+- **THEN** the remote service request fails and recovers only after relay transport is restored
+- **AND** normal cleanup uses acknowledged, non-forced workload deletion
+
+### Requirement: The two-tier VM sample SHALL execute a real database query
+Separately selectable VM tests SHALL deploy the actual PostgreSQL/frontend sample manifests on
+distinct agents, preload the declared database image, verify synthetic workload DNS, and require
+a real SQL result through frontend ingress. Normal and forced-relay modes SHALL retain acknowledged
+cleanup. Demo database storage SHALL remain pod-ephemeral.
+
+#### Scenario: Frontend queries PostgreSQL on another VM
+- **WHEN** the sample starts in the opt-in VM mesh
+- **THEN** the frontend resolves its configured database alias to a synthetic VIP
+- **AND** ingress returns the expected PostgreSQL query result from a different agent VM
+
+#### Scenario: A fresh query requires forced relay transport
+- **GIVEN** the two-tier sample succeeds with direct inter-guest UDP denied
+- **WHEN** relay transport is blocked and the frontend executes a fresh SQL query
+- **THEN** that query fails and succeeds again only after relay transport is restored
+- **AND** both sample pods are absent after non-forced deletion
+
 ## ADDED Requirements
 
 ### Requirement: The three-replica Podman workflow SHALL exercise internal DNS and peer traffic

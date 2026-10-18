@@ -14,20 +14,56 @@ extern "C" fn terminate(_: i32) {
 }
 
 fn main() -> std::io::Result<()> {
-    if let Some(url) = std::env::args().nth(1) {
-        return fetch(&url);
-    }
+    let mode = std::env::args().nth(1);
+    let body = match mode.as_deref() {
+        Some("resolve") => {
+            let authority = std::env::args().nth(2).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "expected DNS name:port")
+            })?;
+            let addresses = authority.to_socket_addrs()?.collect::<Vec<_>>();
+            if addresses.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "DNS returned no addresses",
+                ));
+            }
+            for address in addresses {
+                println!("{address}");
+            }
+            return Ok(());
+        }
+        Some("serve-hostname") => format!(
+            "podmesh-kvm-response:{}",
+            std::env::var("HOSTNAME")
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?
+        ),
+        Some(url) => return fetch(url),
+        None => "podmesh-kvm-response".to_string(),
+    };
     // Container PID 1 ignores default SIGTERM; explicitly exit on Podman stop.
     if unsafe { signal(15, terminate) } == usize::MAX {
         return Err(std::io::Error::last_os_error());
     }
-    let listener = TcpListener::bind(("0.0.0.0", 8081))?;
+    let port = match std::env::var("PODMESH_KVM_HTTP_PORT") {
+        Ok(port) => port
+            .parse::<u16>()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
+        Err(std::env::VarError::NotPresent) => 8081,
+        Err(error) => {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, error));
+        }
+    };
+    let listener = TcpListener::bind(("0.0.0.0", port))?;
     for connection in listener.incoming() {
         let mut connection = connection?;
+        connection.set_read_timeout(Some(Duration::from_secs(5)))?;
+        connection.set_write_timeout(Some(Duration::from_secs(5)))?;
         let mut request = [0; 4096];
         let _ = connection.read(&mut request)?;
-        connection.write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\nConnection: close\r\n\r\npodmesh-kvm-response",
+        write!(
+            connection,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
         )?;
     }
     Ok(())

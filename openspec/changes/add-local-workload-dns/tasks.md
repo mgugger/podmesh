@@ -139,6 +139,44 @@ The user subsequently authorized real Podman execution and fixing observed failu
 - [x] 10.9 Finish final normal workspace/feature-inclusive Clippy/format/OpenSpec checks (540 normal tests pass) and record exact
   results and remaining rootful, IPv6-kernel, fake-upstream and managed-volume limitations.
 
+## 11. VM/libkrun regression verification
+
+The user requested all existing VM/libkrun tests on the current DNS implementation before
+building a workload-discovery sample. This is VM-hosted Podman acceptance, not a native VM
+workload runtime or physical multi-host verification.
+
+- [x] 11.1 Rebuild guest binaries and run KVM unit tests, the two-VM kernel/Podman probe and
+  workload slice, plus eight-VM direct and forced-relay scenarios. All final checks pass;
+  earlier failing executions and fixes are recorded in verification.md.
+- [x] 11.2 Fix observed coupled regressions and repeat affected VM scenarios without weakening
+  endpoint enrollment, DNS bootstrap or existing traffic/lifecycle assertions. Fixed fixture binary
+  path/build optimization, force-delete masking, enrollment contention, initial relay hints and
+  restart readiness. Both final eight-VM modes pass twice consecutively; see verification.md.
+- [x] 11.3 Record exact checks, cleanup and limitations; present the DNS-discovery sample scope
+  and verification approach for approval after the current VM baseline passes.
+
+## 12. Approved VM DNS client/backend sample
+
+The user approved fixing remaining VM failures, then implementing this sample. VM baseline
+verification is a prerequisite; the earlier intermittent failures are not accepted as passing.
+
+- [x] 12.1 Add same-owner client/backend sample manifests using the existing local HTTP fixture
+  image, with distinct Service and target ports and separate workload identities.
+- [x] 12.2 Exercise real application DNS and remote TCP from the client workload, proving its
+  own application cannot satisfy the response and checking canonical internal DNS/VIP behavior.
+- [x] 12.3 Run the sample in direct and forced-relay modes, retain negative controls and
+  existing lifecycle checks, and verify non-forced cleanup.
+- [x] 12.4 Document reproducible sample commands, observed results and trust/runtime limits.
+
+## 13. Approved real two-tier VM sample
+
+- [x] 13.1 Add separately selectable normal-network/forced-relay VM scenarios using the actual
+  PostgreSQL/frontend deployment manifests and explicit guest image preload.
+- [x] 13.2 Verify anti-affinity across actual agent VMs, workload DNS synthetic answers, SQL
+  results through frontend ingress, relay failure/recovery and non-forced cleanup.
+- [x] 13.3 Run both scenarios with real guest Podman; record actual checks, resource/image
+  prerequisites, limitations and cleanup, and document reproducible commands.
+
 ## Workflow follow-up
 
 - Present implementation review and remaining security/runtime limitations before acceptance.

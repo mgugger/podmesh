@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dns-client
+spec:
+  selector:
+    matchLabels:
+      run: dns-client
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        run: dns-client
+    spec:
+      containers:
+        - name: app
+          image: localhost/podmesh-kvm/app:spike
+          imagePullPolicy: Never
+          env:
+            - name: PODMESH_KVM_HTTP_PORT
+              value: "8082"
+          resources:
+            limits:
+              memory: "64Mi"
+              cpu: "300m"
+              ephemeral-storage: "256Mi"
+          ports:
+            - containerPort: 8082
+          securityContext:
+            runAsUser: 1000

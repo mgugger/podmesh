@@ -15,6 +15,32 @@ const ROOTLESS: &str = include_str!("../../deploy/podmesh_rootless.yml");
 const BUILD_CONTAINERS: &str = include_str!("../../deploy/build_containers.sh");
 const CONTAINERFILE: &str = include_str!("../../deploy/Containerfile");
 
+#[test]
+fn vm_dns_sample_maps_remote_service_to_a_port_absent_from_the_client() -> Result<()> {
+    let backend = include_bytes!("../kvm/workload-dns-backend.yml");
+    let client = include_bytes!("../kvm/workload-dns-client.yml");
+    let services = protocol::service_discovery::workload_services(backend)?;
+    ensure!(
+        services.len() == 1 && services[0].name == "echo",
+        "DNS sample backend must expose exactly the echo service"
+    );
+    ensure!(
+        services[0].ports.len() == 1
+            && services[0].ports[0].port == 18081
+            && services[0].ports[0].target_port == 8081,
+        "DNS sample must exercise service-to-target port translation"
+    );
+    let client_services = protocol::service_discovery::workload_services(client)?;
+    ensure!(
+        !client_services.is_empty()
+            && client_services
+                .iter()
+                .all(|service| service.ports.iter().all(|port| port.target_port == 8082)),
+        "DNS sample client must not expose the backend target port"
+    );
+    Ok(())
+}
+
 fn documents(name: &str, manifest: &str) -> Result<Vec<serde_yaml::Value>> {
     serde_yaml::Deserializer::from_str(manifest)
         .map(|document| {

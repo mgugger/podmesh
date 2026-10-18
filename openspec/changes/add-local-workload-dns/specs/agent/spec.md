@@ -76,6 +76,11 @@ Enrollment SHALL correlate key-possession proof with the deployment's nonce, rep
 - **WHEN** a local request names a replica outside the issuer delegation
 - **THEN** no credential is issued
 
+#### Scenario: Owner mutation overlaps background enrollment
+- **WHEN** an owner mutation arrives while background enrollment holds that workload
+- **THEN** it waits within the runtime operation deadline and rechecks live authority before effects
+- **AND** a competing owner mutation is still refused rather than queued behind another owner
+
 ### Requirement: Enrollment and discovery metadata SHALL be bounded and owner-visible
 The agent SHALL expose current authorized sidecar endpoint/bootstrap state only through owner-authorized workload control responses. It SHALL bound local exchanges and SHALL NOT expose a new public enrollment API or give workloads access to Podman control.
 

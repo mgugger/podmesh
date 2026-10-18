@@ -135,6 +135,10 @@ pub async fn run_with_metrics(
             identity: identity.clone(),
             authorization: authorization.clone(),
             network: network.clone(),
+            require_relay_hint: config
+                .proxy_endpoints
+                .iter()
+                .any(|record| record.relay_url.is_some()),
         };
         Some(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
             control.serve(context, cancellation.clone()),

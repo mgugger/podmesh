@@ -65,6 +65,65 @@ Sequential update control waits for the replacement's enrolled record at the req
 before replacing the next replica. Proxy grants remain in-memory and require restoration after
 proxy process restart. See docs/local-dns.md and verification.md for limitations/results.
 
+## VM regression verification scope - 2026-10-18
+
+The user requested running all existing VM/libkrun tests against the DNS implementation, then
+building a workload-to-workload DNS sample once the baseline works. Rebuild current guest
+binaries and preserve the existing two/eight-VM direct/forced-relay assertions. Small fixture
+fixes needed for the current connector contract are in scope; substantial runtime changes or
+the sample design require a separate approval checkpoint. VM-hosted Podman is not a native VM
+workload backend, hardware attestation or a physical multi-host claim.
+
+After reviewing the intermittent forced-relay failures, the user explicitly approved diagnosing
+and fixing confirmed scheduler/lifecycle causes, adding focused regressions and repeating both
+VM modes before implementing a DNS E2E sample. The approved sample uses separate same-owner
+client/backend workload pods, real application DNS under `svc.podmesh.internal`, distinct
+Service/targetPort values, direct and forced-relay checks and non-forced cleanup. Preserve
+authorization and private-name fail-closed behavior; no public DNS fallback or VM-backend claim.
+
+The sample exposed two coupled runtime defects. Background enrollment now holds a distinct
+mutation kind: owner lifecycle calls wait only behind enrollment, bounded by the runtime operation
+timeout, then reverify request/grant freshness and reread active state. Competing owner mutations
+remain fail-fast; cancellation drops guards without releasing workload accounting. Enrollment
+still inspects restarted sidecars and cannot issue concurrently with replacement/deletion.
+
+Sidecars refresh signed discovery records on endpoint address changes as well as the existing
+interval/authority events. When proxy records configure relay transport, owner bootstrap withholds
+the service record until its signed endpoint includes a relay hint; identity evidence remains
+available. This is bootstrap readiness, not a live-proxy prerequisite for DNS or peer traffic.
+Direct-only configurations still publish direct records. A production-path test exercises seeded
+DNS/TCP with a configured but unavailable relay. No wire fields or authorization policy change.
+
+The VM restart check waits up to 45 seconds for all three replica statuses, logging pending errors.
+HTTP health only proves that the API is listening, not that asynchronous peer rediscovery finished.
+Normal-network runs permit direct UDP but do not assert that workload transport selected it;
+forced-relay runs deny direct UDP and require request failure/recovery when relays are blocked.
+
+### Approved PostgreSQL/frontend VM follow-up
+
+The user explicitly approved adding and running real two-tier VM scenarios after learning that
+the existing sample tests cover mock workloads and host Podman only. Reuse the eight-VM harness
+and actual `deploy/demo_two_tier_{db,frontend}.yml` manifests, not substitute HTTP fixtures.
+Add separately selectable normal-network and forced-relay tests requiring a preloaded PostgreSQL
+image archive. The first real runs showed that database plus injected sidecar requests 600m CPU
+and 384Mi memory, exceeding the lean profile's 50% admission ceiling. The two-tier profile gives
+only agent VMs 2 vCPUs/1024Mi RAM with matching 2000m/1024Mi agent capacity; reservation policy
+remains unchanged. It runs the actual sample instead of the lean profile's HTTP/lifecycle phases.
+Those existing scenarios remain separately selectable and unchanged in scope.
+
+Assert distinct agent VMs via both owner placement and actual guest pods, synthetic resolution
+of the frontend's configured database alias, a real `psql` result through frontend ingress, and
+failure/recovery of a fresh SQL query when relay transport is blocked/restored. Use non-forced
+deletion and verify owned pods are gone. Demo passwords remain fixture-only; diagnostics must not
+print connection credentials. Guest Podman/image state is disposable and separate from host
+Podman state. Increase guest resources only if measured runtime failures require it. No persistent
+database storage, automatic recovery, new production authority or physical multi-host claim.
+
+Fresh guest binaries are required: stale binaries initially rejected the already supported
+`emptyDir` manifests. Rebuilding from current source fixed that mismatch without relaxing policy.
+The shared HTTP fixture's local identity check now waits for readiness using the inspected backend
+pod hostname, retaining exact-response and no-local-fallback assertions.
+
 ## Context: observed implementation
 
 | Location | Observed behavior / required change |

@@ -27,6 +27,13 @@ use tokio::{
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn production_sidecar_serves_dns_accepts_seed_and_routes_internal_tcp_without_proxy()
 -> Result<()> {
+    for relay_configured in [false, true] {
+        production_path(relay_configured).await?;
+    }
+    Ok(())
+}
+
+async fn production_path(relay_configured: bool) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(25), async {
         let authority = support::Authority::new();
         let now = support::now();
@@ -80,7 +87,7 @@ async fn production_sidecar_serves_dns_accepts_seed_and_routes_internal_tcp_with
         let absent_proxy = protocol::EndpointRecord {
             version: protocol::ENDPOINT_RECORD_VERSION,
             endpoint_id: iroh::SecretKey::generate().public().as_bytes().to_vec(),
-            relay_url: None,
+            relay_url: relay_configured.then(|| "http://127.0.0.1:9".into()),
             direct_addresses: vec!["127.0.0.1:9".into()],
             signing_pubkey: String::new(),
             issued_at_secs: now,
@@ -95,7 +102,7 @@ async fn production_sidecar_serves_dns_accepts_seed_and_routes_internal_tcp_with
             service_catalog: Some(catalog.clone()),
             proxy_endpoints: vec![absent_proxy],
             workload_replay_limits: protocol::ReplayLimits::default(),
-            workload_relay_auth_token: None,
+            workload_relay_auth_token: relay_configured.then(|| "r".repeat(32)),
             workload_relay_ca_certificates: Vec::new(),
             lookup_interval: Duration::from_secs(1),
             iroh_bind_addr: "127.0.0.1:0".parse()?,
@@ -124,7 +131,7 @@ async fn production_sidecar_serves_dns_accepts_seed_and_routes_internal_tcp_with
                     )
                     .await
                         && let Some(report) = response.identity
-                        && report.service_record.is_some()
+                        && report.service_record.is_some() != relay_configured
                     {
                         return Ok::<_, anyhow::Error>(report);
                     }

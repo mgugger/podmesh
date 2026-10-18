@@ -98,7 +98,7 @@ struct Inner {
     enrollment_notify: tokio::sync::Notify,
     store: Arc<dyn WorkloadStore>,
     state: Mutex<WorkloadState>,
-    mutations: RwLock<HashSet<String>>,
+    mutations: RwLock<HashMap<String, MutationOwner>>,
     replay: Mutex<ReplayCache>,
     current_endpoint_address: RwLock<Option<iroh::EndpointAddr>>,
     service_mesh_required: bool,
@@ -111,8 +111,25 @@ struct BuildOptions {
     metrics: podmesh_metrics::Metrics,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutationOwner {
+    Lifecycle,
+    Enrollment,
+}
+
+impl std::fmt::Display for MutationOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Lifecycle => "workload is busy",
+            Self::Enrollment => "workload is busy with endpoint enrollment",
+        })
+    }
+}
+
+impl std::error::Error for MutationOwner {}
+
 struct MutationGuard<'a> {
-    mutations: &'a RwLock<HashSet<String>>,
+    mutations: &'a RwLock<HashMap<String, MutationOwner>>,
     workload_id: String,
 }
 
@@ -344,7 +361,7 @@ impl AgentService {
                 enrollment_notify: tokio::sync::Notify::new(),
                 store,
                 state: Mutex::new(WorkloadState::default()),
-                mutations: RwLock::new(HashSet::new()),
+                mutations: RwLock::new(HashMap::new()),
                 replay: Mutex::new(ReplayCache::default()),
                 current_endpoint_address: RwLock::new(None),
                 service_mesh_required,
@@ -557,6 +574,14 @@ impl AgentService {
     }
 
     fn mutation(&self, workload_id: &str) -> Result<MutationGuard<'_>> {
+        self.mutation_with_owner(workload_id, MutationOwner::Lifecycle)
+    }
+
+    fn mutation_with_owner(
+        &self,
+        workload_id: &str,
+        owner: MutationOwner,
+    ) -> Result<MutationGuard<'_>> {
         let mut mutations = self
             .inner
             .mutations
@@ -566,14 +591,33 @@ impl AgentService {
             mutations.len() < MAX_CONFIGURED_WORKLOADS,
             "workload mutation limit reached"
         );
-        anyhow::ensure!(
-            mutations.insert(workload_id.to_string()),
-            "workload is busy"
-        );
+        if let Some(owner) = mutations.get(workload_id) {
+            return Err((*owner).into());
+        }
+        mutations.insert(workload_id.to_string(), owner);
         Ok(MutationGuard {
             mutations: &self.inner.mutations,
             workload_id: workload_id.to_string(),
         })
+    }
+
+    async fn owner_mutation(&self, workload_id: &str) -> Result<MutationGuard<'_>> {
+        tokio::time::timeout(self.inner.runtime_operation_timeout, async {
+            loop {
+                match self.mutation(workload_id) {
+                    Ok(guard) => return Ok(guard),
+                    Err(error)
+                        if error.downcast_ref::<MutationOwner>()
+                            == Some(&MutationOwner::Enrollment) =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        })
+        .await
+        .context("timed out waiting for endpoint enrollment to release workload")?
     }
 
     async fn runtime_operation<T>(
@@ -950,7 +994,9 @@ impl AgentService {
         // reservation. A custom signed client must not bypass podctl's
         // normalization and turn one reservation into multiple runtime pods.
         protocol::validate_and_measure_manifest(&execution.manifest)?;
-        let _mutation = self.mutation(&grant.workload_id)?;
+        let _mutation = self.owner_mutation(&grant.workload_id).await?;
+        let now = now_secs();
+        grant.verify(now)?;
         let mut state = self.inner.state.lock().await;
         // Consume and bind the reservation *before* consulting the active set.
         // Checking `active` first would leave the reservation intact only when
@@ -1147,7 +1193,9 @@ impl AgentService {
         .await?;
 
         let execution = self.decode_execution(&request.grant)?;
-        let _mutation = self.mutation(&request.workload_id)?;
+        let _mutation = self.owner_mutation(&request.workload_id).await?;
+        let now = now_secs();
+        request.verify(now)?;
         protocol::validate_and_measure_manifest(&execution.manifest)?;
         let (manifest, measured) =
             self.runtime_manifest(&request.workload_id, &request.namespace_id, &execution)?;
@@ -1450,7 +1498,8 @@ impl AgentService {
                 anyhow!("workload not found")
             })?;
         let _mutation = if matches!(command.operation, WorkloadOperation::Delete) {
-            let guard = self.mutation(&command.workload_id)?;
+            let guard = self.owner_mutation(&command.workload_id).await?;
+            command.verify(now_secs())?;
             active = self
                 .inner
                 .state
@@ -2277,6 +2326,154 @@ mod tests {
                 assert_eq!(service.inner.state.lock().await.usage().cpu_milli, 0);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn owner_update_and_delete_wait_for_background_enrollment() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = AgentService::new(
+            test_config(temp.path(), 2000, 4),
+            Arc::new(crate::runtime::MockRuntime::default()),
+        )
+        .await
+        .unwrap();
+        let (workload, grant) = prepare_test_workload(&service, "enrollment-contention", 500).await;
+        let revision = grant.revision_id.clone();
+        service.deploy(grant).await.unwrap();
+        let enrollment = service
+            .mutation_with_owner(&workload.workload_id, MutationOwner::Enrollment)
+            .unwrap();
+        let request = test_update_request(
+            &service,
+            &workload,
+            "v2",
+            revision,
+            false,
+            "enrollment-update",
+        );
+        let update = service.update(request);
+        tokio::pin!(update);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut update)
+                .await
+                .is_err()
+        );
+        drop(enrollment);
+        update.await.unwrap();
+
+        let enrollment = service
+            .mutation_with_owner(&workload.workload_id, MutationOwner::Enrollment)
+            .unwrap();
+        let delete = command_test_workload(
+            &service,
+            &workload,
+            WorkloadOperation::Delete,
+            "enrollment-delete",
+        );
+        tokio::pin!(delete);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut delete)
+                .await
+                .is_err()
+        );
+        drop(enrollment);
+        assert!(delete.await.ok);
+        assert!(
+            !service
+                .inner
+                .state
+                .lock()
+                .await
+                .active
+                .contains_key(&workload.workload_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_update_rechecks_authority_after_waiting_for_enrollment() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::runtime::MockRuntime::default());
+        let service = AgentService::new(test_config(temp.path(), 2000, 4), runtime.clone())
+            .await
+            .unwrap();
+        let (workload, grant) = prepare_test_workload(&service, "enrollment-expiry", 500).await;
+        let revision = grant.revision_id.clone();
+        service.deploy(grant).await.unwrap();
+        let enrollment = service
+            .mutation_with_owner(&workload.workload_id, MutationOwner::Enrollment)
+            .unwrap();
+        let mut request = test_update_request(
+            &service,
+            &workload,
+            "v2",
+            revision.clone(),
+            false,
+            "expired-enrollment-update",
+        );
+        request.expires_at_secs = now_secs() + 2 - protocol::agent::MAX_AGENT_CLOCK_SKEW_SECS;
+        request.issued_at_secs = request.expires_at_secs - 1;
+        request = request.sign(&workload.owner_private).unwrap();
+        let expiry = request.expires_at_secs + protocol::agent::MAX_AGENT_CLOCK_SKEW_SECS;
+        let update = service.update(request);
+        tokio::pin!(update);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut update)
+                .await
+                .is_err()
+        );
+        while now_secs() <= expiry {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        drop(enrollment);
+        let error = match update.await {
+            Err(error) => error,
+            Ok(_) => panic!("expired update must be refused"),
+        };
+        assert!(error.to_string().contains("expired"), "{error:#}");
+        assert_eq!(
+            service.inner.state.lock().await.active[&workload.workload_id]
+                .grant
+                .revision_id,
+            revision
+        );
+        assert_eq!(runtime.deploy_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn enrollment_contention_has_a_bounded_cancellation_safe_wait() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut service = AgentService::new(
+            test_config(temp.path(), 2000, 4),
+            Arc::new(crate::runtime::MockRuntime::default()),
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut service.inner)
+            .unwrap()
+            .runtime_operation_timeout = Duration::from_millis(50);
+        let enrollment = service
+            .mutation_with_owner("waiting", MutationOwner::Enrollment)
+            .unwrap();
+        let error = service.owner_mutation("waiting").await.err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("timed out waiting for endpoint enrollment")
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), service.owner_mutation("waiting"))
+                .await
+                .is_err()
+        );
+        drop(enrollment);
+        let lifecycle = service.owner_mutation("waiting").await.unwrap();
+        let error = service.owner_mutation("waiting").await.err().unwrap();
+        assert_eq!(
+            error.downcast_ref::<MutationOwner>(),
+            Some(&MutationOwner::Lifecycle)
+        );
+        drop(lifecycle);
+        assert!(service.mutation("waiting").is_ok());
     }
 
     #[tokio::test]

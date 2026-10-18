@@ -55,7 +55,7 @@ impl AgentService {
             .for_each_concurrent(4, |id| async move {
                 // Lifecycle mutation guards prevent issuing during replacement or
                 // deletion. An unavailable replica is retried on a later tick.
-                let Ok(_mutation) = self.mutation(&id) else {
+                let Ok(_mutation) = self.mutation_with_owner(&id, MutationOwner::Enrollment) else {
                     return;
                 };
                 let stored = self.inner.state.lock().await.active.get(&id).cloned();

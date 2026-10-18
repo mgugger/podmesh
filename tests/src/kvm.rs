@@ -20,8 +20,10 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const MIB: u64 = 1024 * 1024;
 const HOST_MEMORY_RESERVE_MIB: u64 = 1024;
 
-fn guest_memory_mib(name: &str) -> u32 {
-    if name.starts_with("agent") || name == "control" {
+fn guest_memory_mib(name: &str, two_tier: bool) -> u32 {
+    if two_tier && name.starts_with("agent") {
+        1024
+    } else if name.starts_with("agent") || name == "control" {
         512
     } else {
         256
@@ -52,10 +54,10 @@ fn check_memory_budget(available_bytes: u64, guest_mib: u64) -> Result<()> {
     Ok(())
 }
 
-fn memory_preflight(names: &[&str]) -> Result<()> {
+fn memory_preflight(names: &[&str], two_tier: bool) -> Result<()> {
     let guest_mib: u64 = names
         .iter()
-        .map(|name| u64::from(guest_memory_mib(name)))
+        .map(|name| u64::from(guest_memory_mib(name, two_tier)))
         .sum();
     let mut available =
         proc_memory_kib(&fs::read_to_string("/proc/meminfo")?, "MemAvailable:")? * 1024;
@@ -91,9 +93,17 @@ fn memory_preflight(names: &[&str]) -> Result<()> {
     }
     check_memory_budget(available, guest_mib)?;
     println!(
-        "KVM lean profile: {} guests, {} vCPUs, {guest_mib} MiB guest RAM; available {} MiB, host reserve {HOST_MEMORY_RESERVE_MIB} MiB",
+        "KVM {} profile: {} guests, {} vCPUs, {guest_mib} MiB guest RAM; available {} MiB, host reserve {HOST_MEMORY_RESERVE_MIB} MiB",
+        if two_tier { "two-tier" } else { "lean" },
         names.len(),
-        names.len(),
+        names
+            .iter()
+            .map(|name| if guest_memory_mib(name, two_tier) == 1024 {
+                2
+            } else {
+                1
+            })
+            .sum::<usize>(),
         available / MIB
     );
     Ok(())
@@ -201,14 +211,23 @@ fn route_overlaps(destination: &str, subnet: Ipv4Addr) -> Result<bool> {
 
 impl KvmRun {
     pub async fn launch(image: &Path, worker: &Path) -> Result<Self> {
-        Self::launch_named(image, worker, &["control", "agent"]).await
+        Self::launch_named(image, worker, &["control", "agent"], false).await
     }
 
     pub async fn launch_mesh(image: &Path, worker: &Path) -> Result<Self> {
-        Self::launch_named(image, worker, &MESH_GUESTS).await
+        Self::launch_named(image, worker, &MESH_GUESTS, false).await
     }
 
-    async fn launch_named(image: &Path, worker: &Path, names: &[&str]) -> Result<Self> {
+    pub async fn launch_two_tier_mesh(image: &Path, worker: &Path) -> Result<Self> {
+        Self::launch_named(image, worker, &MESH_GUESTS, true).await
+    }
+
+    async fn launch_named(
+        image: &Path,
+        worker: &Path,
+        names: &[&str],
+        two_tier: bool,
+    ) -> Result<Self> {
         ensure!(!names.is_empty(), "a KVM run requires at least one guest");
         ensure!(
             names.len() <= u8::MAX as usize - 10,
@@ -234,7 +253,7 @@ impl KvmRun {
             .write(true)
             .open("/dev/kvm")
             .context("kvm-tests requires usable /dev/kvm")?;
-        memory_preflight(names)?;
+        memory_preflight(names, two_tier)?;
         command("ssh", &["-V"], None).await?;
         let directory = tempfile::Builder::new().prefix("podmesh-kvm-").tempdir()?;
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
@@ -413,7 +432,7 @@ impl KvmRun {
                 .arg(&config)
                 .arg(&tap)
                 .arg(index.to_string())
-                .arg(guest_memory_mib(name).to_string())
+                .arg(guest_memory_mib(name, two_tier).to_string())
                 .stdin(Stdio::null())
                 .stdout(output.try_clone()?)
                 .stderr(output)
@@ -963,7 +982,7 @@ fn console_tail(path: &Path) -> Result<String> {
 
 pub fn worker(disk: &Path, config: &Path, tap: &str, index: u8, memory_mib: u32) -> Result<()> {
     ensure!(
-        matches!(memory_mib, 256 | 512),
+        matches!(memory_mib, 256 | 512 | 1024),
         "unsupported lean guest memory budget"
     );
     let disk = CString::new(path_string(disk)?)?;
@@ -988,7 +1007,10 @@ pub fn worker(disk: &Path, config: &Path, tap: &str, index: u8, memory_mib: u32)
         let ctx = u32::try_from(ctx)?;
         let configure =
             library.get::<unsafe extern "C" fn(u32, u8, u32) -> i32>(b"krun_set_vm_config\0")?;
-        check_krun("VM configuration", configure(ctx, 1, memory_mib))?;
+        check_krun(
+            "VM configuration",
+            configure(ctx, if memory_mib == 1024 { 2 } else { 1 }, memory_mib),
+        )?;
         let add_disk =
             library.get::<unsafe extern "C" fn(u32, *const c_char, *const c_char, bool) -> i32>(
                 b"krun_add_disk\0",
@@ -1052,13 +1074,22 @@ mod tests {
 
     #[test]
     fn lean_profiles_and_memory_preflight_bounds() -> Result<()> {
-        assert_eq!(guest_memory_mib("control"), 512);
-        assert_eq!(guest_memory_mib("agent"), 512);
+        assert_eq!(guest_memory_mib("control", false), 512);
+        assert_eq!(guest_memory_mib("agent", false), 512);
         let total: u64 = MESH_GUESTS
             .iter()
-            .map(|name| u64::from(guest_memory_mib(name)))
+            .map(|name| u64::from(guest_memory_mib(name, false)))
             .sum();
         assert_eq!(total, 2816);
+        assert_eq!(guest_memory_mib("agent-1", true), 1024);
+        assert_eq!(guest_memory_mib("scheduler-1", true), 256);
+        assert_eq!(
+            MESH_GUESTS
+                .iter()
+                .map(|name| u64::from(guest_memory_mib(name, true)))
+                .sum::<u64>(),
+            4352
+        );
         assert!(check_memory_budget((total + 1024) * MIB, total).is_ok());
         assert!(check_memory_budget((total + 1024) * MIB - 1, total).is_err());
         assert_eq!(

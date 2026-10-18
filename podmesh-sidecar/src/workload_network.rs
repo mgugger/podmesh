@@ -296,7 +296,11 @@ impl WorkloadNetwork {
         self.persist()
     }
     pub async fn run(self: Arc<Self>) -> Result<()> {
+        use futures::StreamExt;
+        use iroh::Watcher;
         let mut changed = self.authorization.subscribe();
+        let addresses = self.endpoint.watch_addr().stream();
+        tokio::pin!(addresses);
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         let mut online_refreshed = false;
         loop {
@@ -307,6 +311,7 @@ impl WorkloadNetwork {
                 },
                 _ = interval.tick() => {},
                 result = changed.changed() => { result.context("workload authority channel closed")?; },
+                address = addresses.next() => { address.context("workload endpoint address stream closed")?; },
             }
             tokio::select! {
                 _ = self.shutdown.cancelled() => return Ok(()),

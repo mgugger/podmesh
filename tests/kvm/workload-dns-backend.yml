@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dns-backend
+spec:
+  selector:
+    matchLabels:
+      run: dns-backend
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        run: dns-backend
+    spec:
+      containers:
+        - name: app
+          image: localhost/podmesh-kvm/app:spike
+          imagePullPolicy: Never
+          args: ["serve-hostname"]
+          resources:
+            limits:
+              memory: "64Mi"
+              cpu: "300m"
+              ephemeral-storage: "256Mi"
+          ports:
+            - containerPort: 8081
+          securityContext:
+            runAsUser: 1000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo
+spec:
+  selector:
+    run: dns-backend
+  ports:
+    - name: http
+      port: 18081
+      targetPort: 8081
