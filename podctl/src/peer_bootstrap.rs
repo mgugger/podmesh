@@ -26,7 +26,9 @@ async fn bootstrap_inner(key_dir: &Path, deployment: &str, options: &ClientOptio
         for placement in &catalog.replicas {
             match record(key_dir, placement, options.api_base()).await {
                 Ok(record) => records.push(record),
-                Err(error) => pending.push(format!("replica {}: {error}", placement.replica_index)),
+                Err(error) => {
+                    pending.push(format!("replica {}: {error:#}", placement.replica_index))
+                }
             }
         }
         if pending.is_empty() {
@@ -90,7 +92,7 @@ async fn bootstrap_inner(key_dir: &Path, deployment: &str, options: &ClientOptio
         .filter(|other| other.deployment_id != deployment)
         .take(8)
     {
-        for placement in other.replicas.iter().take(2) {
+        for placement in &other.replicas {
             for seed in records.iter().take(2) {
                 if let Err(error) = command(
                     key_dir,
@@ -128,7 +130,7 @@ pub(super) async fn wait_ready(
     }).await.context("updated connector did not enroll/publish the requested revision; remaining replicas were not replaced")?
 }
 
-async fn record(
+pub(super) async fn record(
     key_dir: &Path,
     placement: &ReplicaPlacement,
     api: Option<&str>,
@@ -141,7 +143,7 @@ async fn record(
         api,
     )
     .await?;
-    anyhow::ensure!(response.ok, "connector is not ready");
+    anyhow::ensure!(response.ok, "connector is not ready: {}", response.payload);
     let report =
         protocol::workload_connector::ConnectorResponse::from_bytes(response.payload.as_bytes())?
             .identity

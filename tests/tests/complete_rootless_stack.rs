@@ -414,6 +414,167 @@ async fn complete_rootless_stack_serves_ingress() -> Result<()> {
     Ok(())
 }
 
+/// Live container & network test for the two-tier sample (`deploy/demo_two_tier_db.yml`
+/// + `deploy/demo_two_tier_frontend.yml`):
+/// 1. Starts a scheduler, two real Podman-backed agents, and a proxy with ingress enabled.
+/// 2. Applies `deploy/demo_two_tier_db.yml` (`postgres:16-alpine` on port 5432 with `emptyDir` volumes).
+/// 3. Applies `deploy/demo_two_tier_frontend.yml` (`podmesh.io/anti-affinity: "postgres-db"`).
+/// 4. Asserts the two workloads land on the two distinct agents and both Podman pods start.
+/// 5. Sends an HTTP request to `http://<proxy-ingress>/` (`Host: demo-frontend.mesh.local`);
+///    the frontend container resolves `postgres-db.svc.podmesh.internal` via workload-local
+///    split DNS (`198.18.0.x`), opens a direct sidecar-to-sidecar Iroh TCP tunnel (`PEER_ALPN`)
+///    to the database pod on the other agent, executes `SELECT 'podmesh-two-tier-postgres-ok';`
+///    with `psql`, and returns `DB_RESULT=podmesh-two-tier-postgres-ok`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn live_podman_two_tier_frontend_queries_postgres_on_distinct_agent() -> Result<()> {
+    init_tracing();
+    anyhow::ensure!(
+        is_podman_available().await,
+        "podman-tests requires the podman CLI"
+    );
+    ensure_podman_network(PODMESH_NETWORK).await?;
+
+    let mesh = tokio::time::timeout(
+        podmesh_integration_tests::mesh::MESH_TIMEOUT,
+        podmesh_integration_tests::mesh::TestMesh::start_podman(2, PODMESH_NETWORK),
+    )
+    .await
+    .context("start two-agent Podman mesh timed out")??;
+
+    let iroh_port = podmesh_integration_tests::support::allocate_udp_port();
+    let rest_port = podmesh_integration_tests::support::allocate_tcp_port();
+    let mut proxy = podmesh_proxy::Workload::new(podmesh_proxy::Config {
+        proxy_endpoints: Vec::new(),
+        workload_replay_limits: protocol::ReplayLimits::default(),
+        identity: podmesh_proxy::IdentitySource::ephemeral(),
+        iroh_bind_addr: format!("0.0.0.0:{iroh_port}").parse()?,
+        metrics_listen: None,
+        workload_relay: None,
+        workload_relay_certificate_der: Vec::new(),
+        publish_relay_bootstrap: false,
+        rest_host: "127.0.0.1".into(),
+        rest_port,
+        disable_rest_api: false,
+        enable_ingress: true,
+        advertise_addresses: Vec::new(),
+        rest_rate_limit_per_minute: podmesh_proxy::restapi::DEFAULT_REST_RATE_LIMIT_PER_MINUTE,
+        owner_pubkey: None,
+    })?;
+    proxy.start().await?;
+    let proxy_record = proxy
+        .endpoint_record()
+        .context("proxy EndpointRecord unavailable")?;
+    let ingress_addr = proxy
+        .ingress_address()
+        .context("proxy ingress address unavailable")?;
+
+    let key_dir = ClientKeyDir::with_trusted_agents(&mesh.trusted_agent_keys())?;
+    key_dir.activate();
+    let (owner_public, owner_private) = crypto::load_or_create_signing_keypair(key_dir.path())?;
+    podmesh_integration_tests::support::provision_proxy_cert(
+        rest_port,
+        &owner_public,
+        &owner_private,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let options = ClientOptions::with_api_base(Some(&mesh.api_base));
+    let workspace = workspace_root();
+    let db_manifest = workspace.join("deploy/demo_two_tier_db.yml");
+    let frontend_manifest = workspace.join("deploy/demo_two_tier_frontend.yml");
+    let db_workload_id = protocol::workload_id(&owner_public, "postgres-db", 0);
+    let frontend_workload_id = protocol::workload_id(&owner_public, "demo-frontend", 0);
+    let mut workload_guard = WorkloadGuard::default();
+    workload_guard.set(db_workload_id.clone());
+    workload_guard.set(frontend_workload_id.clone());
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let encoded_proxy = vec![crypto::b64_encode(&proxy_record.to_bytes(now)?)];
+    let relay_token = "podmesh-two-tier-live-relay-token-000001".to_string();
+
+    let result: Result<()> = async {
+        let db_deployment_id = podctl::apply_file_with_proxy_endpoints(
+            db_manifest.clone(),
+            &options,
+            encoded_proxy.clone(),
+            relay_token.clone(),
+            Vec::new(),
+        )
+        .await
+        .context("apply demo_two_tier_db.yml failed")?;
+
+        let frontend_deployment_id = podctl::apply_file_with_proxy_endpoints(
+            frontend_manifest.clone(),
+            &options,
+            encoded_proxy,
+            relay_token,
+            Vec::new(),
+        )
+        .await
+        .context("apply demo_two_tier_frontend.yml failed")?;
+
+        let db_catalog = podctl::catalog::load(key_dir.path(), &db_deployment_id)?;
+        let frontend_catalog = podctl::catalog::load(key_dir.path(), &frontend_deployment_id)?;
+        anyhow::ensure!(
+            db_catalog.replicas[0].agent_endpoint_id
+                != frontend_catalog.replicas[0].agent_endpoint_id,
+            "postgres-db and demo-frontend must be placed on two distinct agents"
+        );
+
+        wait_for_connector_identities(&db_deployment_id, &options, 1, Duration::from_secs(60))
+            .await?;
+        wait_for_connector_identities(
+            &frontend_deployment_id,
+            &options,
+            1,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+        let url = format!("http://{ingress_addr}/");
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut last_body = String::new();
+        while Instant::now() < deadline {
+            if let Ok(response) = client
+                .get(&url)
+                .header("Host", "demo-frontend.mesh.local")
+                .send()
+                .await
+                && response.status().is_success()
+                && let Ok(body) = response.text().await
+            {
+                if body.contains("DB_RESULT=podmesh-two-tier-postgres-ok") {
+                    log::info!("two-tier live query succeeded: {}", body.trim());
+                    last_body = body;
+                    break;
+                }
+                last_body = body;
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+        anyhow::ensure!(
+            last_body.contains("DB_RESULT=podmesh-two-tier-postgres-ok"),
+            "frontend did not return expected Postgres query result over internal DNS/Iroh; last body: {last_body:?}"
+        );
+
+        delete_file(frontend_manifest, true, &options).await?;
+        delete_file(db_manifest, true, &options).await?;
+        wait_for_workload_teardown(&frontend_workload_id, Duration::from_secs(60)).await?;
+        wait_for_workload_teardown(&db_workload_id, Duration::from_secs(60)).await?;
+        workload_guard.disarm();
+        Ok(())
+    }
+    .await;
+
+    proxy.close().await;
+    result
+}
+
 /// Owner-agent control reaches each in-workload connector via remote Podman
 /// exec. Self-signed reports are inspection evidence, not enrolled membership.
 async fn wait_for_connector_identities(

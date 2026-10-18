@@ -486,8 +486,9 @@ Losing that layer requires a new owner-authorized generation; no managed persist
 provisioned and tenant volumes remain prohibited. Deletion stops honest-agent issuance, but existing
 children expire naturally rather than being instantly revoked. Standing issuer authority assumes
 the owner-approved execution agent remains trusted. Proxy grants retain their separate finite
-lifetime/manual recovery limitations. No VM backend, confidential attestation, internal DNS or direct
-tenant peer routing is enabled yet.
+lifetime/manual recovery limitations. Workload-local split DNS and direct tenant peer routing are
+enabled automatically on enrollment; no VM backend or confidential attestation is enabled in the
+container stack.
 
 Logs are fetched per replica, container by container, through the scheduler relay. A deployment can
 be addressed by name or by its 64-hex deployment ID:
@@ -614,6 +615,26 @@ podman pod ps --format '{{.Name}}' | grep -v 'podmesh-control\|podmesh-agents\|p
 
 ```
 []
+```
+
+## Optional — Two-tier deployment (Database + Frontend on distinct agents)
+
+To deploy a stateful database (`postgres:16-alpine` using pod-ephemeral `emptyDir` scratch volumes)
+on one agent and a frontend (`deploy/demo_two_tier_frontend.yml`) on a different agent using
+`podmesh.io/anti-affinity: "postgres-db"` and workload-local split DNS (`postgres-db.svc.podmesh.internal:5432`):
+
+```bash
+./target/debug/podctl --trust-any-agent apply -f deploy/demo_two_tier_db.yml
+./target/debug/podctl --trust-any-agent apply -f deploy/demo_two_tier_frontend.yml
+./target/debug/podctl get pods
+curl -H 'Host: demo-frontend.mesh.local' http://127.0.0.1:8080/
+```
+
+Clean both up when finished:
+
+```bash
+./target/debug/podctl delete demo-frontend
+./target/debug/podctl delete postgres-db
 ```
 
 ## Step 9 — Tear down the mesh

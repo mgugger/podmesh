@@ -72,6 +72,9 @@ pub(crate) trait WorkloadStore: Send + Sync {
     fn save_enrollment(&self, _binding: &EnrollmentBinding) -> Result<()> {
         anyhow::bail!("enrollment persistence is unsupported")
     }
+    fn remove_enrollment(&self, _workload_id: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Mode for the state file. It holds encrypted tenant records.
@@ -232,6 +235,15 @@ impl AgentStore {
         Ok(())
     }
 
+    fn remove_enrollment(&self, workload_id: &str) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            write.open_table(ENROLLMENT_TABLE)?.remove(workload_id)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
     pub fn remove(&self, workload_id: &str) -> Result<()> {
         let write = self.db.begin_write()?;
         {
@@ -250,6 +262,9 @@ impl WorkloadStore for AgentStore {
     }
     fn save_enrollment(&self, binding: &EnrollmentBinding) -> Result<()> {
         Self::save_enrollment(self, binding)
+    }
+    fn remove_enrollment(&self, workload_id: &str) -> Result<()> {
+        Self::remove_enrollment(self, workload_id)
     }
 
     fn load_all(&self) -> Result<Vec<(String, Result<StoredWorkload>)>> {

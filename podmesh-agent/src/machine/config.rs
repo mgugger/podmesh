@@ -30,6 +30,14 @@ pub struct MachineConfig {
     )]
     pub bind_addr: SocketAddr,
 
+    /// Addresses schedulers should dial instead of the ones this agent bound locally.
+    #[arg(
+        long = "advertise-address",
+        env = "PODMESH_AGENT_ADVERTISE_ADDRESSES",
+        value_delimiter = ','
+    )]
+    pub advertise_addresses: Vec<String>,
+
     #[arg(
         long = "scheduler-endpoint",
         env = "PODMESH_AGENT_SCHEDULER_ENDPOINTS",
@@ -120,6 +128,7 @@ impl Default for MachineConfig {
             bind_addr: DEFAULT_MACHINE_BIND
                 .parse()
                 .expect("valid default machine bind"),
+            advertise_addresses: Vec::new(),
             scheduler_endpoints: Vec::new(),
             scheduler_urls: Vec::new(),
             relay_urls: Vec::new(),

@@ -552,3 +552,76 @@ async fn remote_reconciliation_rebuilds_catalog_and_survives_entry_restart() -> 
     assert_eq!(mesh.total_deployed_workloads().await, 0);
     Ok(())
 }
+
+/// Deploying a database (`deploy/demo_two_tier_db.yml`) and a frontend
+/// (`deploy/demo_two_tier_frontend.yml`) with `podmesh.io/anti-affinity: "postgres-db"`
+/// places the two workloads on distinct agents, allows `emptyDir` scratch volumes
+/// for unprivileged Postgres, and seeds both connectors with each other's
+/// owner-signed `ServiceCatalog` (`postgres-db:5432` and `demo-frontend-svc:80`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn two_tier_database_and_frontend_deploy_to_distinct_agents_and_exchange_service_seeds()
+-> Result<()> {
+    let (mesh, key_dir, options) = mesh_with_client(2).await?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let db_manifest = root.join("deploy/demo_two_tier_db.yml");
+    let frontend_manifest = root.join("deploy/demo_two_tier_frontend.yml");
+
+    let db_deployment_id = timeout(TEST_TIMEOUT, apply(&db_manifest, &options))
+        .await
+        .context("apply postgres-db timed out")??;
+    let frontend_deployment_id = timeout(TEST_TIMEOUT, apply(&frontend_manifest, &options))
+        .await
+        .context("apply demo-frontend timed out")??;
+
+    let db_catalog = podctl::catalog::load(key_dir.path(), &db_deployment_id)?;
+    let frontend_catalog = podctl::catalog::load(key_dir.path(), &frontend_deployment_id)?;
+    assert_eq!(db_catalog.replicas.len(), 1);
+    assert_eq!(frontend_catalog.replicas.len(), 1);
+    assert_ne!(
+        db_catalog.replicas[0].agent_endpoint_id, frontend_catalog.replicas[0].agent_endpoint_id,
+        "podmesh.io/anti-affinity must place the frontend on a different agent than postgres-db"
+    );
+
+    let db_reports = timeout(
+        TEST_TIMEOUT,
+        podctl::get_connector_identities(&db_deployment_id, &options),
+    )
+    .await
+    .context("inspect db connector timed out")??;
+    let frontend_reports = timeout(
+        TEST_TIMEOUT,
+        podctl::get_connector_identities(&frontend_deployment_id, &options),
+    )
+    .await
+    .context("inspect frontend connector timed out")??;
+    let db_record = db_reports[0]
+        .service_record
+        .as_ref()
+        .context("db service record missing")?;
+    assert_eq!(db_record.catalog.services[0].name, "postgres-db");
+    assert_eq!(db_record.catalog.services[0].ports[0].port, 5432);
+    let frontend_record = frontend_reports[0]
+        .service_record
+        .as_ref()
+        .context("frontend service record missing")?;
+    assert_eq!(
+        frontend_record.catalog.services[0].name,
+        "demo-frontend-svc"
+    );
+
+    timeout(
+        TEST_TIMEOUT,
+        podctl::delete_file(frontend_manifest, false, &options),
+    )
+    .await
+    .context("delete frontend timed out")??;
+    timeout(
+        TEST_TIMEOUT,
+        podctl::delete_file(db_manifest, false, &options),
+    )
+    .await
+    .context("delete db timed out")??;
+    assert_eq!(mesh.total_deployed_workloads().await, 0);
+    Ok(())
+}

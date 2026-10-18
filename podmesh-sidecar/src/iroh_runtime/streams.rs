@@ -382,6 +382,9 @@ async fn execute_local_http_request(
     );
     let mut builder = client.request(method, url);
     for (name, value) in request.headers {
+        if !request.upgrade_requested && is_hop_by_hop_header(&name) {
+            continue;
+        }
         if let (Ok(name), Ok(value)) = (
             HeaderName::from_bytes(name.as_bytes()),
             HeaderValue::from_str(&value),
@@ -394,6 +397,17 @@ async fn execute_local_http_request(
         .send()
         .await
         .context("send local HTTP request")
+}
+
+fn is_hop_by_hop_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("content-length")
+        || name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("te")
+        || name.eq_ignore_ascii_case("trailer")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("proxy-authenticate")
 }
 
 fn now_millis() -> Result<u64> {

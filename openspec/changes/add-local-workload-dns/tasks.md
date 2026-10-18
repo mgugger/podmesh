@@ -33,33 +33,33 @@ The connector, endpoint enrollment and DNS/discovery deployment wiring are imple
 
 ## 3. Deployment seed exchange
 
-- [ ] 3.1 Add a bounded typed owner-agent bootstrap/status response and seed-update operation in shared/protocol, agent service and runtime; verify target/owner signatures, encrypted transport, size limits and non-owner refusal.
-- [ ] 3.2 Extend podctl catalog/apply to collect actual enrolled sidecar endpoint records after startup and deliver a bounded connected seed graph; verify three-replica tests do not deadlock placement while earlier replicas await peers.
-- [ ] 3.3 Join later workloads to authorized existing tenant seeds using catalog/reconciliation and refreshed agent reports; verify two deployments form one discovery mesh and another owner's seeds are rejected.
-- [ ] 3.4 Persist/retry per-replica bootstrap progress while retaining confirmed ownership and cleanup handles; verify interrupted apply, unavailable agent and partial seed delivery tests, and document bootstrap-unavailable behavior.
+- [x] 3.1 Add a bounded typed owner-agent bootstrap/status response and seed-update operation in shared/protocol, agent service and runtime; verify target/owner signatures, encrypted transport, size limits and non-owner refusal.
+- [x] 3.2 Extend podctl catalog/apply to collect actual enrolled sidecar endpoint records after startup and deliver a bounded connected seed graph; verify three-replica tests do not deadlock placement while earlier replicas await peers.
+- [x] 3.3 Join later workloads to authorized existing tenant seeds using catalog/reconciliation and refreshed agent reports; verify two deployments form one discovery mesh and another owner's seeds are rejected.
+- [x] 3.4 Persist/retry per-replica bootstrap progress while retaining confirmed ownership and cleanup handles; verify interrupted apply, unavailable agent and partial seed delivery tests, and document bootstrap-unavailable behavior.
 
 ## 4. Peer discovery and service cache
 
-- [ ] 4.1 Extend the supported Service parser/catalog for standalone Services, service port -> targetPort and owner-authorized advertisement scope; verify numeric/named ports, no Ingress dependency and invalid selectors/aliases fail safely.
-- [ ] 4.2 Add signed expiring ReplicaServiceRecord encoding and per-incarnation/sequence merge with named bounds; verify expiry, equivocation, sequence regression, invalid authority and bounded cache properties.
-- [ ] 4.3 Add sidecar incoming peer accept loop, mutual endpoint-bound handshake and role-separated peer ALPN/typed envelope operations; verify foreign owners, proxy-role confusion, replay and unauthorized signing keys are refused.
-- [ ] 4.4 Implement bounded neighbor management, Digest/Fetch/Records synchronization and authorized candidate exchange; verify three in-process sidecars converge from sparse seeds and reconnect without a proxy or per-query broadcasts.
-- [ ] 4.5 Implement lease refresh, credential-aware record expiry and caller-local reachability penalties; verify lost peers expire without deleting siblings or turning a suspicion into global revocation, and document partition limitations.
+- [x] 4.1 Extend the supported Service parser/catalog for standalone Services, service port -> targetPort and owner-authorized advertisement scope; verify numeric/named ports, no Ingress dependency and invalid selectors/aliases fail safely.
+- [x] 4.2 Add signed expiring ReplicaServiceRecord encoding and per-incarnation/sequence merge with named bounds; verify expiry, equivocation, sequence regression, invalid authority and bounded cache properties.
+- [x] 4.3 Add sidecar incoming peer accept loop, mutual endpoint-bound handshake and role-separated peer ALPN/typed envelope operations; verify foreign owners, proxy-role confusion, replay and unauthorized signing keys are refused.
+- [x] 4.4 Implement bounded neighbor management, Digest/Fetch/Records synchronization and authorized candidate exchange; verify three in-process sidecars converge from sparse seeds and reconnect without a proxy or per-query broadcasts.
+- [x] 4.5 Implement lease refresh, credential-aware record expiry and caller-local reachability penalties; verify lost peers expire without deleting siblings or turning a suspicion into global revocation, and document partition limitations.
 
 ## 5. Local DNS adapter
 
-- [ ] 5.1 Add compatible direct Hickory dependencies and a bounded loopback UDP/TCP DNS handler; verify build/MSRV, bind collisions, oversized requests, unsupported DNS operations, deadlines and shutdown tests.
-- [ ] 5.2 Implement internal FQDN classification and stable bounded VIP allocation with safe restart/no-reuse behavior; verify full-digest base32 route labels (the existing 64-character hex key cannot be a DNS label), label/name length bounds, case/trailing-dot handling, foreign-owner scope, collisions, A/AAAA behavior and stale-address safety properties.
-- [ ] 5.3 Capture original workload resolver configuration and forward only non-internal names through it; verify deterministic upstream UDP/TCP/CNAME/AAAA, timeout/cache bounds and zero forwarding for failed internal names.
-- [ ] 5.4 Implement the approved nftables DNS/synthetic routing and outbound bypass integration; verify rules work before UID/network exclusions and unwind on startup failure/cancellation.
-- [ ] 5.5 Document canonical service names, incomplete-cache SERVFAIL, IPv4-first scope and preserved host/runtime DNS behavior; verify examples against a test fixture rather than claiming full Kubernetes DNS/search semantics.
+- [x] 5.1 Add compatible direct Hickory dependencies and a bounded loopback UDP/TCP DNS handler; verify build/MSRV, bind collisions, oversized requests, unsupported DNS operations, deadlines and shutdown tests.
+- [x] 5.2 Implement internal FQDN classification and stable bounded VIP allocation with safe restart/no-reuse behavior; verify full-digest base32 route labels (the existing 64-character hex key cannot be a DNS label), label/name length bounds, case/trailing-dot handling, foreign-owner scope, collisions, A/AAAA behavior and stale-address safety properties.
+- [x] 5.3 Capture original workload resolver configuration and forward only non-internal names through it; verify deterministic upstream UDP/TCP/CNAME/AAAA, timeout/cache bounds and zero forwarding for failed internal names.
+- [x] 5.4 Implement the approved nftables DNS/synthetic routing and outbound bypass integration; verify rules work before UID/network exclusions and unwind on startup failure/cancellation.
+- [x] 5.5 Document canonical service names, incomplete-cache SERVFAIL, IPv4-first scope and preserved host/runtime DNS behavior; verify examples against a test fixture rather than claiming full Kubernetes DNS/search semantics.
 
 ## 6. Direct internal TCP routing
 
-- [ ] 6.1 Dispatch VIP destinations before proxy session selection; verify unknown reserved destinations fail closed and public destinations retain proxy egress.
-- [ ] 6.2 Add mutually authorized internal tunnel setup and loopback-only service target resolution, using existing raw relay supervision/limits; verify service-port translation, arbitrary-target refusal, cancellation and authority expiry.
-- [ ] 6.3 Implement replica balancing and setup-only retry; verify remote and self-selected paths, unreachable backend fallback and no retry after any application bytes are forwarded.
-- [ ] 6.4 Add finite-catalog DNS/discovery/peer-tunnel metrics and readiness state; verify no identity labels/secrets and that internal traffic works with zero proxy sessions, then update docs/p2p-flows.md.
+- [x] 6.1 Dispatch VIP destinations before proxy session selection; verify unknown reserved destinations fail closed and public destinations retain proxy egress.
+- [x] 6.2 Add mutually authorized internal tunnel setup and loopback-only service target resolution, using existing raw relay supervision/limits; verify service-port translation, arbitrary-target refusal, cancellation and authority expiry.
+- [x] 6.3 Implement replica balancing and setup-only retry; verify remote and self-selected paths, unreachable backend fallback and no retry after any application bytes are forwarded.
+- [x] 6.4 Add finite-catalog DNS/discovery/peer-tunnel metrics and readiness state; verify no identity labels/secrets and that internal traffic works with zero proxy sessions, then update docs/p2p-flows.md.
 
 ## 7. Real three-replica Podman acceptance
 

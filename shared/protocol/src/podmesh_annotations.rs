@@ -13,6 +13,8 @@ pub struct PodmeshAnnotations {
     pub lease_ttl_secs: Option<u32>,
     /// Base64-encoded signed proxy EndpointRecords.
     pub proxy_endpoints: Vec<String>,
+    /// Workload names or deployment IDs whose agents must be excluded when placing this workload.
+    pub anti_affinity: Vec<String>,
 }
 
 impl PodmeshAnnotations {
@@ -20,6 +22,7 @@ impl PodmeshAnnotations {
     pub const REPLICAS: &'static str = "podmesh.io/replicas";
     pub const LEASE_TTL: &'static str = "podmesh.io/lease-ttl";
     pub const PROXY_ENDPOINTS: &'static str = "podmesh.io/proxy-endpoints";
+    pub const ANTI_AFFINITY: &'static str = "podmesh.io/anti-affinity";
 
     /// Parse annotations from a serde_yaml Value (the annotations map from a k8s manifest).
     pub fn from_yaml_annotations(annotations: &serde_yaml::Value) -> Self {
@@ -45,6 +48,16 @@ impl PodmeshAnnotations {
                     .collect()
             })
             .unwrap_or_default();
+        result.anti_affinity = get(Self::ANTI_AFFINITY)
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|target| !target.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         result
     }
@@ -60,6 +73,7 @@ impl PodmeshAnnotations {
                     || parsed.replicas.is_some()
                     || parsed.lease_ttl_secs.is_some()
                     || !parsed.proxy_endpoints.is_empty()
+                    || !parsed.anti_affinity.is_empty()
                 {
                     return Ok(parsed);
                 }

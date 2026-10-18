@@ -134,8 +134,22 @@ fn ensure_key_directory(key_dir: &Path) -> Result<()> {
         );
         return Ok(());
     }
-    fs::create_dir_all(key_dir)
-        .with_context(|| format!("create Iroh key directory {}", key_dir.display()))?;
+    use std::os::unix::fs::DirBuilderExt;
+    let mut missing = Vec::<PathBuf>::new();
+    let mut current = key_dir;
+    while !current.exists() {
+        missing.push(current.to_path_buf());
+        current = current
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Iroh key directory has no existing ancestor"))?;
+    }
+    for directory in missing.into_iter().rev() {
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(KEY_DIRECTORY_MODE);
+        builder
+            .create(&directory)
+            .with_context(|| format!("create Iroh key directory {}", directory.display()))?;
+    }
     fs::set_permissions(key_dir, fs::Permissions::from_mode(KEY_DIRECTORY_MODE))
         .with_context(|| format!("secure Iroh key directory {}", key_dir.display()))?;
     Ok(())

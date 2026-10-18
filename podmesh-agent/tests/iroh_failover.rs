@@ -149,6 +149,7 @@ fn agent_config(root: &std::path::Path, records: &[protocol::EndpointRecord]) ->
             podmesh_agent::config::DEFAULT_RUNTIME_OPERATION_TIMEOUT_SECS,
         machine: MachineConfig {
             bind_addr: "127.0.0.1:0".parse()?,
+            advertise_addresses: Vec::new(),
             scheduler_endpoints: records
                 .iter()
                 .map(|record| Ok(crypto::b64_encode(&record.to_bytes(now_secs())?)))

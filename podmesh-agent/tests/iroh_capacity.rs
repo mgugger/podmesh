@@ -149,6 +149,7 @@ async fn agent_attaches_receives_live_query_and_returns_signed_offer() -> Result
             podmesh_agent::config::DEFAULT_RUNTIME_OPERATION_TIMEOUT_SECS,
         machine: MachineConfig {
             bind_addr: "127.0.0.1:0".parse()?,
+            advertise_addresses: Vec::new(),
             scheduler_endpoints: vec![crypto::b64_encode(&scheduler_record.to_bytes(now_secs())?)],
             scheduler_urls: Vec::new(),
             relay_urls: vec![RELAY_URL.into()],

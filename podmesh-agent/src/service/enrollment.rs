@@ -62,7 +62,7 @@ impl AgentService {
                 if let Some(stored) = stored
                     && let Err(error) = self.enroll_stored(&stored).await
                 {
-                    log::debug!("workload enrollment refresh unavailable: {error}");
+                    log::debug!("workload enrollment refresh unavailable: {error:#}");
                 }
             })
             .await;

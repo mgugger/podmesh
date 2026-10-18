@@ -468,12 +468,25 @@ async fn apply_file_internal(
                 replica.revision_id == revision_id && !service_mesh_renewal_due(replica, now_secs())
             })
     }) {
+        if let Some(proxy_urls) = proxy_urls.as_deref() {
+            grant_proxies(proxy_urls, &owner_public, &owner_private).await?;
+        }
         peer_bootstrap::bootstrap(&key_dir, &deployment_id, options).await?;
         return Ok(deployment_id);
     }
     let annotations = protocol::PodmeshAnnotations::from_manifest_yaml(
         std::str::from_utf8(&manifest).context("manifest is not UTF-8")?,
     )?;
+    let mut anti_affinity_agents = Vec::new();
+    for target in &annotations.anti_affinity {
+        if let Ok(other_catalog) = catalog::load(&key_dir, target) {
+            for replica in other_catalog.replicas {
+                if !anti_affinity_agents.contains(&replica.agent_endpoint_id) {
+                    anti_affinity_agents.push(replica.agent_endpoint_id);
+                }
+            }
+        }
+    }
     let (encoded_proxy_endpoints, workload_relay_auth_token, workload_relay_ca_certificates) =
         if let Some(explicit) = explicit_proxy_config {
             explicit
@@ -526,6 +539,14 @@ async fn apply_file_internal(
     let api_base = resolve_api_base(options.api_base());
 
     let mut catalog = if let Some(mut catalog) = existing_catalog {
+        let mut existing_peers = Vec::new();
+        for placement in &catalog.replicas {
+            if let Ok(record) =
+                peer_bootstrap::record(&key_dir, placement, options.api_base()).await
+            {
+                existing_peers.push((placement.replica_index, record));
+            }
+        }
         let mut failures = Vec::new();
         for placement_index in 0..catalog.replicas.len() {
             if catalog.replicas[placement_index].revision_id == revision_id
@@ -577,6 +598,35 @@ async fn apply_file_internal(
                         options.api_base(),
                     )
                     .await?;
+                    // Seed the newly updated replica with live siblings immediately
+                    // so its DNS cache is populated before the next replica updates.
+                    for (other_idx, seed) in &existing_peers {
+                        if *other_idx != catalog.replicas[placement_index].replica_index {
+                            let _ = command(
+                                &key_dir,
+                                &catalog.replicas[placement_index],
+                                WorkloadOperation::SeedPeer(Box::new(seed.clone())),
+                                None,
+                                options.api_base(),
+                            )
+                            .await;
+                        }
+                    }
+                    if let Ok(fresh_record) = peer_bootstrap::record(
+                        &key_dir,
+                        &catalog.replicas[placement_index],
+                        options.api_base(),
+                    )
+                    .await
+                    {
+                        existing_peers.retain(|(idx, _)| {
+                            *idx != catalog.replicas[placement_index].replica_index
+                        });
+                        existing_peers.push((
+                            catalog.replicas[placement_index].replica_index,
+                            fresh_record,
+                        ));
+                    }
                 }
                 Err(error) => failures.push(format!(
                     "replica {} on {}: {error:#}",
@@ -608,6 +658,11 @@ async fn apply_file_internal(
         .iter()
         .map(|replica| replica.agent_endpoint_id.clone())
         .collect();
+    for excluded in anti_affinity_agents {
+        if !occupied_agents.contains(&excluded) {
+            occupied_agents.push(excluded);
+        }
+    }
     for replica_index in 0..replica_count {
         if catalog
             .replicas
@@ -622,7 +677,9 @@ async fn apply_file_internal(
             let agent = select_agent(
                 &api_base,
                 &excluded_agents,
-                replica_count.saturating_sub(replica_index),
+                replica_count
+                    .saturating_sub(replica_index)
+                    .saturating_add(excluded_agents.len() as u32),
                 &resources,
                 &trust,
             )
@@ -1470,7 +1527,7 @@ async fn reconcile_workloads(options: &ClientOptions) -> Result<DiscoveryReport>
                     && recovered_catalog.replica_count == workload.replica_count,
                 "agents disagree about deployment identity or replica count"
             );
-            let placement = catalog::ReplicaPlacement {
+            let mut placement = catalog::ReplicaPlacement {
                 replica_index: workload.replica_index,
                 revision_id: workload.revision_id.clone(),
                 receipt: workload.receipt.clone(),
@@ -1487,6 +1544,11 @@ async fn reconcile_workloads(options: &ClientOptions) -> Result<DiscoveryReport>
                 .iter_mut()
                 .find(|existing| existing.replica_index == workload.replica_index)
             {
+                if existing.revision_id == placement.revision_id
+                    && existing.agent_endpoint_id == placement.agent_endpoint_id
+                {
+                    placement.service_mesh_expires_at_secs = existing.service_mesh_expires_at_secs;
+                }
                 *existing = placement;
             } else {
                 recovered_catalog.replicas.push(placement);

@@ -165,8 +165,22 @@ pub(super) fn admit_announced_peer(
     let Ok(address) = iroh_support::endpoint_addr(&record, crate::now_secs()) else {
         return;
     };
+    // Because an EndpointRecord is self-signed by its application signing key,
+    // an existing member's address and signing-key binding must not be
+    // overwritten by a foreign signing key claiming the same EndpointId.
+    if members.contains(&endpoint_id)
+        && !member_issuers.matches(&record.signing_pubkey, &record.endpoint_id)
+    {
+        log::warn!(
+            "ignoring announcement for admitted scheduler {} with conflicting signing key",
+            endpoint_id.fmt_short()
+        );
+        return;
+    }
+    if !member_issuers.bind(&record.signing_pubkey, record.endpoint_id.clone()) {
+        return;
+    }
     lookup.set_endpoint_info(address);
-    member_issuers.bind(&record.signing_pubkey, record.endpoint_id.clone());
     if members.insert(endpoint_id) {
         log::info!(
             "admitted announced scheduler {} into the gossip mesh",

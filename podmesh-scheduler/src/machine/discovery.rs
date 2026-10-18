@@ -64,6 +64,7 @@ pub struct PeerDiscovery {
     pub local_endpoint: EndpointId,
     pub members: MemberRegistry,
     pub issuers: IssuerRegistry,
+    pub member_issuers: crate::machine::MemberIssuers,
     pub joiner: PeerJoiner,
     pub lookup: MemoryLookup,
     pub pins: Arc<PeerPins>,
@@ -85,6 +86,7 @@ pub async fn run_peer_discovery(
         local_endpoint,
         members,
         issuers,
+        member_issuers,
         joiner,
         lookup,
         pins,
@@ -129,6 +131,10 @@ pub async fn run_peer_discovery(
                             // Refreshed on every sweep so a peer that restarts
                             // on a new address stays dialable.
                             lookup.set_endpoint_info(address);
+                            member_issuers.bind(
+                                &crypto::b64_encode(&signing_key),
+                                endpoint_id.as_bytes().to_vec(),
+                            );
                             if issuers.insert(signing_key) {
                                 log::info!("machine relay now trusts scheduler {url}");
                             }

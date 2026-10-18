@@ -39,19 +39,32 @@ impl MemberIssuers {
     /// Bounded like the member allowlist itself, and refuses rather than evicts:
     /// dropping a live binding would silently cut a scheduler off its relays,
     /// which is worse than declining to learn a new one.
-    pub fn bind(&self, signing_pubkey_b64: &str, endpoint_id: Vec<u8>) {
+    pub fn bind(&self, signing_pubkey_b64: &str, endpoint_id: Vec<u8>) -> bool {
         let Ok(mut bindings) = self.inner.write() else {
             log::error!("member issuer registry lock poisoned; binding not recorded");
-            return;
+            return false;
         };
         if bindings.get(signing_pubkey_b64) == Some(&endpoint_id) {
-            return;
+            return true;
         }
         if !bindings.contains_key(signing_pubkey_b64) && bindings.len() >= MAX_CONVERGED_MEMBERS {
             log::warn!("member issuer limit of {MAX_CONVERGED_MEMBERS} reached; refusing binding");
-            return;
+            return false;
         }
         bindings.insert(signing_pubkey_b64.to_string(), endpoint_id);
+        true
+    }
+
+    pub fn matches(&self, signing_pubkey_b64: &str, endpoint_id: &[u8]) -> bool {
+        self.inner
+            .read()
+            .ok()
+            .and_then(|bindings| {
+                bindings
+                    .get(signing_pubkey_b64)
+                    .map(|bound| bound.as_slice() == endpoint_id)
+            })
+            .unwrap_or(false)
     }
 
     /// The endpoint `signing_pubkey_b64` is allowed to authorise, if any.

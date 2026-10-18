@@ -172,15 +172,24 @@ impl TryFrom<Args> for SidecarConfig {
             .with_context(|| format!("failed to extract routes for manifest {manifest_id}"))?;
 
         let mut routes = extraction.routes;
+        let default_app_port = routes
+            .first()
+            .map(|route| route.target_port)
+            .or_else(|| {
+                protocol::service_discovery::workload_services(&manifest_bytes)
+                    .ok()
+                    .and_then(|services| services.first()?.ports.first().map(|p| p.target_port))
+            })
+            .unwrap_or(DEFAULT_SIDECAR_APP_PORT);
         // Every workload is always reachable under its own routing key, whether
         // or not the manifest declares an Ingress.
         let ingress_host = format!("{manifest_id}.{MESH_DOMAIN_SUFFIX}");
         routes.push(SidecarRouteSpec {
             host: ingress_host.clone(),
             path_prefix: "/".to_string(),
-            target_port: DEFAULT_SIDECAR_APP_PORT,
+            target_port: default_app_port,
             service_name: metadata.workload_name.clone(),
-            service_port: DEFAULT_SIDECAR_APP_PORT.to_string(),
+            service_port: default_app_port.to_string(),
             source: SidecarRouteKind::Ingress,
         });
 
@@ -208,7 +217,7 @@ impl TryFrom<Args> for SidecarConfig {
             replica_count: metadata.replica_count,
             manifest_id,
             ingress_host,
-            app_port: DEFAULT_SIDECAR_APP_PORT,
+            app_port: default_app_port,
             routes,
             owner_public_key_b64: Some(metadata.owner_public_key_b64.clone()),
             workload_credential_b64: Some(metadata.workload_credential_b64.clone()),

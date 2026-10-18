@@ -86,7 +86,42 @@ impl TestMesh {
         let scheduler_endpoint = crypto::b64_encode(&record.to_bytes(now_secs())?);
         let mut agents = Vec::with_capacity(agent_count);
         for _ in 0..agent_count {
-            agents.push(start_agent(&scheduler_endpoint).await?);
+            let runtime = Arc::new(MockRuntime::default());
+            agents.push(start_agent_with_runtime(&scheduler_endpoint, runtime).await?);
+        }
+        timeout(MESH_TIMEOUT, async {
+            while scheduler.attachments.len().await != agent_count {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .with_context(|| format!("only some of the {agent_count} agents attached"))?;
+
+        Ok(Self {
+            api_base,
+            agents,
+            _schedulers: vec![scheduler],
+        })
+    }
+
+    /// Starts a scheduler and `agent_count` agents backed by the real Podman runtime.
+    pub async fn start_podman(agent_count: usize, workload_network: &str) -> Result<Self> {
+        anyhow::ensure!(
+            (1..=MAX_ATTACHED_AGENTS).contains(&agent_count),
+            "agent_count must be between 1 and {MAX_ATTACHED_AGENTS}"
+        );
+        let temp = tempfile::tempdir()?;
+        let identity = SchedulerIdentity::load(temp.path())?;
+        let config = scheduler_config(HashSet::from([identity.endpoint_id()]), Vec::new())?;
+        let endpoint = identity.bind_endpoint(&config, now_secs()).await?;
+        let scheduler = TestScheduler::start(temp, identity, endpoint, config).await?;
+        let record = scheduler.record()?;
+        let api_base = scheduler.api_base.clone();
+
+        let scheduler_endpoint = crypto::b64_encode(&record.to_bytes(now_secs())?);
+        let mut agents = Vec::with_capacity(agent_count);
+        for _ in 0..agent_count {
+            agents.push(start_podman_agent(&scheduler_endpoint, workload_network).await?);
         }
         timeout(MESH_TIMEOUT, async {
             while scheduler.attachments.len().await != agent_count {
@@ -192,6 +227,13 @@ impl TestMesh {
 }
 
 async fn start_agent(scheduler_endpoint: &str) -> Result<TestAgent> {
+    start_agent_with_runtime(scheduler_endpoint, Arc::new(MockRuntime::default())).await
+}
+
+async fn start_agent_with_runtime(
+    scheduler_endpoint: &str,
+    runtime: Arc<MockRuntime>,
+) -> Result<TestAgent> {
     let temp = tempfile::tempdir()?;
     let config = Config {
         listen: "127.0.0.1:0".into(),
@@ -213,6 +255,7 @@ async fn start_agent(scheduler_endpoint: &str) -> Result<TestAgent> {
             podmesh_agent::config::DEFAULT_RUNTIME_OPERATION_TIMEOUT_SECS,
         machine: MachineConfig {
             bind_addr: "127.0.0.1:0".parse()?,
+            advertise_addresses: Vec::new(),
             scheduler_endpoints: vec![scheduler_endpoint.to_string()],
             scheduler_urls: Vec::new(),
             relay_urls: vec![RELAY_URL.into()],
@@ -229,7 +272,6 @@ async fn start_agent(scheduler_endpoint: &str) -> Result<TestAgent> {
             connection_receive_window_bytes: 1024 * 1024,
         },
     };
-    let runtime = Arc::new(MockRuntime::default());
     let service = AgentService::new(config.clone(), runtime.clone()).await?;
     let signing_pubkey =
         crypto::b64_encode(&crypto::load_or_create_signing_keypair(&config.key_dir)?.0);
@@ -238,6 +280,60 @@ async fn start_agent(scheduler_endpoint: &str) -> Result<TestAgent> {
         endpoint_id: hex::encode(machine.endpoint().id().as_bytes()),
         signing_pubkey,
         runtime,
+        _machine: machine,
+        _temp: temp,
+    })
+}
+
+async fn start_podman_agent(scheduler_endpoint: &str, workload_network: &str) -> Result<TestAgent> {
+    let temp = tempfile::tempdir()?;
+    let config = Config {
+        listen: "127.0.0.1:0".into(),
+        metrics_listen: None,
+        sidecar_metrics_listen: None,
+        key_dir: temp.path().join("keys"),
+        state_path: temp.path().join("state.redb"),
+        runtime: RuntimeKind::Podman,
+        workload_network: workload_network.into(),
+        max_reserved_capacity_percent: podmesh_agent::config::DEFAULT_MAX_RESERVED_CAPACITY_PERCENT,
+        sidecar_image: "podmesh/sidecar:latest".into(),
+        capacity_cpu_milli: AGENT_CPU_MILLI,
+        capacity_memory_bytes: AGENT_MEMORY_BYTES,
+        capacity_storage_bytes: AGENT_STORAGE_BYTES,
+        max_workloads: AGENT_MAX_WORKLOADS,
+        max_concurrent_runtime_operations:
+            podmesh_agent::config::DEFAULT_MAX_CONCURRENT_RUNTIME_OPERATIONS,
+        runtime_operation_timeout_secs:
+            podmesh_agent::config::DEFAULT_RUNTIME_OPERATION_TIMEOUT_SECS,
+        machine: MachineConfig {
+            bind_addr: "127.0.0.1:0".parse()?,
+            advertise_addresses: Vec::new(),
+            scheduler_endpoints: vec![scheduler_endpoint.to_string()],
+            scheduler_urls: Vec::new(),
+            relay_urls: vec![RELAY_URL.into()],
+            relay_ca_certificate_paths: Vec::new(),
+            max_scheduler_attachments: 1,
+            reconnect_initial_ms: 25,
+            reconnect_max_ms: 100,
+            max_seen_queries: 64,
+            operation_timeout_secs: 10,
+            max_concurrent_uni_streams: 16,
+            max_concurrent_bidi_streams: 8,
+            max_idle_secs: 180,
+            stream_receive_window_bytes: 64 * 1024,
+            connection_receive_window_bytes: 1024 * 1024,
+        },
+    };
+    let podman_runtime =
+        podmesh_agent::runtime::create_runtime(RuntimeKind::Podman, workload_network)?;
+    let service = AgentService::new(config.clone(), podman_runtime).await?;
+    let signing_pubkey =
+        crypto::b64_encode(&crypto::load_or_create_signing_keypair(&config.key_dir)?.0);
+    let machine = AgentMachine::start(&config, service).await?;
+    Ok(TestAgent {
+        endpoint_id: hex::encode(machine.endpoint().id().as_bytes()),
+        signing_pubkey,
+        runtime: Arc::new(MockRuntime::default()),
         _machine: machine,
         _temp: temp,
     })

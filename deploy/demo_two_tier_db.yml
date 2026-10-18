@@ -1,0 +1,70 @@
+# Two-tier sample (Part 1): PostgreSQL database on one agent
+#
+# Uses pod-ephemeral emptyDir volumes for PGDATA and /var/run/postgresql so
+# PostgreSQL runs unprivileged (UID 70) without hostPath or cluster PVCs.
+# Exposes ClusterIP Service `postgres-db` on port 5432 for workload-local split
+# DNS (`postgres-db.svc.podmesh.internal`) and direct sidecar-to-sidecar Iroh TCP.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-db
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-db
+  template:
+    metadata:
+      labels:
+        app: postgres-db
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+      volumes:
+        - name: pgdata
+          emptyDir: {}
+        - name: pgrun
+          emptyDir: {}
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - name: tcp-pg
+              containerPort: 5432
+              protocol: TCP
+          env:
+            - name: POSTGRES_DB
+              value: "podmesh_demo"
+            - name: POSTGRES_USER
+              value: "demo_user"
+            - name: POSTGRES_PASSWORD
+              value: "demo_password"
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+            - name: pgrun
+              mountPath: /var/run/postgresql
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-db
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres-db
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: tcp-pg
+      protocol: TCP

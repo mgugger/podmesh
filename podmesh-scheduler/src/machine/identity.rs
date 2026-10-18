@@ -19,6 +19,7 @@ pub struct SchedulerIdentity {
     transport_secret: SecretKey,
     signing_public: Vec<u8>,
     signing_private: Vec<u8>,
+    advertise_addresses: Vec<String>,
     /// Addressing information for peers learned out of band.
     ///
     /// Peer schedulers are discovered over HTTP rather than through a DNS or
@@ -36,6 +37,7 @@ impl SchedulerIdentity {
             transport_secret: SecretKey::generate(),
             signing_public,
             signing_private,
+            advertise_addresses: Vec::new(),
             peer_lookup: MemoryLookup::new(),
         })
     }
@@ -49,8 +51,14 @@ impl SchedulerIdentity {
             transport_secret,
             signing_public,
             signing_private,
+            advertise_addresses: Vec::new(),
             peer_lookup: MemoryLookup::new(),
         })
+    }
+
+    pub fn with_advertise_addresses(mut self, advertise_addresses: Vec<String>) -> Self {
+        self.advertise_addresses = advertise_addresses;
+        self
     }
 
     pub fn endpoint_id(&self) -> iroh::EndpointId {
@@ -107,11 +115,19 @@ impl SchedulerIdentity {
             "scheduler reply address does not match persistent transport identity"
         );
         let relay_url = address.relay_urls().next().map(ToString::to_string);
-        let direct_addresses = address
-            .ip_addrs()
-            .take(MAX_ENDPOINT_DIRECT_ADDRESSES)
-            .map(ToString::to_string)
-            .collect();
+        let direct_addresses = if self.advertise_addresses.is_empty() {
+            address
+                .ip_addrs()
+                .take(MAX_ENDPOINT_DIRECT_ADDRESSES)
+                .map(ToString::to_string)
+                .collect()
+        } else {
+            self.advertise_addresses
+                .iter()
+                .take(MAX_ENDPOINT_DIRECT_ADDRESSES)
+                .cloned()
+                .collect()
+        };
         EndpointRecord {
             version: ENDPOINT_RECORD_VERSION,
             endpoint_id: self.endpoint_id().as_bytes().to_vec(),

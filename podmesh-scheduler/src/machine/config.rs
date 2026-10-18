@@ -37,6 +37,14 @@ pub struct MachineConfig {
     )]
     pub bind_addr: SocketAddr,
 
+    /// Addresses agents and peer schedulers should dial instead of the ones bound locally.
+    #[arg(
+        long = "advertise-address",
+        env = "PODMESH_SCHEDULER_ADVERTISE_ADDRESSES",
+        value_delimiter = ','
+    )]
+    pub advertise_addresses: Vec<String>,
+
     #[arg(
         long = "machine-relay-url",
         env = "PODMESH_SCHEDULER_MACHINE_RELAY_URLS",
@@ -235,6 +243,7 @@ mod tests {
             scheduler_peer_pins: Vec::new(),
             key_dir: "/tmp/podmesh-scheduler-test".into(),
             bind_addr: DEFAULT_MACHINE_BIND.parse().unwrap(),
+            advertise_addresses: Vec::new(),
             relay_urls: vec!["https://relay.example.test".into()],
             relay_ca_certificate_paths: Vec::new(),
             scheduler_members: vec![member.to_string()],

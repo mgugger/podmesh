@@ -31,9 +31,22 @@ pub fn resolve_target(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     let resolved: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
         .map_err(|error| anyhow::anyhow!("resolve egress target {host}: {error}"))?
+        .filter(|addr| {
+            let ip = addr.ip();
+            !ip.is_unspecified() && !is_cloud_metadata(ip)
+        })
         .collect();
     ensure!(!resolved.is_empty(), "egress target {host} did not resolve");
     Ok(resolved)
+}
+
+fn is_cloud_metadata(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.octets() == [169, 254, 169, 254],
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .is_some_and(|v4| v4.octets() == [169, 254, 169, 254]),
+    }
 }
 
 #[cfg(test)]
@@ -52,5 +65,7 @@ mod tests {
         assert!(resolve_target("", 80).is_err());
         assert!(resolve_target("example.com", 0).is_err());
         assert!(resolve_target(&"a".repeat(MAX_EGRESS_HOST_LEN + 1), 80).is_err());
+        assert!(resolve_target("0.0.0.0", 80).is_err());
+        assert!(resolve_target("169.254.169.254", 80).is_err());
     }
 }

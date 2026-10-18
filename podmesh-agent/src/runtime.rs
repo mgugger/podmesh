@@ -151,14 +151,18 @@ impl WorkloadRuntime for MockRuntime {
 
     async fn deploy(&self, deployment: WorkloadDeployment<'_>) -> Result<String> {
         self.deploy_calls.fetch_add(1, Ordering::SeqCst);
-        if self
-            .fail_deploys
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok()
-        {
-            return Err(anyhow!("injected mock runtime deploy failure"));
+        loop {
+            let current = self.fail_deploys.load(Ordering::SeqCst);
+            let Some(next) = current.checked_sub(1) else {
+                break;
+            };
+            if self
+                .fail_deploys
+                .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Err(anyhow!("injected mock runtime deploy failure"));
+            }
         }
         self.workloads.write().await.insert(
             deployment.workload_id.to_string(),

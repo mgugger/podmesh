@@ -86,6 +86,8 @@ pub fn inject(manifest: &[u8], injection: SidecarInjection<'_>) -> Result<Vec<u8
         "imagePullPolicy": "IfNotPresent",
         "env": environment,
         "securityContext": {
+            "runAsUser": 0,
+            "runAsNonRoot": false,
             "capabilities": { "add": ["NET_ADMIN"] }
         }
     });
@@ -134,8 +136,8 @@ pub fn inject(manifest: &[u8], injection: SidecarInjection<'_>) -> Result<Vec<u8
             );
             containers.push(sidecar.clone());
             injected += 1;
+            output.push(serde_yaml::to_value(value)?);
         }
-        output.push(serde_yaml::to_value(value)?);
     }
     anyhow::ensure!(
         injected > 0,
@@ -373,10 +375,13 @@ spec:
     }
 
     #[test]
-    fn preserves_non_workload_documents() {
-        let manifest = br#"kind: ConfigMap
+    fn strips_auxiliary_documents_from_runtime_manifest() {
+        let manifest = br#"kind: Service
 metadata:
   name: config
+spec:
+  ports:
+    - port: 80
 ---
 kind: Pod
 metadata:
@@ -397,10 +402,10 @@ spec:
         )
         .unwrap();
         let docs = protocol::manifest_yaml::parse_yaml_documents_from_slice(&output).unwrap();
-        assert_eq!(docs.len(), 2);
+        assert_eq!(docs.len(), 1);
         assert_eq!(
             docs[0].get("kind").and_then(serde_yaml::Value::as_str),
-            Some("ConfigMap")
+            Some("Pod")
         );
     }
 }

@@ -191,16 +191,30 @@ the routing key it serves, and the proxy SHALL record that tenancy against the c
 verifying it. Because the owner key is also the credential's signing root, a credential cannot be
 minted for a tenant whose private key the minter does not hold.
 
-The credential SHALL be minted by `podctl` at deploy time, SHALL travel inside the owner-encrypted
-execution specification, and SHALL expire. It is a bearer credential: whoever reads a pod's metadata
-may act as that workload, which SHALL be stated rather than implied away. Binding it to the sidecar's
-transport key is not possible, because that key does not exist when the owner mints it.
+The credential SHALL be minted by `podctl` at deploy time as an owner-signed enrollment delegation (and enrolled by the selected agent into a short-lived endpoint-bound child Biscuit), SHALL travel inside the owner-encrypted
+execution specification, and SHALL expire. It is a bearer credential for that enrolled endpoint identity: whoever holds the enrolled pod's material
+may act as that workload, which SHALL be stated rather than implied away.
 
-Expiry SHALL be enforced where the authorisation decision is made — at the proxy — and SHALL NOT be
+Expiry SHALL be enforced where the authorisation decision is made — at the proxy and peer sidecars — and SHALL NOT be
 enforced by components that merely carry the credential. A pod may run for longer than its
 credential's lifetime, and an agent re-reads a stored execution specification on every restart;
 refusing there would delete a healthy workload because of an unrelated restart. Those components
 SHALL still verify the signature and the tenant and workload it names.
+
+### Requirement: Sidecars SHALL support workload-local split DNS and direct peer TCP
+
+Injected sidecars SHALL receive an owner-signed `ServiceCatalog` for their deployment and SHALL
+expose a loopback-only split DNS server (`127.0.0.1:15053`) redirected from pod port 53 via
+nftables. Internal `*.svc.podmesh.internal.` queries SHALL resolve to stable local VIPs in
+`198.18.0.0/24` backed by mutually authenticated, endpoint-bound Iroh peer sessions (`PEER_ALPN`)
+and signed expiring `ReplicaServiceRecord`s. Non-internal DNS queries SHALL be forwarded to the
+workload's captured upstream resolver without recursive CNAME chasing.
+
+#### Scenario: Internal service resolves and routes directly between sidecars
+
+- **GIVEN** a multi-replica or multi-service tenant deployment with enrolled sidecars
+- **WHEN** an application queries `<service>.<route-label>.svc.podmesh.internal.` and connects to the returned VIP
+- **THEN** the sidecar resolves the VIP locally without upstream DNS leakage and tunnels the TCP connection directly to an authorized peer replica over Iroh
 
 #### Scenario: A long-running workload survives an agent restart
 

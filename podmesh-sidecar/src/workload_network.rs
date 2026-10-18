@@ -298,9 +298,13 @@ impl WorkloadNetwork {
     pub async fn run(self: Arc<Self>) -> Result<()> {
         let mut changed = self.authorization.subscribe();
         let mut interval = tokio::time::interval(Duration::from_secs(10));
+        let mut online_refreshed = false;
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => return Ok(()),
+                _ = self.endpoint.online(), if !online_refreshed => {
+                    online_refreshed = true;
+                },
                 _ = interval.tick() => {},
                 result = changed.changed() => { result.context("workload authority channel closed")?; },
             }

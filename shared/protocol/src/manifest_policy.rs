@@ -104,12 +104,14 @@ violations contains msg if {
 
 violations contains msg if {
     some container in all_containers
+    not is_injected_sidecar(container)
     container.securityContext.runAsUser == 0
     msg := sprintf("container '%s' requests runAsUser: 0", [container.name])
 }
 
 violations contains msg if {
     some container in all_containers
+    not is_injected_sidecar(container)
     container.securityContext.runAsNonRoot == false
     msg := sprintf("container '%s' sets runAsNonRoot: false", [container.name])
 }
@@ -118,6 +120,26 @@ violations contains msg if {
     some container in all_containers
     object.get(container, "securityContext", {}).procMount == "Unmasked"
     msg := sprintf("container '%s' requests an unmasked /proc", [container.name])
+}
+
+violations contains msg if {
+    some container in all_containers
+    seccomp_type := object.get(object.get(container, "securityContext", {}), "seccompProfile", {}).type
+    not seccomp_type in ["RuntimeDefault"]
+    msg := sprintf("container '%s' requests seccompProfile.type '%v'; only RuntimeDefault is allowed", [container.name, seccomp_type])
+}
+
+violations contains msg if {
+    some container in all_containers
+    apparmor_type := object.get(object.get(container, "securityContext", {}), "appArmorProfile", {}).type
+    not apparmor_type in ["RuntimeDefault"]
+    msg := sprintf("container '%s' requests appArmorProfile.type '%v'; only RuntimeDefault is allowed", [container.name, apparmor_type])
+}
+
+violations contains msg if {
+    some container in all_containers
+    count(object.get(object.get(container, "securityContext", {}), "seLinuxOptions", {})) > 0
+    msg := sprintf("container '%s' sets seLinuxOptions, which is not permitted", [container.name])
 }
 
 # --- pod-level namespace sharing ------------------------------------------
@@ -157,6 +179,41 @@ violations contains msg if {
     msg := "pod requests hostUsers, disabling user-namespace isolation"
 }
 
+violations contains msg if {
+    seccomp_type := object.get(object.get(pod_spec, "securityContext", {}), "seccompProfile", {}).type
+    not seccomp_type in ["RuntimeDefault"]
+    msg := sprintf("pod securityContext requests seccompProfile.type '%v'; only RuntimeDefault is allowed", [seccomp_type])
+}
+
+violations contains msg if {
+    apparmor_type := object.get(object.get(pod_spec, "securityContext", {}), "appArmorProfile", {}).type
+    not apparmor_type in ["RuntimeDefault"]
+    msg := sprintf("pod securityContext requests appArmorProfile.type '%v'; only RuntimeDefault is allowed", [apparmor_type])
+}
+
+violations contains msg if {
+    count(object.get(object.get(pod_spec, "securityContext", {}), "seLinuxOptions", {})) > 0
+    msg := "pod securityContext sets seLinuxOptions, which is not permitted"
+}
+
+violations contains msg if {
+    count(object.get(object.get(pod_spec, "securityContext", {}), "sysctls", [])) > 0
+    msg := "pod securityContext sets sysctls, which is not permitted"
+}
+
+# --- runtime escape annotations -------------------------------------------
+
+all_annotations := object.union(
+    object.get(object.get(input, "metadata", {}), "annotations", {}),
+    object.get(object.get(object.get(object.get(input, "spec", {}), "template", {}), "metadata", {}), "annotations", {}),
+)
+
+violations contains msg if {
+    some key, _ in all_annotations
+    not startswith(key, "podmesh.io/")
+    msg := sprintf("annotation '%s' is not allowed; only podmesh.io/* annotations are permitted", [key])
+}
+
 # --- host ports ------------------------------------------------------------
 
 violations contains msg if {
@@ -167,19 +224,53 @@ violations contains msg if {
 }
 
 # --- volumes ---------------------------------------------------------------
-# No volume type is permitted yet. hostPath alone is a container escape, and
-# the projected/CSI/PVC types need per-tenant naming rules that do not exist.
+# Only pod-ephemeral `emptyDir` volumes are permitted. `hostPath`, `configMap`,
+# `secret`, `persistentVolumeClaim`, `projected`, and `csi` volumes are refused:
+# `hostPath` is a direct container escape, and cluster-mounted volume types need
+# per-tenant naming rules that do not exist yet.
+
+is_safe_emptydir_volume(vol) if {
+    is_object(vol)
+    is_string(vol.name)
+    vol.name != ""
+    is_object(vol.emptyDir)
+    every key, _ in vol {
+        key in ["name", "emptyDir"]
+    }
+    every key, _ in vol.emptyDir {
+        key in ["medium", "sizeLimit"]
+    }
+}
+
+declared_emptydir_names contains vol.name if {
+    some vol in object.get(pod_spec, "volumes", [])
+    is_safe_emptydir_volume(vol)
+}
 
 violations contains msg if {
-    count(object.get(pod_spec, "volumes", [])) > 0
-    msg := "pod declares volumes; volume mounts are not supported yet"
+    some vol in object.get(pod_spec, "volumes", [])
+    not is_safe_emptydir_volume(vol)
+    msg := sprintf("pod declares unsupported volume '%v'; only emptyDir volumes are supported", [object.get(vol, "name", "unnamed")])
+}
+
+is_safe_volume_mount(mount) if {
+    is_object(mount)
+    mount.name in declared_emptydir_names
+    is_string(mount.mountPath)
+    startswith(mount.mountPath, "/")
+    not contains(mount.mountPath, "..")
+    not startswith(mount.mountPath, "/var/run/podmesh")
+    not startswith(mount.mountPath, "/var/lib/podmesh-connector")
+    object.get(mount, "mountPropagation", "None") in ["None", ""]
+    object.get(mount, "subPathExpr", "") == ""
 }
 
 violations contains msg if {
     some container in all_containers
-    count(object.get(container, "volumeMounts", [])) > 0
     not is_injected_sidecar(container)
-    msg := sprintf("container '%s' declares volumeMounts; volume mounts are not supported yet", [container.name])
+    some mount in object.get(container, "volumeMounts", [])
+    not is_safe_volume_mount(mount)
+    msg := sprintf("container '%s' declares unsupported volumeMount '%v'; only mounts of declared emptyDir volumes are supported", [container.name, object.get(mount, "name", "unnamed")])
 }
 "#;
 
@@ -971,5 +1062,96 @@ spec:
             "violations: {:?}",
             result.violations
         );
+    }
+
+    #[test]
+    fn runtime_escape_annotations_and_unconfined_profiles_are_rejected() {
+        let manifest = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: escape-annotations
+  annotations:
+    io.podman.annotations.label: "disable"
+    podmesh.io/replicas: "1"
+spec:
+  securityContext:
+    seccompProfile:
+      type: Unconfined
+    sysctls:
+    - name: net.ipv4.ip_unprivileged_port_start
+      value: "0"
+  containers:
+  - name: app
+    image: nginx:latest
+    securityContext:
+      appArmorProfile:
+        type: Unconfined
+      seLinuxOptions:
+        type: spc_t
+"#;
+        let result = validate_manifest(manifest).expect("validation should succeed");
+        assert!(!result.allowed);
+        for expected in [
+            "io.podman.annotations.label",
+            "seccompProfile",
+            "appArmorProfile",
+            "seLinuxOptions",
+            "sysctls",
+        ] {
+            assert!(
+                result.violations.iter().any(|v| v.contains(expected)),
+                "expected {expected} violation in {:?}",
+                result.violations
+            );
+        }
+    }
+
+    #[test]
+    fn emptydir_volumes_are_allowed_while_other_volumes_are_rejected() {
+        let emptydir_pod = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: postgres-pod
+spec:
+  volumes:
+  - name: pgdata
+    emptyDir: {}
+  - name: run-postgres
+    emptyDir:
+      medium: Memory
+  containers:
+  - name: postgres
+    image: postgres:16-alpine
+    volumeMounts:
+    - name: pgdata
+      mountPath: /var/lib/postgresql/data
+    - name: run-postgres
+      mountPath: /var/run/postgresql
+"#;
+        let result = validate_manifest(emptydir_pod).expect("validation should succeed");
+        assert!(
+            result.allowed,
+            "emptyDir volumes should be allowed: {:?}",
+            result.violations
+        );
+
+        let undeclared_mount_pod = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: undeclared-mount
+spec:
+  containers:
+  - name: app
+    image: nginx:latest
+    volumeMounts:
+    - name: missing-vol
+      mountPath: /data
+"#;
+        let result = validate_manifest(undeclared_mount_pod).expect("validation should succeed");
+        assert!(!result.allowed);
+        assert!(result.violations.iter().any(|v| v.contains("volumeMount")));
     }
 }

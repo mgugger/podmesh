@@ -89,7 +89,9 @@ The agent SHALL evaluate every manifest against a deny-by-default pod security p
 deploying it, covering `initContainers` and `ephemeralContainers` as well as `containers`. The policy
 SHALL refuse privileged containers, privilege escalation, added capabilities on any container other
 than the injected sidecar, `runAsUser: 0`, `hostNetwork`, `hostPID`, `hostIPC`,
-`shareProcessNamespace`, `hostUsers`, host ports, and **volumes of every kind**.
+`shareProcessNamespace`, `hostUsers`, host ports, and all non-`emptyDir` volumes (`hostPath`,
+`configMap`, `secret`, `persistentVolumeClaim`, `projected`, `csi`). Pod-ephemeral `emptyDir`
+volumes with safe container `volumeMounts` are permitted for scratch and database runtime directories.
 
 Volumes are refused wholesale for the first release. The agent drives a Podman socket that is
 equivalent to host control, so a single `hostPath` entry is a complete escape, and admitting the safe

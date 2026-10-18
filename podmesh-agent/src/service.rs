@@ -479,11 +479,22 @@ impl AgentService {
             .relay_urls()
             .next()
             .map(ToString::to_string);
-        let direct_addresses = endpoint_address
-            .ip_addrs()
-            .take(protocol::MAX_ENDPOINT_DIRECT_ADDRESSES)
-            .map(ToString::to_string)
-            .collect();
+        let direct_addresses = if self.inner.config.machine.advertise_addresses.is_empty() {
+            endpoint_address
+                .ip_addrs()
+                .take(protocol::MAX_ENDPOINT_DIRECT_ADDRESSES)
+                .map(ToString::to_string)
+                .collect()
+        } else {
+            self.inner
+                .config
+                .machine
+                .advertise_addresses
+                .iter()
+                .take(protocol::MAX_ENDPOINT_DIRECT_ADDRESSES)
+                .cloned()
+                .collect()
+        };
         EndpointRecord {
             version: ENDPOINT_RECORD_VERSION,
             endpoint_id: endpoint_address.id.as_bytes().to_vec(),
@@ -1787,6 +1798,10 @@ impl AgentService {
                 && measured.storage_bytes <= stored.storage_bytes,
             "persisted workload resource limits exceed reservation"
         );
+        // Recreating a missing runtime pod generates fresh container-writable
+        // connector keys; clear the previous binding before deploying so the
+        // restored pod can enroll under the stored owner delegation.
+        self.inner.store.remove_enrollment(&workload_id)?;
         stored.runtime_id = self
             .runtime_operation(
                 "reconciliation deploy",

@@ -1,0 +1,103 @@
+# Two-tier sample (Part 2): Frontend application on a distinct agent
+#
+# Uses `podmesh.io/anti-affinity: "postgres-db"` so `podctl` places the
+# frontend on a different agent than the database.
+# Inside the frontend pod, workload-local split DNS resolves
+# `postgres-db.svc.podmesh.internal` (or `postgres-db`) to a local 198.18.0.x VIP
+# and tunnels TCP port 5432 directly over an authenticated Iroh stream to the
+# database replica's sidecar.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-frontend
+  annotations:
+    podmesh.io/anti-affinity: "postgres-db"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-frontend
+  template:
+    metadata:
+      labels:
+        app: demo-frontend
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+      volumes:
+        - name: cache
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+      containers:
+        - name: frontend
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - |
+              while true; do
+                result=$(psql -h "$DB_HOST" -p "$DB_PORT" -tAc "SELECT 'podmesh-two-tier-postgres-ok';" 2>&1 || true)
+                body="DB_RESULT=${result}"
+                len=${#body}
+                printf "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" "$len" "$body" | nc -l -p 18080 -w 2 || sleep 0.1
+              done
+          ports:
+            - name: http
+              containerPort: 18080
+              protocol: TCP
+          env:
+            - name: DB_HOST
+              value: "postgres-db.svc.podmesh.internal"
+            - name: DB_PORT
+              value: "5432"
+            - name: PGUSER
+              value: "demo_user"
+            - name: PGPASSWORD
+              value: "demo_password"
+            - name: PGDATABASE
+              value: "podmesh_demo"
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/nginx
+            - name: run
+              mountPath: /var/run
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "128Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-frontend-svc
+spec:
+  type: ClusterIP
+  selector:
+    app: demo-frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo-frontend-ingress
+spec:
+  rules:
+    - host: demo-frontend.mesh.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: demo-frontend-svc
+                port:
+                  number: 80

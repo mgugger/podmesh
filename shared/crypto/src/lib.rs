@@ -78,12 +78,26 @@ pub fn generate_secure_nonce() -> String {
 }
 
 fn ensure_key_dir(path: &Path) -> anyhow::Result<()> {
-    if !path.exists() {
-        std::fs::create_dir_all(path)?;
-    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        if !path.exists() {
+            let mut missing = Vec::<PathBuf>::new();
+            let mut current = path;
+            while !current.exists() {
+                missing.push(current.to_path_buf());
+                current = current.parent().ok_or_else(|| {
+                    anyhow::anyhow!("key directory {} has no existing ancestor", path.display())
+                })?;
+            }
+            for directory in missing.into_iter().rev() {
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(KEY_DIR_MODE);
+                builder.create(&directory).map_err(|e| {
+                    anyhow::anyhow!("create key directory {}: {e}", directory.display())
+                })?;
+            }
+        }
         let metadata = std::fs::symlink_metadata(path)
             .map_err(|e| anyhow::anyhow!("inspect key directory {}: {e}", path.display()))?;
         anyhow::ensure!(
@@ -92,6 +106,10 @@ fn ensure_key_dir(path: &Path) -> anyhow::Result<()> {
             path.display()
         );
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(KEY_DIR_MODE))?;
+    }
+    #[cfg(not(unix))]
+    if !path.exists() {
+        std::fs::create_dir_all(path)?;
     }
     Ok(())
 }

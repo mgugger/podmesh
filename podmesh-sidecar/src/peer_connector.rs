@@ -194,8 +194,12 @@ impl PeerConnector {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("service cache poisoned"))?;
             for record in records {
-                cache.authorize_catalog(record.catalog.clone())?;
-                changed += usize::from(cache.merge(record, (self.state.clock)())?);
+                if cache.authorize_catalog(record.catalog.clone()).is_err() {
+                    continue;
+                }
+                if let Ok(merged) = cache.merge(record, (self.state.clock)()) {
+                    changed += usize::from(merged);
+                }
             }
             drop(cache);
             match next {

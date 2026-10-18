@@ -90,7 +90,8 @@ pub struct Config {
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let mut config = config;
     let listener = tokio::net::TcpListener::bind(&config.listen).await?;
-    let identity = machine::SchedulerIdentity::load(&config.machine.key_dir)?;
+    let identity = machine::SchedulerIdentity::load(&config.machine.key_dir)?
+        .with_advertise_addresses(config.machine.advertise_addresses.clone());
     provision_relay_credentials(&mut config, &identity)?;
     identity.validate_relay_trust(&config.relay)?;
     let machine_config = config.machine.validate(identity.endpoint_id())?;
@@ -178,7 +179,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             offers: queries.offer_handler(),
             placement: placement.clone(),
             locations: locations.clone(),
-            member_issuers,
+            member_issuers: member_issuers.clone(),
             lookup: identity.peer_lookup(),
         },
         &machine_config,
@@ -254,6 +255,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 local_endpoint: machine_endpoint.id(),
                 members: scheduler_gossip.members(),
                 issuers: relay_issuers,
+                member_issuers,
                 joiner: scheduler_gossip.peer_joiner(),
                 lookup: api_identity.peer_lookup(),
                 pins,
